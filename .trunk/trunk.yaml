@@ -1,0 +1,42 @@
+# This file controls the behavior of Trunk: https://docs.trunk.io/cli
+# Format reference:
+# https://docs.trunk.io/reference/trunk-yaml
+version: 0.1
+cli:
+  version: 1.25.0
+plugins:
+  sources:
+    - id: trunk
+      ref: v1.10.2
+      uri: https://github.com/trunk-io/plugins
+runtimes:
+  enabled:
+    - node@24.16.0
+    - python@3.14.4
+lint:
+  definitions:
+    - name: clippy
+      commands:
+        - name: lint
+          target: .
+          run: >-
+            cargo clippy --workspace --all-targets --all-features
+            --message-format json --locked -- --cap-lints=warn --no-deps
+          run_from: ${target_directory}
+    - name: rustfmt
+      commands:
+        - name: format
+          run: rustfmt --edition 2024 ${target}
+  ignore:
+    - linters: [markdownlint-cli2, taplo]
+      paths:
+        - crates/unpin-core/tests/fixtures/**
+  enabled:
+    - actionlint@1.7.12
+    - clippy@1.97.0
+    - git-diff-check
+    - markdownlint-cli2@0.23.1
+    - rustfmt@1.97.0
+    - taplo@0.10.0
+    - trufflehog@3.95.6
+    - yamllint@1.38.0

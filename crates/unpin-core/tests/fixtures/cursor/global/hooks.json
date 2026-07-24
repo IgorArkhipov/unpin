@@ -1,0 +1,11 @@
+{
+  "hooks": {
+    "BeforeShellExecution": [
+      {
+        "command": "/usr/bin/true",
+        "matcher": "shell",
+        "timeout": 10
+      }
+    ]
+  }
+}

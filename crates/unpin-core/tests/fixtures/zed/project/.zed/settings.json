@@ -1,0 +1,11 @@
+{
+  "context_servers": {
+    "local-docs": {
+      "command": "python3",
+      "args": [
+        "-m",
+        "unpin_fixture_server"
+      ]
+    }
+  }
+}

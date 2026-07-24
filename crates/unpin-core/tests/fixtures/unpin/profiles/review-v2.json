@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "id": "review",
+  "displayName": "Review",
+  "description": "Review capabilities plus tests",
+  "members": [
+    "skill.review",
+    "mcp.review",
+    "skill.tests"
+  ]
+}

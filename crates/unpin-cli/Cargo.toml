@@ -1,0 +1,39 @@
+[package]
+name = "unpin-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "unpin"
+path = "src/main.rs"
+
+[dependencies]
+unpin-core.workspace = true
+clap.workspace = true
+crossterm.workspace = true
+futures.workspace = true
+getrandom.workspace = true
+http.workspace = true
+keyring.workspace = true
+ratatui.workspace = true
+reqwest.workspace = true
+rmcp.workspace = true
+serde_json.workspace = true
+sse-stream.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+zeroize.workspace = true
+
+[dev-dependencies]
+assert_cmd.workspace = true
+tempfile.workspace = true
