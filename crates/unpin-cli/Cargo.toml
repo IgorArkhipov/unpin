@@ -25,8 +25,8 @@ serde_json.workspace = true
 sse-stream.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
-predicates.workspace = true
 tempfile.workspace = true

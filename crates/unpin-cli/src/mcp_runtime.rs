@@ -39,6 +39,7 @@ use unpin_core::hooks::{
     HookDispatchPlan, HookDispatchStep, HookEventFamily, HookFailurePolicy, HookInvocationChain,
     HookRewriteAuthorization, HookRewriteRequest,
 };
+use zeroize::Zeroize;
 
 mod bounded_http;
 
@@ -52,6 +53,16 @@ const MAX_BEARER_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_UPSTREAM_STDIO_MESSAGE_BYTES: usize = 32 * 1024 * 1024;
 const MCP_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_MALFORMED_STDIO_FRAMES: u8 = 3;
+const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 1;
+const HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
+    reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .pool_max_idle_per_host(HTTP_POOL_MAX_IDLE_PER_HOST)
+        .pool_idle_timeout(HTTP_POOL_IDLE_TIMEOUT)
+        .build()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayRuntimeTimeouts {
@@ -132,7 +143,7 @@ impl std::fmt::Debug for BoundBearerToken {
 
 impl Drop for BoundBearerToken {
     fn drop(&mut self) {
-        self.token.fill(0);
+        self.token.zeroize();
     }
 }
 
@@ -662,6 +673,7 @@ pub struct GatewayMcpServer {
     upstreams: Arc<McpUpstreamPool>,
     credentials: Arc<dyn GatewayCredentialResolver>,
     hook_authorizations: Arc<dyn GatewayHookAuthorizationSource>,
+    hook_http_client: Option<reqwest::Client>,
     timeouts: GatewayRuntimeTimeouts,
     list_change_gate: Arc<RwLock<()>>,
 }
@@ -691,6 +703,7 @@ impl GatewayMcpServer {
             upstreams: Arc::new(McpUpstreamPool::default()),
             credentials,
             hook_authorizations: Arc::new(NoGatewayHookAuthorizations),
+            hook_http_client: build_hardened_http_client().ok(),
             timeouts,
             list_change_gate: Arc::new(RwLock::new(())),
         }
@@ -848,6 +861,7 @@ impl GatewayMcpServer {
                 }
             } else {
                 execute_hook_action(
+                    self.hook_http_client.as_ref(),
                     step.handler().action(),
                     &payload,
                     Duration::from_millis(step.handler().timeout_ms()),
@@ -1301,6 +1315,7 @@ enum HookExecutionError {
 }
 
 async fn execute_hook_action(
+    http_client: Option<&reqwest::Client>,
     action: &HookAction,
     payload: &Value,
     timeout: Duration,
@@ -1316,7 +1331,8 @@ async fn execute_hook_action(
         return execute_command_hook(command, payload, timeout, maximum_output_bytes).await;
     }
     if let Some(endpoint) = action.http_endpoint() {
-        return execute_http_hook(endpoint, payload, timeout, maximum_output_bytes).await;
+        let client = http_client.ok_or(HookExecutionError::Failed)?;
+        return execute_http_hook(client, endpoint, payload, timeout, maximum_output_bytes).await;
     }
     if action.mcp_target().is_some() || action.component_reference().is_some() {
         return Err(HookExecutionError::Unsupported);
@@ -1374,16 +1390,12 @@ async fn execute_command_hook(
 }
 
 async fn execute_http_hook(
+    client: &reqwest::Client,
     endpoint: &str,
     payload: &Value,
     timeout: Duration,
     maximum_output_bytes: usize,
 ) -> Result<HookActionOutcome, HookExecutionError> {
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .pool_max_idle_per_host(0)
-        .build()
-        .map_err(|_| HookExecutionError::Failed)?;
     let execution = async {
         let response = client
             .post(endpoint)
@@ -2797,10 +2809,15 @@ mod tests {
         )
         .expect("structured hook");
 
-        let outcome =
-            execute_hook_action(&action, &json!({"value": 1}), Duration::from_secs(2), 128)
-                .await
-                .expect("execute hook");
+        let outcome = execute_hook_action(
+            None,
+            &action,
+            &json!({"value": 1}),
+            Duration::from_secs(2),
+            128,
+        )
+        .await
+        .expect("execute hook");
 
         assert_eq!(outcome, HookActionOutcome::Continue);
     }
@@ -3068,7 +3085,9 @@ mod tests {
             tokio::time::sleep(Duration::from_secs(5)).await;
         });
 
+        let client = build_hardened_http_client().expect("hook HTTP client");
         let outcome = execute_http_hook(
+            &client,
             &format!("http://{address}/hook"),
             &json!({}),
             Duration::from_millis(50),
@@ -3078,6 +3097,101 @@ mod tests {
         server.abort();
 
         assert!(matches!(outcome, Err(HookExecutionError::TimedOut)));
+    }
+
+    #[tokio::test]
+    async fn repeated_http_hooks_reuse_one_hardened_client_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn read_request(socket: &mut tokio::net::TcpStream) -> io::Result<bool> {
+            let mut request = Vec::with_capacity(1024);
+            loop {
+                if let Some(header_end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n")
+                {
+                    let headers = std::str::from_utf8(&request[..header_end])
+                        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+                    let content_length = headers
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find_map(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or_default();
+                    if request.len() >= header_end + 4 + content_length {
+                        return Ok(true);
+                    }
+                }
+                let mut chunk = [0_u8; 1024];
+                let read = socket.read(&mut chunk).await?;
+                if read == 0 {
+                    return if request.is_empty() {
+                        Ok(false)
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "HTTP hook request ended before its declared body",
+                        ))
+                    };
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+        }
+
+        async fn serve_connection(mut socket: tokio::net::TcpStream) -> io::Result<()> {
+            const BODY: &[u8] = br#"{"decision":"continue"}"#;
+            while read_request(&mut socket).await? {
+                socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                            BODY.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await?;
+                socket.write_all(BODY).await?;
+            }
+            Ok(())
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("hook listener");
+        let address = listener.local_addr().expect("hook address");
+        let connections = Arc::new(AtomicUsize::new(0));
+        let observed_connections = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            loop {
+                let (socket, _) = listener.accept().await.expect("accept hook request");
+                observed_connections.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    serve_connection(socket)
+                        .await
+                        .expect("serve hook connection");
+                });
+            }
+        });
+        let client = build_hardened_http_client().expect("hook HTTP client");
+        let action =
+            HookAction::http(format!("http://{address}/hook")).expect("local HTTP hook action");
+
+        for _ in 0..2 {
+            let outcome = execute_hook_action(
+                Some(&client),
+                &action,
+                &json!({}),
+                Duration::from_secs(2),
+                128,
+            )
+            .await
+            .expect("execute HTTP hook");
+            assert_eq!(outcome, HookActionOutcome::Continue);
+        }
+        server.abort();
+
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
     }
 
     #[cfg(unix)]

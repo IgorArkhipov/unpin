@@ -54,11 +54,8 @@ impl BoundedHttpClient {
         if maximum_message_bytes == 0 {
             return Err(BoundedHttpClientError::ResponseLimitExceeded);
         }
-        let client = reqwest::Client::builder()
-            .pool_max_idle_per_host(0)
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(BoundedHttpClientError::Request)?;
+        let client =
+            super::build_hardened_http_client().map_err(BoundedHttpClientError::Request)?;
         Ok(Self {
             client,
             maximum_message_bytes,
