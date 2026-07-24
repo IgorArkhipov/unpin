@@ -842,7 +842,8 @@ for raw in sys.stdin:
         "/usr/local/bin/python3",
     ]
     .into_iter()
-    .find(|path| Path::new(path).is_file())
+    .filter_map(|path| fs::canonicalize(path).ok())
+    .find(|path| path.is_file())
     .expect("Python 3 executable");
     let forbidden = ["USER", "SHELL", "TERM", "SSH_AUTH_SOCK", "CODEX_THREAD_ID"]
         .into_iter()
