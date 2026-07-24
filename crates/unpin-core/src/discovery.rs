@@ -2908,11 +2908,19 @@ fn project_skill_scope_roots(
         }
         ProjectSkillTraversal::AncestorsAndDescendants => {
             add_project_ancestors(project_root, repository_root, &mut scope_roots);
-            add_descendant_skill_scopes(project_root, relative_skill_root, &mut scope_roots)?
+            add_descendant_skill_scopes(
+                project_root,
+                repository_root,
+                relative_skill_root,
+                &mut scope_roots,
+            )?
         }
-        ProjectSkillTraversal::Repository => {
-            add_descendant_skill_scopes(repository_root, relative_skill_root, &mut scope_roots)?
-        }
+        ProjectSkillTraversal::Repository => add_descendant_skill_scopes(
+            repository_root,
+            repository_root,
+            relative_skill_root,
+            &mut scope_roots,
+        )?,
     };
 
     Ok(ProjectSkillScopeRoots {
@@ -2938,6 +2946,7 @@ fn add_project_ancestors(
 
 fn add_descendant_skill_scopes(
     search_root: &Path,
+    repository_root: &Path,
     relative_skill_root: &Path,
     scope_roots: &mut BTreeSet<PathBuf>,
 ) -> Result<usize, DiscoveryError> {
@@ -2982,7 +2991,10 @@ fn add_descendant_skill_scopes(
                 }
                 Err(error) => return Err(error.into()),
             };
-            if !file_type.is_dir() || should_skip_project_scope_dir(&entry.file_name()) {
+            if !file_type.is_dir()
+                || should_skip_project_scope_dir(&entry.file_name())
+                || is_retained_local_matrix_scenario_dir(repository_root, &entry.path())
+            {
                 continue;
             }
             pending.push(entry.path());
@@ -3017,6 +3029,33 @@ fn should_skip_project_scope_dir(name: &OsStr) -> bool {
                 | "target"
         )
     )
+}
+
+fn is_retained_local_matrix_scenario_dir(repository_root: &Path, directory: &Path) -> bool {
+    let Ok(relative) = directory.strip_prefix(repository_root) else {
+        return false;
+    };
+    let mut components = relative.components();
+    let (
+        Some(std::path::Component::Normal(tmp)),
+        Some(std::path::Component::Normal(matrix)),
+        Some(std::path::Component::Normal(scenario)),
+        None,
+    ) = (
+        components.next(),
+        components.next(),
+        components.next(),
+        components.next(),
+    )
+    else {
+        return false;
+    };
+
+    tmp == OsStr::new("tmp")
+        && matrix
+            .to_str()
+            .is_some_and(|name| name.ends_with("-local-matrix"))
+        && matches!(scenario.to_str(), Some("cases" | "tui-cases" | "mcp-cases"))
 }
 
 fn skill_id_path(path: &Path) -> String {

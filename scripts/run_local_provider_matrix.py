@@ -46,6 +46,11 @@ from local_provider_matrix_support import (
     write_text,
 )
 
+RETAINED_MATRIX_SCENARIO_DIRECTORIES = frozenset(
+    {"cases", "tui-cases", "mcp-cases"}
+)
+RETAINED_MATRIX_PARENT = (REPO_ROOT / "tmp").resolve()
+
 
 def count_inventory(items: list[dict[str, Any]]) -> dict[str, Any]:
     def count(field: str) -> dict[str, int]:
@@ -80,6 +85,35 @@ def inventory_paths(items: list[dict[str, Any]]) -> list[Path]:
 
 def digest_paths(paths: list[Path]) -> dict[str, str]:
     return {str(path): digest_path(path) for path in paths}
+
+
+def inventory_item_paths(item: dict[str, Any]) -> list[Path]:
+    return [
+        Path(value).expanduser().resolve()
+        for field in ("sourcePath", "statePath")
+        if (value := item.get(field))
+    ]
+
+
+def is_retained_matrix_scenario_path(path: Path) -> bool:
+    try:
+        relative = path.relative_to(RETAINED_MATRIX_PARENT)
+    except ValueError:
+        return False
+    return (
+        len(relative.parts) >= 2
+        and relative.parts[0].endswith("-local-matrix")
+        and relative.parts[1] in RETAINED_MATRIX_SCENARIO_DIRECTORIES
+    )
+
+
+def live_inventory_exclusion_reason(item: dict[str, Any]) -> str | None:
+    paths = inventory_item_paths(item)
+    if any(path.is_relative_to(FIXTURE_ROOT) for path in paths):
+        return "repository-fixture"
+    if any(is_retained_matrix_scenario_path(path) for path in paths):
+        return "retained-matrix-scenario"
+    return None
 
 
 def path_class(path: Path, *, artifact_root: Path, home_root: Path) -> str:
@@ -151,15 +185,13 @@ def capture_live_inventory(
     inventory = parse_json_output(process.stdout)
 
     all_items = inventory["items"]
-    items = [
-        item
-        for item in all_items
-        if not any(
-            Path(item[field]).expanduser().resolve().is_relative_to(FIXTURE_ROOT)
-            for field in ("sourcePath", "statePath")
-        )
-    ]
-    excluded_fixture_items = len(all_items) - len(items)
+    items = []
+    excluded_items: collections.Counter[str] = collections.Counter()
+    for item in all_items:
+        if reason := live_inventory_exclusion_reason(item):
+            excluded_items[reason] += 1
+        else:
+            items.append(item)
     provider_paths = inventory_paths(items)
     provider_baseline = digest_paths(provider_paths)
     plans: list[dict[str, Any]] = []
@@ -329,7 +361,10 @@ def capture_live_inventory(
 
     summary = {
         **count_inventory(items),
-        "excludedRepositoryFixtureItems": excluded_fixture_items,
+        "excludedRepositoryFixtureItems": excluded_items["repository-fixture"],
+        "excludedRetainedMatrixScenarioItems": excluded_items[
+            "retained-matrix-scenario"
+        ],
         "warnings": len(inventory.get("warnings", [])),
         "dryRunCells": plans,
         "providerStateUnchanged": provider_state_unchanged,

@@ -406,6 +406,70 @@ fn discovers_recursive_cursor_skill_roots_with_stable_scoped_ids() {
 }
 
 #[test]
+fn recursive_project_skill_scans_exclude_retained_local_matrix_scenarios_only() {
+    let home_root = tempfile::TempDir::new().expect("temp home root");
+    let repository_root = tempfile::TempDir::new().expect("temp repository root");
+    let cursor_root = tempfile::TempDir::new().expect("temp cursor root");
+    write_file(
+        &repository_root.path().join(".git"),
+        "gitdir: /tmp/example.git\n",
+    );
+
+    for (relative_path, heading) in [
+        (
+            "tmp/ordinary/.claude/skills/ordinary-claude/SKILL.md",
+            "Ordinary Claude",
+        ),
+        (
+            "tmp/ordinary/.cursor/skills/ordinary-cursor/SKILL.md",
+            "Ordinary Cursor",
+        ),
+    ] {
+        write_file(
+            &repository_root.path().join(relative_path),
+            &format!("# {heading}\n"),
+        );
+    }
+
+    for scenario in ["cases", "tui-cases", "mcp-cases"] {
+        for provider_root in [".claude", ".cursor"] {
+            write_file(
+                &repository_root.path().join(format!(
+                    "tmp/2026-07-24-184505-local-matrix/{scenario}/fixture/{provider_root}/skills/generated-{scenario}/SKILL.md"
+                )),
+                "# Generated matrix evidence\n",
+            );
+        }
+    }
+
+    let result = discover_all(&DiscoveryRoots::from_locations(
+        home_root.path(),
+        repository_root.path(),
+        cursor_root.path(),
+    ))
+    .expect("discovery succeeds");
+
+    for id in [
+        "claude:project:skill:@scope/tmp/ordinary/ordinary-claude",
+        "cursor:project:skill:@scope/tmp/ordinary/ordinary-cursor",
+    ] {
+        assert!(
+            result.items.iter().any(|item| item.id == id),
+            "ordinary tmp project skill {id} should remain discoverable; got {:#?}",
+            result.items
+        );
+    }
+    assert!(
+        result
+            .items
+            .iter()
+            .all(|item| !item.source_path.contains("-local-matrix")),
+        "retained local matrix scenarios must not become live project capabilities; got {:#?}",
+        result.items
+    );
+}
+
+#[test]
 fn cursor_native_and_compatibility_skill_ids_cannot_collide() {
     let home_root = tempfile::TempDir::new().expect("temp home root");
     let project_root = tempfile::TempDir::new().expect("temp project root");

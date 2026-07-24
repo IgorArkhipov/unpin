@@ -34,6 +34,11 @@ jobs:
           tar -xzf /tmp/actionlint.tar.gz -C /tmp actionlint
           /tmp/actionlint -color
 
+      - name: Test release tooling
+        run: |
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 -m py_compile scripts/*.py
+
   rust:
     name: Rust
     runs-on: ubuntu-latest
