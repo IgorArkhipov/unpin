@@ -50,10 +50,14 @@ from the exact clean release commit, approved evidence and checksums attached to
 the draft, and enabled branch, private-security-reporting, and immutable-release
 controls.
 
-The [onboarding guide](docs/ONBOARDING.md) explains the architecture and first
-safe run. The [local provider validation matrix](docs/local-provider-matrix.md)
-documents the release evidence procedure, and the
-[release guide](docs/RELEASING.md) documents publication.
+The [README](README.md#five-minute-local-setup) provides the installed-user
+quick start and exact project toggle recipe. The [MCP setup guide](docs/MCP.md)
+documents agent-host registration and verification. The
+[onboarding guide](docs/ONBOARDING.md) explains the architecture and first safe
+run from source, the
+[local provider validation matrix](docs/local-provider-matrix.md) documents the
+release evidence procedure, and the [release guide](docs/RELEASING.md)
+documents publication.
 
 Copied TypeScript-era context under `old/` and agent workflow material under
 `memory-bank/`, `.prompts/`, and `.protocols/` are local-only and git-ignored so

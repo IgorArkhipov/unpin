@@ -21,14 +21,23 @@ gh attestation verify unpin-v0.1.0-beta.2-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
-Extract the archive and start with read-only inspection:
+Extract the archive, install the included binary on your user `PATH`, and start
+with read-only inspection:
 
 ```bash
+cd unpin-v0.1.0-beta.2-TARGET
+mkdir -p "$HOME/.local/bin"
+install -m 0755 unpin "$HOME/.local/bin/unpin"
+export PATH="$HOME/.local/bin:$PATH"
+
 unpin --help
 unpin providers
 unpin doctor
 unpin list --json
 ```
+
+Add `$HOME/.local/bin` to your shell's startup configuration if it is not
+already on `PATH`.
 
 To build from source, use Rust 1.96 or newer:
 
@@ -37,8 +46,96 @@ cargo build --release --locked
 ./target/release/unpin --help
 ```
 
-See the [onboarding guide](docs/ONBOARDING.md) for the safety model, architecture,
-scope precedence, a guided code tour, and a fixture-backed first mutation.
+Release users can continue with the five-minute setup below. To connect an
+agent, use the [MCP setup guide](docs/MCP.md). Contributors should start with
+the [onboarding guide](docs/ONBOARDING.md) for the architecture, scope
+precedence, guided code tour, and fixture-backed first mutation.
+
+## Five-minute local setup
+
+Run Unpin from the Git repository whose agent configuration you want to
+inspect:
+
+```bash
+cd /path/to/repository
+PROJECT_ROOT="$(git rev-parse --show-toplevel)"
+
+unpin --version
+unpin doctor --project-root "$PROJECT_ROOT"
+unpin list --project-root "$PROJECT_ROOT" --json
+```
+
+These commands are read-only. Before the first persistent toggle, restore, or
+protected session, initialize Unpin's purpose-separated keychain keys once:
+
+```bash
+unpin auth backup init
+unpin auth approval init
+unpin auth session init
+```
+
+### Toggle one project skill or MCP server
+
+First discover the exact item ID. Narrow the inventory by provider, kind, and
+project layer:
+
+```bash
+unpin list \
+  --project-root "$PROJECT_ROOT" \
+  --provider claude \
+  --kind skill \
+  --layer project \
+  --json
+```
+
+Plan the one-item toggle without writing anything:
+
+```bash
+unpin toggle \
+  --project-root "$PROJECT_ROOT" \
+  --provider claude \
+  --kind skill \
+  --layer project \
+  --id EXACT_ITEM_ID \
+  --json
+```
+
+Review the target state, effects, and fingerprint. Apply that exact selection
+only by repeating it with the returned fingerprint:
+
+```bash
+unpin toggle \
+  --project-root "$PROJECT_ROOT" \
+  --provider claude \
+  --kind skill \
+  --layer project \
+  --id EXACT_ITEM_ID \
+  --apply \
+  --confirm \
+  --plan-fingerprint PLAN_FINGERPRINT_FROM_DRY_RUN
+```
+
+`toggle` flips the item's current enabled state. To manage a configured MCP
+server instead, use `--kind mcp` and the exact MCP item ID returned by `list`.
+Change `--provider` for another supported agent. Unpin refuses unsupported or
+read-only combinations rather than inventing provider state.
+
+### Connect Unpin to an agent
+
+Agents connect by launching Unpin's local stdio server:
+
+```bash
+unpin mcp --project-root "$PROJECT_ROOT"
+```
+
+The process stays attached to stdio while the host is connected; normally put
+this command in the host's MCP configuration instead of running it by hand.
+
+The [MCP setup guide](docs/MCP.md) has copy-ready configuration for Codex,
+Claude Code, Cursor, OpenCode, and Zed; explains Pi's native-MCP limitation;
+and includes a prompt you can give an agent to configure and verify the
+connection automatically. MCP can inspect and prepare plans, but persistent
+writes always return a CLI/TUI human-action handoff.
 
 ## Command Surface
 
@@ -294,6 +391,7 @@ Contributor and reviewer guidance:
 
 - [Project and distribution status](PROJECT.md)
 - [Changelog](CHANGELOG.md)
+- [Agent MCP setup](docs/MCP.md)
 - [Onboarding guide](docs/ONBOARDING.md)
 - [Local provider validation matrix](docs/local-provider-matrix.md)
 - [Release procedure](docs/RELEASING.md)

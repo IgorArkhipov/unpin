@@ -1,8 +1,18 @@
 # Unpin onboarding
 
-This guide is the shortest path from a fresh checkout to using, understanding,
-and safely changing Unpin. For the complete command reference, start with
-[`README.md`](../README.md). For the release-grade provider test procedure, use
+Choose the path that matches what you want to do:
+
+- **Use an installed release:** follow the
+  [README five-minute setup](../README.md#five-minute-local-setup), including
+  the project-scoped skill and MCP toggle recipe.
+- **Connect Unpin to an agent:** follow the
+  [MCP setup guide](MCP.md) for Codex, Claude Code, Cursor, OpenCode, Zed, and
+  the copy-ready automatic setup prompt.
+- **Understand or contribute to Unpin:** continue with this guide for the
+  safety model, architecture, scope precedence, code tour, and
+  fixture-isolated development workflow.
+
+For the release-grade provider test procedure, use
 [`local-provider-matrix.md`](local-provider-matrix.md).
 
 ## Project overview
@@ -23,10 +33,14 @@ Persistent writes require confirmation, an exact plan fingerprint, scoped
 approval, conflict protection, authenticated backup evidence, audit evidence,
 and a restore path.
 
-## First safe run
+## First safe run from source
 
 Unpin requires Rust 1.96 or newer. The repository's development and CI
 toolchain is pinned to Rust 1.97.1.
+
+Release users do not need a source checkout or Rust toolchain; use the
+[release installation and local setup](../README.md#distribution-status-and-quick-start)
+instead.
 
 ```bash
 cargo build --release --locked

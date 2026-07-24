@@ -1,9 +1,10 @@
 # Local provider validation matrix
 
 This guide takes an engineer from a source checkout to a safe Unpin inventory,
-CLI/TUI use, MCP host registration, and a reproducible local evidence bundle.
-Start with the [onboarding guide](ONBOARDING.md) for architecture, terminology,
-and the first fixture-backed workflow.
+CLI/TUI validation, MCP host validation, and a reproducible local evidence
+bundle. Start with the [onboarding guide](ONBOARDING.md) for architecture,
+terminology, and the first fixture-backed workflow. For day-to-day agent
+registration, use the dedicated [MCP setup guide](MCP.md).
 
 Unpin supports Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It inventories current
 provider configuration, plans changes without writing by default, and applies
@@ -275,130 +276,32 @@ printf '%s' "$CURSOR_DASHBOARD_COOKIE" \
 Cookie presence never changes a read-only inventory item by itself. Unpin
 still reports current marketplace mutation support per operation.
 
-## Register Unpin MCP
+## MCP host validation
 
-Unpin runs a local stdio MCP server:
+User-facing registration instructions, current host configuration examples,
+the MCP safety boundary, troubleshooting, and a copy-ready automatic setup
+prompt live in the [MCP setup guide](MCP.md).
 
-```bash
-/absolute/path/to/unpin mcp
-```
+For provider-matrix validation, register the exact build under test with at
+least one supported host and verify:
 
-Omit `--project-root` when host launches MCP from active repository. Add an
-absolute `--project-root` argument when registration must stay fixed to one repo.
-Keep normal host tool approvals enabled. Unpin MCP verifies reviewed plans
-but cannot mint human approval: persistent apply requests return structured
-handoff for CLI/TUI completion. Host approval remains another safety boundary.
+1. The host launches the absolute Unpin binary path with a pinned absolute
+   `--project-root`.
+2. MCP initialization and `tools/list` complete successfully.
+3. `agentscope_get_inventory_summary` reports the expected repository,
+   `writesEnabled=false`, and `humanApproval=cli-or-tui-required`.
+4. `agentscope_list_items` can filter project skills and configured MCP
+   servers without changing provider files.
+5. A one-item plan identifies the intended provider, kind, layer, target state,
+   and exact plan fingerprint.
+6. An apply request returns a structured CLI/TUI human-action handoff rather
+   than mutating provider state.
 
-### Codex
-
-User registration:
-
-```bash
-codex mcp add unpin -- /absolute/path/to/unpin mcp
-codex mcp list
-```
-
-Repository registration in trusted `.codex/config.toml`:
-
-```toml
-[mcp_servers.unpin]
-command = "/absolute/path/to/unpin"
-args = ["mcp", "--project-root", "/absolute/path/to/repository"]
-```
-
-Restart Codex, then use `/mcp` to inspect server. See
-[Codex MCP documentation](https://developers.openai.com/codex/mcp/).
-
-### Claude Code
-
-User registration:
-
-```bash
-claude mcp add --scope user unpin -- /absolute/path/to/unpin mcp
-claude mcp list
-```
-
-Shared repository registration:
-
-```bash
-claude mcp add --scope project unpin -- \
-  /absolute/path/to/unpin mcp \
-  --project-root /absolute/path/to/repository
-```
-
-Open Claude Code and use `/mcp` to approve project registration and inspect
-status. See [Claude Code MCP documentation](https://code.claude.com/docs/en/mcp).
-
-### Cursor
-
-Use `$HOME/.cursor/mcp.json` for global registration or `.cursor/mcp.json` for
-repository registration:
-
-```json
-{
-  "mcpServers": {
-    "unpin": {
-      "command": "/absolute/path/to/unpin",
-      "args": [
-        "mcp",
-        "--project-root",
-        "/absolute/path/to/repository"
-      ]
-    }
-  }
-}
-```
-
-Reload Cursor and inspect Settings > Tools & MCP. See
-[Cursor MCP documentation](https://cursor.com/docs/mcp).
-
-### Zed
-
-Add global registration to `$HOME/.config/zed/settings.json`, or repository
-registration to `.zed/settings.json`:
-
-```jsonc
-{
-  "context_servers": {
-    "unpin": {
-      "command": "/absolute/path/to/unpin",
-      "args": [
-        "mcp",
-        "--project-root",
-        "/absolute/path/to/repository"
-      ]
-    }
-  }
-}
-```
-
-Open Settings > AI > MCP Servers. Active server has green status indicator. See
-[Zed MCP documentation](https://zed.dev/docs/ai/mcp).
-
-## MCP safety check
-
-Before requesting an MCP human-action handoff, call inventory summary and verify:
-
-- backup authentication and approval signing are ready before CLI/TUI completion;
-- `writesEnabled` is `false` and `humanApproval` is `cli-or-tui-required`;
-- selected item is `read-write`;
-- plan matches intended provider, kind, layer, and target state.
-
-Apply and restore tools reject stale or incomplete review data and never write
-provider state directly. Bulk handoff also requires reviewed plan fingerprint and
-maximum item count. MCP entries named `unpin` or `agentscope` cannot disable
-themselves through MCP control plane.
-
-Typical MCP sequence:
-
-1. `initialize`, then `notifications/initialized`.
-2. `tools/list` and verify Unpin tools are discoverable.
-3. `agentscope_get_inventory_summary` and `agentscope_list_items`.
-4. `agentscope_plan_toggle_item` with exact provider/kind/layer/id selection.
-5. `agentscope_apply_toggle_item` only after reviewing exact fingerprint; follow
-   returned human-action handoff in CLI/TUI.
-6. `agentscope_list_backups`, then plan restore and follow same signed handoff
-   when rollback is needed.
+Current host registration is documented for Codex, Claude Code, Cursor,
+OpenCode, and Zed. Pi core has no native MCP client configuration surface.
+Keep normal host tool approvals enabled, and retain the self-protection check:
+configured MCP entries named `unpin` or `agentscope` cannot disable themselves
+through Unpin's MCP control plane.
 
 ## Reproduce local provider matrix
 
