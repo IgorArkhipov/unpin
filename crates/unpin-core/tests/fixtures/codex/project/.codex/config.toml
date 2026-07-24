@@ -1,0 +1,11 @@
+[mcp_servers.project-docs]
+command = "node"
+args = ["tools/project-docs-mcp.js"]
+enabled = false
+
+[hooks.ProjectStart]
+command = "echo"
+
+# Negative contract fixture: Codex plugin state is user-scoped.
+[plugins."project-only@example-marketplace"]
+enabled = false

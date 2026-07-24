@@ -1,0 +1,5 @@
+config:
+  # Existing public docs intentionally use prose lines and long JSON examples.
+  MD013: false
+  # GitHub templates use the issue or pull-request title as their H1.
+  MD041: false

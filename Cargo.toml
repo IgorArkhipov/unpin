@@ -1,0 +1,38 @@
+[workspace]
+members = ["crates/unpin-core", "crates/unpin-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+unpin-core = { path = "crates/unpin-core" }
+assert_cmd = "2.2.2"
+clap = { version = "4.6.1", features = ["derive"] }
+color-eyre = "0.6.5"
+crossterm = "0.29.0"
+futures = "0.3.32"
+getrandom = "0.4.3"
+hmac = "0.13.0"
+http = "1.4.2"
+insta = "1.48.0"
+jsonc-parser = { version = "0.32.4", features = ["cst", "serde"] }
+keyring = "4.1.4"
+predicates = "3.1.4"
+ratatui = "0.30.2"
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
+rmcp = { version = "2.2.0", default-features = false, features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11.0"
+sse-stream = "0.2.4"
+tempfile = "3.27.0"
+time = { version = "0.3.49", features = ["formatting", "parsing"] }
+tokio = { version = "1.52.3", features = ["io-std", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
+toml = "1.1.2"
+tracing = "0.1.44"

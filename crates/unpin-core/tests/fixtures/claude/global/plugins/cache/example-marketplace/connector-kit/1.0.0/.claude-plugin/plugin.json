@@ -1,0 +1,6 @@
+{
+  "name": "connector-kit",
+  "version": "1.0.0",
+  "description": "Fixture plugin with a bundled MCP connector",
+  "mcpServers": "./.mcp.json"
+}

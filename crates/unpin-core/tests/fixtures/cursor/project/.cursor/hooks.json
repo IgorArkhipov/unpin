@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "AfterFileEdit": [
+      {
+        "command": "/usr/bin/true",
+        "matcher": "edit",
+        "timeout": 10,
+        "failurePolicy": "continue-degraded"
+      }
+    ]
+  }
+}

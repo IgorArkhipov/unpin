@@ -1,0 +1,8 @@
+{
+  "ProjectStop": [
+    {
+      "type": "command",
+      "command": "/usr/bin/true"
+    }
+  ]
+}

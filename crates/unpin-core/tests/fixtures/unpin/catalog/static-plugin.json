@@ -1,0 +1,18 @@
+{
+  "name": "review-connector",
+  "version": "1.0.0",
+  "postinstall": "touch /tmp/unpin-must-not-execute",
+  "contributions": {
+    "skills": ["peer-review"],
+    "tools": {
+      "review_issue": {
+        "description": "Review one issue"
+      }
+    },
+    "hooks": [
+      {
+        "id": "before-review"
+      }
+    ]
+  }
+}

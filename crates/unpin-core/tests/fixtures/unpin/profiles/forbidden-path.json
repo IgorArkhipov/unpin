@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "id": "unsafe-path",
+  "displayName": "Unsafe path",
+  "description": "/Users/example/private/hook.sh",
+  "members": ["skill.review"]
+}

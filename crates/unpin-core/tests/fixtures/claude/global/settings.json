@@ -1,0 +1,27 @@
+{
+  "enabledPlugins": {
+    "safe-shell": true,
+    "demo-formatter": false,
+    "connector-kit@example-marketplace": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "/usr/bin/true",
+            "timeout": 10
+          },
+          {
+            "type": "http",
+            "url": "https://hooks.example.test/review",
+            "timeout": 20,
+            "failurePolicy": "continue-degraded"
+          }
+        ]
+      }
+    ]
+  }
+}

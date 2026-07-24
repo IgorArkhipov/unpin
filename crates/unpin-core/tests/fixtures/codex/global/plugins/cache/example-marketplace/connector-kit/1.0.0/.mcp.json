@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "connector-kit": {
+      "command": "unpin",
+      "args": ["mcp"]
+    }
+  }
+}
