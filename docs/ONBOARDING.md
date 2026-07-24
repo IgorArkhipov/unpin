@@ -7,7 +7,9 @@ Choose the path that matches what you want to do:
   the project-scoped skill and MCP toggle recipe.
 - **Connect Unpin to an agent:** follow the
   [MCP setup guide](MCP.md) for Codex, Claude Code, Cursor, OpenCode, Zed, and
-  the copy-ready automatic setup prompt.
+  the copy-ready automatic setup prompt. Then use the
+  [capability-control prompt library](MCP-PROMPTS.md) for project allowlists,
+  profiles, locks, hooks, sessions, and restore.
 - **Understand or contribute to Unpin:** continue with this guide for the
   safety model, architecture, scope precedence, code tour, and
   fixture-isolated development workflow.

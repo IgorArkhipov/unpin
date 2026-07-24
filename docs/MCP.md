@@ -230,6 +230,11 @@ disabling themselves through the same MCP control plane.
 Bulk plans require an explicit maximum item count. Prefer one-item plans while
 learning the workflow.
 
+For copy-ready requests covering one-item changes, bounded project allowlists,
+reusable profiles, session-specific profiles, capability locks, hook trust, and
+restore, use the
+[MCP capability-control prompt library](MCP-PROMPTS.md).
+
 ## Prompt an agent to configure Unpin
 
 Once `unpin` is installed, paste the following prompt into Codex, Claude Code,

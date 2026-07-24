@@ -134,8 +134,11 @@ this command in the host's MCP configuration instead of running it by hand.
 The [MCP setup guide](docs/MCP.md) has copy-ready configuration for Codex,
 Claude Code, Cursor, OpenCode, and Zed; explains Pi's native-MCP limitation;
 and includes a prompt you can give an agent to configure and verify the
-connection automatically. MCP can inspect and prepare plans, but persistent
-writes always return a CLI/TUI human-action handoff.
+connection automatically. The
+[MCP capability-control prompt library](docs/MCP-PROMPTS.md) covers project
+allowlists, profiles, capability locks, hooks, sessions, and restore. MCP can
+inspect and prepare plans, but persistent writes always return a CLI/TUI
+human-action handoff.
 
 ## Command Surface
 
@@ -392,6 +395,7 @@ Contributor and reviewer guidance:
 - [Project and distribution status](PROJECT.md)
 - [Changelog](CHANGELOG.md)
 - [Agent MCP setup](docs/MCP.md)
+- [MCP capability-control prompts](docs/MCP-PROMPTS.md)
 - [Onboarding guide](docs/ONBOARDING.md)
 - [Local provider validation matrix](docs/local-provider-matrix.md)
 - [Release procedure](docs/RELEASING.md)
