@@ -4,9 +4,45 @@ Unpin is a Rust CLI/TUI for local AI-agent configuration discovery, safe mutatio
 
 Internal agent workflow context may exist locally under `memory-bank/`, `.prompts/`, `.protocols/`, and `old/`, but those folders are excluded from git and are not part of the public repository surface.
 
+## Distribution status and quick start
+
+Unpin `0.1.0-beta.1` is the first public beta. GitHub Releases provide
+provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
+GNU/Linux, together with CycloneDX SBOM attestations, SHA-256 checksums, and
+approved provider-matrix evidence. The binaries are not Apple-notarized or
+platform-code-signed. crates.io and package-manager distribution are deferred.
+
+Download the archive for your platform from
+[GitHub Releases](https://github.com/IgorArkhipov/unpin/releases), verify it
+against `SHA256SUMS`, then verify its GitHub build provenance:
+
+```bash
+gh attestation verify unpin-v0.1.0-beta.1-TARGET.tar.gz \
+  --repo IgorArkhipov/unpin
+```
+
+Extract the archive and start with read-only inspection:
+
+```bash
+unpin --help
+unpin providers
+unpin doctor
+unpin list --json
+```
+
+To build from source, use Rust 1.96 or newer:
+
+```bash
+cargo build --release --locked
+./target/release/unpin --help
+```
+
+See the [onboarding guide](docs/ONBOARDING.md) for the safety model, architecture,
+scope precedence, a guided code tour, and a fixture-backed first mutation.
+
 ## Command Surface
 
-- `unpin auth backup|approval|cursor-dashboard` manages purpose-separated OS-keychain state.
+- `unpin auth backup|approval|session|cursor-dashboard` manages purpose-separated OS-keychain state.
 - `unpin providers` prints the provider capability matrix.
 - `unpin doctor` validates discovery inputs, configured vault integrity, fixture capability-matrix drift, and provider fixture shape drift.
 - `unpin snapshot` writes a discovery snapshot into Unpin app state.
@@ -19,7 +55,7 @@ Internal agent workflow context may exist locally under `memory-bank/`, `.prompt
 
 ## Provider Coverage
 
-Unpin currently discovers Claude Code, Codex, Cursor, Pi, OpenCode, and Zed skills, configured MCPs, agents, hooks, provider settings, and selected plugin surfaces from fixture-backed or explicitly provided roots. Provider-owned Claude skills under `$HOME/.claude/skills` and repository-scoped `.claude/skills`, recursively nested Cursor skills under `$HOME/.cursor/skills` and repository-scoped `.cursor/skills`, Pi skills under `$HOME/.pi/agent/skills` and `.pi/skills`, OpenCode skills under `$HOME/.config/opencode/skills` and `.opencode/skills`, Cursor local plugin directories under `$HOME/.cursor/plugins/local`, and agent files are writable through guarded Unpin vault toggles with backup and restore evidence. Pi direct Markdown skills use a file vault; skill directories use a directory vault. Cursor-compatible skills, Codex shared `.agents/skills`, Pi shared `.agents/skills`, OpenCode shared `.agents/skills` and `.claude/skills`, plus Zed `.agents/skills`, use the same guarded cross-provider flow. Disabling one shared source records its original path and keeps every loading provider visible as disabled; re-enable through any provider view or backup restore returns it to that path. OpenCode MCPs use native `mcp.<id>.enabled` state in global or project JSON/JSONC while preserving comments and trailing commas. OpenCode npm plugin toggles remove and restore only config references through guarded Unpin vault state with authenticated backup evidence; Bun cache files remain installed. Pi intentionally has no native MCP core; MCP connectors belong to Pi extensions/packages. Pi package extension toggles set native `packages[].extensions` filters to `[]`, retain package references and every non-extension resource, then restore the exact original package entry through guarded Unpin vault state with authenticated backup evidence. Pi and OpenCode config toggles are fixture-verified but still need live-host validation because neither host is installed locally. OpenCode auto-loaded local plugin files are read-only because current host docs expose no local-file disable setting. Existing Claude, Codex, Cursor, and Zed mutation contracts remain unchanged. Hooks, settings, instructions, permissions, and sandbox files remain non-writable inventory. IDE extensions unrelated to agent harnesses remain outside scope.
+Unpin currently discovers Claude Code, Codex, Cursor, Pi, OpenCode, and Zed skills, configured MCPs, agents, hooks, provider settings, and selected plugin surfaces from fixture-backed or explicitly provided roots. Provider-owned Claude skills under `$HOME/.claude/skills` and repository-scoped `.claude/skills`, recursively nested Cursor skills under `$HOME/.cursor/skills` and repository-scoped `.cursor/skills`, Pi skills under `$HOME/.pi/agent/skills` and `.pi/skills`, OpenCode skills under `$HOME/.config/opencode/skills` and `.opencode/skills`, Cursor local plugin directories under `$HOME/.cursor/plugins/local`, and agent files are writable through guarded Unpin vault toggles with backup and restore evidence. Pi direct Markdown skills use a file vault; skill directories use a directory vault. Cursor-compatible skills, Codex shared `.agents/skills`, Pi shared `.agents/skills`, OpenCode shared `.agents/skills` and `.claude/skills`, plus Zed `.agents/skills`, use the same guarded cross-provider flow. Disabling one shared source records its original path and keeps every loading provider visible as disabled; re-enable through any provider view or backup restore returns it to that path. OpenCode MCPs use native `mcp.<id>.enabled` state in global or project JSON/JSONC while preserving comments and trailing commas. OpenCode npm plugin toggles remove and restore only config references through guarded Unpin vault state with authenticated backup evidence; Bun cache files remain installed. Pi intentionally has no native MCP core; MCP connectors belong to Pi extensions/packages. Pi package extension toggles set native `packages[].extensions` filters to `[]`, retain package references and every non-extension resource, then restore the exact original package entry through guarded Unpin vault state with authenticated backup evidence. Pi 0.81.1 and OpenCode 1.18.4 global/project config compatibility was live-validated in disposable, explicitly rooted environments for this beta. OpenCode auto-loaded local plugin files are read-only because current host docs expose no local-file disable setting. Existing Claude, Codex, Cursor, and Zed mutation contracts remain unchanged. Hooks, settings, instructions, permissions, and sandbox files remain non-writable inventory. IDE extensions unrelated to agent harnesses remain outside scope.
 
 Unpin prefers provider-native enable state. Claude, Codex, and OpenCode plugin toggles edit supported settings references and leave installed bundles or caches untouched. Cursor local plugin directories are path-discovered and have no documented local disable reference; Unpin therefore relocates the intact bundle into authenticated Unpin vault state instead of deleting it, then restores it to its recorded origin on re-enable or backup restore.
 
@@ -30,8 +66,8 @@ Plugin scope support is explicit:
 | Claude Code | Writable through `enabledPlugins` | Writable through project/local `enabledPlugins` |
 | Codex | Writable through user `plugins.<id>.enabled` | Unsupported by current Codex plugin host contract |
 | Cursor | Local bundles writable through intact vault/restore; marketplace installs read-only | Marketplace installs inventoried read-only |
-| Pi | Package extension filters fixture-verified, live host pending | Package extension filters fixture-verified, live host pending |
-| OpenCode | npm config toggles fixture-verified, live host pending; local files read-only | npm config toggles fixture-verified, live host pending; local files read-only |
+| Pi | Package extension filters fixture- and live-host-verified | Package extension filters fixture- and live-host-verified |
+| OpenCode | npm config toggles fixture- and live-host-verified; local files read-only | npm config toggles fixture- and live-host-verified; local files read-only |
 | Zed | Out of scope; Zed uses standard Agent Skills | Out of scope; Zed uses standard Agent Skills |
 
 Unpin does not invent repository plugin state for Codex or write Cursor marketplace caches/SQLite rows as if they were authoritative settings.
@@ -151,7 +187,7 @@ cargo run -p unpin-cli -- auth cursor-dashboard remove
 
 Cookie presence does not make unsupported Cursor marketplace entries writable; each operation still reports current provider support and required human action.
 
-New backup manifests use version 2 with HMAC-SHA256 authentication over manifest fields and deterministic payload-tree SHA-256 digests. Restore verifies both before acquiring mutation lock or writing provider state. Missing, mismatched, or tampered authentication blocks restore. Legacy version 1 backups remain visible as `legacy-unauthenticated` but are not restorable unless a trusted caller explicitly authenticates current contents through core migration API; Unpin never signs them automatically.
+New backup manifests use version 3 with purpose-separated HMAC-SHA256 authentication over manifest fields and deterministic payload-tree SHA-256 digests. Restore verifies both before acquiring mutation lock or writing provider state. Missing, mismatched, or tampered authentication blocks restore. Older authenticated manifests use version-specific verification. Legacy version 1 backups remain visible as `legacy-unauthenticated` but are not restorable unless a trusted caller explicitly authenticates current contents through the core migration API; Unpin never signs them automatically.
 
 TUI header reports backup-auth readiness. MCP inventory summary exposes `writeSafety.backupAuthentication` and `writeSafety.writesEnabled`, allowing agents to preflight write availability without attempting mutation.
 
@@ -256,7 +292,12 @@ MCP apply tools require exact reviewed fingerprints and return structured human-
 
 Contributor and reviewer guidance:
 
-- [Local onboarding and provider matrix](docs/local-provider-matrix.md)
+- [Project and distribution status](PROJECT.md)
+- [Changelog](CHANGELOG.md)
+- [Onboarding guide](docs/ONBOARDING.md)
+- [Local provider validation matrix](docs/local-provider-matrix.md)
+- [Release procedure](docs/RELEASING.md)
+- [Security policy](SECURITY.md)
 - [Contributing guide](CONTRIBUTING.md)
 - [Reviewer guide](REVIEWING.md)
 - [Code of conduct](CODE_OF_CONDUCT.md)

@@ -3,10 +3,17 @@ members = ["crates/unpin-core", "crates/unpin-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.0-beta.1"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
+authors = ["Igor Arkhipov"]
+description = "Safely inspect and manage local AI-agent configuration across Claude Code, Codex, Cursor, Pi, OpenCode, and Zed."
+repository = "https://github.com/IgorArkhipov/unpin"
+homepage = "https://github.com/IgorArkhipov/unpin"
+readme = "README.md"
+keywords = ["ai-agents", "configuration", "mcp", "cli", "tui"]
+categories = ["command-line-utilities", "config", "development-tools"]
 publish = false
 
 [workspace.dependencies]

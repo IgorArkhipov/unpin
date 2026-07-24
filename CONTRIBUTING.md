@@ -9,6 +9,8 @@ Unpin is a Rust CLI/TUI for discovering, snapshotting, safely toggling, and rest
 - Claude Code
 - Codex CLI
 - Cursor current MCP/config locations
+- Pi current skills and package-extension filters
+- OpenCode current skills, MCP settings, and npm plugin references
 - Zed current skills, instructions, and `context_servers` settings
 
 Please do not add compatibility for legacy app versions or historical config paths unless maintainers explicitly open an issue for that work.
@@ -20,6 +22,9 @@ Please do not add compatibility for legacy app versions or historical config pat
 - Search existing tests before adding new behavior.
 - Avoid reading or depending on real home-directory provider state.
 - Never use `.env*` files as inputs, fixtures, examples, or test data.
+
+Read the [onboarding guide](docs/ONBOARDING.md) for the architecture, policy
+precedence, safety vocabulary, guided code tour, and focused test map.
 
 For behavior changes, open or comment on an issue first when the intended behavior is not obvious from the current code and tests.
 
@@ -37,6 +42,16 @@ cargo machete
 ```
 
 CI also verifies the declared Rust 1.96 MSRV separately from the pinned Rust 1.97.1 development toolchain.
+
+Before distribution or after broad provider, mutation, backup/restore, TUI, or
+MCP changes, run the full fixture-isolated matrix:
+
+```bash
+python3 scripts/run_local_provider_matrix.py
+```
+
+Follow [the matrix guide](docs/local-provider-matrix.md) to capture, visually
+review, and finalize the publishable evidence set.
 
 ## Code Guidelines
 
@@ -70,4 +85,6 @@ Unpin operates near private local configuration. Contributions should avoid logg
 
 Please follow the [Code of Conduct](CODE_OF_CONDUCT.md) in issues, pull requests, reviews, and other project spaces.
 
-If you believe you found a security issue, please avoid opening a public proof-of-concept issue with sensitive details. Contact the maintainers privately once a security reporting channel is published.
+If you believe you found a security issue, do not open a public issue or pull
+request with sensitive details. Follow the [security policy](SECURITY.md) and
+use GitHub private vulnerability reporting.

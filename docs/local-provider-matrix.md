@@ -1,7 +1,9 @@
-# Local onboarding and provider matrix
+# Local provider validation matrix
 
-This guide gets an engineer from a source checkout to a safe Unpin inventory,
+This guide takes an engineer from a source checkout to a safe Unpin inventory,
 CLI/TUI use, MCP host registration, and a reproducible local evidence bundle.
+Start with the [onboarding guide](ONBOARDING.md) for architecture, terminology,
+and the first fixture-backed workflow.
 
 Unpin supports Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It inventories current
 provider configuration, plans changes without writing by default, and applies
@@ -14,8 +16,8 @@ supported toggles with authenticated backup, audit, and restore evidence.
 | Claude Code | Global and project | Global and project `enabledPlugins` | Global and project |
 | Codex | Global and project | Global only; project plugins unsupported by current host contract | Global and project |
 | Cursor | Global, shared, and project | Local global bundles writable; marketplace installs read-only | Global and project |
-| Pi | Global, shared, and project | Global and project package extension filters; live host verification pending | Unsupported by Pi core; use package extensions |
-| OpenCode | Global, shared, and project | Global and project npm config references; auto-loaded local files read-only; fixture-verified, live host pending | Global and project native enabled state; fixture-verified, live host pending |
+| Pi | Global, shared, and project | Global and project package extension filters; fixture- and live-host-verified | Unsupported by Pi core; use package extensions |
+| OpenCode | Global, shared, and project | Global and project npm config references; auto-loaded local files read-only; fixture- and live-host-verified | Global and project native enabled state; fixture- and live-host-verified |
 | Zed | Global and project standard Agent Skills | Out of scope | Global and project `context_servers` |
 
 Zed plugins are intentionally absent. Zed uses standard Agent Skills for reusable
@@ -30,12 +32,29 @@ Codex shared `.agents/skills` entries use that cross-provider vault flow. Codex
 administrator-managed skills remain in place and use path-specific
 `[[skills.config]]` state, because those sources are not shared with other hosts.
 
+For the first beta, disposable-root validation used Pi 0.81.1 and OpenCode
+1.18.4. Each host loaded its native global/project configuration, then Unpin
+discovered the host-produced or host-accepted package, plugin, and MCP entries
+without warnings and produced no-write plans for every writable cell.
+
+With both host executables on `PATH`, reproduce that isolated check after
+building Unpin:
+
+```bash
+cargo build -p unpin-cli --locked
+python3 scripts/validate_live_provider_hosts.py
+```
+
+The script supplies an empty temporary home and project, disables Pi telemetry
+and network startup, runs OpenCode in pure config-debug mode, and prints only
+versions and aggregate assertions. It never applies a mutation.
+
 ## Build
 
 From repository root:
 
 ```bash
-cargo build -p unpin-cli
+cargo build -p unpin-cli --locked
 ./target/debug/unpin --help
 ```
 
@@ -78,13 +97,18 @@ does not rewrite Cursor-owned marketplace cache or SQLite state.
 
 ## Backup authentication
 
-Live writes and protected session launches require backup authentication; writes also require a separate approval-signing key in OS keychain:
+Live writes and protected session launches require backup authentication.
+Reviewed writes use a separate approval-signing key, while leases use a
+dedicated session key. Initialize all three purpose-separated keys in the OS
+keychain:
 
 ```bash
 ./target/debug/unpin auth backup init
 ./target/debug/unpin auth backup status
 ./target/debug/unpin auth approval init
 ./target/debug/unpin auth approval status
+./target/debug/unpin auth session init
+./target/debug/unpin auth session status
 ```
 
 `status` prints readiness and a non-secret fingerprint. It never prints key
@@ -386,8 +410,23 @@ fixtures, and restores every copy byte-for-byte:
 python3 scripts/run_local_provider_matrix.py
 ```
 
-Runner prints private evidence directory outside checkout, such as
-`/tmp/2026-07-17-174208-local-matrix`. It covers:
+Runner prints a private evidence directory outside the checkout. After
+finalization, the most recent run `2026-07-24-184505-local-matrix` was archived
+under the repository's ignored
+`tmp/2026-07-24-184505-local-matrix` directory. It was bound to clean workspace
+commit `8f267d626b479ae2798a1712ef79537cb2352e31` and recorded:
+
+- 31/31 CLI, 31/31 real-PTY TUI, and 31/31 persistent MCP scenarios;
+- 620 passing Rust tests and all eight local quality gates passing;
+- 938 live inventory items aggregated without persisting private item names;
+- Claude Code 2.1.219, Codex CLI 0.144.6, Cursor 3.12.30, and Zed Preview
+  1.13.0 detected locally;
+- Pi and OpenCode fixture coverage passing while live host verification remains
+  pending because those executables were not installed;
+- unchanged live provider state;
+- 11 visually approved screenshots and a 21-file checksum manifest.
+
+Each full run covers:
 
 - installed host versions and aggregate library counts;
 - one no-write live plan for every installed writable matrix cell;
@@ -454,6 +493,8 @@ Safe files to share are listed in `evidence-manifest.json`:
 
 Full live inventory is aggregated in memory and never persisted. Saved live plans
 contain only provider/kind/layer, operation types, and path classes. Keep case
-directories, backup payloads, and audit logs local. Evidence root and contents use
-owner-only permissions under `/tmp`, outside Git tracking; attach manifest-listed
-files explicitly instead of committing machine-local output.
+directories, backup payloads, and audit logs local. The runner creates the
+evidence root with owner-only permissions under the system temporary directory.
+If a finalized run is archived under the repository's ignored `tmp/` directory,
+preserve those permissions and attach only manifest-listed files instead of
+committing machine-local output.

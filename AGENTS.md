@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guidance for AI coding agents working in this repository. Keep this file concise and project-specific; human-facing contribution details live in `README.md`, `CONTRIBUTING.md`, and `REVIEWING.md`.
+Guidance for AI coding agents working in this repository. Keep this file concise and project-specific; human-facing architecture and contribution details live in `docs/ONBOARDING.md`, `README.md`, `CONTRIBUTING.md`, and `REVIEWING.md`.
 
 ## Project Overview
 
@@ -11,8 +11,8 @@ Supported provider scope:
 - Claude Code
 - Codex CLI
 - Cursor current MCP/config locations
-- Pi current skills and package-extension filters (fixture-verified; live host pending; native MCP unsupported)
-- OpenCode current skills, MCP settings, and npm plugin references (fixture-verified; live host pending)
+- Pi current skills and package-extension filters (fixture- and live-host-verified; native MCP unsupported)
+- OpenCode current skills, MCP settings, and npm plugin references (fixture- and live-host-verified)
 - Zed current skills, instructions, and `context_servers` settings
 
 Zed plugins remain out of scope; Zed uses standard Agent Skills.
@@ -78,12 +78,22 @@ Testing guidance:
 - CLI output changes need integration tests.
 - TUI changes should prefer state/event tests that do not require an interactive terminal.
 - Docs-only changes should at least pass `git diff --check`.
+- Distribution candidates and broad provider, mutation, backup/restore, TUI, or
+  MCP changes should pass and finalize `python3
+  scripts/run_local_provider_matrix.py`.
+- Public release candidates should also pass
+  `python3 scripts/validate_live_provider_hosts.py` with supported Pi and
+  OpenCode executables on `PATH`.
 
 ## Provider-Specific Notes
 
 - Claude Code: preserve settings and MCP approval-map shapes.
 - Codex CLI: preserve unrelated TOML sections and ordering as much as practical.
 - Cursor: support modern `$HOME/.cursor/mcp.json`, project `.cursor/mcp.json`, and workspace SQLite disabled-server state; do not rely on legacy app-support `mcp.json`.
+- Pi: preserve package sources and non-extension resources when changing
+  extension filters; native MCP remains unsupported.
+- OpenCode: preserve JSON/JSONC comments and trailing commas; local auto-loaded
+  plugin files remain read-only.
 - Zed: preserve JSONC settings behavior, global/project skill paths, instructions, and `context_servers`.
 
 ## Pull Request Output

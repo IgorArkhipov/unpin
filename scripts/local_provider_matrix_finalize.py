@@ -131,6 +131,8 @@ def finalize_artifacts(artifact_root: Path) -> dict[str, Any]:
         tested_binary
     ):
         raise MatrixFailure("cannot finalize; evidence is not bound to a workspace build")
+    if tested_binary.get("workspaceDirty") is not False:
+        raise MatrixFailure("cannot finalize; release evidence requires a clean workspace")
     current_identity = workspace_identity()
     if any(
         tested_binary.get(key) != current_identity.get(key)
@@ -255,6 +257,12 @@ def finalize_artifacts(artifact_root: Path) -> dict[str, Any]:
     manifest = {
         "generatedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
         "runId": root.name,
+        "source": {
+            "gitCommit": tested_binary["gitHead"],
+            "workspaceStateSha256": tested_binary["workspaceStateSha256"],
+            "workspaceDirty": tested_binary["workspaceDirty"],
+            "binarySha256": f"sha256:{tested_binary['sha256']}",
+        },
         "assertions": {
             "report": True,
             "dashboard": True,

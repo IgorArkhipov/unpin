@@ -16,7 +16,8 @@ Review in this order:
 
 Before reviewing details, confirm the PR fits the current public project scope:
 
-- Supports the modern provider stack: Claude Code, Codex CLI, Cursor current config paths, and Zed current config paths.
+- Supports the modern provider stack: Claude Code, Codex CLI, Cursor, Pi,
+  OpenCode, and Zed current config paths.
 - Does not revive legacy app-version behavior or historical paths without an explicit maintainer decision.
 - Does not read `.env*` files or real provider configuration in tests.
 - Keeps generated, local, and private state out of committed artifacts.
@@ -37,6 +38,10 @@ For any change that can write provider or Unpin state, verify:
 - Claude Code: check JSON shape preservation for settings and MCP approval maps.
 - Codex CLI: check TOML section handling and unrelated section preservation.
 - Cursor: check modern `$HOME/.cursor/mcp.json`, project `.cursor/mcp.json`, and workspace SQLite state handling; do not rely on legacy app-support `mcp.json`.
+- Pi: check recursive native/shared skills and package extension filters; Pi
+  has no native MCP core.
+- OpenCode: check JSON/JSONC preservation for skills, MCP enabled state, and npm
+  plugin references; do not treat auto-loaded local plugin files as writable.
 - Zed: check JSONC settings handling, global/project skill paths, instructions, and `context_servers`.
 
 ## MCP And CLI Checklist
@@ -58,6 +63,13 @@ A PR that changes behavior should usually include a focused regression test plus
 - Fixture validation or capability matrices
 
 Docs-only PRs should still be checked for command accuracy and safety of examples.
+
+For a distribution candidate or a change spanning provider discovery, mutation,
+backup/restore, TUI, or MCP, require a finalized local provider matrix from the
+exact commit. The report should prove 31/31 CLI, 31/31 real-PTY TUI, and 31/31
+persistent MCP scenarios, visually approved screenshots, unchanged live state,
+and a checksum manifest. A public release also requires explicit Pi and OpenCode
+host versions with disposable-root global/project compatibility checks.
 
 ## Review Feedback Style
 
