@@ -12,27 +12,44 @@ publish = false
 [workspace.dependencies]
 unpin-core = { path = "crates/unpin-core" }
 assert_cmd = "2.2.2"
-clap = { version = "4.6.1", features = ["derive"] }
-color-eyre = "0.6.5"
+clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29.0"
-futures = "0.3.32"
+futures = "0.3.33"
 getrandom = "0.4.3"
 hmac = "0.13.0"
 http = "1.4.2"
-insta = "1.48.0"
-jsonc-parser = { version = "0.32.4", features = ["cst", "serde"] }
-keyring = "4.1.4"
+jsonc-parser = { version = "0.33.0", features = ["cst", "serde"] }
+keyring = "4.1.5"
 predicates = "3.1.4"
-ratatui = "0.30.2"
-reqwest = { version = "0.13.4", default-features = false, features = ["json", "stream", "rustls"] }
-rmcp = { version = "2.2.0", default-features = false, features = ["client", "server", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
+ratatui = { version = "0.30.2", default-features = false, features = [
+  "crossterm",
+] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "json",
+  "stream",
+  "rustls",
+] }
+rmcp = { version = "3.0.0-beta.1", default-features = false, features = [
+  "client",
+  "server",
+  "transport-child-process",
+  "transport-io",
+  "transport-streamable-http-client-reqwest",
+] }
 rusqlite = { version = "0.40.1", features = ["bundled"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.150"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 sha2 = "0.11.0"
-sse-stream = "0.2.4"
+sse-stream = "0.2.5"
 tempfile = "3.27.0"
-time = { version = "0.3.49", features = ["formatting", "parsing"] }
-tokio = { version = "1.52.3", features = ["io-std", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
-toml = "1.1.2"
+time = { version = "0.3.54", features = ["formatting", "parsing"] }
+tokio = { version = "1.53.1", features = [
+  "io-std",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
 tracing = "0.1.44"

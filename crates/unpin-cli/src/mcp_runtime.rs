@@ -13,9 +13,9 @@ use futures::StreamExt;
 use rmcp::{
     ErrorData as McpError, RoleClient, ServerHandler, ServiceExt,
     model::{
-        CallToolRequestParams, CallToolResult, ContentBlock, ErrorCode, Implementation, JsonObject,
-        ListToolsResult, PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
-        ToolAnnotations, ToolExecution,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
+        Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
+        ServerInfo, Tool, ToolAnnotations,
     },
     service::{
         RequestContext, RoleServer, RunningService, RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage,
@@ -304,9 +304,7 @@ impl McpUpstreamPool {
         }
         let tool_request = CallToolRequestParams::new(request.tool_name.to_string())
             .with_arguments(request.arguments);
-        match tokio::time::timeout(timeouts.call, client.service.peer().call_tool(tool_request))
-            .await
-        {
+        match tokio::time::timeout(timeouts.call, client.service.call_tool(tool_request)).await {
             Ok(Ok(result)) => Ok(result),
             Ok(Err(_)) => {
                 self.clients.lock().await.remove(&connection_key);
@@ -409,7 +407,8 @@ async fn connect_upstream(
                 .map_err(|_| GatewayRuntimeError::InvalidUpstreamIdentity)?;
             let mut config =
                 StreamableHttpClientTransportConfig::with_uri(identity.endpoint.clone())
-                    .reinit_on_expired_session(false);
+                    .reinit_on_expired_session(false)
+                    .max_sse_event_size(maximum_message_bytes);
             if let Some(mut authorization) = authorization {
                 // rmcp requires an owned String and retains a transport-owned plaintext
                 // header copy. BoundBearerToken only zeroes resolver-owned bytes; callers
@@ -1684,8 +1683,8 @@ impl ServerHandler for GatewayMcpServer {
         &self,
         request: CallToolRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
-        self.call(request).await
+    ) -> Result<CallToolResponse, McpError> {
+        self.call(request).await.map(Into::into)
     }
 }
 
@@ -1982,11 +1981,6 @@ fn projected_tool(projected: ProjectedTool) -> Result<Tool, McpError> {
     tool.annotations = projected
         .annotations
         .map(serde_json::from_value::<ToolAnnotations>)
-        .transpose()
-        .map_err(|_| internal_error())?;
-    tool.execution = projected
-        .execution
-        .map(serde_json::from_value::<ToolExecution>)
         .transpose()
         .map_err(|_| internal_error())?;
     Ok(tool)

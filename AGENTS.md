@@ -63,9 +63,11 @@ Use the standard checks from the repository root:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo run -p unpin-cli -- --help
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo run -p unpin-cli --locked -- --help
+cargo audit --no-yanked
+cargo machete
 ```
 
 Testing guidance:

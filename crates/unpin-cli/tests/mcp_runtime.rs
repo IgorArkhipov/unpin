@@ -999,7 +999,9 @@ async fn gateway_projects_and_dispatches_upstream_tool_end_to_end() {
     assert_eq!(projected_json["title"], "Unpin doctor");
     assert_eq!(projected_json["outputSchema"]["type"], "object");
     assert_eq!(projected_json["annotations"]["readOnlyHint"], true);
-    assert_eq!(projected_json["execution"]["taskSupport"], "optional");
+    // rmcp 3's draft-aligned Tool model no longer serializes the legacy
+    // execution.taskSupport field.
+    assert!(projected_json.get("execution").is_none());
 
     let result = client
         .call_tool(CallToolRequestParams::new(projected.name.clone()))

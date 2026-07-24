@@ -35,7 +35,7 @@ lint:
     - actionlint@1.7.12
     - clippy@1.97.0
     - git-diff-check
-    - markdownlint-cli2@0.18.1
+    - markdownlint-cli2@0.23.1
     - rustfmt@1.97.0
     - taplo@0.10.0
     - trufflehog@3.95.6

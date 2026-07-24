@@ -266,7 +266,11 @@ Local CI-equivalent gates:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo run -p unpin-cli -- --help
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo run -p unpin-cli --locked -- --help
+cargo audit --no-yanked
+cargo machete
 ```
+
+CI also checks the declared Rust 1.96 MSRV separately from the pinned Rust 1.97.1 development toolchain.

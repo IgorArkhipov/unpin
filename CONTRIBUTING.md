@@ -29,12 +29,14 @@ Run the local CI-equivalent checks from the repository root:
 
 ```bash
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace --all-features
-cargo run -p unpin-cli -- --help
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
+cargo run -p unpin-cli --locked -- --help
+cargo audit --no-yanked
+cargo machete
 ```
 
-CI runs formatting, Clippy, and the full workspace test suite.
+CI also verifies the declared Rust 1.96 MSRV separately from the pinned Rust 1.97.1 development toolchain.
 
 ## Code Guidelines
 
