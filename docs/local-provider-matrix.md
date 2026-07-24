@@ -410,11 +410,11 @@ fixtures, and restores every copy byte-for-byte:
 python3 scripts/run_local_provider_matrix.py
 ```
 
-Runner prints a private evidence directory outside the checkout. After
-finalization, the most recent run `2026-07-24-184505-local-matrix` was archived
-under the repository's ignored
-`tmp/2026-07-24-184505-local-matrix` directory. It was bound to clean workspace
-commit `8f267d626b479ae2798a1712ef79537cb2352e31` and recorded:
+Runner prints a private evidence directory outside the checkout. The
+pre-release baseline run `2026-07-24-184505-local-matrix` was archived under the
+repository's ignored `tmp/2026-07-24-184505-local-matrix` directory. It was
+bound to clean workspace commit
+`8f267d626b479ae2798a1712ef79537cb2352e31` and recorded:
 
 - 31/31 CLI, 31/31 real-PTY TUI, and 31/31 persistent MCP scenarios;
 - 620 passing Rust tests and all eight local quality gates passing;
@@ -425,6 +425,10 @@ commit `8f267d626b479ae2798a1712ef79537cb2352e31` and recorded:
   pending because those executables were not installed;
 - unchanged live provider state;
 - 11 visually approved screenshots and a 21-file checksum manifest.
+
+Release-specific runs repeat the full procedure from the exact clean tag commit
+with Pi and OpenCode available on `PATH`. Their manifest-approved evidence is
+attached to the GitHub release rather than committed to source control.
 
 Each full run covers:
 

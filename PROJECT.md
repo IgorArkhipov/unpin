@@ -31,10 +31,11 @@ audit evidence, and explicit recovery outcomes.
 - Native MCP-reference lifecycle and strict live provider attachment remain
   explicit gateway limitations rather than inferred support.
 
-The finalized local matrix run `2026-07-24-184505-local-matrix` passed 31 CLI,
-31 real-PTY TUI, and 31 persistent MCP scenarios. It also passed 620 Rust tests,
-inventoried 938 live items without persisting private names, and verified that
-live provider state did not change.
+The pre-release baseline matrix run `2026-07-24-184505-local-matrix` passed 31
+CLI, 31 real-PTY TUI, and 31 persistent MCP scenarios. It also passed 620 Rust
+tests, inventoried 938 live items without persisting private names, and verified
+that live provider state did not change. Release-specific evidence is rerun from
+the exact tag commit and attached to the GitHub release rather than committed.
 
 ## Distribution readiness
 
@@ -44,13 +45,10 @@ SBOM generation, provenance attestation, checksums, and a draft-only release
 workflow. crates.io, Homebrew, Linux ARM64, Windows, and platform code signing
 remain deferred.
 
-Before publishing `v0.1.0-beta.1`, maintainers still need to:
-
-- create the public GitHub repository and enable branch, security, and immutable
-  release controls;
-- rerun and finalize the provider matrix from the exact release commit;
-- publish the complete draft only after attaching approved evidence and
-  checksums.
+Publishing `v0.1.0-beta.1` is gated on required CI, a finalized provider matrix
+from the exact clean release commit, approved evidence and checksums attached to
+the draft, and enabled branch, private-security-reporting, and immutable-release
+controls.
 
 The [onboarding guide](docs/ONBOARDING.md) explains the architecture and first
 safe run. The [local provider validation matrix](docs/local-provider-matrix.md)
