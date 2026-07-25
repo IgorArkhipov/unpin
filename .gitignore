@@ -1,0 +1,22 @@
+/.env
+/.env.*
+/old/
+/memory-bank/
+/.prompts/
+/.protocols/
+/.codegraph/
+/.understand-anything/
+/graphify-out/
+/target/
+__pycache__/
+*.py[cod]
+/.cache/
+/.tmp/
+# Local runtime, matrix, and release evidence
+/tmp/
+/artifacts/
+/.DS_Store
+**/.DS_Store
+*.log
+
+!crates/unpin-core/tests/fixtures/**/settings.local.json

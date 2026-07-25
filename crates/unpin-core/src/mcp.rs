@@ -1,0 +1,3253 @@
+use std::{
+    io::{self, BufRead, BufReader, Read, Write},
+    path::{Path, PathBuf},
+};
+
+use serde::Serialize;
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::capabilities::{validate_capability_matrix, validate_provider_fixtures};
+use crate::catalog::{Catalog, CatalogRecord, adoption::plan_discovered_adoption};
+use crate::control::build_control_status;
+use crate::control_operation::{
+    ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle, ControlResolvedContext,
+};
+use crate::discovery::{
+    DiscoveryCategory, DiscoveryItem, DiscoveryKind, DiscoveryOutput, DiscoveryRoots, ProviderId,
+    discover_all,
+};
+use crate::hooks::HookTrustStore;
+use crate::mutation::{
+    BackupAuthenticationKey, BackupSummary, NativeToggleController, RestoreController,
+    TogglePlanRequest, ToggleStatus, load_backup_summaries_authenticated, plan_toggle,
+};
+use crate::profiles::{
+    CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, CompiledProfileRevision,
+    GatewaySelection, PolicyChange, PolicyStore, PolicyTarget, ProfileDefinition,
+    ProfilePolicyController, ProfileReference, ProfileSelection, ProfileSourceScope, ProfileStore,
+    capability_lock_enforcement, compile_profile, propose_profile, resolve_effective_gateway,
+};
+use crate::sessions::{
+    GatewayModeAction, GatewayModeController, GatewayModeTarget, GatewayWorkflowController,
+    PinnedExposure, PinnedProfile, SessionAuthorityKey, SessionEndController,
+};
+use crate::snapshots::build_inventory_summary;
+use crate::state::workspace::resolve_workspace_identity;
+use crate::{
+    approval::{ApprovalExpectation, ControlApprovalContext},
+    transitions::{EffectActivation, TransitionContext, TransitionPlan},
+};
+
+// Keep the public MCP contract in one Unpin-owned namespace.
+pub const UNPIN_MCP_TOOL_NAMES: &[&str] = &[
+    "unpin_get_inventory_summary",
+    "unpin_list_items",
+    "unpin_plan_toggle_item",
+    "unpin_apply_toggle_item",
+    "unpin_plan_toggle_items",
+    "unpin_apply_toggle_items",
+    "unpin_list_backups",
+    "unpin_restore_backup",
+    "unpin_run_doctor",
+    "unpin_get_control_status",
+    "unpin_list_catalog",
+    "unpin_list_hooks",
+    "unpin_plan_catalog_adoption",
+    "unpin_apply_catalog_adoption",
+    "unpin_plan_hook_trust",
+    "unpin_apply_hook_trust",
+    "unpin_propose_session_profile",
+    "unpin_validate_profile",
+    "unpin_plan_profile_policy",
+    "unpin_apply_profile_policy",
+    "unpin_get_capability_locks",
+    "unpin_plan_capability_lock",
+    "unpin_apply_capability_lock",
+    "unpin_plan_gateway_mode",
+    "unpin_apply_gateway_mode",
+    "unpin_get_gateway_status",
+    "unpin_plan_session_end",
+    "unpin_apply_session_end",
+    "unpin_plan_session_launch",
+];
+
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+    &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
+const LATEST_MCP_PROTOCOL_VERSION: &str = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
+const CONTROL_PLANE_PROTECTED_REASON: &str = "control-plane-protected";
+const ADOPTION_APPROVAL_ISSUER: &str = "unpin-cli-human";
+const ADOPTION_APPROVAL_AUDIENCE: &str = "unpin-core-transition";
+const HOOK_TRUST_APPROVAL_ISSUER: &str = "unpin-cli-human";
+const HOOK_TRUST_APPROVAL_AUDIENCE: &str = "unpin-core-hook-trust";
+const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const UNPIN_CONTROL_CONTRACT_VERSION: u32 = 2;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum McpCredentialStatus {
+    Ready,
+    Missing,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpCredentialReadiness {
+    pub status: McpCredentialStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_id: Option<String>,
+}
+
+impl McpCredentialReadiness {
+    #[must_use]
+    pub fn ready(key_id: Option<String>) -> Self {
+        Self {
+            status: McpCredentialStatus::Ready,
+            key_id,
+        }
+    }
+
+    #[must_use]
+    pub const fn missing() -> Self {
+        Self {
+            status: McpCredentialStatus::Missing,
+            key_id: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn unavailable() -> Self {
+        Self {
+            status: McpCredentialStatus::Unavailable,
+            key_id: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct McpAuthenticationReadiness {
+    pub backup_authentication: McpCredentialReadiness,
+    pub approval_signing: McpCredentialReadiness,
+    pub cursor_dashboard: McpCredentialReadiness,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpContext {
+    pub discovery_roots: DiscoveryRoots,
+    pub fixture_root: Option<PathBuf>,
+    pub package_root: PathBuf,
+    pub app_state_root: PathBuf,
+    pub project_root: PathBuf,
+    pub backup_authentication_key: Option<BackupAuthenticationKey>,
+    pub session_authority_key: Option<SessionAuthorityKey>,
+    pub authentication: McpAuthenticationReadiness,
+}
+
+pub fn handle_mcp_request(context: &McpContext, request: &Value) -> Value {
+    let id = request.get("id").cloned().unwrap_or(Value::Null);
+    let Some(method) = request.get("method").and_then(Value::as_str) else {
+        return error_response(id, -32600, "missing method");
+    };
+
+    match method {
+        "initialize" => result_response(
+            id,
+            json!({
+                "protocolVersion": negotiated_protocol_version(request),
+                "serverInfo": {
+                    "name": "unpin",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "tools": {},
+                    "experimental": {
+                        "unpinControl": {
+                            "version": UNPIN_CONTROL_CONTRACT_VERSION,
+                            "mutation": "human-handoff-only"
+                        }
+                    }
+                }
+            }),
+        ),
+        "notifications/initialized" => result_response(id, json!({})),
+        "tools/list" => result_response(id, json!({ "tools": tool_descriptors() })),
+        "tools/call" => match handle_tool_call(context, request) {
+            Ok(result) => result_response(id, result),
+            Err(message) => error_response(id, -32000, message),
+        },
+        _ => error_response(id, -32601, format!("unsupported method: {method}")),
+    }
+}
+
+fn negotiated_protocol_version(request: &Value) -> &'static str {
+    let requested = request
+        .get("params")
+        .and_then(|params| params.get("protocolVersion"))
+        .and_then(Value::as_str);
+
+    SUPPORTED_MCP_PROTOCOL_VERSIONS
+        .iter()
+        .copied()
+        .find(|supported| Some(*supported) == requested)
+        .unwrap_or(LATEST_MCP_PROTOCOL_VERSION)
+}
+
+pub fn handle_stdio_request_once(
+    context: &McpContext,
+    input: impl Read,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let mut reader = BufReader::new(input);
+    let body = read_message_body(&mut reader)?
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "missing MCP message"))?;
+    let Some(response) = handle_stdio_message(context, &body) else {
+        return Ok(Vec::new());
+    };
+    let response_body = serde_json::to_string(&response)?;
+
+    Ok(encode_message(&response_body))
+}
+
+pub fn handle_stdio_requests(
+    context: &McpContext,
+    input: impl Read,
+    mut output: impl Write,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+    let mut reader = BufReader::new(input);
+
+    while let Some(body) = read_message_body(&mut reader)? {
+        let Some(response) = handle_stdio_message(context, &body) else {
+            continue;
+        };
+        let response_body = serde_json::to_string(&response)?;
+        output.write_all(&encode_message(&response_body))?;
+        output.flush()?;
+    }
+
+    Ok(())
+}
+
+fn handle_stdio_message(context: &McpContext, body: &[u8]) -> Option<Value> {
+    let request = match serde_json::from_slice::<Value>(body) {
+        Ok(request) => request,
+        Err(_) => return Some(error_response(Value::Null, -32700, "parse error")),
+    };
+
+    handle_mcp_response(context, &request)
+}
+
+fn handle_mcp_response(context: &McpContext, request: &Value) -> Option<Value> {
+    request.get("id")?;
+
+    Some(handle_mcp_request(context, request))
+}
+
+fn read_message_body(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>, io::Error> {
+    let mut body = Vec::new();
+    let bytes_read = reader
+        .take((MAX_MCP_MESSAGE_BYTES + 2) as u64)
+        .read_until(b'\n', &mut body)?;
+    if bytes_read == 0 {
+        return Ok(None);
+    }
+
+    if body.last() == Some(&b'\n') {
+        body.pop();
+        if body.last() == Some(&b'\r') {
+            body.pop();
+        }
+    }
+    if body.len() > MAX_MCP_MESSAGE_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("MCP message exceeds {MAX_MCP_MESSAGE_BYTES}-byte limit"),
+        ));
+    }
+    Ok(Some(body))
+}
+
+fn handle_tool_call(context: &McpContext, request: &Value) -> Result<Value, String> {
+    let params = request
+        .get("params")
+        .ok_or_else(|| "tools/call params are required".to_string())?;
+    let name = params
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "tools/call params.name is required".to_string())?;
+    let arguments = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    match name {
+        "unpin_get_inventory_summary" => {
+            structured_result(get_inventory_summary(context, &arguments)?)
+        }
+        "unpin_list_items" => structured_result(list_items(context, &arguments)?),
+        "unpin_run_doctor" => structured_result(run_doctor_structured(context)),
+        "unpin_plan_toggle_item" => structured_result(plan_single_toggle(context, &arguments)),
+        "unpin_apply_toggle_item" => structured_result(apply_single_toggle(context, &arguments)),
+        "unpin_plan_toggle_items" => structured_result(plan_bulk_toggle_items(context, &arguments)),
+        "unpin_apply_toggle_items" => {
+            structured_result(apply_bulk_toggle_items(context, &arguments))
+        }
+        "unpin_list_backups" => structured_result(list_backups(context, &arguments)),
+        "unpin_restore_backup" => structured_result(restore_backup_tool(context, &arguments)),
+        "unpin_get_control_status" => structured_result(get_control_status(context, &arguments)?),
+        "unpin_list_catalog" => structured_result(list_catalog(context, &arguments)?),
+        "unpin_list_hooks" => structured_result(list_hooks(context, &arguments)?),
+        "unpin_plan_catalog_adoption" => {
+            structured_result(plan_catalog_adoption(context, &arguments)?)
+        }
+        "unpin_apply_catalog_adoption" => {
+            structured_result(apply_catalog_adoption(context, &arguments)?)
+        }
+        "unpin_plan_hook_trust" => structured_result(plan_hook_trust(context, &arguments)?),
+        "unpin_apply_hook_trust" => structured_result(apply_hook_trust(context, &arguments)?),
+        "unpin_propose_session_profile" => {
+            structured_result(propose_session_profile(context, &arguments)?)
+        }
+        "unpin_validate_profile" => structured_result(validate_profile(context, &arguments)?),
+        "unpin_plan_profile_policy" => structured_result(plan_profile_policy(context, &arguments)?),
+        "unpin_apply_profile_policy" => {
+            structured_result(apply_profile_policy(context, &arguments)?)
+        }
+        "unpin_get_capability_locks" => {
+            structured_result(get_capability_locks(context, &arguments)?)
+        }
+        "unpin_plan_capability_lock" => {
+            structured_result(plan_capability_lock(context, &arguments)?)
+        }
+        "unpin_apply_capability_lock" => {
+            structured_result(apply_capability_lock(context, &arguments)?)
+        }
+        "unpin_plan_gateway_mode" => structured_result(plan_gateway_mode(context, &arguments)?),
+        "unpin_apply_gateway_mode" => structured_result(apply_gateway_mode(context, &arguments)?),
+        "unpin_get_gateway_status" => structured_result(get_gateway_status(context, &arguments)?),
+        "unpin_plan_session_end" => structured_result(plan_session_end(context, &arguments)?),
+        "unpin_apply_session_end" => structured_result(apply_session_end(context, &arguments)?),
+        "unpin_plan_session_launch" => structured_result(plan_session_launch(context, &arguments)?),
+        _ => Err(format!("unknown tool: {name}")),
+    }
+}
+
+fn propose_session_profile(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(
+        arguments,
+        &["prompt", "provider"],
+        "profile proposal arguments",
+    )?;
+    let prompt = required_string(arguments, "prompt")?;
+    let provider = optional_provider(arguments)?;
+    let identity =
+        resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
+    let store = ProfileStore::new(&context.app_state_root);
+    let mut profiles = store
+        .list_global_definitions()
+        .map_err(|error| error.to_string())?;
+    profiles.extend(
+        ProfileStore::list_workspace_definitions(&context.project_root)
+            .map_err(|error| error.to_string())?,
+    );
+    let proposal = propose_profile(
+        prompt,
+        &identity.repository_key,
+        &identity.workspace_key,
+        provider,
+        profiles,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "status": if proposal.recommended.is_some() { "proposed" } else { "selection-required" },
+        "proposal": proposal,
+        "humanAction": {
+            "code": "confirm-session-profile",
+            "guidance": "Ask the user to choose the proposed profile, then use the explicit session launch handoff. This tool never changes exposure.",
+        },
+    }))
+}
+
+fn validate_profile(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(
+        arguments,
+        &["profileId", "definition", "sourceScope"],
+        "profile validation arguments",
+    )?;
+    let stored_id = optional_string(arguments, "profileId")?;
+    let inline = arguments.get("definition");
+    let (definition, source_scope) = match (stored_id, inline) {
+        (Some(profile_id), None) => load_stored_profile(context, profile_id)?,
+        (None, Some(definition)) => {
+            let definition = serde_json::from_value::<ProfileDefinition>(definition.clone())
+                .map_err(|error| format!("profile definition is invalid: {error}"))?;
+            let source_scope =
+                parse_profile_source_scope(required_string(arguments, "sourceScope")?)?;
+            (definition, source_scope)
+        }
+        _ => {
+            return Err(
+                "provide exactly one of profileId or definition; inline definitions require sourceScope"
+                    .to_string(),
+            );
+        }
+    };
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
+    let revision =
+        compile_profile(&definition, &catalog, source_scope).map_err(|error| error.to_string())?;
+    Ok(json!({
+        "status": "valid",
+        "sourceScope": profile_source_scope_name(source_scope),
+        "revision": revision,
+        "materialized": false,
+    }))
+}
+
+fn structured_result(value: Value) -> Result<Value, String> {
+    let text = serde_json::to_string_pretty(&value).map_err(|error| error.to_string())?;
+
+    Ok(json!({
+        "content": [
+            {
+                "type": "text",
+                "text": text
+            }
+        ],
+        "structuredContent": value
+    }))
+}
+
+fn get_inventory_summary(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    validate_selector(arguments)?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = filter_summary_discovery(discovery, arguments);
+
+    Ok(json!({
+        "status": "ok",
+        "controlContractVersion": UNPIN_CONTROL_CONTRACT_VERSION,
+        "projectRoot": context.project_root.to_string_lossy().into_owned(),
+        "writeSafety": {
+            "backupAuthentication": context.authentication.backup_authentication.status,
+            "backupAuthenticationDetails": &context.authentication.backup_authentication,
+            "approvalSigning": &context.authentication.approval_signing,
+            "cursorDashboard": &context.authentication.cursor_dashboard,
+            "humanApproval": "cli-or-tui-required",
+            "writesEnabled": false
+        },
+        "inventory": {
+            "providers": provider_summaries(&discovery, arguments)
+        },
+        "warnings": discovery.warnings
+    }))
+}
+
+fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let selector = arguments.get("selector").unwrap_or(&Value::Null);
+    validate_selector(selector)?;
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let mut items = discovery
+        .items
+        .into_iter()
+        .filter(|item| selector_matches(item, selector))
+        .collect::<Vec<_>>();
+    let total_matched = items.len();
+    if let Some(limit) = limit {
+        items.truncate(limit);
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "selector": selector,
+        "totalMatched": total_matched,
+        "items": items,
+        "warnings": discovery.warnings
+    }))
+}
+
+fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_empty_object(arguments)?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let control = build_control_status(
+        &discovery,
+        &context.app_state_root,
+        &context.project_root,
+        context
+            .session_authority_key
+            .as_ref()
+            .ok_or_else(|| "session authority key is unavailable".to_string())?,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok(json!({"status": "ok", "control": control}))
+}
+
+fn list_catalog(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_empty_object(arguments)?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
+    Ok(json!({
+        "status": "ok",
+        "capabilities": catalog.records.values().collect::<Vec<_>>(),
+    }))
+}
+
+fn list_hooks(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let provider = optional_provider(arguments)?;
+    let profile_digest = optional_string(arguments, "profileDigest")?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let trust = HookTrustStore::new(&context.app_state_root);
+    let hooks = discovery
+        .items
+        .into_iter()
+        .filter(|item| {
+            item.kind == DiscoveryKind::Hook && provider.is_none_or(|value| item.provider == value)
+        })
+        .map(|item| {
+            let stored_trust_decision = stored_hook_trust_decision(&trust, &item, profile_digest)?;
+            Ok(json!({
+                "provider": item.provider,
+                "id": item.id,
+                "displayName": item.display_name,
+                "layer": item.layer,
+                "enabled": item.enabled,
+                "mutability": item.mutability,
+                "handler": item.hook,
+                "storedTrustDecision": stored_trust_decision,
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(json!({"status": "ok", "hooks": hooks}))
+}
+
+fn stored_hook_trust_decision(
+    trust: &HookTrustStore,
+    item: &DiscoveryItem,
+    profile_digest: Option<&str>,
+) -> Result<bool, String> {
+    let Some(profile_digest) = profile_digest else {
+        return Ok(false);
+    };
+    let metadata = item
+        .hook
+        .as_ref()
+        .ok_or_else(|| "hook metadata is missing".to_string())?;
+    let record = trust
+        .load_for(item.provider, &item.id, metadata, profile_digest)
+        .map_err(|error| error.to_string())?;
+    Ok(record.is_some_and(|record| {
+        record.provider == item.provider
+            && record.handler_id == item.id
+            && record.handler_fingerprint == metadata.fingerprint
+            && record.invocation_fingerprint == metadata.invocation_fingerprint
+            && record.profile_digest == profile_digest
+    }))
+}
+
+fn plan_catalog_adoption(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (item, capability, transition) = catalog_adoption_plan(context, arguments)?;
+    let expectation =
+        transition.approval_expectation(ADOPTION_APPROVAL_ISSUER, ADOPTION_APPROVAL_AUDIENCE);
+    let operation = control_operation(
+        &expectation,
+        &transition.effect_graph_digest,
+        EffectActivation::NextSessionOnly,
+        ControlOperationLifecycle::Planned,
+        Some(item.provider),
+        json!({
+            "item": item,
+            "capability": capability,
+            "transition": transition,
+        }),
+    );
+    Ok(json!({
+        "status": "planned",
+        "operation": operation,
+        "item": item,
+        "capability": capability,
+        "transition": transition,
+        "planFingerprint": transition.effect_graph_digest,
+        "humanApprovalRequired": true,
+        "continuation": "Use Unpin CLI to review and apply this fingerprint, then read control status.",
+    }))
+}
+
+fn apply_catalog_adoption(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (item, capability, transition) = catalog_adoption_plan(context, arguments)?;
+    require_plan_fingerprint(arguments, &transition.effect_graph_digest)?;
+    let expectation =
+        transition.approval_expectation(ADOPTION_APPROVAL_ISSUER, ADOPTION_APPROVAL_AUDIENCE);
+    Ok(human_action_required(control_operation(
+        &expectation,
+        &transition.effect_graph_digest,
+        EffectActivation::NextSessionOnly,
+        ControlOperationLifecycle::AwaitingHumanAction,
+        Some(item.provider),
+        json!({
+            "item": item,
+            "capability": capability,
+            "transition": transition,
+        }),
+    )))
+}
+
+fn catalog_adoption_plan(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<(DiscoveryItem, CatalogRecord, TransitionPlan), String> {
+    let provider = required_provider(arguments)?;
+    let item_id = required_string(arguments, "id")?;
+    let provider_root = PathBuf::from(required_string(arguments, "providerRoot")?);
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.provider == provider && item.id == item_id)
+        .cloned()
+        .ok_or_else(|| "provider item not found".to_string())?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
+    let capability = catalog
+        .find_provider_view(provider, item_id)
+        .cloned()
+        .ok_or_else(|| "catalog capability not found".to_string())?;
+    let identity =
+        resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
+    let operation_id = format!(
+        "adopt-{}-{}",
+        provider.as_str(),
+        capability.fingerprint.chars().take(24).collect::<String>()
+    );
+    let planned = plan_discovered_adoption(
+        &item,
+        &capability,
+        operation_id,
+        provider_root,
+        &context.app_state_root,
+        TransitionContext {
+            repository_key: identity.repository_key,
+            workspace_key: identity.workspace_key,
+            session_id: None,
+            profile_digest: None,
+        },
+        EffectActivation::NextSessionOnly,
+    )
+    .map_err(|error| error.to_string())?;
+    Ok((item, capability, planned.transition))
+}
+
+fn plan_hook_trust(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (item, expectation, fingerprint) = hook_trust_plan(context, arguments)?;
+    let operation = control_operation(
+        &expectation,
+        &fingerprint,
+        EffectActivation::NextSessionOnly,
+        ControlOperationLifecycle::Planned,
+        Some(item.provider),
+        json!({"hook": item, "expectation": expectation}),
+    );
+    Ok(json!({
+        "status": "planned",
+        "operation": operation,
+        "hook": item,
+        "expectation": expectation,
+        "planFingerprint": fingerprint,
+        "activation": "next-session-only",
+        "humanApprovalRequired": true,
+        "continuation": "Use Unpin CLI to review and apply this fingerprint, then read control status.",
+    }))
+}
+
+fn apply_hook_trust(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (item, expectation, fingerprint) = hook_trust_plan(context, arguments)?;
+    require_plan_fingerprint(arguments, &fingerprint)?;
+    Ok(human_action_required(control_operation(
+        &expectation,
+        &fingerprint,
+        EffectActivation::NextSessionOnly,
+        ControlOperationLifecycle::AwaitingHumanAction,
+        Some(item.provider),
+        json!({"hook": item, "expectation": expectation}),
+    )))
+}
+
+fn hook_trust_plan(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<(DiscoveryItem, ApprovalExpectation, String), String> {
+    let provider = required_provider(arguments)?;
+    let item_id = required_string(arguments, "id")?;
+    let profile_digest = required_string(arguments, "profileDigest")?;
+    let session_id = optional_string(arguments, "sessionId")?.unwrap_or("profile-policy");
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| {
+            item.provider == provider && item.kind == DiscoveryKind::Hook && item.id == item_id
+        })
+        .cloned()
+        .ok_or_else(|| "hook not found".to_string())?;
+    require_hook_profile_membership(context, &discovery, &item, profile_digest)?;
+    let metadata = item
+        .hook
+        .as_ref()
+        .ok_or_else(|| "hook metadata is missing".to_string())?;
+    let identity =
+        resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
+    let expectation = metadata
+        .trust_approval_expectation(
+            provider,
+            item_id,
+            profile_digest,
+            HOOK_TRUST_APPROVAL_ISSUER,
+            HOOK_TRUST_APPROVAL_AUDIENCE,
+            &identity.repository_key,
+            &identity.workspace_key,
+            session_id,
+        )
+        .map_err(|error| error.to_string())?;
+    let fingerprint = expectation.effect_graph_digest.clone();
+    Ok((item, expectation, fingerprint))
+}
+
+fn require_hook_profile_membership(
+    context: &McpContext,
+    discovery: &DiscoveryOutput,
+    hook: &DiscoveryItem,
+    profile_digest: &str,
+) -> Result<(), String> {
+    let revision = ProfileStore::new(&context.app_state_root)
+        .load_revision(profile_digest)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "compiled profile revision is missing".to_string())?;
+    let catalog = Catalog::from_discovery(discovery).map_err(|error| error.to_string())?;
+    let capability = catalog
+        .find_provider_view(hook.provider, &hook.id)
+        .ok_or_else(|| "hook capability is missing from catalog".to_string())?;
+    if revision.selects(&capability.id, hook.provider) {
+        Ok(())
+    } else {
+        Err("hook is not selected by compiled profile".to_string())
+    }
+}
+
+fn plan_profile_policy(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (revision, plan) = profile_policy_plan(context, arguments)?;
+    let approval_context = control_approval_context(context)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    let operation = control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.activation,
+        ControlOperationLifecycle::Planned,
+        optional_provider(arguments)?,
+        json!({"plan": plan}),
+    );
+    Ok(json!({
+        "status": "planned",
+        "operation": operation,
+        "profile": revision,
+        "plan": plan,
+        "humanApprovalRequired": true,
+        "continuation": "Use Unpin CLI to review and apply this fingerprint, then read control status.",
+    }))
+}
+
+fn apply_profile_policy(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (_, plan) = profile_policy_plan(context, arguments)?;
+    require_plan_fingerprint(arguments, &plan.plan_fingerprint)?;
+    let approval_context = control_approval_context(context)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    Ok(human_action_required(control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.activation,
+        ControlOperationLifecycle::AwaitingHumanAction,
+        optional_provider(arguments)?,
+        json!({"plan": plan}),
+    )))
+}
+
+fn profile_policy_plan(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<(CompiledProfileRevision, crate::profiles::PolicyChangePlan), String> {
+    let profile_id = required_string(arguments, "profileId")?;
+    let revision = compile_stored_profile(context, profile_id)?;
+    let provider = optional_provider(arguments)?;
+    let (_, policy_target) = control_targets(context, arguments, provider)?;
+    let gateway = match required_string(arguments, "mode")? {
+        "native" => GatewaySelection::Native,
+        "gateway" => GatewaySelection::Gateway,
+        _ => return Err("mode must be native or gateway".to_string()),
+    };
+    let plan = ProfilePolicyController::new(&context.app_state_root)
+        .plan_with_revisions(
+            policy_target,
+            provider,
+            PolicyChange {
+                profile: Some(ProfileSelection::Profile {
+                    reference: ProfileReference::from(&revision),
+                }),
+                gateway: Some(gateway),
+                capability_lock: None,
+            },
+            std::slice::from_ref(&revision),
+        )
+        .map_err(|error| error.to_string())?;
+    Ok((revision, plan))
+}
+
+fn get_capability_locks(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(arguments, &["provider"], "capability lock status arguments")?;
+    let requested_provider = optional_provider(arguments)?;
+    let identity =
+        resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
+    let policies = PolicyStore::new(&context.app_state_root)
+        .load_resolution_policies(&identity.repository_key, &identity.workspace_key, None)
+        .map_err(|error| error.to_string())?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
+    let providers = requested_provider.map_or_else(
+        || {
+            policies
+                .global
+                .providers
+                .iter()
+                .filter_map(|(provider, policy)| {
+                    (!policy.capability_locks.is_empty()).then_some(*provider)
+                })
+                .collect::<Vec<_>>()
+        },
+        |provider| vec![provider],
+    );
+    let locks = providers
+        .into_iter()
+        .map(|provider| {
+            let provider_policy = policies.global.providers.get(&provider);
+            let snapshot = CapabilityLockSnapshot::compile(
+                provider,
+                provider_policy
+                    .map(|policy| policy.capability_locks.clone())
+                    .unwrap_or_default(),
+            )
+            .map_err(|error| error.to_string())?;
+            let (gateway, gateway_source) = resolve_effective_gateway(provider, &policies);
+            Ok(json!({
+                "provider": provider,
+                "source": "global",
+                "activation": "next-session-only",
+                "activeSessionsUnaffected": true,
+                "repositoryKey": identity.repository_key,
+                "workspaceKey": identity.workspace_key,
+                "gateway": gateway,
+                "gatewaySource": gateway_source,
+                "digest": snapshot.digest,
+                "entries": snapshot.entries,
+                "enforcement": capability_lock_enforcement(&snapshot, &catalog, gateway),
+                "action": "unpin profile lock",
+            }))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    Ok(json!({"status": "ok", "locks": locks}))
+}
+
+fn plan_capability_lock(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let plan = capability_lock_plan(context, arguments)?;
+    let approval_context = control_approval_context(context)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    let provider = required_provider(arguments)?;
+    let operation = control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.activation,
+        ControlOperationLifecycle::Planned,
+        Some(provider),
+        json!({"plan": plan}),
+    );
+    Ok(json!({
+        "status": "planned",
+        "operation": operation,
+        "plan": plan,
+        "humanApprovalRequired": true,
+        "continuation": "Use Unpin CLI profile lock to review and apply this fingerprint, then read capability lock status.",
+    }))
+}
+
+fn apply_capability_lock(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let plan = capability_lock_plan(context, arguments)?;
+    require_plan_fingerprint(arguments, &plan.plan_fingerprint)?;
+    let approval_context = control_approval_context(context)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    Ok(human_action_required(control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.activation,
+        ControlOperationLifecycle::AwaitingHumanAction,
+        Some(required_provider(arguments)?),
+        json!({"plan": plan}),
+    )))
+}
+
+fn capability_lock_plan(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<crate::profiles::PolicyChangePlan, String> {
+    let provider = required_provider(arguments)?;
+    let capability_id =
+        crate::catalog::CapabilityId::new(required_string(arguments, "capabilityId")?)
+            .map_err(|error| error.to_string())?;
+    let state = match required_string(arguments, "state")? {
+        "hard-enabled" => Some(CapabilityLockState::HardEnabled),
+        "hard-disabled" => Some(CapabilityLockState::HardDisabled),
+        "clear" => None,
+        _ => return Err("state must be hard-enabled, hard-disabled, or clear".to_string()),
+    };
+    ProfilePolicyController::new(&context.app_state_root)
+        .plan(
+            PolicyTarget::Global,
+            Some(provider),
+            PolicyChange {
+                capability_lock: Some(CapabilityLockChange {
+                    capability_id,
+                    state,
+                }),
+                ..PolicyChange::default()
+            },
+        )
+        .map_err(|error| error.to_string())
+}
+
+fn compile_stored_profile(
+    context: &McpContext,
+    profile_id: &str,
+) -> Result<CompiledProfileRevision, String> {
+    let (definition, source_scope) = load_stored_profile(context, profile_id)?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
+    compile_profile(&definition, &catalog, source_scope).map_err(|error| error.to_string())
+}
+
+fn load_stored_profile(
+    context: &McpContext,
+    profile_id: &str,
+) -> Result<(ProfileDefinition, ProfileSourceScope), String> {
+    if let Some(entry) = ProfileStore::load_workspace_definition(&context.project_root, profile_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Ok((entry.definition, entry.scope));
+    }
+    let snapshot = ProfileStore::new(&context.app_state_root)
+        .load_global_definition(profile_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "profile not found".to_string())?;
+    Ok((snapshot.value, ProfileSourceScope::Global))
+}
+
+fn plan_gateway_mode(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let plan = gateway_workflow_plan(context, arguments)?;
+    let approval_context = control_approval_context(context)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    let operation = control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.mode.activation,
+        if plan.mode.blocked_reason.is_some() {
+            ControlOperationLifecycle::Blocked
+        } else {
+            ControlOperationLifecycle::Planned
+        },
+        optional_provider(arguments)?,
+        json!({
+            "plan": plan,
+            "nativeMcpReferences": "not-managed",
+        }),
+    );
+    Ok(json!({
+        "status": if plan.mode.blocked_reason.is_some() { "blocked" } else { "planned" },
+        "operation": operation,
+        "plan": plan,
+        "nativeMcpReferences": "not-managed",
+        "humanApprovalRequired": true,
+        "continuation": "Use Unpin CLI to review and apply this fingerprint, then read control status.",
+    }))
+}
+
+fn get_gateway_status(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(
+        arguments,
+        &["scope", "provider"],
+        "gateway status arguments",
+    )?;
+    let provider = optional_provider(arguments)?;
+    let (mode_target, policy_target) = control_targets(context, arguments, provider)?;
+    let mode = GatewayModeController::new(&context.app_state_root)
+        .status(&mode_target)
+        .map_err(|error| error.to_string())?;
+    let policy = PolicyStore::new(&context.app_state_root)
+        .load(&policy_target)
+        .map_err(|error| error.to_string())?;
+    Ok(json!({
+        "status": "ok",
+        "target": mode_target,
+        "mode": mode,
+        "policy": policy.map(|snapshot| snapshot.policy),
+        "provider": provider,
+        "runtime": {
+            "nativeMcpReferences": "not-managed",
+            "liveProviderAttachment": "blocked-until-provider-overlay-is-verified",
+        },
+    }))
+}
+
+fn apply_gateway_mode(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let plan = gateway_workflow_plan(context, arguments)?;
+    require_plan_fingerprint(arguments, &plan.plan_fingerprint)?;
+    let approval_context = control_approval_context(context)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    Ok(human_action_required(control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.mode.activation,
+        ControlOperationLifecycle::AwaitingHumanAction,
+        optional_provider(arguments)?,
+        json!({
+            "plan": plan,
+            "nativeMcpReferences": "not-managed",
+        }),
+    )))
+}
+
+fn gateway_workflow_plan(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<crate::sessions::GatewayWorkflowPlan, String> {
+    let provider = optional_provider(arguments)?;
+    let (mode_target, policy_target) = control_targets(context, arguments, provider)?;
+    let action = match required_string(arguments, "action")? {
+        "install" => GatewayModeAction::Install,
+        "on" => GatewayModeAction::Activate,
+        "off" => GatewayModeAction::Off,
+        "detach" => GatewayModeAction::Detach,
+        _ => return Err("action must be install, on, off, or detach".to_string()),
+    };
+    GatewayWorkflowController::with_authority_keys(
+        &context.app_state_root,
+        context
+            .session_authority_key
+            .clone()
+            .ok_or_else(|| "session authority key is unavailable".to_string())?,
+        context
+            .backup_authentication_key
+            .clone()
+            .ok_or_else(|| "backup authentication key is unavailable".to_string())?,
+    )
+    .plan(
+        mode_target,
+        policy_target,
+        provider,
+        action,
+        arguments
+            .get("force")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn plan_session_end(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let approval_context = control_approval_context(context)?;
+    let plan = SessionEndController::with_authority_key(
+        &context.app_state_root,
+        context
+            .session_authority_key
+            .clone()
+            .ok_or_else(|| "session authority key is unavailable".to_string())?,
+    )
+    .plan(required_string(arguments, "sessionId")?, &approval_context)
+    .map_err(|error| error.to_string())?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    let operation = control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.activation,
+        ControlOperationLifecycle::Planned,
+        plan.provider,
+        json!({"plan": plan}),
+    );
+    Ok(json!({
+        "status": "planned",
+        "operation": operation,
+        "plan": plan,
+        "humanApprovalRequired": true,
+        "continuation": "Use Unpin CLI to review and apply this fingerprint, then read control status.",
+    }))
+}
+
+fn apply_session_end(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let approval_context = control_approval_context(context)?;
+    let controller = SessionEndController::with_authority_key(
+        &context.app_state_root,
+        context
+            .session_authority_key
+            .clone()
+            .ok_or_else(|| "session authority key is unavailable".to_string())?,
+    );
+    let plan = controller
+        .plan(required_string(arguments, "sessionId")?, &approval_context)
+        .map_err(|error| error.to_string())?;
+    require_plan_fingerprint(arguments, &plan.plan_fingerprint)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|error| error.to_string())?;
+    Ok(human_action_required(control_operation(
+        &expectation,
+        &plan.plan_fingerprint,
+        plan.activation,
+        ControlOperationLifecycle::AwaitingHumanAction,
+        plan.provider,
+        json!({"plan": plan}),
+    )))
+}
+
+fn plan_session_launch(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(
+        arguments,
+        &["provider", "exposureRevision", "profile"],
+        "session launch arguments",
+    )?;
+    let provider = required_provider(arguments)?;
+    let profile = session_launch_profile(context, arguments)?;
+    let capability_locks = CapabilityLockSnapshot::compile(
+        provider,
+        PolicyStore::new(&context.app_state_root)
+            .load(&PolicyTarget::Global)
+            .map_err(|error| error.to_string())?
+            .as_ref()
+            .and_then(|snapshot| snapshot.policy.providers.get(&provider))
+            .map(|policy| policy.capability_locks.clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|error| error.to_string())?;
+    let exposure = PinnedExposure {
+        revision: required_string(arguments, "exposureRevision")?.to_string(),
+        profile,
+        capability_locks: Some(Box::new(capability_locks)),
+    };
+    exposure.validate().map_err(|error| error.to_string())?;
+    let workspace =
+        resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
+
+    let mut cli_arguments = vec![
+        "session".to_string(),
+        "launch".to_string(),
+        "--project-root".to_string(),
+        mcp_cli_path(&workspace.canonical_root, "project root")?,
+    ];
+    if let Some(fixture_root) = &context.fixture_root {
+        cli_arguments.extend([
+            "--fixture-root".to_string(),
+            mcp_cli_path(fixture_root, "fixture root")?,
+        ]);
+    }
+    cli_arguments.extend([
+        "--app-state-root".to_string(),
+        mcp_cli_path(&context.app_state_root, "app state root")?,
+        "--provider".to_string(),
+        provider.as_str().to_string(),
+        "--exposure-revision".to_string(),
+        exposure.revision.clone(),
+        "--capability-lock-revision".to_string(),
+        exposure
+            .capability_locks
+            .as_ref()
+            .expect("session launch always pins capability locks")
+            .digest
+            .clone(),
+    ]);
+    match &exposure.profile {
+        PinnedProfile::Native => cli_arguments.push("--native".to_string()),
+        PinnedProfile::None => {}
+        PinnedProfile::Profile {
+            profile_id,
+            profile_digest,
+            origin_scope,
+            definition_digest,
+        } => {
+            cli_arguments.extend([
+                "--profile-id".to_string(),
+                profile_id.clone(),
+                "--profile-digest".to_string(),
+                profile_digest.clone(),
+                "--definition-digest".to_string(),
+                definition_digest.clone(),
+                "--profile-origin".to_string(),
+                profile_source_scope_name(*origin_scope).to_string(),
+            ]);
+        }
+    }
+    cli_arguments.extend(["--json".to_string(), "--".to_string()]);
+    let profile_handoff = match &exposure.profile {
+        PinnedProfile::Native => json!({"type": "native"}),
+        PinnedProfile::None => json!({"type": "none"}),
+        PinnedProfile::Profile {
+            profile_id,
+            profile_digest,
+            origin_scope,
+            definition_digest,
+        } => json!({
+            "type": "profile",
+            "profileId": profile_id,
+            "profileDigest": profile_digest,
+            "originScope": origin_scope,
+            "definitionDigest": definition_digest,
+        }),
+    };
+
+    Ok(json!({
+        "status": "human-action-required",
+        "humanAction": {
+            "code": "run-session-launch",
+            "guidance": "Append the provider harness command after the final -- argument, review the argv array, then run it in a trusted terminal.",
+        },
+        "handoff": {
+            "version": 1,
+            "kind": "unpin-cli-session-launch",
+            "provider": provider,
+            "workspace": {
+                "projectRoot": workspace.canonical_root,
+                "repositoryKey": workspace.repository_key,
+                "workspaceKey": workspace.workspace_key,
+                "workspaceRevision": workspace.diagnostics.head,
+            },
+            "exposure": {
+                "revision": exposure.revision,
+                "profile": profile_handoff,
+                "capabilityLocks": exposure.capability_locks,
+            },
+            "cli": {
+                "executable": "unpin",
+                "arguments": cli_arguments,
+                "appendChildCommandAfterSeparator": true,
+            },
+        },
+        "constraints": {
+            "commandAccepted": false,
+            "processSpawned": false,
+            "stateWritten": false,
+            "approvalMinted": false,
+            "authorityExposed": false,
+        },
+    }))
+}
+
+fn session_launch_profile(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<PinnedProfile, String> {
+    let profile = arguments
+        .get("profile")
+        .ok_or_else(|| "missing required field: profile".to_string())?;
+    let profile_type = required_string(profile, "type")?;
+    match profile_type {
+        "native" => {
+            require_only_fields(profile, &["type"], "session launch profile")?;
+            Ok(PinnedProfile::Native)
+        }
+        "none" => {
+            require_only_fields(profile, &["type"], "session launch profile")?;
+            Ok(PinnedProfile::None)
+        }
+        "profile" => {
+            require_only_fields(
+                profile,
+                &["type", "profileId", "profileDigest", "definitionDigest"],
+                "session launch profile",
+            )?;
+            let profile_id = required_string(profile, "profileId")?;
+            let requested_profile_digest = required_string(profile, "profileDigest")?;
+            let requested_definition_digest = required_string(profile, "definitionDigest")?;
+            let revision = compile_stored_profile(context, profile_id)?;
+            if revision.digest != requested_profile_digest
+                || revision.origin.definition_digest != requested_definition_digest
+            {
+                return Err(
+                    "session launch profile revision does not match stored definition".to_string(),
+                );
+            }
+            Ok(PinnedProfile::Profile {
+                profile_id: revision.profile_id,
+                profile_digest: revision.digest,
+                origin_scope: revision.origin.scope,
+                definition_digest: revision.origin.definition_digest,
+            })
+        }
+        _ => Err("profile.type must be native, none, or profile".to_string()),
+    }
+}
+
+const fn profile_source_scope_name(scope: ProfileSourceScope) -> &'static str {
+    match scope {
+        ProfileSourceScope::Global => "global",
+        ProfileSourceScope::Repository => "repository",
+        ProfileSourceScope::Workspace => "workspace",
+        ProfileSourceScope::Session => "session",
+    }
+}
+
+fn parse_profile_source_scope(value: &str) -> Result<ProfileSourceScope, String> {
+    match value {
+        "global" => Ok(ProfileSourceScope::Global),
+        "repository" => Ok(ProfileSourceScope::Repository),
+        "workspace" => Ok(ProfileSourceScope::Workspace),
+        "session" => Ok(ProfileSourceScope::Session),
+        _ => Err("sourceScope must be global, repository, workspace, or session".to_string()),
+    }
+}
+
+fn mcp_cli_path(path: &Path, label: &str) -> Result<String, String> {
+    path.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| format!("{label} cannot be represented in MCP JSON"))
+}
+
+fn control_approval_context(context: &McpContext) -> Result<ControlApprovalContext, String> {
+    let identity =
+        resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
+    ControlApprovalContext::new(identity.repository_key, identity.workspace_key)
+        .map_err(|error| error.to_string())
+}
+
+fn control_targets(
+    context: &McpContext,
+    arguments: &Value,
+    provider: Option<ProviderId>,
+) -> Result<(GatewayModeTarget, PolicyTarget), String> {
+    let identity =
+        resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
+    match arguments
+        .get("scope")
+        .and_then(Value::as_str)
+        .unwrap_or("workspace")
+    {
+        "global" => Ok((
+            provider.map_or_else(
+                GatewayModeTarget::global,
+                GatewayModeTarget::global_provider,
+            ),
+            PolicyTarget::Global,
+        )),
+        "repository" => Ok((
+            match provider {
+                Some(provider) => {
+                    GatewayModeTarget::repository_provider(&identity.repository_key, provider)
+                }
+                None => GatewayModeTarget::repository(&identity.repository_key),
+            }
+            .map_err(|error| error.to_string())?,
+            PolicyTarget::repository(&identity.repository_key)
+                .map_err(|error| error.to_string())?,
+        )),
+        "workspace" => Ok((
+            match provider {
+                Some(provider) => GatewayModeTarget::workspace_provider(
+                    &identity.repository_key,
+                    &identity.workspace_key,
+                    provider,
+                ),
+                None => {
+                    GatewayModeTarget::workspace(&identity.repository_key, &identity.workspace_key)
+                }
+            }
+            .map_err(|error| error.to_string())?,
+            PolicyTarget::workspace(&identity.repository_key, &identity.workspace_key)
+                .map_err(|error| error.to_string())?,
+        )),
+        _ => Err("scope must be global, repository, or workspace".to_string()),
+    }
+}
+
+fn optional_provider(arguments: &Value) -> Result<Option<ProviderId>, String> {
+    arguments
+        .get("provider")
+        .map(|value| {
+            value
+                .as_str()
+                .ok_or_else(|| "provider must be a string".to_string())
+                .and_then(parse_provider_id)
+        })
+        .transpose()
+}
+
+fn required_provider(arguments: &Value) -> Result<ProviderId, String> {
+    parse_provider_id(required_string(arguments, "provider")?)
+}
+
+fn optional_string<'a>(arguments: &'a Value, field: &str) -> Result<Option<&'a str>, String> {
+    arguments
+        .get(field)
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| format!("{field} must be a non-empty string"))
+        })
+        .transpose()
+}
+
+fn parse_provider_id(value: &str) -> Result<ProviderId, String> {
+    ProviderId::ALL
+        .into_iter()
+        .find(|provider| provider.as_str() == value)
+        .ok_or_else(|| format!("unsupported provider: {value}"))
+}
+
+fn require_plan_fingerprint(arguments: &Value, expected: &str) -> Result<(), String> {
+    if arguments.get("planFingerprint").and_then(Value::as_str) == Some(expected) {
+        Ok(())
+    } else {
+        Err("plan fingerprint does not match current reviewed plan".to_string())
+    }
+}
+
+fn control_operation(
+    expectation: &crate::approval::ApprovalExpectation,
+    plan_fingerprint: &str,
+    activation: EffectActivation,
+    lifecycle: ControlOperationLifecycle,
+    provider: Option<ProviderId>,
+    details: Value,
+) -> ControlOperationEnvelope {
+    let human_action = matches!(
+        lifecycle,
+        ControlOperationLifecycle::Planned | ControlOperationLifecycle::AwaitingHumanAction
+    )
+    .then(|| ControlHumanAction {
+        code: "confirm-and-apply".to_string(),
+        guidance: "Review and apply this fingerprint in Unpin CLI or TUI".to_string(),
+    });
+    ControlOperationEnvelope::from_expectation(
+        expectation,
+        plan_fingerprint,
+        activation,
+        lifecycle,
+        human_action,
+        true,
+        provider.map_or_else(|| ProviderId::ALL.to_vec(), |provider| vec![provider]),
+        details,
+    )
+}
+
+fn human_action_required(operation: ControlOperationEnvelope) -> Value {
+    json!({
+        "status": "human-action-required",
+        "controlContractVersion": UNPIN_CONTROL_CONTRACT_VERSION,
+        "planFingerprint": operation.plan_fingerprint.clone(),
+        "operation": operation,
+        "continuation": "Review and apply this plan in Unpin CLI. MCP cannot mint or substitute human approval; read control status after completion.",
+    })
+}
+
+fn legacy_bulk_human_action_required(operation_kind: &str, plan_fingerprint: &str) -> Value {
+    json!({
+        "status": "human-action-required",
+        "contractVariant": "legacy-bulk-handoff",
+        "legacyBulkHandoff": true,
+        "operationReference": format!("{operation_kind}:{plan_fingerprint}"),
+        "operationKind": operation_kind,
+        "planFingerprint": plan_fingerprint,
+        "continuation": "Review matching items and apply them in Unpin CLI or TUI. This predecessor bulk handoff is not one durable control operation and does not use ControlOperationEnvelope v2.",
+    })
+}
+
+fn legacy_plan_fingerprint(operation_kind: &str, plan: &Value) -> String {
+    bulk_plan_fingerprint(json!({
+        "schemaVersion": 1,
+        "operationKind": operation_kind,
+        "plan": plan,
+    }))
+}
+
+fn require_empty_object(arguments: &Value) -> Result<(), String> {
+    match arguments.as_object() {
+        Some(arguments) if arguments.is_empty() => Ok(()),
+        Some(_) => Err("this tool does not accept arguments".to_string()),
+        None => Err("arguments must be an object".to_string()),
+    }
+}
+
+fn require_only_fields(arguments: &Value, allowed: &[&str], label: &str) -> Result<(), String> {
+    let object = arguments
+        .as_object()
+        .ok_or_else(|| format!("{label} must be an object"))?;
+    if let Some(field) = object
+        .keys()
+        .find(|field| !allowed.contains(&field.as_str()))
+    {
+        return Err(format!("unsupported {label} field: {field}"));
+    }
+    Ok(())
+}
+
+fn run_doctor_structured(context: &McpContext) -> Value {
+    let matrix_issues = capability_matrix_issues(context.fixture_root.as_ref());
+    if !matrix_issues.is_empty() {
+        let provider_issues = capability_matrix_provider_issues(&matrix_issues);
+        return json!({
+            "status": "error",
+            "packageRoot": context.package_root,
+            "fixturesRoot": context.fixture_root,
+            "providers": provider_health_rows("error", provider_issues),
+            "capabilityMatrixIssues": matrix_issues,
+            "fixtureIssues": [],
+            "warnings": []
+        });
+    }
+
+    let fixture_issues = provider_fixture_issues(context.fixture_root.as_ref());
+    if !fixture_issues.is_empty() {
+        let provider_issues = fixture_provider_issues(&fixture_issues);
+        return json!({
+            "status": "error",
+            "packageRoot": context.package_root,
+            "fixturesRoot": context.fixture_root,
+            "providers": provider_health_rows("error", provider_issues),
+            "fixtureIssues": fixture_issues,
+            "warnings": []
+        });
+    }
+
+    match discover_all(&context.discovery_roots) {
+        Ok(discovery) => {
+            let provider_issues = discovery
+                .warnings
+                .iter()
+                .map(discovery_warning_provider_issue)
+                .collect::<Vec<_>>();
+            json!({
+                "status": if provider_issues.is_empty() { "ok" } else { "warning" },
+                "packageRoot": context.package_root,
+                "fixturesRoot": context.fixture_root,
+                "providers": provider_health_rows("warning", provider_issues),
+                "itemsDiscovered": discovery.items.len(),
+                "warnings": discovery.warnings
+            })
+        }
+        Err(error) => json!({
+            "status": "error",
+            "packageRoot": context.package_root,
+            "fixturesRoot": context.fixture_root,
+            "providers": provider_health_rows("error", discovery_error_provider_issues(&error.to_string())),
+            "itemsDiscovered": 0,
+            "warnings": [],
+            "reason": error.to_string()
+        }),
+    }
+}
+
+fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
+    let Some(target_enabled) = arguments.get("targetEnabled").and_then(Value::as_bool) else {
+        return blocked_value("missing required field: targetEnabled");
+    };
+    let item = match selected_item(context, arguments) {
+        Ok(item) => item,
+        Err(reason) => return blocked_value(reason),
+    };
+    if is_control_plane_protected_disable(&item, target_enabled) {
+        return blocked_toggle_value(item, target_enabled, CONTROL_PLANE_PROTECTED_REASON);
+    }
+
+    if item.enabled == target_enabled {
+        let mut plan = json!({
+            "status": "planned",
+            "selection": item,
+            "targetEnabled": target_enabled,
+            "applyMode": "re-resolve-on-apply",
+            "operations": [],
+            "affectedTargets": [],
+            "affectedPaths": [],
+            "blocked": null,
+            "warnings": []
+        });
+        plan["planFingerprint"] = json!(legacy_plan_fingerprint("toggle-item", &plan));
+        let approval_context = match control_approval_context(context) {
+            Ok(context) => context,
+            Err(error) => return blocked_value(error),
+        };
+        let fingerprint = plan["planFingerprint"]
+            .as_str()
+            .expect("single toggle no-op plan includes fingerprint");
+        let operation = ControlOperationEnvelope::new(
+            format!("native-toggle-no-op-{fingerprint}"),
+            "native-toggle",
+            fingerprint,
+            ControlResolvedContext {
+                repository_key: approval_context.repository_key().to_string(),
+                workspace_key: approval_context.workspace_key().to_string(),
+                session_id: None,
+                profile_digest: None,
+            },
+            ControlOperationLifecycle::NoOp,
+            EffectActivation::Live,
+            None,
+            false,
+            vec![item.provider],
+            json!({"plan": plan.clone(), "reason": "already-in-desired-state"}),
+        );
+        plan["controlContractVersion"] = json!(UNPIN_CONTROL_CONTRACT_VERSION);
+        plan["operation"] =
+            serde_json::to_value(operation).expect("control operation envelope serializes");
+        return plan;
+    }
+
+    let approval_context = match control_approval_context(context) {
+        Ok(approval_context) => approval_context,
+        Err(error) => return blocked_value(error),
+    };
+    let controlled =
+        match NativeToggleController::new(&context.app_state_root).plan(item, &approval_context) {
+            Ok(controlled) => controlled,
+            Err(error) => return blocked_value(error.to_string()),
+        };
+    let expectation = match controlled.approval_expectation(&approval_context) {
+        Ok(expectation) => expectation,
+        Err(error) => return blocked_value(error.to_string()),
+    };
+    let provider = controlled.preview.selection.provider;
+    let activation = controlled
+        .transition
+        .effects
+        .first()
+        .map_or(EffectActivation::RestartRequired, |effect| {
+            effect.activation
+        });
+    let operation = control_operation(
+        &expectation,
+        &controlled.plan_fingerprint,
+        activation,
+        ControlOperationLifecycle::Planned,
+        Some(provider),
+        json!({"plan": controlled.clone()}),
+    );
+    let mut plan = plan_summary_value(
+        serde_json::to_value(&controlled.preview).expect("toggle result serializes"),
+    );
+    plan["planFingerprint"] = json!(controlled.plan_fingerprint);
+    plan["controlContractVersion"] = json!(UNPIN_CONTROL_CONTRACT_VERSION);
+    plan["operation"] =
+        serde_json::to_value(operation).expect("control operation envelope serializes");
+    plan["continuation"] =
+        json!("Review this plan, then call unpin_apply_toggle_item with its planFingerprint.");
+    plan
+}
+
+fn apply_single_toggle(context: &McpContext, arguments: &Value) -> Value {
+    let plan = plan_single_toggle(context, arguments);
+    if plan["status"] == "blocked" {
+        return plan;
+    }
+    let fingerprint = plan["planFingerprint"]
+        .as_str()
+        .expect("single toggle plan includes fingerprint");
+    if let Err(error) = require_plan_fingerprint(arguments, fingerprint) {
+        return blocked_value(error);
+    }
+    if plan["operations"].as_array().is_some_and(Vec::is_empty) {
+        let mut no_op = plan;
+        no_op["status"] = json!("no-op");
+        return no_op;
+    }
+    let item = match selected_item(context, arguments) {
+        Ok(item) => item,
+        Err(reason) => return blocked_value(reason),
+    };
+    let approval_context = match control_approval_context(context) {
+        Ok(context) => context,
+        Err(error) => return blocked_value(error),
+    };
+    let controlled =
+        match NativeToggleController::new(&context.app_state_root).plan(item, &approval_context) {
+            Ok(controlled) => controlled,
+            Err(error) => return blocked_value(error.to_string()),
+        };
+    if controlled.plan_fingerprint != fingerprint {
+        return blocked_value("plan fingerprint does not match current reviewed plan");
+    }
+    let expectation = match controlled.approval_expectation(&approval_context) {
+        Ok(expectation) => expectation,
+        Err(error) => return blocked_value(error.to_string()),
+    };
+    let provider = controlled.preview.selection.provider;
+    let activation = controlled
+        .transition
+        .effects
+        .first()
+        .map_or(EffectActivation::RestartRequired, |effect| {
+            effect.activation
+        });
+    let mut response = human_action_required(control_operation(
+        &expectation,
+        fingerprint,
+        activation,
+        ControlOperationLifecycle::AwaitingHumanAction,
+        Some(provider),
+        json!({"plan": controlled}),
+    ));
+    response["operationKind"] = json!("toggle-item");
+    response["operationReference"] = json!(format!("toggle-item:{fingerprint}"));
+    response
+}
+
+fn plan_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
+    match build_bulk_plan(context, arguments) {
+        Ok(plan) => plan,
+        Err(reason) => blocked_value(reason),
+    }
+}
+
+fn apply_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
+    let Some(provided_fingerprint) = arguments.get("planFingerprint").and_then(Value::as_str)
+    else {
+        return blocked_value("missing required field: planFingerprint");
+    };
+
+    let Some(max_items) = arguments.get("maxItems").and_then(Value::as_u64) else {
+        return blocked_value("missing required field: maxItems");
+    };
+
+    let current_plan = match build_bulk_plan(context, arguments) {
+        Ok(plan) => plan,
+        Err(reason) => return blocked_value(reason),
+    };
+    let current_fingerprint = current_plan["planFingerprint"]
+        .as_str()
+        .expect("bulk plan includes fingerprint");
+    if current_fingerprint != provided_fingerprint {
+        return json!({
+            "status": "blocked",
+            "reasonCode": "plan-fingerprint-mismatch",
+            "message": "The reviewed bulk plan no longer matches the current machine state. Re-run the plan step before applying.",
+            "currentPlanFingerprint": current_fingerprint,
+            "planFingerprint": provided_fingerprint
+        });
+    }
+
+    let actionable = current_plan["actionable"]
+        .as_array()
+        .expect("bulk plan includes actionable array");
+    if actionable.len() as u64 > max_items {
+        return json!({
+            "status": "blocked",
+            "reason": "max-items-exceeded",
+            "reasonCode": "max-items-exceeded",
+            "message": "The reviewed bulk plan exceeds the requested maxItems guard.",
+            "maxItems": max_items,
+            "actionableCount": actionable.len(),
+            "planFingerprint": current_fingerprint
+        });
+    }
+
+    if actionable.is_empty() {
+        return json!({
+            "status": "no-op",
+            "selector": current_plan["selector"],
+            "targetEnabled": current_plan["targetEnabled"],
+            "applyMode": "fingerprint-required",
+            "planFingerprint": current_fingerprint,
+            "matchedCount": current_plan["matchedCount"],
+            "actionableCount": 0,
+            "blockedCount": current_plan["blockedCount"],
+            "blockedItems": current_plan["blockedItems"],
+            "warnings": current_plan["warnings"]
+        });
+    }
+
+    legacy_bulk_human_action_required("toggle-items", current_fingerprint)
+}
+
+fn build_bulk_plan(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let target_enabled = arguments
+        .get("targetEnabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "missing required field: targetEnabled".to_string())?;
+    let selector = arguments.get("selector").unwrap_or(&Value::Null);
+    validate_selector(selector)?;
+    let allow_empty = arguments
+        .get("allowEmptySelection")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let warnings = discovery.warnings;
+    let matched_items = discovery
+        .items
+        .into_iter()
+        .filter(|item| selector_matches(item, selector))
+        .collect::<Vec<_>>();
+
+    let mut actionable = Vec::new();
+    let mut blocked = Vec::new();
+    let mut blocked_items = Vec::new();
+    for item in &matched_items {
+        if is_control_plane_protected_disable(item, target_enabled) {
+            blocked.push(json!({
+                "item": item,
+                "reason": CONTROL_PLANE_PROTECTED_REASON
+            }));
+            blocked_items.push(blocked_item_value(item, CONTROL_PLANE_PROTECTED_REASON));
+            continue;
+        }
+
+        if item.enabled == target_enabled {
+            let reason_code = "already-in-desired-state";
+            blocked.push(json!({
+                "item": item,
+                "reason": reason_code
+            }));
+            blocked_items.push(blocked_item_value(item, reason_code));
+            continue;
+        }
+
+        let plan = plan_toggle(TogglePlanRequest {
+            app_state_root: context.app_state_root.clone(),
+            item: item.clone(),
+        });
+        if plan.status == ToggleStatus::DryRun {
+            actionable.push(plan_summary_value(
+                serde_json::to_value(plan).expect("toggle result serializes"),
+            ));
+        } else {
+            let reason_code = plan.reason.unwrap_or_else(|| "not-actionable".to_string());
+            blocked.push(json!({
+                "item": item,
+                "reason": reason_code
+            }));
+            blocked_items.push(blocked_item_value(item, &reason_code));
+        }
+    }
+
+    let selector = canonical_selector(selector);
+    let matched_items_json = matched_items
+        .iter()
+        .map(|item| serde_json::to_value(item).expect("discovery item serializes"))
+        .collect::<Vec<_>>();
+    let mut matched_item_identities = matched_items
+        .iter()
+        .map(item_identity_value)
+        .collect::<Vec<_>>();
+    sort_item_identity_values(&mut matched_item_identities);
+    let mut actionable_items = actionable
+        .iter()
+        .map(|entry| item_identity_from_value(&entry["selection"]))
+        .collect::<Vec<_>>();
+    sort_item_identity_values(&mut actionable_items);
+    sort_blocked_item_values(&mut blocked_items);
+    let mut per_item_plans = actionable
+        .iter()
+        .map(per_item_plan_value)
+        .collect::<Vec<_>>();
+    sort_per_item_plan_values(&mut per_item_plans);
+    let per_item_operation_digests = per_item_plans
+        .iter()
+        .map(per_item_operation_digest_value)
+        .collect::<Vec<_>>();
+    let fingerprint = bulk_plan_fingerprint(json!({
+        "schemaVersion": 1,
+        "tool": "unpin_plan_toggle_items",
+        "projectRoot": context.project_root.to_string_lossy().into_owned(),
+        "selector": selector.clone(),
+        "targetEnabled": target_enabled,
+        "matchedItems": matched_item_identities.clone(),
+        "actionableItems": actionable_items.clone(),
+        "blockedItems": blocked_fingerprint_values(&blocked_items),
+        "perItemOperationDigests": per_item_operation_digests
+    }));
+    let status = if matched_items.is_empty() {
+        if allow_empty { "no-op" } else { "blocked" }
+    } else if actionable.is_empty() {
+        "blocked"
+    } else {
+        "planned"
+    };
+
+    let mut response = json!({
+        "status": status,
+        "selector": selector,
+        "targetEnabled": target_enabled,
+        "applyMode": "fingerprint-required",
+        "planFingerprint": fingerprint,
+        "matchedCount": matched_item_identities.len(),
+        "actionableCount": actionable_items.len(),
+        "blockedCount": blocked_items.len(),
+        "matchedItems": matched_item_identities,
+        "actionableItems": actionable_items,
+        "blockedItems": blocked_items,
+        "perItemPlans": per_item_plans,
+        "warnings": warnings,
+        "matched": matched_items_json,
+        "actionable": actionable,
+        "blocked": blocked
+    });
+    if matched_items.is_empty() && !allow_empty {
+        response["reason"] = json!("empty-selection");
+        response["reasonCode"] = json!("empty-selection");
+        response["message"] = json!(blocked_reason_message("empty-selection"));
+    }
+
+    Ok(response)
+}
+
+fn item_identity_value(item: &DiscoveryItem) -> Value {
+    json!({
+        "provider": item.provider.as_str(),
+        "kind": item.kind.as_str(),
+        "id": item.id,
+        "layer": item.layer.as_str()
+    })
+}
+
+fn item_identity_from_value(item: &Value) -> Value {
+    json!({
+        "provider": item["provider"],
+        "kind": item["kind"],
+        "id": item["id"],
+        "layer": item["layer"]
+    })
+}
+
+fn blocked_item_value(item: &DiscoveryItem, reason_code: &str) -> Value {
+    json!({
+        "item": item_identity_value(item),
+        "reasonCode": reason_code,
+        "message": blocked_reason_message(reason_code)
+    })
+}
+
+fn blocked_reason_message(reason_code: &str) -> String {
+    match reason_code {
+        "already-in-desired-state" => "Item is already in the requested state.".to_string(),
+        CONTROL_PLANE_PROTECTED_REASON => {
+            "This configured MCP entry appears to be the Unpin control plane and cannot be disabled through MCP tools.".to_string()
+        }
+        "empty-selection" => "The selector did not match any items.".to_string(),
+        "max-items-exceeded" => {
+            "The reviewed bulk plan exceeds the requested maxItems guard.".to_string()
+        }
+        "plan-fingerprint-mismatch" => {
+            "The reviewed bulk plan no longer matches the current machine state. Re-run the plan step before applying.".to_string()
+        }
+        other => format!("Item is blocked: {other}"),
+    }
+}
+
+fn per_item_plan_value(plan: &Value) -> Value {
+    let mut value = plan.clone();
+    if let Some(object) = value.as_object_mut()
+        && let Some(selection) = object.get("selection").cloned()
+    {
+        object.insert(
+            "selection".to_string(),
+            item_identity_from_value(&selection),
+        );
+    }
+    value
+}
+
+fn per_item_operation_digest_value(plan: &Value) -> Value {
+    json!({
+        "selection": plan["selection"],
+        "operations": plan["operations"]
+    })
+}
+
+fn blocked_fingerprint_values(blocked_items: &[Value]) -> Vec<Value> {
+    blocked_items
+        .iter()
+        .map(|item| {
+            json!({
+                "item": item["item"],
+                "reasonCode": item["reasonCode"]
+            })
+        })
+        .collect()
+}
+
+fn sort_item_identity_values(items: &mut [Value]) {
+    items.sort_by_key(item_identity_key);
+}
+
+fn sort_blocked_item_values(items: &mut [Value]) {
+    items.sort_by_key(|entry| item_identity_key(&entry["item"]));
+}
+
+fn sort_per_item_plan_values(items: &mut [Value]) {
+    items.sort_by_key(|entry| item_identity_key(&entry["selection"]));
+}
+
+fn item_identity_key(item: &Value) -> (String, String, String, String) {
+    (
+        item.get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        item.get("kind")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        item.get("layer")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        item.get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+    )
+}
+
+fn plan_summary_value(result: Value) -> Value {
+    let affected_targets = target_summary_values(&result["affectedTargets"]);
+    let affected_paths = path_values_from_targets(&affected_targets);
+    let warnings = toggle_warning_values(&result);
+
+    if result["status"] == "blocked" {
+        let reason = result["reason"].as_str().unwrap_or("blocked").to_string();
+        return json!({
+            "status": "blocked",
+            "selection": result["selection"],
+            "targetEnabled": result["targetEnabled"],
+            "applyMode": "re-resolve-on-apply",
+            "operations": operation_summary_values(&result["operations"]),
+            "affectedTargets": affected_targets,
+            "affectedPaths": affected_paths,
+            "reason": reason,
+            "blocked": blocked_reason_value(&reason),
+            "warnings": warnings
+        });
+    }
+
+    json!({
+        "status": "planned",
+        "selection": result["selection"],
+        "targetEnabled": result["targetEnabled"],
+        "applyMode": "re-resolve-on-apply",
+        "operations": operation_summary_values(&result["operations"]),
+        "affectedTargets": affected_targets,
+        "affectedPaths": affected_paths,
+        "blocked": null,
+        "warnings": warnings
+    })
+}
+
+fn toggle_warning_values(result: &Value) -> Value {
+    let changed_or_planned = matches!(
+        result.get("status").and_then(Value::as_str),
+        Some("dry-run" | "applied")
+    );
+    let provider = result["selection"]["provider"].as_str();
+    let category = result["selection"]["category"].as_str();
+    let restart_message = match (provider, category) {
+        (Some("codex"), Some("skill")) => Some("Restart Codex to load the skill state change."),
+        (Some("codex"), Some("plugin-config")) => {
+            Some("Restart Codex to load the plugin state change.")
+        }
+        (Some("cursor"), Some("plugin-manifest")) => {
+            Some("Restart Cursor or reload its window to load the local plugin state change.")
+        }
+        _ => None,
+    };
+    if changed_or_planned && let Some(message) = restart_message {
+        json!([{
+            "code": "restart-required",
+            "message": message
+        }])
+    } else {
+        json!([])
+    }
+}
+
+fn operation_summary_values(operations: &Value) -> Value {
+    Value::Array(
+        operations
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(operation_summary_value)
+            .collect(),
+    )
+}
+
+fn operation_summary_value(operation: &Value) -> Value {
+    if let Some(operation_type) = operation.get("type").and_then(Value::as_str) {
+        return operation_with_contract_aliases(operation.clone(), operation_type);
+    }
+
+    match operation.get("operationType").and_then(Value::as_str) {
+        Some("renamePath") => {
+            let (Some(from_path), Some(to_path)) = (
+                operation.get("fromPath").and_then(Value::as_str),
+                operation.get("toPath").and_then(Value::as_str),
+            ) else {
+                return operation.clone();
+            };
+
+            json!({
+                "type": "renamePath",
+                "op": "renamePath",
+                "from": from_path,
+                "to": to_path,
+                "fromPath": from_path,
+                "toPath": to_path
+            })
+        }
+        Some("replaceJsonValue") => {
+            let (Some(path), Some(json_path), Some(value)) = (
+                operation.get("path").and_then(Value::as_str),
+                operation.get("jsonPath").and_then(Value::as_array),
+                operation.get("value"),
+            ) else {
+                return operation.clone();
+            };
+
+            json!({
+                "type": "replaceJsonValue",
+                "op": "replaceJsonValue",
+                "path": path,
+                "jsonPath": json_path,
+                "pointer": json_pointer_from_path(json_path),
+                "value": value
+            })
+        }
+        Some("replaceFile") => {
+            let Some(path) = operation
+                .get("path")
+                .or_else(|| operation.get("fromPath"))
+                .and_then(Value::as_str)
+            else {
+                return operation.clone();
+            };
+
+            json!({
+                "type": "replaceFile",
+                "op": "replaceFile",
+                "path": path
+            })
+        }
+        Some("replaceSqliteItemTableValue") => {
+            let (Some(path), Some(value)) = (
+                operation.get("path").and_then(Value::as_str),
+                operation.get("value"),
+            ) else {
+                return operation.clone();
+            };
+
+            json!({
+                "type": "replaceSqliteItemTableValue",
+                "op": "replaceSqliteItemTableValue",
+                "path": path,
+                "value": value
+            })
+        }
+        _ => operation.clone(),
+    }
+}
+
+fn operation_with_contract_aliases(mut operation: Value, operation_type: &str) -> Value {
+    let Some(object) = operation.as_object_mut() else {
+        return operation;
+    };
+
+    object
+        .entry("op".to_string())
+        .or_insert_with(|| json!(operation_type));
+
+    match operation_type {
+        "renamePath" => {
+            if let Some(from_path) = object.get("fromPath").cloned() {
+                object.entry("from".to_string()).or_insert(from_path);
+            }
+            if let Some(to_path) = object.get("toPath").cloned() {
+                object.entry("to".to_string()).or_insert(to_path);
+            }
+        }
+        "replaceJsonValue" => {
+            if let Some(json_path) = object.get("jsonPath").and_then(Value::as_array) {
+                let pointer = json_pointer_from_path(json_path);
+                object
+                    .entry("pointer".to_string())
+                    .or_insert_with(|| json!(pointer));
+            }
+        }
+        _ => {}
+    }
+
+    operation
+}
+
+fn json_pointer_from_path(path: &[Value]) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+
+    let mut pointer = String::new();
+    for segment in path {
+        pointer.push('/');
+        let rendered = segment
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| segment.to_string());
+        pointer.push_str(&rendered.replace('~', "~0").replace('/', "~1"));
+    }
+    pointer
+}
+
+fn target_summary_values(targets: &Value) -> Value {
+    Value::Array(
+        targets
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(target_summary_value)
+            .collect(),
+    )
+}
+
+fn target_summary_value(target: &Value) -> Value {
+    if target.get("type").is_some() {
+        return target.clone();
+    }
+
+    let Some(path) = target.get("path").and_then(Value::as_str) else {
+        return target.clone();
+    };
+    let Some(target_type) = target.get("targetType").and_then(Value::as_str) else {
+        return json!({ "type": "path", "path": path });
+    };
+
+    if target_type == "sqlite-item" {
+        json!({ "type": target_type, "targetType": target_type, "path": path })
+    } else {
+        json!({ "type": "path", "path": path })
+    }
+}
+
+fn path_values_from_targets(targets: &Value) -> Vec<String> {
+    targets
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|target| target.get("path").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
+fn blocked_reason_value(reason_code: &str) -> Value {
+    json!({
+        "reasonCode": reason_code,
+        "message": blocked_reason_message(reason_code)
+    })
+}
+
+fn blocked_toggle_value(item: DiscoveryItem, target_enabled: bool, reason_code: &str) -> Value {
+    json!({
+        "status": "blocked",
+        "selection": item,
+        "targetEnabled": target_enabled,
+        "applyMode": "re-resolve-on-apply",
+        "operations": [],
+        "affectedTargets": [],
+        "affectedPaths": [],
+        "reason": reason_code,
+        "reasonCode": reason_code,
+        "message": blocked_reason_message(reason_code),
+        "blocked": blocked_reason_value(reason_code),
+        "warnings": []
+    })
+}
+
+fn is_control_plane_protected_disable(item: &DiscoveryItem, target_enabled: bool) -> bool {
+    !target_enabled
+        && item.category == DiscoveryCategory::ConfiguredMcp
+        && item.kind == DiscoveryKind::Mcp
+        && is_control_plane_name(item)
+}
+
+fn is_control_plane_name(item: &DiscoveryItem) -> bool {
+    let id_name = item
+        .id
+        .rsplit(':')
+        .next()
+        .unwrap_or(item.id.as_str())
+        .to_ascii_lowercase();
+    let display_name = item.display_name.to_ascii_lowercase();
+
+    id_name == "unpin" || display_name == "unpin"
+}
+
+fn list_backups(context: &McpContext, arguments: &Value) -> Value {
+    let limit = arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0);
+    let mut backups = load_backup_summaries_authenticated(
+        &context.app_state_root,
+        context.backup_authentication_key.as_ref(),
+    )
+    .into_iter()
+    .map(backup_summary_value)
+    .collect::<Vec<_>>();
+    let total_backups = backups.len();
+    if let Some(limit) = limit {
+        backups.truncate(limit);
+    }
+
+    json!({
+        "status": "ok",
+        "totalBackups": total_backups,
+        "backups": backups
+    })
+}
+
+fn backup_summary_value(summary: BackupSummary) -> Value {
+    json!({
+        "backupId": summary.backup_id,
+        "createdAt": summary.created_at,
+        "itemCount": summary.item_count,
+        "providers": summary.providers,
+        "layers": summary.layers,
+        "paths": summary.paths,
+        "restorable": summary.restorable,
+        "authentication": summary.authentication,
+        "selection": summary.selection,
+        "targetEnabled": summary.target_enabled
+    })
+}
+
+fn restore_backup_tool(context: &McpContext, arguments: &Value) -> Value {
+    let Some(backup_id) = arguments.get("backupId").and_then(Value::as_str) else {
+        return json!({
+            "status": "failed",
+            "reason": "missing required field: backupId"
+        });
+    };
+
+    let approval_context = match control_approval_context(context) {
+        Ok(context) => context,
+        Err(error) => return blocked_value(error),
+    };
+    let plan = match RestoreController::new(&context.app_state_root).plan(
+        backup_id,
+        &approval_context,
+        context.backup_authentication_key.as_ref(),
+    ) {
+        Ok(plan) => plan,
+        Err(error) => return blocked_value(error.to_string()),
+    };
+    let fingerprint = plan.plan_fingerprint.clone();
+    if arguments.get("planFingerprint").is_some()
+        && let Err(error) = require_plan_fingerprint(arguments, &fingerprint)
+    {
+        return blocked_value(error);
+    }
+    let expectation = match plan.approval_expectation(&approval_context) {
+        Ok(expectation) => expectation,
+        Err(error) => return blocked_value(error.to_string()),
+    };
+    let reviewed = arguments.get("planFingerprint").is_some();
+    let lifecycle = if reviewed {
+        ControlOperationLifecycle::AwaitingHumanAction
+    } else {
+        ControlOperationLifecycle::Planned
+    };
+    let operation = control_operation(
+        &expectation,
+        &fingerprint,
+        plan.activation,
+        lifecycle,
+        Some(plan.provider),
+        json!({"plan": plan.clone()}),
+    );
+    let mut response = if reviewed {
+        human_action_required(operation)
+    } else {
+        json!({
+            "status": "planned",
+            "controlContractVersion": UNPIN_CONTROL_CONTRACT_VERSION,
+            "planFingerprint": fingerprint,
+            "operation": operation,
+            "continuation": "Review this plan, then call unpin_restore_backup again with its planFingerprint."
+        })
+    };
+    response["operationKind"] = json!("restore-backup");
+    response["operationReference"] = json!(format!("restore-backup:{fingerprint}"));
+    response["plan"] = serde_json::to_value(plan).expect("restore plan serializes");
+    response
+}
+
+fn selected_item(context: &McpContext, arguments: &Value) -> Result<DiscoveryItem, String> {
+    let provider = required_string(arguments, "provider")?;
+    let kind = required_string(arguments, "kind")?;
+    let layer = required_string(arguments, "layer")?;
+    let id = required_string(arguments, "id")?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let matches = discovery
+        .items
+        .into_iter()
+        .filter(|item| {
+            item.provider.as_str() == provider
+                && item.kind.as_str() == kind
+                && item.layer.as_str() == layer
+                && item.id == id
+        })
+        .collect::<Vec<_>>();
+
+    match matches.len() {
+        0 => Err(format!("unknown selection for {id}")),
+        1 => Ok(matches.into_iter().next().expect("one match exists")),
+        _ => Err(format!("ambiguous selection for {id}")),
+    }
+}
+
+fn required_string<'a>(arguments: &'a Value, field: &str) -> Result<&'a str, String> {
+    arguments
+        .get(field)
+        .and_then(Value::as_str)
+        .ok_or_else(|| format!("missing required field: {field}"))
+}
+
+fn blocked_value(reason: impl Into<String>) -> Value {
+    json!({
+        "status": "blocked",
+        "reason": reason.into(),
+        "controlContractVersion": UNPIN_CONTROL_CONTRACT_VERSION,
+    })
+}
+
+fn capability_matrix_issues(fixture_root: Option<&PathBuf>) -> Vec<Value> {
+    let Some(fixture_root) = fixture_root else {
+        return Vec::new();
+    };
+
+    validate_capability_matrix(fixture_root)
+        .issues
+        .into_iter()
+        .map(|message| json!({ "message": message }))
+        .collect()
+}
+
+fn provider_fixture_issues(fixture_root: Option<&PathBuf>) -> Vec<Value> {
+    let Some(fixture_root) = fixture_root else {
+        return Vec::new();
+    };
+
+    validate_provider_fixtures(fixture_root)
+        .issues
+        .into_iter()
+        .map(|issue| {
+            json!({
+                "providerId": issue.provider_id,
+                "relativePath": issue.relative_path,
+                "message": issue.message
+            })
+        })
+        .collect()
+}
+
+fn provider_health_rows(issue_status: &str, issues: Vec<Value>) -> Vec<Value> {
+    ProviderId::ALL
+        .into_iter()
+        .map(ProviderId::as_str)
+        .map(|provider| {
+            let provider_issues = issues
+                .iter()
+                .filter(|issue| issue.get("provider").and_then(Value::as_str) == Some(provider))
+                .cloned()
+                .collect::<Vec<_>>();
+            let status = if provider_issues.is_empty() {
+                "ok"
+            } else {
+                issue_status
+            };
+
+            json!({
+                "provider": provider,
+                "status": status,
+                "issues": provider_issues
+            })
+        })
+        .collect()
+}
+
+fn fixture_provider_issues(issues: &[Value]) -> Vec<Value> {
+    issues
+        .iter()
+        .filter_map(|issue| {
+            let provider = issue.get("providerId").and_then(Value::as_str)?;
+            Some(json!({
+                "provider": provider,
+                "code": "fixture-validation",
+                "relativePath": issue["relativePath"],
+                "message": issue["message"]
+            }))
+        })
+        .collect()
+}
+
+fn capability_matrix_provider_issues(issues: &[Value]) -> Vec<Value> {
+    issues
+        .iter()
+        .flat_map(|issue| {
+            let message = issue
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("capability matrix issue");
+            let providers = provider_ids_from_message(message);
+            providers.into_iter().map(move |provider| {
+                json!({
+                    "provider": provider,
+                    "code": "capability-matrix",
+                    "message": message
+                })
+            })
+        })
+        .collect()
+}
+
+fn discovery_warning_provider_issue(warning: &crate::discovery::DiscoveryWarning) -> Value {
+    let mut issue = json!({
+        "provider": warning.provider.as_str(),
+        "code": warning.code,
+        "message": warning.message
+    });
+    if let Some(layer) = warning.layer
+        && let Some(object) = issue.as_object_mut()
+    {
+        object.insert("layer".to_string(), json!(layer.as_str()));
+    }
+    issue
+}
+
+fn discovery_error_provider_issues(message: &str) -> Vec<Value> {
+    ProviderId::ALL
+        .into_iter()
+        .map(ProviderId::as_str)
+        .map(|provider| {
+            json!({
+                "provider": provider,
+                "code": "discovery-error",
+                "message": message
+            })
+        })
+        .collect()
+}
+
+fn provider_ids_from_message(message: &str) -> Vec<&'static str> {
+    let providers = ProviderId::ALL
+        .into_iter()
+        .map(ProviderId::as_str)
+        .filter(|provider| message.contains(provider))
+        .collect::<Vec<_>>();
+
+    if providers.is_empty() {
+        ProviderId::ALL.map(ProviderId::as_str).to_vec()
+    } else {
+        providers
+    }
+}
+
+fn provider_summaries(discovery: &DiscoveryOutput, arguments: &Value) -> Vec<Value> {
+    let mut summaries = build_inventory_summary(discovery)
+        .providers
+        .into_iter()
+        .map(|summary| serde_json::to_value(summary).expect("provider summary serializes"))
+        .collect::<Vec<_>>();
+    summaries.retain(|summary| {
+        summary
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| selector_array_matches(arguments, "providers", provider))
+    });
+    summaries
+}
+
+fn filter_summary_discovery(mut discovery: DiscoveryOutput, arguments: &Value) -> DiscoveryOutput {
+    discovery.items.retain(|item| {
+        selector_array_matches(arguments, "providers", item.provider.as_str())
+            && selector_array_matches(arguments, "layers", item.layer.as_str())
+    });
+    discovery.warnings.retain(|warning| {
+        selector_array_matches(arguments, "providers", warning.provider.as_str())
+            && warning
+                .layer
+                .is_none_or(|layer| selector_array_matches(arguments, "layers", layer.as_str()))
+    });
+    discovery
+}
+
+fn selector_matches(item: &DiscoveryItem, selector: &Value) -> bool {
+    selector_array_matches(selector, "providers", item.provider.as_str())
+        && selector_array_matches(selector, "kinds", item.kind.as_str())
+        && selector_array_matches(selector, "categories", item.category.as_str())
+        && selector_array_matches(selector, "layers", item.layer.as_str())
+        && selector_array_matches(selector, "ids", &item.id)
+        && selector
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .is_none_or(|enabled| enabled == item.enabled)
+}
+
+fn validate_selector(selector: &Value) -> Result<(), String> {
+    if selector.is_null() {
+        return Ok(());
+    }
+
+    let selector = selector
+        .as_object()
+        .ok_or_else(|| "selector must be an object".to_string())?;
+
+    for field in ["providers", "kinds", "categories", "layers", "ids"] {
+        validate_selector_array_field(selector.get(field), field)?;
+    }
+
+    if let Some(enabled) = selector.get("enabled")
+        && !enabled.is_boolean()
+    {
+        return Err("selector.enabled must be a boolean".to_string());
+    }
+
+    Ok(())
+}
+
+fn validate_selector_array_field(value: Option<&Value>, field: &str) -> Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let entries = value
+        .as_array()
+        .ok_or_else(|| format!("selector.{field} must be an array of strings"))?;
+    if entries.iter().any(|entry| !entry.is_string()) {
+        return Err(format!("selector.{field} must be an array of strings"));
+    }
+
+    Ok(())
+}
+
+fn selector_array_matches(selector: &Value, field: &str, value: &str) -> bool {
+    selector
+        .get(field)
+        .and_then(Value::as_array)
+        .is_none_or(|entries| entries.iter().any(|entry| entry.as_str() == Some(value)))
+}
+
+fn canonical_selector(selector: &Value) -> Value {
+    let Some(selector_object) = selector.as_object() else {
+        return json!({});
+    };
+    let mut canonical = serde_json::Map::new();
+
+    for field in ["providers", "kinds", "categories", "layers", "ids"] {
+        if let Some(values) = selector_object.get(field).and_then(Value::as_array) {
+            let mut strings = values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect::<Vec<_>>();
+            strings.sort();
+            canonical.insert(field.to_string(), json!(strings));
+        }
+    }
+
+    if let Some(enabled) = selector_object.get("enabled").and_then(Value::as_bool) {
+        canonical.insert("enabled".to_string(), json!(enabled));
+    }
+
+    Value::Object(canonical)
+}
+
+fn bulk_plan_fingerprint(payload: Value) -> String {
+    let canonical = serde_json::to_vec(&payload).expect("bulk plan payload serializes");
+    let digest = Sha256::digest(canonical);
+    format!("sha256:{}", hex_bytes(&digest))
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut rendered = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        rendered.push(HEX[(byte >> 4) as usize] as char);
+        rendered.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    rendered
+}
+
+fn tool_descriptors() -> Vec<Value> {
+    UNPIN_MCP_TOOL_NAMES
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "title": tool_title(name),
+                "description": tool_description(name),
+                "inputSchema": tool_input_schema(name),
+                "annotations": tool_annotations(name)
+            })
+        })
+        .collect()
+}
+
+fn tool_title(name: &str) -> &'static str {
+    match name {
+        "unpin_get_inventory_summary" => "Get Unpin inventory summary",
+        "unpin_list_items" => "List Unpin items",
+        "unpin_plan_toggle_item" => "Plan one Unpin item toggle",
+        "unpin_apply_toggle_item" => "Request one Unpin item toggle",
+        "unpin_plan_toggle_items" => "Plan Unpin item toggles",
+        "unpin_apply_toggle_items" => "Request Unpin item toggles",
+        "unpin_list_backups" => "List Unpin backups",
+        "unpin_restore_backup" => "Request Unpin backup restore",
+        "unpin_run_doctor" => "Run Unpin doctor",
+        "unpin_get_control_status" => "Get Unpin control status",
+        "unpin_list_catalog" => "List Unpin catalog",
+        "unpin_list_hooks" => "List Unpin hooks",
+        "unpin_plan_catalog_adoption" => "Plan Unpin catalog adoption",
+        "unpin_apply_catalog_adoption" => "Request Unpin catalog adoption",
+        "unpin_plan_hook_trust" => "Plan Unpin hook trust",
+        "unpin_apply_hook_trust" => "Request Unpin hook trust",
+        "unpin_propose_session_profile" => "Propose Unpin session profile",
+        "unpin_validate_profile" => "Validate Unpin profile",
+        "unpin_plan_profile_policy" => "Plan Unpin profile policy",
+        "unpin_apply_profile_policy" => "Request Unpin profile policy apply",
+        "unpin_get_capability_locks" => "Get Unpin capability locks",
+        "unpin_plan_capability_lock" => "Plan Unpin capability lock",
+        "unpin_apply_capability_lock" => "Request Unpin capability lock apply",
+        "unpin_plan_gateway_mode" => "Plan Unpin gateway mode",
+        "unpin_apply_gateway_mode" => "Request Unpin gateway mode apply",
+        "unpin_get_gateway_status" => "Get Unpin gateway status",
+        "unpin_plan_session_end" => "Plan Unpin session end",
+        "unpin_apply_session_end" => "Request Unpin session end",
+        "unpin_plan_session_launch" => "Plan isolated Unpin session launch",
+        _ => "Unpin tool",
+    }
+}
+
+fn tool_description(name: &str) -> &'static str {
+    match name {
+        "unpin_get_inventory_summary" => {
+            "Return structured provider inventory counts and discovery warnings."
+        }
+        "unpin_list_items" => {
+            "List discovered Unpin provider items with optional selector filters."
+        }
+        "unpin_plan_toggle_item" => {
+            "Plan a reversible toggle for one selected provider item without writing."
+        }
+        "unpin_apply_toggle_item" => {
+            "Validate one exact toggle plan and return a human-action handoff without writing."
+        }
+        "unpin_plan_toggle_items" => {
+            "Plan a bulk selector toggle and return a stable review fingerprint."
+        }
+        "unpin_apply_toggle_items" => {
+            "Validate a reviewed bulk toggle plan and return a human-action handoff without writing."
+        }
+        "unpin_list_backups" => "List recent Unpin mutation backups from local app state.",
+        "unpin_restore_backup" => {
+            "Validate one backup restore request and return a human-action handoff without writing."
+        }
+        "unpin_run_doctor" => "Return structured fixture and provider discovery health output.",
+        "unpin_get_control_status" => {
+            "Return redacted catalog, profiles, policies, gateway, sessions, and hook coverage state."
+        }
+        "unpin_list_catalog" => {
+            "List normalized catalog capabilities and provider contribution fan-out."
+        }
+        "unpin_list_hooks" => {
+            "List granular hook metadata and optional profile-bound stored trust status without executable bodies or trust receipts."
+        }
+        "unpin_plan_catalog_adoption" => {
+            "Plan copying one adoptable native skill or agent into Unpin catalog storage without writing."
+        }
+        "unpin_apply_catalog_adoption" => {
+            "Validate an exact catalog adoption fingerprint and return a CLI human-approval handoff without writing."
+        }
+        "unpin_plan_hook_trust" => {
+            "Plan profile-bound trust for one discovered hook without storing a receipt."
+        }
+        "unpin_apply_hook_trust" => {
+            "Validate an exact hook-trust fingerprint and return a CLI human-approval handoff without writing."
+        }
+        "unpin_propose_session_profile" => {
+            "Rank locally stored profiles from metadata, return only a prompt digest, and require explicit user confirmation before session launch."
+        }
+        "unpin_validate_profile" => {
+            "Validate one stored or inline typed profile against current catalog without materializing state."
+        }
+        "unpin_plan_profile_policy" => {
+            "Compile one stored profile and plan its next-session native/gateway policy selection without writing."
+        }
+        "unpin_apply_profile_policy" => {
+            "Validate an exact profile policy fingerprint and return a CLI human-approval handoff without writing."
+        }
+        "unpin_get_capability_locks" => {
+            "Return global provider capability lock revisions and conservative enforcement evidence without writing."
+        }
+        "unpin_plan_capability_lock" => {
+            "Plan one global provider hard-enabled, hard-disabled, or cleared capability lock without writing."
+        }
+        "unpin_apply_capability_lock" => {
+            "Validate an exact capability lock fingerprint and return a CLI human-approval handoff without writing."
+        }
+        "unpin_plan_gateway_mode" => {
+            "Plan combined gateway lifecycle and profile policy changes without writing."
+        }
+        "unpin_apply_gateway_mode" => {
+            "Validate an exact gateway workflow fingerprint and return a CLI human-approval handoff without writing."
+        }
+        "unpin_get_gateway_status" => {
+            "Return gateway mode and policy state for global, repository, or workspace scope without writing."
+        }
+        "unpin_plan_session_end" => {
+            "Plan fencing one session while preserving process-owned cleanup state."
+        }
+        "unpin_apply_session_end" => {
+            "Validate an exact session-end fingerprint and return a CLI human-approval handoff without writing."
+        }
+        "unpin_plan_session_launch" => {
+            "Validate immutable session exposure identifiers and return an argv-safe CLI launch handoff without accepting a child command, spawning a process, writing state, minting approval, or exposing session authority."
+        }
+        _ => "Unpin MCP tool.",
+    }
+}
+
+fn tool_input_schema(name: &str) -> Value {
+    let provider_ids = ProviderId::ALL.map(ProviderId::as_str);
+    match name {
+        "unpin_get_inventory_summary" => json!({
+            "type": "object",
+            "properties": {
+                "providers": { "type": "array", "items": string_enum(&provider_ids) },
+                "layers": { "type": "array", "items": string_enum(&["global", "project"]) }
+            }
+        }),
+        "unpin_list_items" => json!({
+            "type": "object",
+            "properties": {
+                "selector": selector_schema(),
+                "limit": { "type": "integer", "minimum": 1 }
+            }
+        }),
+        "unpin_plan_toggle_item" => json!({
+            "type": "object",
+            "required": ["provider", "kind", "layer", "id", "targetEnabled"],
+            "properties": {
+                "provider": string_enum(&provider_ids),
+                "kind": string_enum(&["skill", "mcp", "plugin", "agent", "hook", "setting"]),
+                "layer": string_enum(&["global", "project"]),
+                "id": non_empty_string_schema(),
+                "targetEnabled": { "type": "boolean" },
+                "requireConfirmation": { "type": "boolean" },
+                "confirm": { "type": "boolean" }
+            }
+        }),
+        "unpin_apply_toggle_item" => json!({
+            "type": "object",
+            "required": ["provider", "kind", "layer", "id", "targetEnabled", "planFingerprint"],
+            "properties": {
+                "provider": string_enum(&provider_ids),
+                "kind": string_enum(&["skill", "mcp", "plugin", "agent", "hook", "setting"]),
+                "layer": string_enum(&["global", "project"]),
+                "id": non_empty_string_schema(),
+                "targetEnabled": { "type": "boolean" },
+                "requireConfirmation": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+                "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+                "planFingerprint": non_empty_string_schema()
+            }
+        }),
+        "unpin_plan_toggle_items" => json!({
+            "type": "object",
+            "required": ["targetEnabled"],
+            "properties": {
+                "selector": selector_schema(),
+                "targetEnabled": { "type": "boolean" },
+                "requireConfirmation": { "type": "boolean" },
+                "confirm": { "type": "boolean" },
+                "planFingerprint": { "type": "string" },
+                "maxItems": { "type": "integer", "minimum": 0 },
+                "allowEmptySelection": { "type": "boolean" }
+            }
+        }),
+        "unpin_apply_toggle_items" => json!({
+            "type": "object",
+            "required": ["targetEnabled", "planFingerprint", "maxItems"],
+            "properties": {
+                "selector": selector_schema(),
+                "targetEnabled": { "type": "boolean" },
+                "requireConfirmation": { "type": "boolean" },
+                "confirm": { "type": "boolean" },
+                "planFingerprint": { "type": "string" },
+                "maxItems": { "type": "integer", "minimum": 0 },
+                "allowEmptySelection": { "type": "boolean" }
+            }
+        }),
+        "unpin_restore_backup" => json!({
+            "type": "object",
+            "required": ["backupId"],
+            "properties": {
+                "backupId": non_empty_string_schema(),
+                "requireConfirmation": { "type": "boolean" },
+                "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+                "planFingerprint": non_empty_string_schema()
+            }
+        }),
+        "unpin_list_backups" => json!({
+            "type": "object",
+            "properties": {
+                "limit": { "type": "integer", "minimum": 1 }
+            }
+        }),
+        "unpin_get_control_status" | "unpin_list_catalog" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "unpin_list_hooks" => json!({
+            "type": "object",
+            "properties": {
+                "provider": string_enum(&provider_ids),
+                "profileDigest": non_empty_string_schema()
+            },
+            "additionalProperties": false
+        }),
+        "unpin_propose_session_profile" => json!({
+            "type": "object",
+            "required": ["prompt"],
+            "properties": {
+                "prompt": { "type": "string", "minLength": 1, "maxLength": 16384 },
+                "provider": string_enum(&provider_ids)
+            },
+            "additionalProperties": false
+        }),
+        "unpin_validate_profile" => json!({
+            "type": "object",
+            "properties": {
+                "profileId": non_empty_string_schema(),
+                "definition": { "type": "object" },
+                "sourceScope": string_enum(&["global", "repository", "workspace", "session"])
+            },
+            "oneOf": [
+                { "required": ["profileId"] },
+                { "required": ["definition", "sourceScope"] }
+            ],
+            "additionalProperties": false
+        }),
+        "unpin_plan_catalog_adoption" => control_catalog_adoption_schema(&provider_ids, false),
+        "unpin_apply_catalog_adoption" => control_catalog_adoption_schema(&provider_ids, true),
+        "unpin_plan_hook_trust" => control_hook_trust_schema(&provider_ids, false),
+        "unpin_apply_hook_trust" => control_hook_trust_schema(&provider_ids, true),
+        "unpin_plan_profile_policy" => control_profile_schema(&provider_ids, false),
+        "unpin_apply_profile_policy" => control_profile_schema(&provider_ids, true),
+        "unpin_get_capability_locks" => json!({
+            "type": "object",
+            "properties": {
+                "provider": string_enum(&provider_ids)
+            },
+            "additionalProperties": false
+        }),
+        "unpin_plan_capability_lock" => control_capability_lock_schema(&provider_ids, false),
+        "unpin_apply_capability_lock" => control_capability_lock_schema(&provider_ids, true),
+        "unpin_plan_gateway_mode" => control_gateway_schema(&provider_ids, false),
+        "unpin_apply_gateway_mode" => control_gateway_schema(&provider_ids, true),
+        "unpin_get_gateway_status" => json!({
+            "type": "object",
+            "properties": {
+                "scope": string_enum(&["global", "repository", "workspace"]),
+                "provider": string_enum(&provider_ids)
+            },
+            "additionalProperties": false
+        }),
+        "unpin_plan_session_end" => control_session_end_schema(false),
+        "unpin_apply_session_end" => control_session_end_schema(true),
+        "unpin_plan_session_launch" => control_session_launch_schema(&provider_ids),
+        _ => json!({
+            "type": "object",
+            "properties": {}
+        }),
+    }
+}
+
+fn control_catalog_adoption_schema(provider_ids: &[&str], apply: bool) -> Value {
+    let mut required = vec![json!("provider"), json!("id"), json!("providerRoot")];
+    if apply {
+        required.push(json!("planFingerprint"));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            "provider": string_enum(provider_ids),
+            "id": non_empty_string_schema(),
+            "providerRoot": non_empty_string_schema(),
+            "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+            "planFingerprint": non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn control_hook_trust_schema(provider_ids: &[&str], apply: bool) -> Value {
+    let mut required = vec![json!("provider"), json!("id"), json!("profileDigest")];
+    if apply {
+        required.push(json!("planFingerprint"));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            "provider": string_enum(provider_ids),
+            "id": non_empty_string_schema(),
+            "profileDigest": non_empty_string_schema(),
+            "sessionId": non_empty_string_schema(),
+            "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+            "planFingerprint": non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn control_profile_schema(provider_ids: &[&str], apply: bool) -> Value {
+    let mut required = vec![json!("profileId"), json!("mode")];
+    if apply {
+        required.push(json!("planFingerprint"));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            "profileId": non_empty_string_schema(),
+            "mode": string_enum(&["native", "gateway"]),
+            "scope": string_enum(&["global", "repository", "workspace"]),
+            "provider": string_enum(provider_ids),
+            "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+            "planFingerprint": non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn control_capability_lock_schema(provider_ids: &[&str], apply: bool) -> Value {
+    let mut required = vec![json!("provider"), json!("capabilityId"), json!("state")];
+    if apply {
+        required.push(json!("planFingerprint"));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            "provider": string_enum(provider_ids),
+            "capabilityId": non_empty_string_schema(),
+            "state": string_enum(&["hard-enabled", "hard-disabled", "clear"]),
+            "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+            "planFingerprint": non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn control_gateway_schema(provider_ids: &[&str], apply: bool) -> Value {
+    let mut required = vec![json!("action")];
+    if apply {
+        required.push(json!("planFingerprint"));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            "action": string_enum(&["install", "on", "off", "detach"]),
+            "scope": string_enum(&["global", "repository", "workspace"]),
+            "provider": string_enum(provider_ids),
+            "force": { "type": "boolean" },
+            "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+            "planFingerprint": non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn control_session_end_schema(apply: bool) -> Value {
+    let mut required = vec![json!("sessionId")];
+    if apply {
+        required.push(json!("planFingerprint"));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            "sessionId": non_empty_string_schema(),
+            "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+            "planFingerprint": non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn control_session_launch_schema(provider_ids: &[&str]) -> Value {
+    json!({
+        "type": "object",
+        "required": ["provider", "exposureRevision", "profile"],
+        "properties": {
+            "provider": string_enum(provider_ids),
+            "exposureRevision": non_empty_string_schema(),
+            "profile": {
+                "oneOf": [
+                    {
+                        "type": "object",
+                        "required": ["type"],
+                        "properties": {
+                            "type": string_enum(&["native"])
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["type"],
+                        "properties": {
+                            "type": string_enum(&["none"])
+                        },
+                        "additionalProperties": false
+                    },
+                    {
+                        "type": "object",
+                        "required": ["type", "profileId", "profileDigest", "definitionDigest"],
+                        "properties": {
+                            "type": string_enum(&["profile"]),
+                            "profileId": non_empty_string_schema(),
+                            "profileDigest": non_empty_string_schema(),
+                            "definitionDigest": non_empty_string_schema()
+                        },
+                        "additionalProperties": false
+                    }
+                ]
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+fn tool_annotations(name: &str) -> Value {
+    match name {
+        "unpin_get_inventory_summary"
+        | "unpin_list_items"
+        | "unpin_plan_toggle_item"
+        | "unpin_plan_toggle_items"
+        | "unpin_apply_toggle_item"
+        | "unpin_apply_toggle_items"
+        | "unpin_list_backups"
+        | "unpin_restore_backup"
+        | "unpin_run_doctor"
+        | "unpin_get_control_status"
+        | "unpin_list_catalog"
+        | "unpin_list_hooks"
+        | "unpin_plan_catalog_adoption"
+        | "unpin_apply_catalog_adoption"
+        | "unpin_plan_hook_trust"
+        | "unpin_apply_hook_trust"
+        | "unpin_propose_session_profile"
+        | "unpin_validate_profile"
+        | "unpin_plan_profile_policy"
+        | "unpin_apply_profile_policy"
+        | "unpin_get_capability_locks"
+        | "unpin_plan_capability_lock"
+        | "unpin_apply_capability_lock"
+        | "unpin_plan_gateway_mode"
+        | "unpin_apply_gateway_mode"
+        | "unpin_get_gateway_status"
+        | "unpin_plan_session_end"
+        | "unpin_apply_session_end"
+        | "unpin_plan_session_launch" => json!({
+            "readOnlyHint": true
+        }),
+        _ => json!({}),
+    }
+}
+
+fn selector_schema() -> Value {
+    let provider_ids = ProviderId::ALL.map(ProviderId::as_str);
+    json!({
+        "type": "object",
+        "properties": {
+            "providers": { "type": "array", "items": string_enum(&provider_ids) },
+            "kinds": { "type": "array", "items": string_enum(&["skill", "mcp", "plugin", "agent", "hook", "setting"]) },
+            "categories": { "type": "array", "items": string_enum(&[
+                "skill",
+                "configured-mcp",
+                "tool",
+                "agent",
+                "hook",
+                "provider-setting",
+                "plugin-config",
+                "plugin-manifest"
+            ]) },
+            "layers": { "type": "array", "items": string_enum(&["global", "project"]) },
+            "enabled": { "type": "boolean" },
+            "ids": { "type": "array", "items": non_empty_string_schema() }
+        }
+    })
+}
+
+fn string_enum(values: &[&str]) -> Value {
+    json!({
+        "type": "string",
+        "enum": values
+    })
+}
+
+fn non_empty_string_schema() -> Value {
+    json!({
+        "type": "string",
+        "minLength": 1
+    })
+}
+
+fn result_response(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": result
+    })
+}
+
+fn error_response(id: Value, code: i64, message: impl Into<String>) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message.into()
+        }
+    })
+}
+
+fn encode_message(body: &str) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(body.len() + 1);
+    encoded.extend_from_slice(body.as_bytes());
+    encoded.push(b'\n');
+    encoded
+}

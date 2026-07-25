@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "example-global": {
+      "type": "local",
+      "command": ["example-opencode-mcp"],
+      "enabled": true,
+    },
+  },
+  "plugin": ["example-opencode-connector"],
+}

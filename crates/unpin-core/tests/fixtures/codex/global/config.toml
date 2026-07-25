@@ -1,0 +1,19 @@
+[plugins.safe-shell]
+enabled = true
+
+[plugins."connector-kit@example-marketplace"]
+enabled = true
+
+[plugins."disabled-helper"] # disabled plugin
+enabled = false # disabled in Codex
+
+[mcp_servers.github]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-github"]
+
+[mcp_servers.disabled-docs]
+url = "https://example.invalid/mcp"
+enabled = false
+
+[hooks.PreToolUse]
+command = "echo"

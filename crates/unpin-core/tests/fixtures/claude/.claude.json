@@ -1,0 +1,36 @@
+{
+  "mcpServers": {
+    "global-docs": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "global-docs-mcp"
+      ]
+    }
+  },
+  "projects": {
+    "/fixture/project": {
+      "mcpServers": {
+        "local-search": {
+          "command": "local-search-mcp",
+          "args": [
+            "--stdio"
+          ]
+        }
+      },
+      "unrelatedProjectState": {
+        "preserve": true
+      }
+    },
+    "/fixture/other-project": {
+      "mcpServers": {
+        "other-local": {
+          "command": "other-local-mcp"
+        }
+      }
+    }
+  },
+  "unrelatedState": {
+    "preserve": true
+  }
+}

@@ -1,0 +1,9 @@
+---
+extends: default
+rules:
+  # GitHub Actions and Trunk configs do not require document markers.
+  document-start: disable
+  line-length:
+    max: 100
+  # GitHub Actions reserves `on` as a mapping key.
+  truthy: disable

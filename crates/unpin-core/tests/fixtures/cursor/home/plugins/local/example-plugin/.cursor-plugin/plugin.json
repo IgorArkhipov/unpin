@@ -1,0 +1,5 @@
+{
+  "name": "example-plugin",
+  "displayName": "Example Cursor Plugin",
+  "mcpServers": "./mcp.json"
+}

@@ -1,0 +1,63 @@
+[workspace]
+members = ["crates/unpin-core", "crates/unpin-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0-beta.3"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+authors = ["Igor Arkhipov"]
+description = "Safely inspect and manage local AI-agent configuration across Claude Code, Codex, Cursor, Pi, OpenCode, and Zed."
+repository = "https://github.com/IgorArkhipov/unpin"
+homepage = "https://github.com/IgorArkhipov/unpin"
+readme = "README.md"
+keywords = ["ai-agents", "configuration", "mcp", "cli", "tui"]
+categories = ["command-line-utilities", "config", "development-tools"]
+publish = false
+
+[workspace.dependencies]
+unpin-core = { path = "crates/unpin-core" }
+assert_cmd = "2.2.2"
+clap = { version = "4.6.4", features = ["derive"] }
+crossterm = "0.29.0"
+futures = "0.3.33"
+getrandom = "0.4.3"
+hmac = "0.13.0"
+http = "1.4.2"
+jsonc-parser = { version = "0.33.0", features = ["cst", "serde"] }
+keyring = "4.1.5"
+ratatui = { version = "0.30.2", default-features = false, features = [
+  "crossterm",
+] }
+reqwest = { version = "0.13.4", default-features = false, features = [
+  "json",
+  "stream",
+  "rustls",
+] }
+rmcp = { version = "3.0.0-beta.1", default-features = false, features = [
+  "client",
+  "server",
+  "transport-streamable-http-client",
+] }
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+sse-stream = "0.2.5"
+tempfile = "3.27.0"
+time = { version = "0.3.54", features = ["formatting", "parsing"] }
+tokio = { version = "1.53.1", features = [
+  "io-std",
+  "macros",
+  "net",
+  "process",
+  "rt-multi-thread",
+  "sync",
+  "time",
+] }
+tracing = "0.1.44"
+zeroize = "1.9.0"
+
+[profile.release]
+strip = "symbols"

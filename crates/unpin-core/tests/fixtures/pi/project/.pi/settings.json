@@ -1,0 +1,11 @@
+{
+  "packages": [
+    {
+      "source": "npm:example-pi-project-connector",
+      "extensions": [
+        "connector"
+      ],
+      "skills": []
+    }
+  ]
+}
