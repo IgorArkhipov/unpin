@@ -52,6 +52,12 @@ unpin auth session init
 
 ## Choose a scope
 
+- Set `--provider` to the agent host that owns the connection: `claude`,
+  `codex`, `cursor`, `opencode`, or `zed`. The named provider becomes a hard
+  boundary for every tool call. Omitted provider fields inherit that boundary,
+  and conflicting scalar or list selectors are rejected.
+- Use `--provider all` only for a deliberate cross-provider administrative
+  connection. `all` is the compatibility default when the flag is omitted.
 - Omit `--project-root` when the host always starts Unpin from the active
   repository and the MCP should follow that working directory.
 - Add `--project-root /absolute/path/to/repository` to pin one registration to
@@ -68,7 +74,7 @@ The examples below pin the server to one repository.
 For a user-level server that follows the active Codex working directory:
 
 ```bash
-codex mcp add unpin -- "$UNPIN_BIN" mcp
+codex mcp add unpin -- "$UNPIN_BIN" mcp --provider codex
 codex mcp list
 ```
 
@@ -77,7 +83,7 @@ For a trusted repository, add a project-scoped `.codex/config.toml` entry:
 ```toml
 [mcp_servers.unpin]
 command = "/absolute/path/to/unpin"
-args = ["mcp", "--project-root", "/absolute/path/to/repository"]
+args = ["mcp", "--provider", "codex", "--project-root", "/absolute/path/to/repository"]
 cwd = "/absolute/path/to/repository"
 ```
 
@@ -96,7 +102,7 @@ claude mcp add \
   --transport stdio \
   --scope local \
   unpin -- \
-  "$UNPIN_BIN" mcp --project-root "$PROJECT_ROOT"
+  "$UNPIN_BIN" mcp --provider claude --project-root "$PROJECT_ROOT"
 
 claude mcp list
 ```
@@ -120,6 +126,8 @@ Cursor project:
       "command": "/absolute/path/to/unpin",
       "args": [
         "mcp",
+        "--provider",
+        "cursor",
         "--project-root",
         "/absolute/path/to/repository"
       ]
@@ -145,6 +153,8 @@ Add a local server to the repository's `opencode.json` or `opencode.jsonc`:
       "command": [
         "/absolute/path/to/unpin",
         "mcp",
+        "--provider",
+        "opencode",
         "--project-root",
         "/absolute/path/to/repository"
       ],
@@ -176,6 +186,8 @@ same entry in the user settings file Zed opens:
       "command": "/absolute/path/to/unpin",
       "args": [
         "mcp",
+        "--provider",
+        "zed",
         "--project-root",
         "/absolute/path/to/repository"
       ]
@@ -219,7 +231,7 @@ through the same MCP control plane.
 
 1. The host initializes the server and discovers its tools.
 2. Call `unpin_get_inventory_summary` and confirm the expected project,
-   backup-authentication state, and `humanApproval` boundary.
+   `providerScope`, backup-authentication state, and `humanApproval` boundary.
 3. Call `unpin_list_items` with provider, kind, and layer filters.
 4. Call `unpin_plan_toggle_item` for one exact item ID.
 5. Review the target state, affected resources, and plan fingerprint.
@@ -258,12 +270,16 @@ Requirements:
 5. Preserve all unrelated configuration. Show the exact file and proposed diff
    before writing it. Back up the file before changing it.
 6. Configure a server named `unpin` with the absolute command path and these
-   arguments: `mcp`, `--project-root`, and the absolute repository root.
+   arguments: `mcp`, `--provider`, the detected host provider ID,
+   `--project-root`, and the absolute repository root. Use `claude`, `codex`,
+   `cursor`, `opencode`, or `zed`; never choose `all` unless I explicitly ask
+   for a cross-provider administrative connection.
 7. Do not initialize keychain credentials, toggle capabilities, apply plans, or
    modify provider configuration during setup.
 8. Reload or restart the host as required, verify that the Unpin MCP tools are
-   visible, then use them only to list project skills and configured MCP
-   servers. Do not plan or apply a change.
+   visible, confirm inventory reports the detected `providerScope`, then use
+   them only to list project skills and configured MCP servers. Do not plan or
+   apply a change.
 9. Report what changed, how the connection was verified, and how to remove the
    registration.
 
