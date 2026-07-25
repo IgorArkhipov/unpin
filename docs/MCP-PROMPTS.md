@@ -39,6 +39,11 @@ Include these instructions whenever an agent is allowed to prepare changes:
 Use only the Unpin MCP server for inventory, planning, and handoff generation.
 Do not edit provider configuration directly.
 
+Confirm the inventory `providerScope` before proceeding. Treat a named scope as
+a hard provider boundary and never attempt to widen it with a conflicting
+provider or selector. If cross-provider administration is genuinely required,
+stop and ask me to configure a separate `--provider all` connection.
+
 Begin with Unpin inventory and control status. Resolve exact provider, kind,
 layer or policy scope, item or capability IDs, enabled state, mutability, and
 current revisions before proposing a change.

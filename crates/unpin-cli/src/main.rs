@@ -13,7 +13,7 @@ mod hook_support;
 mod session_process;
 mod tui;
 
-use clap::{Args, CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unpin_core::{
     approval::ControlApprovalContext,
     capabilities::{CAPABILITY_ROWS, validate_capability_matrix, validate_provider_fixtures},
@@ -25,8 +25,8 @@ use unpin_core::{
     },
     discovery::{DiscoveryItem, DiscoveryOutput, DiscoveryRoots, DiscoveryWarning, discover_all},
     mcp::{
-        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, handle_stdio_request_once,
-        handle_stdio_requests,
+        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, McpProviderScope,
+        handle_stdio_request_once, handle_stdio_requests,
     },
     mutation::{
         BackupAuthenticationKey, MutationOperation, MutationTarget, NativeToggleControlError,
@@ -62,6 +62,33 @@ struct DiscoveryRootArgs {
     /// Cursor app-support root used to resolve Cursor profiles and workspace state.
     #[arg(long)]
     cursor_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+enum McpProviderScopeArg {
+    #[default]
+    All,
+    Claude,
+    Codex,
+    Cursor,
+    Pi,
+    #[value(name = "opencode")]
+    OpenCode,
+    Zed,
+}
+
+impl From<McpProviderScopeArg> for McpProviderScope {
+    fn from(value: McpProviderScopeArg) -> Self {
+        match value {
+            McpProviderScopeArg::All => Self::All,
+            McpProviderScopeArg::Claude => Self::Provider(ProviderId::Claude),
+            McpProviderScopeArg::Codex => Self::Provider(ProviderId::Codex),
+            McpProviderScopeArg::Cursor => Self::Provider(ProviderId::Cursor),
+            McpProviderScopeArg::Pi => Self::Provider(ProviderId::Pi),
+            McpProviderScopeArg::OpenCode => Self::Provider(ProviderId::OpenCode),
+            McpProviderScopeArg::Zed => Self::Provider(ProviderId::Zed),
+        }
+    }
 }
 
 impl DiscoveryRootArgs {
@@ -215,6 +242,9 @@ enum Commands {
         /// Unpin-owned state root containing backups and audit logs.
         #[arg(long)]
         app_state_root: Option<PathBuf>,
+        /// Restrict every MCP tool to one provider, or use all providers.
+        #[arg(long, value_enum, default_value_t)]
+        provider: McpProviderScopeArg,
         /// Read one newline-delimited request, write one response, then exit.
         #[arg(long)]
         once: bool,
@@ -1033,6 +1063,7 @@ fn main() -> ExitCode {
         Some(Commands::Mcp {
             roots,
             app_state_root,
+            provider,
             once,
         }) => {
             let fixture_mode = roots.fixture_root.is_some();
@@ -1073,6 +1104,7 @@ fn main() -> ExitCode {
                 backup_authentication_key,
                 session_authority_key,
                 authentication,
+                provider_scope: provider.into(),
             };
 
             if once {

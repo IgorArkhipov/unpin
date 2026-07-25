@@ -4469,6 +4469,49 @@ fn mcp_once_lists_stable_tool_surface() {
 }
 
 #[test]
+fn mcp_once_accepts_a_provider_scope() {
+    let app_state = TempDir::new().expect("temp app state");
+    let request = line_request(serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": "summary",
+        "method": "tools/call",
+        "params": {
+            "name": "unpin_get_inventory_summary",
+            "arguments": {}
+        }
+    }));
+
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["mcp", "--provider", "zed", "--fixture-root"])
+        .arg(fixtures_root())
+        .args(["--app-state-root"])
+        .arg(app_state.path())
+        .arg("--once")
+        .write_stdin(request)
+        .output()
+        .expect("mcp output");
+
+    assert!(
+        output.status.success(),
+        "mcp --provider zed should succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let bodies = response_bodies(&output.stdout);
+    assert_eq!(bodies.len(), 1);
+    let content = &bodies[0]["result"]["structuredContent"];
+    assert_eq!(content["providerScope"], "zed");
+    assert_eq!(
+        content["inventory"]["providers"]
+            .as_array()
+            .expect("providers")
+            .len(),
+        1
+    );
+    assert_eq!(content["inventory"]["providers"][0]["provider"], "zed");
+}
+
+#[test]
 fn mcp_processes_stdio_messages_until_eof_without_once() {
     let app_state = TempDir::new().expect("temp app state");
     let mut input = String::new();

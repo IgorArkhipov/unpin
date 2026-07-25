@@ -125,11 +125,14 @@ read-only combinations rather than inventing provider state.
 Agents connect by launching Unpin's local stdio server:
 
 ```bash
-unpin mcp --project-root "$PROJECT_ROOT"
+unpin mcp --provider zed --project-root "$PROJECT_ROOT"
 ```
 
 The process stays attached to stdio while the host is connected; normally put
 this command in the host's MCP configuration instead of running it by hand.
+Replace `zed` with the agent host (`claude`, `codex`, `cursor`, or `opencode`).
+The provider pin is a hard boundary for every MCP tool. Use `--provider all`
+only when the connection intentionally administers every supported provider.
 
 The [MCP setup guide](docs/MCP.md) has copy-ready configuration for Codex,
 Claude Code, Cursor, OpenCode, and Zed; explains Pi's native-MCP limitation;

@@ -13,8 +13,8 @@ use unpin_core::{
     discovery::{DiscoveryKind, DiscoveryRoots, ProviderId, discover_all},
     hooks::{HookTrustRecord, HookTrustStore},
     mcp::{
-        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, UNPIN_MCP_TOOL_NAMES,
-        handle_mcp_request, handle_stdio_request_once, handle_stdio_requests,
+        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, McpProviderScope,
+        UNPIN_MCP_TOOL_NAMES, handle_mcp_request, handle_stdio_request_once, handle_stdio_requests,
     },
     mutation::{BackupAuthenticationKey, authenticate_legacy_backup},
     profiles::{
@@ -45,6 +45,7 @@ fn context() -> McpContext {
         authentication: authentication_readiness(Some(backup_authentication_key.key_id())),
         backup_authentication_key: Some(backup_authentication_key),
         session_authority_key: Some(SessionAuthorityKey::new([0x53; 32])),
+        provider_scope: McpProviderScope::All,
     }
 }
 
@@ -59,7 +60,14 @@ fn context_with_roots(fixture_root: &Path, app_state_root: &Path) -> McpContext 
         authentication: authentication_readiness(Some(backup_authentication_key.key_id())),
         backup_authentication_key: Some(backup_authentication_key),
         session_authority_key: Some(SessionAuthorityKey::new([0x53; 32])),
+        provider_scope: McpProviderScope::All,
     }
+}
+
+fn context_for_provider(provider: ProviderId) -> McpContext {
+    let mut context = context();
+    context.provider_scope = McpProviderScope::Provider(provider);
+    context
 }
 
 fn authentication_readiness(backup_key_id: Option<String>) -> McpAuthenticationReadiness {
@@ -2603,6 +2611,164 @@ fn returns_inventory_summary_and_doctor_structured_content() {
                 && provider["status"] == "ok"
                 && provider["issues"] == json!([]))
     );
+}
+
+#[test]
+fn provider_scoped_mcp_defaults_and_filters_read_contracts() {
+    let context = context_for_provider(ProviderId::Zed);
+    let initialized = handle_mcp_request(
+        &context,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize"
+        }),
+    );
+    assert_eq!(
+        initialized["result"]["capabilities"]["experimental"]["unpinControl"]["providerScope"],
+        "zed"
+    );
+
+    let tools = handle_mcp_request(
+        &context,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "method": "tools/list"
+        }),
+    );
+    let toggle = tools["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "unpin_plan_toggle_item")
+        .expect("toggle descriptor");
+    assert_eq!(
+        toggle["inputSchema"]["properties"]["provider"]["enum"],
+        json!(["zed"])
+    );
+    assert!(
+        !toggle["inputSchema"]["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "provider")
+    );
+
+    let summary = call_tool(&context, "unpin_get_inventory_summary", json!({}));
+    assert_eq!(summary["providerScope"], "zed");
+    assert_eq!(
+        summary["inventory"]["providers"]
+            .as_array()
+            .expect("providers")
+            .len(),
+        1
+    );
+    assert_eq!(summary["inventory"]["providers"][0]["provider"], "zed");
+
+    let items = call_tool(&context, "unpin_list_items", json!({}));
+    assert!(
+        items["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["provider"] == "zed")
+    );
+    assert!(
+        items["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .all(|warning| warning["provider"] == "zed")
+    );
+
+    let doctor = call_tool(&context, "unpin_run_doctor", json!({}));
+    assert_eq!(
+        doctor["providers"]
+            .as_array()
+            .expect("doctor providers")
+            .len(),
+        1
+    );
+    assert_eq!(doctor["providers"][0]["provider"], "zed");
+    let expected_zed_items = discover_all(&DiscoveryRoots::fixture_root(fixtures_root()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .filter(|item| item.provider == ProviderId::Zed)
+        .count();
+    assert_eq!(doctor["itemsDiscovered"], expected_zed_items);
+
+    let status = call_tool(&context, "unpin_get_control_status", json!({}));
+    for field in ["gateways", "sessions", "hooks"] {
+        assert!(
+            status["control"][field]
+                .as_array()
+                .expect("provider-scoped control rows")
+                .iter()
+                .all(|row| row["provider"] == "zed")
+        );
+    }
+    for scope in ["global", "repository", "workspace", "session"] {
+        let Some(providers) = status["control"]["policies"][scope]["providers"].as_object() else {
+            continue;
+        };
+        assert!(providers.keys().all(|provider| provider == "zed"));
+    }
+}
+
+#[test]
+fn provider_scoped_mcp_defaults_required_provider_and_rejects_widening() {
+    let context = context_for_provider(ProviderId::Zed);
+    let item = discover_all(&context.discovery_roots)
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.provider == ProviderId::Zed)
+        .expect("zed item");
+    let planned = call_tool(
+        &context,
+        "unpin_plan_toggle_item",
+        json!({
+            "kind": item.kind.as_str(),
+            "layer": item.layer.as_str(),
+            "id": item.id,
+            "targetEnabled": item.enabled
+        }),
+    );
+    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["selection"]["provider"], "zed");
+
+    for arguments in [
+        json!({"provider": "claude"}),
+        json!({"providers": ["zed", "claude"]}),
+        json!({"selector": {"providers": ["claude"]}}),
+    ] {
+        let name = if arguments.get("provider").is_some() {
+            "unpin_list_hooks"
+        } else if arguments.get("selector").is_some() {
+            "unpin_list_items"
+        } else {
+            "unpin_get_inventory_summary"
+        };
+        let response = handle_mcp_request(
+            &context,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "scope",
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }),
+        );
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(
+            response["error"]["message"],
+            "provider claude is outside MCP provider scope zed"
+        );
+    }
 }
 
 #[test]
