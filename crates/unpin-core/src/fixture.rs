@@ -1,5 +1,42 @@
 use std::path::{Component, Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FixtureCredentialPurpose {
+    Approval,
+    BackupAuthentication,
+    SessionAuthority,
+}
+
+impl FixtureCredentialPurpose {
+    const fn domain(self) -> &'static [u8] {
+        match self {
+            Self::Approval => b"approval",
+            Self::BackupAuthentication => b"backup-authentication",
+            Self::SessionAuthority => b"session-authority",
+        }
+    }
+}
+
+/// Derives deterministic, domain-separated fixture authority for one Unpin
+/// state root. The physical path binding keeps independent fixture runs from
+/// authenticating each other's evidence while remaining stable across the
+/// separate CLI processes used by end-to-end tests.
+pub fn fixture_credential_key(
+    app_state_root: &Path,
+    purpose: FixtureCredentialPurpose,
+) -> Result<[u8; 32], String> {
+    let scope = canonical_fixture_scope_path(app_state_root)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"unpin-fixture-credential-v1");
+    hasher.update([0]);
+    hasher.update(purpose.domain());
+    hasher.update([0]);
+    update_hasher_with_path(&mut hasher, &scope);
+    Ok(hasher.finalize().into())
+}
+
 /// Confines deterministic fixture authority to a private child of the OS
 /// temporary directory. Live authority keeps normal provider-path behavior.
 pub fn require_fixture_write_sandbox<'a>(
@@ -28,6 +65,29 @@ pub fn require_fixture_write_sandbox<'a>(
     Ok(())
 }
 
+fn canonical_fixture_scope_path(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
+        return Err(
+            "fixture credential scope must be an absolute path without parent traversal"
+                .to_string(),
+        );
+    }
+    let existing = path
+        .ancestors()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| "fixture credential scope has no existing ancestor".to_string())?;
+    let canonical = std::fs::canonicalize(existing)
+        .map_err(|error| format!("fixture credential scope could not be resolved: {error}"))?;
+    let suffix = path.strip_prefix(existing).map_err(|_| {
+        "fixture credential scope could not be bound to its physical path".to_string()
+    })?;
+    if suffix.as_os_str().is_empty() {
+        Ok(canonical)
+    } else {
+        Ok(canonical.join(suffix))
+    }
+}
+
 fn canonical_existing_path_prefix(path: &Path) -> Result<PathBuf, String> {
     path.ancestors()
         .find(|candidate| candidate.exists())
@@ -36,6 +96,27 @@ fn canonical_existing_path_prefix(path: &Path) -> Result<PathBuf, String> {
             std::fs::canonicalize(candidate)
                 .map_err(|error| format!("fixture write path could not be resolved: {error}"))
         })
+}
+
+#[cfg(unix)]
+fn update_hasher_with_path(hasher: &mut Sha256, path: &Path) {
+    use std::os::unix::ffi::OsStrExt;
+
+    hasher.update(path.as_os_str().as_bytes());
+}
+
+#[cfg(windows)]
+fn update_hasher_with_path(hasher: &mut Sha256, path: &Path) {
+    use std::os::windows::ffi::OsStrExt;
+
+    for unit in path.as_os_str().encode_wide() {
+        hasher.update(unit.to_le_bytes());
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn update_hasher_with_path(hasher: &mut Sha256, path: &Path) {
+    hasher.update(path.to_string_lossy().as_bytes());
 }
 
 #[cfg(test)]
@@ -81,6 +162,36 @@ mod tests {
         let repository_path = std::env::current_dir().expect("current repository path");
         require_fixture_write_sandbox(false, [repository_path.as_path()])
             .expect("live authority uses normal safety controls");
+    }
+
+    #[test]
+    fn fixture_credentials_are_stable_and_scoped_by_root_and_purpose() {
+        let first = tempfile::TempDir::new().expect("first fixture root");
+        let second = tempfile::TempDir::new().expect("second fixture root");
+        let first_state = first.path().join("state");
+        let second_state = second.path().join("state");
+
+        let approval =
+            fixture_credential_key(&first_state, FixtureCredentialPurpose::Approval).unwrap();
+        std::fs::create_dir(&first_state).expect("materialize first state root");
+        assert_eq!(
+            approval,
+            fixture_credential_key(&first_state, FixtureCredentialPurpose::Approval).unwrap()
+        );
+        assert_ne!(
+            approval,
+            fixture_credential_key(&second_state, FixtureCredentialPurpose::Approval).unwrap()
+        );
+        assert_ne!(
+            approval,
+            fixture_credential_key(&first_state, FixtureCredentialPurpose::BackupAuthentication)
+                .unwrap()
+        );
+        assert_ne!(
+            approval,
+            fixture_credential_key(&first_state, FixtureCredentialPurpose::SessionAuthority)
+                .unwrap()
+        );
     }
 
     #[cfg(unix)]

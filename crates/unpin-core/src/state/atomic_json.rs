@@ -534,10 +534,8 @@ fn open_private_lock_file(path: &Path) -> StateResult<File> {
     Ok(file)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn validate_opened_file(path: &Path, file: &File) -> StateResult<()> {
-    use std::os::unix::fs::MetadataExt;
-
     let path_metadata = fs::symlink_metadata(path).map_err(|error| io_error(path, error))?;
     if path_metadata.file_type().is_symlink() {
         return Err(StateError::SymlinkRejected {
@@ -549,8 +547,9 @@ fn validate_opened_file(path: &Path, file: &File) -> StateResult<()> {
             path: path.to_path_buf(),
         });
     }
-    let file_metadata = file.metadata().map_err(|error| io_error(path, error))?;
-    if path_metadata.dev() != file_metadata.dev() || path_metadata.ino() != file_metadata.ino() {
+    if !crate::fs_support::path_matches_open_file(path, file)
+        .map_err(|error| io_error(path, error))?
+    {
         return Err(StateError::PhysicalResourceChanged {
             before: path.to_path_buf(),
             after: path.to_path_buf(),
@@ -559,7 +558,7 @@ fn validate_opened_file(path: &Path, file: &File) -> StateResult<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn validate_opened_file(path: &Path, _file: &File) -> StateResult<()> {
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(StateError::SymlinkRejected {

@@ -7,6 +7,7 @@ use std::{
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{
     profiles::{CapabilityLockSnapshot, ProfileSourceScope},
@@ -92,7 +93,7 @@ impl fmt::Debug for SessionAuthorityKey {
 
 impl Drop for SessionAuthorityKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -260,13 +261,12 @@ impl BootstrapRequest {
         for resource in &self.protected_resources {
             validate_identifier("protected resource", resource)?;
         }
-        let lifetime = self
-            .lease_expires_at_unix
-            .checked_sub(now_unix)
-            .ok_or(LeaseValidationError::InvalidLeaseExpiry)?;
-        if lifetime <= 0 || lifetime > MAX_SESSION_LIFETIME_SECONDS {
-            return Err(LeaseValidationError::InvalidLeaseExpiry);
-        }
+        validate_lifetime(
+            now_unix,
+            self.lease_expires_at_unix,
+            MAX_SESSION_LIFETIME_SECONDS,
+            LeaseValidationError::InvalidLeaseExpiry,
+        )?;
         Ok(())
     }
 }
@@ -307,13 +307,14 @@ impl BootstrapAuthority {
     }
 
     pub fn write_secret(&self, mut writer: impl Write) -> io::Result<()> {
-        writer.write_all(crate::encode_lower_hex(&self.secret).as_bytes())
+        let encoded = Zeroizing::new(crate::encode_lower_hex(&self.secret));
+        writer.write_all(encoded.as_bytes())
     }
 
     pub fn read_secret(session_id: String, reader: impl Read) -> io::Result<Self> {
         validate_identifier("session id", &session_id)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let mut raw = String::new();
+        let mut raw = Zeroizing::new(String::new());
         reader.take(129).read_to_string(&mut raw)?;
         let secret = decode_secret(raw.trim())?;
         Ok(Self { session_id, secret })
@@ -336,7 +337,7 @@ impl fmt::Debug for BootstrapAuthority {
 
 impl Drop for BootstrapAuthority {
     fn drop(&mut self) {
-        self.secret.fill(0);
+        self.secret.zeroize();
     }
 }
 
@@ -366,7 +367,8 @@ impl SessionHandle {
     }
 
     pub fn write_secret(&self, mut writer: impl Write) -> io::Result<()> {
-        writer.write_all(crate::encode_lower_hex(&self.secret).as_bytes())
+        let encoded = Zeroizing::new(crate::encode_lower_hex(&self.secret));
+        writer.write_all(encoded.as_bytes())
     }
 
     pub fn read_secret(
@@ -377,7 +379,7 @@ impl SessionHandle {
         validate_identifier("session id", &session_id)
             .and_then(|()| validate_identifier("connection owner", &owner_id))
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
-        let mut raw = String::new();
+        let mut raw = Zeroizing::new(String::new());
         reader.take(129).read_to_string(&mut raw)?;
         let secret = decode_secret(raw.trim())?;
         Ok(Self {
@@ -405,7 +407,7 @@ impl fmt::Debug for SessionHandle {
 
 impl Drop for SessionHandle {
     fn drop(&mut self) {
-        self.secret.fill(0);
+        self.secret.zeroize();
     }
 }
 
@@ -552,10 +554,13 @@ impl SessionLease {
         if usize::try_from(self.in_flight_calls).ok() != Some(self.in_flight_call_ids.len()) {
             return Err(LeaseValidationError::InvalidLifecycle);
         }
-        if self.lifecycle.contributes_active_intent()
-            && self.lease_expires_at_unix <= self.heartbeat_at_unix
-        {
-            return Err(LeaseValidationError::InvalidLeaseExpiry);
+        if self.lifecycle.contributes_active_intent() {
+            validate_lifetime(
+                self.heartbeat_at_unix,
+                self.lease_expires_at_unix,
+                MAX_SESSION_LIFETIME_SECONDS,
+                LeaseValidationError::InvalidLeaseExpiry,
+            )?;
         }
         if self.lifecycle == LeaseLifecycle::Active && !self.admission_open {
             return Err(LeaseValidationError::InvalidLifecycle);
@@ -719,11 +724,18 @@ impl PendingBootstrap {
             &self.authority_key_id,
             &self.authentication_tag,
         )?;
-        if self.bootstrap_expires_at_unix <= self.issued_at_unix
-            || self.lease_expires_at_unix <= self.issued_at_unix
-        {
-            return Err(LeaseValidationError::InvalidBootstrapExpiry);
-        }
+        validate_lifetime(
+            self.issued_at_unix,
+            self.bootstrap_expires_at_unix,
+            BOOTSTRAP_LIFETIME_SECONDS,
+            LeaseValidationError::InvalidBootstrapExpiry,
+        )?;
+        validate_lifetime(
+            self.issued_at_unix,
+            self.lease_expires_at_unix,
+            MAX_SESSION_LIFETIME_SECONDS,
+            LeaseValidationError::InvalidLeaseExpiry,
+        )?;
         if self.authentication_algorithm != SESSION_AUTHENTICATION_ALGORITHM
             || self.authority_key_id != authority_key.key_id()
         {
@@ -951,6 +963,22 @@ pub(crate) fn validate_workspace_revision(value: &str) -> Result<(), LeaseValida
     }
 }
 
+fn validate_lifetime(
+    starts_at_unix: i64,
+    expires_at_unix: i64,
+    maximum_seconds: i64,
+    error: LeaseValidationError,
+) -> Result<(), LeaseValidationError> {
+    let lifetime = expires_at_unix
+        .checked_sub(starts_at_unix)
+        .ok_or_else(|| error.clone())?;
+    if lifetime <= 0 || lifetime > maximum_seconds {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     crate::encode_lower_hex(&Sha256::digest(bytes))
 }
@@ -1004,4 +1032,95 @@ fn decode_secret(raw: &str) -> io::Result<[u8; SECRET_BYTES]> {
 
 fn decode_authentication_tag(raw: &str) -> Result<[u8; SECRET_BYTES], LeaseValidationError> {
     decode_secret(raw).map_err(|_| LeaseValidationError::InvalidAuthenticationMetadata)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn request(expires_at_unix: i64) -> BootstrapRequest {
+        BootstrapRequest {
+            provider: ProviderId::Codex,
+            repository_key: "repository-key".to_string(),
+            workspace_key: "workspace-key".to_string(),
+            workspace_revision: None,
+            exposure: PinnedExposure {
+                revision: "e".repeat(64),
+                profile: PinnedProfile::Native,
+                capability_locks: None,
+            },
+            process: ProcessEvidence {
+                pid: 42,
+                start_marker: "process-start".to_string(),
+            },
+            connection_scope_id: "connection-scope".to_string(),
+            isolation: IsolationLevel::Strict,
+            coverage: CoverageLevel::VerifiedMasked,
+            protected_resources: BTreeSet::from(["provider-config".to_string()]),
+            lease_expires_at_unix: expires_at_unix,
+        }
+    }
+
+    fn resign_pending(pending: &mut PendingBootstrap, authority_key: &SessionAuthorityKey) {
+        pending.authentication_tag = authority_key
+            .authenticate(
+                BOOTSTRAP_AUTHENTICATION_PURPOSE,
+                &pending.authentication_message().unwrap(),
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn authenticated_persisted_records_enforce_lifetime_ceilings() {
+        let now_unix = 1_000;
+        let authority_key = SessionAuthorityKey::new([0x53; 32]);
+        let mut pending = PendingBootstrap::from_request(
+            "session-one".to_string(),
+            request(now_unix + 60),
+            digest_bytes(b"bootstrap-secret"),
+            now_unix,
+            &authority_key,
+        )
+        .unwrap();
+
+        pending.bootstrap_expires_at_unix = pending.issued_at_unix + BOOTSTRAP_LIFETIME_SECONDS + 1;
+        resign_pending(&mut pending, &authority_key);
+        assert_eq!(
+            pending.verify(&authority_key),
+            Err(LeaseValidationError::InvalidBootstrapExpiry)
+        );
+
+        pending.bootstrap_expires_at_unix = pending.issued_at_unix + BOOTSTRAP_LIFETIME_SECONDS;
+        pending.lease_expires_at_unix = pending.issued_at_unix + MAX_SESSION_LIFETIME_SECONDS + 1;
+        resign_pending(&mut pending, &authority_key);
+        assert_eq!(
+            pending.verify(&authority_key),
+            Err(LeaseValidationError::InvalidLeaseExpiry)
+        );
+
+        pending.lease_expires_at_unix = pending.issued_at_unix + 60;
+        resign_pending(&mut pending, &authority_key);
+        let claim = ConnectionClaim {
+            connection_owner_id: "connection-owner".to_string(),
+            provider: pending.provider,
+            repository_key: pending.repository_key.clone(),
+            workspace_key: pending.workspace_key.clone(),
+            process: pending.process.clone(),
+            connection_scope_id: "connection-scope".to_string(),
+        };
+        let mut lease = pending
+            .into_lease(
+                &claim,
+                digest_bytes(b"owner-secret"),
+                now_unix + 1,
+                &authority_key,
+            )
+            .unwrap();
+        lease.lease_expires_at_unix = lease.heartbeat_at_unix + MAX_SESSION_LIFETIME_SECONDS + 1;
+        lease.seal(&authority_key).unwrap();
+        assert_eq!(
+            lease.verify(&authority_key),
+            Err(LeaseValidationError::InvalidLeaseExpiry)
+        );
+    }
 }

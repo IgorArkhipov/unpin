@@ -1,6 +1,8 @@
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -9,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 use crate::capabilities::{validate_capability_matrix, validate_provider_fixtures};
 use crate::catalog::{Catalog, CatalogRecord, adoption::plan_discovered_adoption};
-use crate::control::build_control_status;
+use crate::control::{ControlStatus, build_control_status};
 use crate::control_operation::{
     ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle, ControlResolvedContext,
 };
@@ -82,6 +84,7 @@ const HOOK_TRUST_APPROVAL_ISSUER: &str = "unpin-cli-human";
 const HOOK_TRUST_APPROVAL_AUDIENCE: &str = "unpin-core-hook-trust";
 const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const UNPIN_CONTROL_CONTRACT_VERSION: u32 = 2;
+const DEFAULT_MCP_DISCOVERY_CACHE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -143,6 +146,364 @@ pub struct McpContext {
     pub backup_authentication_key: Option<BackupAuthenticationKey>,
     pub session_authority_key: Option<SessionAuthorityKey>,
     pub authentication: McpAuthenticationReadiness,
+    pub provider_scope: McpProviderScope,
+    pub discovery_cache: McpDiscoveryCache,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpDiscoveryCache {
+    ttl: Duration,
+    state: Arc<Mutex<DiscoveryCacheState>>,
+}
+
+impl Default for McpDiscoveryCache {
+    fn default() -> Self {
+        Self::with_ttl(DEFAULT_MCP_DISCOVERY_CACHE_TTL)
+    }
+}
+
+impl McpDiscoveryCache {
+    #[must_use]
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            state: Arc::new(Mutex::new(DiscoveryCacheState::default())),
+        }
+    }
+
+    pub fn invalidate(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.entry = None;
+    }
+
+    fn get_or_discover(&self, roots: &DiscoveryRoots) -> Result<DiscoveryOutput, String> {
+        self.get_or_update(|| discover_all(roots).map_err(|error| error.to_string()))
+    }
+
+    fn refresh(&self, roots: &DiscoveryRoots) -> Result<DiscoveryOutput, String> {
+        self.refresh_with(|| discover_all(roots).map_err(|error| error.to_string()))
+    }
+
+    fn get_or_update(
+        &self,
+        load: impl FnOnce() -> Result<DiscoveryOutput, String>,
+    ) -> Result<DiscoveryOutput, String> {
+        let now = Instant::now();
+        let generation = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = state.entry.as_ref()
+                && now.saturating_duration_since(cached.refreshed_at) < self.ttl
+            {
+                return Ok(cached.discovery.clone());
+            }
+            state.generation
+        };
+
+        let discovery = load()?;
+        let refreshed_at = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != generation {
+            return Ok(discovery);
+        }
+        if let Some(cached) = state.entry.as_ref()
+            && refreshed_at.saturating_duration_since(cached.refreshed_at) < self.ttl
+        {
+            return Ok(cached.discovery.clone());
+        }
+        state.entry = Some(CachedDiscovery {
+            refreshed_at,
+            discovery: discovery.clone(),
+        });
+        Ok(discovery)
+    }
+
+    fn refresh_with(
+        &self,
+        load: impl FnOnce() -> Result<DiscoveryOutput, String>,
+    ) -> Result<DiscoveryOutput, String> {
+        let generation = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation;
+        let discovery = load()?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation == generation {
+            state.entry = Some(CachedDiscovery {
+                refreshed_at: Instant::now(),
+                discovery: discovery.clone(),
+            });
+        }
+        Ok(discovery)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryCacheState {
+    generation: u64,
+    entry: Option<CachedDiscovery>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDiscovery {
+    refreshed_at: Instant,
+    discovery: DiscoveryOutput,
+}
+
+#[cfg(test)]
+mod discovery_cache_tests {
+    use std::cell::Cell;
+
+    use crate::discovery::DiscoveryWarning;
+
+    use super::*;
+
+    #[test]
+    fn reuses_successful_discovery_until_invalidated() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+        let loads = Cell::new(0);
+        let first = cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        let second = cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Err("cached result should be reused".to_string())
+            })
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(loads.get(), 1);
+
+        cache.invalidate();
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        assert_eq!(loads.get(), 2);
+    }
+
+    #[test]
+    fn zero_ttl_refreshes_and_failures_are_not_cached() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::ZERO);
+        let loads = Cell::new(0);
+        assert_eq!(
+            cache.get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Err("transient discovery failure".to_string())
+            }),
+            Err("transient discovery failure".to_string())
+        );
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        assert_eq!(loads.get(), 3);
+    }
+
+    #[test]
+    fn explicit_refresh_replaces_a_live_cached_entry() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+        let loads = Cell::new(0);
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+
+        let refreshed = DiscoveryOutput {
+            warnings: vec![DiscoveryWarning {
+                provider: ProviderId::Codex,
+                layer: None,
+                code: "refreshed".to_string(),
+                message: "refreshed".to_string(),
+            }],
+            ..DiscoveryOutput::default()
+        };
+        cache
+            .refresh_with(|| {
+                loads.set(loads.get() + 1);
+                Ok(refreshed.clone())
+            })
+            .unwrap();
+        let cached = cache
+            .get_or_update(|| Err("refreshed entry should be reused".to_string()))
+            .unwrap();
+
+        assert_eq!(cached, refreshed);
+        assert_eq!(loads.get(), 2);
+    }
+
+    #[test]
+    fn discovery_load_runs_without_holding_the_cache_mutex() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+        let invalidating_cache = cache.clone();
+        cache
+            .get_or_update(|| {
+                invalidating_cache.invalidate();
+                Ok(DiscoveryOutput::default())
+            })
+            .expect("discovery can invalidate without deadlocking");
+
+        let loads = Cell::new(0);
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .expect("invalidation during discovery leaves no stale cache entry");
+        assert_eq!(loads.get(), 1);
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum McpProviderScope {
+    #[default]
+    All,
+    Provider(ProviderId),
+}
+
+impl McpProviderScope {
+    #[must_use]
+    pub const fn provider(self) -> Option<ProviderId> {
+        match self {
+            Self::All => None,
+            Self::Provider(provider) => Some(provider),
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Provider(provider) => provider.as_str(),
+        }
+    }
+
+    fn allows(self, provider: ProviderId) -> bool {
+        self.provider().is_none_or(|allowed| allowed == provider)
+    }
+
+    fn require_allowed(self, provider: ProviderId) -> Result<ProviderId, String> {
+        if self.allows(provider) {
+            Ok(provider)
+        } else {
+            Err(format!(
+                "provider {} is outside MCP provider scope {}",
+                provider.as_str(),
+                self.as_str()
+            ))
+        }
+    }
+
+    fn require_allowed_optional(self, provider: Option<ProviderId>) -> Result<(), String> {
+        match (self.provider(), provider) {
+            (None, _) => Ok(()),
+            (Some(_), Some(provider)) => self.require_allowed(provider).map(|_| ()),
+            (Some(allowed), None) => Err(format!(
+                "target is not associated with MCP provider scope {}",
+                allowed.as_str()
+            )),
+        }
+    }
+
+    fn validate_arguments(self, arguments: &Value) -> Result<(), String> {
+        let Some(allowed) = self.provider() else {
+            return Ok(());
+        };
+        if let Some(provider) = arguments.get("provider") {
+            let provider = provider
+                .as_str()
+                .ok_or_else(|| "provider must be a string".to_string())
+                .and_then(parse_provider_id)?;
+            self.require_allowed(provider)?;
+        }
+        for providers in [
+            arguments.get("providers"),
+            arguments
+                .get("selector")
+                .and_then(|selector| selector.get("providers")),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            let providers = providers
+                .as_array()
+                .ok_or_else(|| "providers must be an array".to_string())?;
+            for provider in providers {
+                let provider = provider
+                    .as_str()
+                    .ok_or_else(|| "providers must contain strings".to_string())
+                    .and_then(parse_provider_id)?;
+                if provider != allowed {
+                    return self.require_allowed(provider).map(|_| ());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn filter_discovery(self, mut discovery: DiscoveryOutput) -> DiscoveryOutput {
+        if let Some(provider) = self.provider() {
+            discovery.items.retain(|item| item.provider == provider);
+            discovery
+                .warnings
+                .retain(|warning| warning.provider == provider);
+        }
+        discovery
+    }
+
+    fn filter_control_status(self, control: &mut ControlStatus) {
+        let Some(provider) = self.provider() else {
+            return;
+        };
+        for policy in [
+            Some(&mut control.policies.global),
+            control.policies.repository.as_mut(),
+            control.policies.workspace.as_mut(),
+            control.policies.session.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            policy
+                .providers
+                .retain(|candidate, _| *candidate == provider);
+        }
+        control
+            .gateways
+            .retain(|gateway| gateway.provider == provider);
+        control
+            .sessions
+            .retain(|session| session.provider == provider);
+        control.hooks.retain(|hook| hook.provider == provider);
+    }
 }
 
 pub fn handle_mcp_request(context: &McpContext, request: &Value) -> Value {
@@ -165,14 +526,18 @@ pub fn handle_mcp_request(context: &McpContext, request: &Value) -> Value {
                     "experimental": {
                         "unpinControl": {
                             "version": UNPIN_CONTROL_CONTRACT_VERSION,
-                            "mutation": "human-handoff-only"
+                            "mutation": "human-handoff-only",
+                            "providerScope": context.provider_scope.as_str()
                         }
                     }
                 }
             }),
         ),
         "notifications/initialized" => result_response(id, json!({})),
-        "tools/list" => result_response(id, json!({ "tools": tool_descriptors() })),
+        "tools/list" => result_response(
+            id,
+            json!({ "tools": tool_descriptors(context.provider_scope) }),
+        ),
         "tools/call" => match handle_tool_call(context, request) {
             Ok(result) => result_response(id, result),
             Err(message) => error_response(id, -32000, message),
@@ -279,6 +644,7 @@ fn handle_tool_call(context: &McpContext, request: &Value) -> Result<Value, Stri
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    context.provider_scope.validate_arguments(&arguments)?;
 
     match name {
         "unpin_get_inventory_summary" => {
@@ -339,7 +705,7 @@ fn propose_session_profile(context: &McpContext, arguments: &Value) -> Result<Va
         "profile proposal arguments",
     )?;
     let prompt = required_string(arguments, "prompt")?;
-    let provider = optional_provider(arguments)?;
+    let provider = optional_provider(context, arguments)?;
     let identity =
         resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
     let store = ProfileStore::new(&context.app_state_root);
@@ -392,7 +758,7 @@ fn validate_profile(context: &McpContext, arguments: &Value) -> Result<Value, St
             );
         }
     };
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped(context)?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
     let revision =
         compile_profile(&definition, &catalog, source_scope).map_err(|error| error.to_string())?;
@@ -420,12 +786,13 @@ fn structured_result(value: Value) -> Result<Value, String> {
 
 fn get_inventory_summary(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     validate_selector(arguments)?;
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped_cached(context)?;
     let discovery = filter_summary_discovery(discovery, arguments);
 
     Ok(json!({
         "status": "ok",
         "controlContractVersion": UNPIN_CONTROL_CONTRACT_VERSION,
+        "providerScope": context.provider_scope.as_str(),
         "projectRoot": context.project_root.to_string_lossy().into_owned(),
         "writeSafety": {
             "backupAuthentication": context.authentication.backup_authentication.status,
@@ -436,14 +803,14 @@ fn get_inventory_summary(context: &McpContext, arguments: &Value) -> Result<Valu
             "writesEnabled": false
         },
         "inventory": {
-            "providers": provider_summaries(&discovery, arguments)
+            "providers": provider_summaries(&discovery, arguments, context.provider_scope)
         },
         "warnings": discovery.warnings
     }))
 }
 
 fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> {
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped_cached(context)?;
     let selector = arguments.get("selector").unwrap_or(&Value::Null);
     validate_selector(selector)?;
     let limit = arguments
@@ -472,8 +839,8 @@ fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> 
 
 fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     require_empty_object(arguments)?;
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
-    let control = build_control_status(
+    let discovery = discover_scoped_cached(context)?;
+    let mut control = build_control_status(
         &discovery,
         &context.app_state_root,
         &context.project_root,
@@ -483,23 +850,30 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
             .ok_or_else(|| "session authority key is unavailable".to_string())?,
     )
     .map_err(|error| error.to_string())?;
-    Ok(json!({"status": "ok", "control": control}))
+    context.provider_scope.filter_control_status(&mut control);
+    Ok(json!({
+        "status": "ok",
+        "control": control,
+        "warnings": discovery.warnings
+    }))
 }
 
 fn list_catalog(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     require_empty_object(arguments)?;
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped_cached(context)?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
     Ok(json!({
         "status": "ok",
         "capabilities": catalog.records.values().collect::<Vec<_>>(),
+        "warnings": discovery.warnings,
     }))
 }
 
 fn list_hooks(context: &McpContext, arguments: &Value) -> Result<Value, String> {
-    let provider = optional_provider(arguments)?;
+    let provider = optional_provider(context, arguments)?;
     let profile_digest = optional_string(arguments, "profileDigest")?;
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped_cached(context)?;
+    let warnings = discovery.warnings;
     let trust = HookTrustStore::new(&context.app_state_root);
     let hooks = discovery
         .items
@@ -521,7 +895,11 @@ fn list_hooks(context: &McpContext, arguments: &Value) -> Result<Value, String> 
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(json!({"status": "ok", "hooks": hooks}))
+    Ok(json!({
+        "status": "ok",
+        "hooks": hooks,
+        "warnings": warnings
+    }))
 }
 
 fn stored_hook_trust_decision(
@@ -599,10 +977,10 @@ fn catalog_adoption_plan(
     context: &McpContext,
     arguments: &Value,
 ) -> Result<(DiscoveryItem, CatalogRecord, TransitionPlan), String> {
-    let provider = required_provider(arguments)?;
+    let provider = required_provider(context, arguments)?;
     let item_id = required_string(arguments, "id")?;
     let provider_root = PathBuf::from(required_string(arguments, "providerRoot")?);
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped(context)?;
     let item = discovery
         .items
         .iter()
@@ -678,11 +1056,11 @@ fn hook_trust_plan(
     context: &McpContext,
     arguments: &Value,
 ) -> Result<(DiscoveryItem, ApprovalExpectation, String), String> {
-    let provider = required_provider(arguments)?;
+    let provider = required_provider(context, arguments)?;
     let item_id = required_string(arguments, "id")?;
     let profile_digest = required_string(arguments, "profileDigest")?;
     let session_id = optional_string(arguments, "sessionId")?.unwrap_or("profile-policy");
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped(context)?;
     let item = discovery
         .items
         .iter()
@@ -746,7 +1124,7 @@ fn plan_profile_policy(context: &McpContext, arguments: &Value) -> Result<Value,
         &plan.plan_fingerprint,
         plan.activation,
         ControlOperationLifecycle::Planned,
-        optional_provider(arguments)?,
+        optional_provider(context, arguments)?,
         json!({"plan": plan}),
     );
     Ok(json!({
@@ -771,7 +1149,7 @@ fn apply_profile_policy(context: &McpContext, arguments: &Value) -> Result<Value
         &plan.plan_fingerprint,
         plan.activation,
         ControlOperationLifecycle::AwaitingHumanAction,
-        optional_provider(arguments)?,
+        optional_provider(context, arguments)?,
         json!({"plan": plan}),
     )))
 }
@@ -782,7 +1160,7 @@ fn profile_policy_plan(
 ) -> Result<(CompiledProfileRevision, crate::profiles::PolicyChangePlan), String> {
     let profile_id = required_string(arguments, "profileId")?;
     let revision = compile_stored_profile(context, profile_id)?;
-    let provider = optional_provider(arguments)?;
+    let provider = optional_provider(context, arguments)?;
     let (_, policy_target) = control_targets(context, arguments, provider)?;
     let gateway = match required_string(arguments, "mode")? {
         "native" => GatewaySelection::Native,
@@ -808,13 +1186,13 @@ fn profile_policy_plan(
 
 fn get_capability_locks(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     require_only_fields(arguments, &["provider"], "capability lock status arguments")?;
-    let requested_provider = optional_provider(arguments)?;
+    let requested_provider = optional_provider(context, arguments)?;
     let identity =
         resolve_workspace_identity(&context.project_root).map_err(|error| error.to_string())?;
     let policies = PolicyStore::new(&context.app_state_root)
         .load_resolution_policies(&identity.repository_key, &identity.workspace_key, None)
         .map_err(|error| error.to_string())?;
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped_cached(context)?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
     let providers = requested_provider.map_or_else(
         || {
@@ -857,7 +1235,11 @@ fn get_capability_locks(context: &McpContext, arguments: &Value) -> Result<Value
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(json!({"status": "ok", "locks": locks}))
+    Ok(json!({
+        "status": "ok",
+        "locks": locks,
+        "warnings": discovery.warnings
+    }))
 }
 
 fn plan_capability_lock(context: &McpContext, arguments: &Value) -> Result<Value, String> {
@@ -866,7 +1248,7 @@ fn plan_capability_lock(context: &McpContext, arguments: &Value) -> Result<Value
     let expectation = plan
         .approval_expectation(&approval_context)
         .map_err(|error| error.to_string())?;
-    let provider = required_provider(arguments)?;
+    let provider = required_provider(context, arguments)?;
     let operation = control_operation(
         &expectation,
         &plan.plan_fingerprint,
@@ -896,7 +1278,7 @@ fn apply_capability_lock(context: &McpContext, arguments: &Value) -> Result<Valu
         &plan.plan_fingerprint,
         plan.activation,
         ControlOperationLifecycle::AwaitingHumanAction,
-        Some(required_provider(arguments)?),
+        Some(required_provider(context, arguments)?),
         json!({"plan": plan}),
     )))
 }
@@ -905,7 +1287,7 @@ fn capability_lock_plan(
     context: &McpContext,
     arguments: &Value,
 ) -> Result<crate::profiles::PolicyChangePlan, String> {
-    let provider = required_provider(arguments)?;
+    let provider = required_provider(context, arguments)?;
     let capability_id =
         crate::catalog::CapabilityId::new(required_string(arguments, "capabilityId")?)
             .map_err(|error| error.to_string())?;
@@ -935,7 +1317,7 @@ fn compile_stored_profile(
     profile_id: &str,
 ) -> Result<CompiledProfileRevision, String> {
     let (definition, source_scope) = load_stored_profile(context, profile_id)?;
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped(context)?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
     compile_profile(&definition, &catalog, source_scope).map_err(|error| error.to_string())
 }
@@ -971,7 +1353,7 @@ fn plan_gateway_mode(context: &McpContext, arguments: &Value) -> Result<Value, S
         } else {
             ControlOperationLifecycle::Planned
         },
-        optional_provider(arguments)?,
+        optional_provider(context, arguments)?,
         json!({
             "plan": plan,
             "nativeMcpReferences": "not-managed",
@@ -993,7 +1375,7 @@ fn get_gateway_status(context: &McpContext, arguments: &Value) -> Result<Value, 
         &["scope", "provider"],
         "gateway status arguments",
     )?;
-    let provider = optional_provider(arguments)?;
+    let provider = optional_provider(context, arguments)?;
     let (mode_target, policy_target) = control_targets(context, arguments, provider)?;
     let mode = GatewayModeController::new(&context.app_state_root)
         .status(&mode_target)
@@ -1026,7 +1408,7 @@ fn apply_gateway_mode(context: &McpContext, arguments: &Value) -> Result<Value, 
         &plan.plan_fingerprint,
         plan.mode.activation,
         ControlOperationLifecycle::AwaitingHumanAction,
-        optional_provider(arguments)?,
+        optional_provider(context, arguments)?,
         json!({
             "plan": plan,
             "nativeMcpReferences": "not-managed",
@@ -1038,7 +1420,7 @@ fn gateway_workflow_plan(
     context: &McpContext,
     arguments: &Value,
 ) -> Result<crate::sessions::GatewayWorkflowPlan, String> {
-    let provider = optional_provider(arguments)?;
+    let provider = optional_provider(context, arguments)?;
     let (mode_target, policy_target) = control_targets(context, arguments, provider)?;
     let action = match required_string(arguments, "action")? {
         "install" => GatewayModeAction::Install,
@@ -1082,6 +1464,9 @@ fn plan_session_end(context: &McpContext, arguments: &Value) -> Result<Value, St
     )
     .plan(required_string(arguments, "sessionId")?, &approval_context)
     .map_err(|error| error.to_string())?;
+    context
+        .provider_scope
+        .require_allowed_optional(plan.provider)?;
     let expectation = plan
         .approval_expectation(&approval_context)
         .map_err(|error| error.to_string())?;
@@ -1114,6 +1499,9 @@ fn apply_session_end(context: &McpContext, arguments: &Value) -> Result<Value, S
     let plan = controller
         .plan(required_string(arguments, "sessionId")?, &approval_context)
         .map_err(|error| error.to_string())?;
+    context
+        .provider_scope
+        .require_allowed_optional(plan.provider)?;
     require_plan_fingerprint(arguments, &plan.plan_fingerprint)?;
     let expectation = plan
         .approval_expectation(&approval_context)
@@ -1134,7 +1522,7 @@ fn plan_session_launch(context: &McpContext, arguments: &Value) -> Result<Value,
         &["provider", "exposureRevision", "profile"],
         "session launch arguments",
     )?;
-    let provider = required_provider(arguments)?;
+    let provider = required_provider(context, arguments)?;
     let profile = session_launch_profile(context, arguments)?;
     let capability_locks = CapabilityLockSnapshot::compile(
         provider,
@@ -1385,8 +1773,25 @@ fn control_targets(
     }
 }
 
-fn optional_provider(arguments: &Value) -> Result<Option<ProviderId>, String> {
-    arguments
+fn discover_scoped(context: &McpContext) -> Result<DiscoveryOutput, String> {
+    context
+        .discovery_cache
+        .refresh(&context.discovery_roots)
+        .map(|discovery| context.provider_scope.filter_discovery(discovery))
+}
+
+fn discover_scoped_cached(context: &McpContext) -> Result<DiscoveryOutput, String> {
+    context
+        .discovery_cache
+        .get_or_discover(&context.discovery_roots)
+        .map(|discovery| context.provider_scope.filter_discovery(discovery))
+}
+
+fn optional_provider(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<Option<ProviderId>, String> {
+    let requested = arguments
         .get("provider")
         .map(|value| {
             value
@@ -1394,11 +1799,17 @@ fn optional_provider(arguments: &Value) -> Result<Option<ProviderId>, String> {
                 .ok_or_else(|| "provider must be a string".to_string())
                 .and_then(parse_provider_id)
         })
-        .transpose()
+        .transpose()?;
+    match (context.provider_scope.provider(), requested) {
+        (Some(provider), None) => Ok(Some(provider)),
+        (_, Some(provider)) => context.provider_scope.require_allowed(provider).map(Some),
+        (None, None) => Ok(None),
+    }
 }
 
-fn required_provider(arguments: &Value) -> Result<ProviderId, String> {
-    parse_provider_id(required_string(arguments, "provider")?)
+fn required_provider(context: &McpContext, arguments: &Value) -> Result<ProviderId, String> {
+    optional_provider(context, arguments)?
+        .ok_or_else(|| "missing required field: provider".to_string())
 }
 
 fn optional_string<'a>(arguments: &'a Value, field: &str) -> Result<Option<&'a str>, String> {
@@ -1508,34 +1919,40 @@ fn require_only_fields(arguments: &Value, allowed: &[&str], label: &str) -> Resu
 }
 
 fn run_doctor_structured(context: &McpContext) -> Value {
-    let matrix_issues = capability_matrix_issues(context.fixture_root.as_ref());
+    let matrix_issues = capability_matrix_issues(context.fixture_root.as_ref())
+        .into_iter()
+        .filter(|issue| capability_matrix_issue_in_scope(context.provider_scope, issue))
+        .collect::<Vec<_>>();
     if !matrix_issues.is_empty() {
         let provider_issues = capability_matrix_provider_issues(&matrix_issues);
         return json!({
             "status": "error",
             "packageRoot": context.package_root,
             "fixturesRoot": context.fixture_root,
-            "providers": provider_health_rows("error", provider_issues),
+            "providers": provider_health_rows(context.provider_scope, "error", provider_issues),
             "capabilityMatrixIssues": matrix_issues,
             "fixtureIssues": [],
             "warnings": []
         });
     }
 
-    let fixture_issues = provider_fixture_issues(context.fixture_root.as_ref());
+    let fixture_issues = provider_fixture_issues(context.fixture_root.as_ref())
+        .into_iter()
+        .filter(|issue| provider_issue_in_scope(context.provider_scope, issue, "providerId"))
+        .collect::<Vec<_>>();
     if !fixture_issues.is_empty() {
         let provider_issues = fixture_provider_issues(&fixture_issues);
         return json!({
             "status": "error",
             "packageRoot": context.package_root,
             "fixturesRoot": context.fixture_root,
-            "providers": provider_health_rows("error", provider_issues),
+            "providers": provider_health_rows(context.provider_scope, "error", provider_issues),
             "fixtureIssues": fixture_issues,
             "warnings": []
         });
     }
 
-    match discover_all(&context.discovery_roots) {
+    match discover_scoped_cached(context) {
         Ok(discovery) => {
             let provider_issues = discovery
                 .warnings
@@ -1546,7 +1963,7 @@ fn run_doctor_structured(context: &McpContext) -> Value {
                 "status": if provider_issues.is_empty() { "ok" } else { "warning" },
                 "packageRoot": context.package_root,
                 "fixturesRoot": context.fixture_root,
-                "providers": provider_health_rows("warning", provider_issues),
+                "providers": provider_health_rows(context.provider_scope, "warning", provider_issues),
                 "itemsDiscovered": discovery.items.len(),
                 "warnings": discovery.warnings
             })
@@ -1555,7 +1972,11 @@ fn run_doctor_structured(context: &McpContext) -> Value {
             "status": "error",
             "packageRoot": context.package_root,
             "fixturesRoot": context.fixture_root,
-            "providers": provider_health_rows("error", discovery_error_provider_issues(&error.to_string())),
+            "providers": provider_health_rows(
+                context.provider_scope,
+                "error",
+                discovery_error_provider_issues(context.provider_scope, &error.to_string())
+            ),
             "itemsDiscovered": 0,
             "warnings": [],
             "reason": error.to_string()
@@ -1794,7 +2215,7 @@ fn build_bulk_plan(context: &McpContext, arguments: &Value) -> Result<Value, Str
         .get("allowEmptySelection")
         .and_then(Value::as_bool)
         .unwrap_or(false);
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped(context)?;
     let warnings = discovery.warnings;
     let matched_items = discovery
         .items
@@ -2312,6 +2733,12 @@ fn list_backups(context: &McpContext, arguments: &Value) -> Value {
         context.backup_authentication_key.as_ref(),
     )
     .into_iter()
+    .filter(|summary| {
+        context.provider_scope.provider().is_none_or(|provider| {
+            summary.providers.len() == 1
+                && summary.providers.first().map(String::as_str) == Some(provider.as_str())
+        })
+    })
     .map(backup_summary_value)
     .collect::<Vec<_>>();
     let total_backups = backups.len();
@@ -2361,6 +2788,12 @@ fn restore_backup_tool(context: &McpContext, arguments: &Value) -> Value {
         Ok(plan) => plan,
         Err(error) => return blocked_value(error.to_string()),
     };
+    if let Err(error) = context
+        .provider_scope
+        .require_allowed_optional(Some(plan.provider))
+    {
+        return blocked_value(error);
+    }
     let fingerprint = plan.plan_fingerprint.clone();
     if arguments.get("planFingerprint").is_some()
         && let Err(error) = require_plan_fingerprint(arguments, &fingerprint)
@@ -2403,16 +2836,16 @@ fn restore_backup_tool(context: &McpContext, arguments: &Value) -> Value {
 }
 
 fn selected_item(context: &McpContext, arguments: &Value) -> Result<DiscoveryItem, String> {
-    let provider = required_string(arguments, "provider")?;
+    let provider = required_provider(context, arguments)?;
     let kind = required_string(arguments, "kind")?;
     let layer = required_string(arguments, "layer")?;
     let id = required_string(arguments, "id")?;
-    let discovery = discover_all(&context.discovery_roots).map_err(|error| error.to_string())?;
+    let discovery = discover_scoped(context)?;
     let matches = discovery
         .items
         .into_iter()
         .filter(|item| {
-            item.provider.as_str() == provider
+            item.provider == provider
                 && item.kind.as_str() == kind
                 && item.layer.as_str() == layer
                 && item.id == id
@@ -2471,9 +2904,14 @@ fn provider_fixture_issues(fixture_root: Option<&PathBuf>) -> Vec<Value> {
         .collect()
 }
 
-fn provider_health_rows(issue_status: &str, issues: Vec<Value>) -> Vec<Value> {
+fn provider_health_rows(
+    scope: McpProviderScope,
+    issue_status: &str,
+    issues: Vec<Value>,
+) -> Vec<Value> {
     ProviderId::ALL
         .into_iter()
+        .filter(|provider| scope.allows(*provider))
         .map(ProviderId::as_str)
         .map(|provider| {
             let provider_issues = issues
@@ -2545,9 +2983,10 @@ fn discovery_warning_provider_issue(warning: &crate::discovery::DiscoveryWarning
     issue
 }
 
-fn discovery_error_provider_issues(message: &str) -> Vec<Value> {
+fn discovery_error_provider_issues(scope: McpProviderScope, message: &str) -> Vec<Value> {
     ProviderId::ALL
         .into_iter()
+        .filter(|provider| scope.allows(*provider))
         .map(ProviderId::as_str)
         .map(|provider| {
             json!({
@@ -2557,6 +2996,21 @@ fn discovery_error_provider_issues(message: &str) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+fn provider_issue_in_scope(scope: McpProviderScope, issue: &Value, field: &str) -> bool {
+    scope
+        .provider()
+        .is_none_or(|provider| issue.get(field).and_then(Value::as_str) == Some(provider.as_str()))
+}
+
+fn capability_matrix_issue_in_scope(scope: McpProviderScope, issue: &Value) -> bool {
+    scope.provider().is_none_or(|provider| {
+        issue
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| provider_ids_from_message(message).contains(&provider.as_str()))
+    })
 }
 
 fn provider_ids_from_message(message: &str) -> Vec<&'static str> {
@@ -2573,7 +3027,11 @@ fn provider_ids_from_message(message: &str) -> Vec<&'static str> {
     }
 }
 
-fn provider_summaries(discovery: &DiscoveryOutput, arguments: &Value) -> Vec<Value> {
+fn provider_summaries(
+    discovery: &DiscoveryOutput,
+    arguments: &Value,
+    scope: McpProviderScope,
+) -> Vec<Value> {
     let mut summaries = build_inventory_summary(discovery)
         .providers
         .into_iter()
@@ -2583,7 +3041,10 @@ fn provider_summaries(discovery: &DiscoveryOutput, arguments: &Value) -> Vec<Val
         summary
             .get("provider")
             .and_then(Value::as_str)
-            .is_some_and(|provider| selector_array_matches(arguments, "providers", provider))
+            .is_some_and(|provider| {
+                parse_provider_id(provider).is_ok_and(|provider| scope.allows(provider))
+                    && selector_array_matches(arguments, "providers", provider)
+            })
     });
     summaries
 }
@@ -2698,7 +3159,7 @@ fn hex_bytes(bytes: &[u8]) -> String {
     rendered
 }
 
-fn tool_descriptors() -> Vec<Value> {
+fn tool_descriptors(provider_scope: McpProviderScope) -> Vec<Value> {
     UNPIN_MCP_TOOL_NAMES
         .iter()
         .map(|name| {
@@ -2706,7 +3167,7 @@ fn tool_descriptors() -> Vec<Value> {
                 "name": name,
                 "title": tool_title(name),
                 "description": tool_description(name),
-                "inputSchema": tool_input_schema(name),
+                "inputSchema": tool_input_schema(name, provider_scope),
                 "annotations": tool_annotations(name)
             })
         })
@@ -2837,9 +3298,12 @@ fn tool_description(name: &str) -> &'static str {
     }
 }
 
-fn tool_input_schema(name: &str) -> Value {
-    let provider_ids = ProviderId::ALL.map(ProviderId::as_str);
-    match name {
+fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
+    let provider_ids = provider_scope.provider().map_or_else(
+        || ProviderId::ALL.map(ProviderId::as_str).to_vec(),
+        |provider| vec![provider.as_str()],
+    );
+    let mut schema = match name {
         "unpin_get_inventory_summary" => json!({
             "type": "object",
             "properties": {
@@ -2850,7 +3314,7 @@ fn tool_input_schema(name: &str) -> Value {
         "unpin_list_items" => json!({
             "type": "object",
             "properties": {
-                "selector": selector_schema(),
+                "selector": selector_schema(&provider_ids),
                 "limit": { "type": "integer", "minimum": 1 }
             }
         }),
@@ -2885,7 +3349,7 @@ fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "required": ["targetEnabled"],
             "properties": {
-                "selector": selector_schema(),
+                "selector": selector_schema(&provider_ids),
                 "targetEnabled": { "type": "boolean" },
                 "requireConfirmation": { "type": "boolean" },
                 "confirm": { "type": "boolean" },
@@ -2898,7 +3362,7 @@ fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "required": ["targetEnabled", "planFingerprint", "maxItems"],
             "properties": {
-                "selector": selector_schema(),
+                "selector": selector_schema(&provider_ids),
                 "targetEnabled": { "type": "boolean" },
                 "requireConfirmation": { "type": "boolean" },
                 "confirm": { "type": "boolean" },
@@ -2990,6 +3454,29 @@ fn tool_input_schema(name: &str) -> Value {
             "type": "object",
             "properties": {}
         }),
+    };
+    if provider_scope.provider().is_some() {
+        remove_provider_requirement(&mut schema);
+    }
+    schema
+}
+
+fn remove_provider_requirement(schema: &mut Value) {
+    match schema {
+        Value::Array(values) => {
+            for value in values {
+                remove_provider_requirement(value);
+            }
+        }
+        Value::Object(object) => {
+            if let Some(required) = object.get_mut("required").and_then(Value::as_array_mut) {
+                required.retain(|field| field.as_str() != Some("provider"));
+            }
+            for value in object.values_mut() {
+                remove_provider_requirement(value);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -3188,12 +3675,11 @@ fn tool_annotations(name: &str) -> Value {
     }
 }
 
-fn selector_schema() -> Value {
-    let provider_ids = ProviderId::ALL.map(ProviderId::as_str);
+fn selector_schema(provider_ids: &[&str]) -> Value {
     json!({
         "type": "object",
         "properties": {
-            "providers": { "type": "array", "items": string_enum(&provider_ids) },
+            "providers": { "type": "array", "items": string_enum(provider_ids) },
             "kinds": { "type": "array", "items": string_enum(&["skill", "mcp", "plugin", "agent", "hook", "setting"]) },
             "categories": { "type": "array", "items": string_enum(&[
                 "skill",

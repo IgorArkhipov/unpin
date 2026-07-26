@@ -47,13 +47,16 @@ fn path_helpers_match_unpin_resolution_rules() {
         normalize_absolute_path("../other-project", &cwd, &home_dir),
         temp.path().join("workspace").join("other-project")
     );
+    let expected_cursor_root = if cfg!(target_os = "macos") {
+        home_dir.join("Library/Application Support/Cursor/User")
+    } else if cfg!(target_os = "windows") {
+        home_dir.join("AppData/Roaming/Cursor/User")
+    } else {
+        home_dir.join(".config/Cursor/User")
+    };
     assert_eq!(
-        default_cursor_root(&home_dir),
-        home_dir
-            .join("Library")
-            .join("Application Support")
-            .join("Cursor")
-            .join("User")
+        default_cursor_root(&home_dir).expect("supported Cursor host"),
+        expected_cursor_root
     );
     assert_eq!(
         get_snapshot_history_dir(Path::new("/state"), Path::new("/workspace/project")),
@@ -162,7 +165,10 @@ fn load_config_uses_unpin_defaults_when_no_config_files_exist() {
         config.app_state_root,
         home_dir.join(".config").join("unpin")
     );
-    assert_eq!(config.cursor_root, default_cursor_root(&home_dir));
+    assert_eq!(
+        config.cursor_root,
+        default_cursor_root(&home_dir).expect("supported Cursor host")
+    );
     assert_eq!(
         config.config_paths.user_config_path,
         home_dir.join(".config").join("unpin").join("config.json")
@@ -193,8 +199,7 @@ fn load_config_merges_user_project_and_cli_precedence() {
     write_text(
         &user_project.join(".unpin.json"),
         &serde_json::json!({
-            "appStateRoot": "./project-state",
-            "cursorRoot": "./CursorProject"
+            "version": 1
         })
         .to_string(),
     );
@@ -211,7 +216,7 @@ fn load_config_merges_user_project_and_cli_precedence() {
 
     assert_eq!(config.project_root, user_project);
     assert_eq!(config.app_state_root, cli_state);
-    assert_eq!(config.cursor_root, cwd.join("CursorProject"));
+    assert_eq!(config.cursor_root, home_dir.join("CursorUser"));
 }
 
 #[test]
@@ -235,8 +240,7 @@ fn load_config_uses_cli_project_root_for_project_config_lookup() {
     write_text(
         &cli_project.join(".unpin.json"),
         &serde_json::json!({
-            "appStateRoot": "./project-state",
-            "cursorRoot": "./ProjectCursor"
+            "version": 1
         })
         .to_string(),
     );
@@ -253,7 +257,7 @@ fn load_config_uses_cli_project_root_for_project_config_lookup() {
     .expect("merged config");
 
     assert_eq!(config.project_root, cli_project);
-    assert_eq!(config.app_state_root, cwd.join("project-state"));
+    assert_eq!(config.app_state_root, PathBuf::from("/tmp/user-state"));
     assert_eq!(config.cursor_root, cli_cursor);
     assert_eq!(
         config.config_paths.project_config_path,
@@ -262,31 +266,61 @@ fn load_config_uses_cli_project_root_for_project_config_lookup() {
 }
 
 #[test]
-fn load_config_rejects_future_schema_versions_and_ignores_unknown_keys() {
+fn load_config_rejects_project_owned_root_overrides() {
+    let temp = TempDir::new().expect("temp config");
+    let cwd = temp.path().join("project");
+    let home_dir = temp.path().join("home");
+
+    for field in ["projectRoot", "appStateRoot", "cursorRoot"] {
+        write_text(
+            &cwd.join(".unpin.json"),
+            &serde_json::json!({
+                (field): "./repository-controlled-root"
+            })
+            .to_string(),
+        );
+
+        let error = load_with(&cwd, &home_dir, UnpinConfigOverrides::default())
+            .expect_err("project config must not control command roots");
+        assert!(
+            error
+                .to_string()
+                .contains(&format!("{field} is not allowed in project config")),
+            "unexpected error for {field}: {error}"
+        );
+    }
+    assert!(!cwd.join("repository-controlled-root").exists());
+}
+
+#[test]
+fn load_config_requires_supported_schema_versions_and_ignores_unknown_keys() {
     let temp = TempDir::new().expect("temp config");
     let cwd = temp.path().join("project");
     let home_dir = temp.path().join("home");
     let config_path = home_dir.join(".config").join("unpin").join("config.json");
 
-    write_text(
-        &config_path,
-        &serde_json::json!({
-            "version": 2
-        })
-        .to_string(),
-    );
-    let error = load_with(&cwd, &home_dir, UnpinConfigOverrides::default())
-        .expect_err("future version should fail");
-    assert!(
-        error
-            .to_string()
-            .contains("Unsupported unpin config schema version: 2"),
-        "unexpected error: {error}"
-    );
+    for unsupported_version in [0, 2] {
+        write_text(
+            &config_path,
+            &serde_json::json!({
+                "version": unsupported_version
+            })
+            .to_string(),
+        );
+        let error = load_with(&cwd, &home_dir, UnpinConfigOverrides::default())
+            .expect_err("unsupported version should fail");
+        assert!(
+            error.to_string().contains(&format!(
+                "Unsupported unpin config schema version: {unsupported_version}"
+            )),
+            "unexpected error: {error}"
+        );
+    }
 
     write_text(
         &config_path,
         &serde_json::json!({
+            "version": 1,
             "projectRoot": "/workspace/from-user",
             "unknownFutureKey": {
                 "keep": "ignored"
@@ -296,6 +330,7 @@ fn load_config_rejects_future_schema_versions_and_ignores_unknown_keys() {
     );
     let config =
         load_with(&cwd, &home_dir, UnpinConfigOverrides::default()).expect("unknown keys ignored");
+    assert_eq!(config.version, 1);
     assert_eq!(config.project_root, PathBuf::from("/workspace/from-user"));
 }
 

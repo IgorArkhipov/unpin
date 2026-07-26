@@ -1,9 +1,12 @@
+use std::path::Path;
+
+use unpin_core::fixture::{FixtureCredentialPurpose, fixture_credential_key};
 use unpin_core::mutation::BackupAuthenticationKey;
+use zeroize::Zeroizing;
 
 use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore};
 
 const BACKUP_AUTHENTICATION_ACCOUNT: &str = "backup-authentication-key-v1";
-const FIXTURE_BACKUP_AUTHENTICATION_KEY: [u8; 32] = [0x42; 32];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BackupAuthenticationState {
@@ -46,16 +49,18 @@ fn initialize_backup_authentication_key_with(
         });
     }
 
-    let mut bytes = [0_u8; 32];
-    if let Err(error) = fill(&mut bytes) {
-        bytes.fill(0);
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    if let Err(error) = fill(&mut *bytes) {
         return Err(format!(
             "backup authentication key generation failed: {error}"
         ));
     }
-    let key = BackupAuthenticationKey::new(bytes);
-    let store_result = store.set(KEYCHAIN_SERVICE, BACKUP_AUTHENTICATION_ACCOUNT, &bytes);
-    bytes.fill(0);
+    let key = BackupAuthenticationKey::new(*bytes);
+    let store_result = store.set(
+        KEYCHAIN_SERVICE,
+        BACKUP_AUTHENTICATION_ACCOUNT,
+        bytes.as_slice(),
+    );
     store_result?;
     Ok(BackupAuthenticationInitialization::Created {
         key_id: key.key_id(),
@@ -64,11 +69,13 @@ fn initialize_backup_authentication_key_with(
 
 pub(crate) fn resolve_backup_authentication_key(
     fixture_mode: bool,
+    app_state_root: &Path,
 ) -> Result<Option<BackupAuthenticationKey>, String> {
     if fixture_mode {
-        return Ok(Some(BackupAuthenticationKey::new(
-            FIXTURE_BACKUP_AUTHENTICATION_KEY,
-        )));
+        return Ok(Some(BackupAuthenticationKey::new(fixture_credential_key(
+            app_state_root,
+            FixtureCredentialPurpose::BackupAuthentication,
+        )?)));
     }
     load_backup_authentication_key(&KeychainSecretStore)
 }
@@ -76,11 +83,11 @@ pub(crate) fn resolve_backup_authentication_key(
 fn load_backup_authentication_key(
     store: &impl SecretStore,
 ) -> Result<Option<BackupAuthenticationKey>, String> {
-    let Some(mut secret) = store.get(KEYCHAIN_SERVICE, BACKUP_AUTHENTICATION_ACCOUNT)? else {
+    let Some(secret) = store.get(KEYCHAIN_SERVICE, BACKUP_AUTHENTICATION_ACCOUNT)? else {
         return Ok(None);
     };
+    let secret = Zeroizing::new(secret);
     let key = BackupAuthenticationKey::from_bytes(&secret);
-    secret.fill(0);
     key.map(Some)
         .map_err(|error| format!("stored backup authentication key is invalid: {error}"))
 }

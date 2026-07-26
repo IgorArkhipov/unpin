@@ -2,12 +2,12 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+use crate::clock::{current_timestamp, unix_nanos_id};
 use crate::config::{
     get_latest_snapshot_path as latest_snapshot_path,
     get_snapshot_history_dir as snapshot_history_dir,
@@ -17,6 +17,7 @@ use crate::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryKind, DiscoveryLayer, DiscoveryOutput,
     DiscoveryWarning, ProviderId,
 };
+use crate::fs_support::{read_optional_dir, read_optional_string};
 
 pub type SnapshotError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -99,8 +100,14 @@ fn write_snapshot(
         return Err("snapshot max_history must be positive".into());
     }
 
-    let captured_at = options.captured_at.unwrap_or_else(current_timestamp);
-    let id = options.id.unwrap_or_else(current_snapshot_id);
+    let captured_at = match options.captured_at {
+        Some(captured_at) => captured_at,
+        None => current_timestamp()?,
+    };
+    let id = match options.id {
+        Some(id) => id,
+        None => current_snapshot_id()?,
+    };
     let latest_path = latest_snapshot_path(&options.app_state_root, &options.project_root);
     let history_dir = snapshot_history_dir(&options.app_state_root, &options.project_root);
     let history_path = history_dir.join(format!("{id}.json"));
@@ -153,11 +160,10 @@ pub fn load_latest_discovery_snapshot(
     project_root: &Path,
 ) -> Result<Option<DiscoverySnapshot>, SnapshotError> {
     let latest_path = latest_snapshot_path(app_state_root, project_root);
-    if !latest_path.exists() {
+    let Some(raw) = read_optional_string(&latest_path)? else {
         return Ok(None);
-    }
-
-    parse_snapshot_file(&latest_path).map(Some)
+    };
+    parse_snapshot(&latest_path, &raw).map(Some)
 }
 
 fn build_discovery_snapshot(
@@ -300,12 +306,12 @@ struct HistoryEntry {
 }
 
 fn read_history(history_dir: &Path) -> Result<Vec<HistoryEntry>, SnapshotError> {
-    if !history_dir.exists() {
+    let Some(read_dir) = read_optional_dir(history_dir)? else {
         return Ok(Vec::new());
-    }
+    };
 
     let mut entries = Vec::new();
-    for entry in fs::read_dir(history_dir)? {
+    for entry in read_dir {
         let entry = entry?;
         let path = entry.path();
         if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
@@ -334,7 +340,11 @@ fn parse_snapshot_file(path: &Path) -> Result<DiscoverySnapshot, SnapshotError> 
             error
         )
     })?;
-    let snapshot = serde_json::from_str::<DiscoverySnapshot>(&raw).map_err(|error| {
+    parse_snapshot(path, &raw)
+}
+
+fn parse_snapshot(path: &Path, raw: &str) -> Result<DiscoverySnapshot, SnapshotError> {
+    let snapshot = serde_json::from_str::<DiscoverySnapshot>(raw).map_err(|error| {
         format!(
             "invalid snapshot file {}: {}",
             path.to_string_lossy(),
@@ -467,16 +477,6 @@ fn prune_history_entries(
     Ok(())
 }
 
-fn current_timestamp() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .expect("UTC timestamp formats as RFC3339")
-}
-
-fn current_snapshot_id() -> String {
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("current time is after unix epoch")
-        .as_nanos();
-    format!("snap-{nanos}")
+fn current_snapshot_id() -> Result<String, String> {
+    unix_nanos_id("snap")
 }

@@ -458,14 +458,18 @@ enum FilesystemIncarnation {
     #[cfg(unix)]
     Unix { device: u64, inode: u64 },
     #[cfg(windows)]
-    Windows { volume: u32, file_index: u64 },
-    #[cfg(not(unix))]
+    Windows {
+        volume: u32,
+        file_index: u64,
+        reliable: bool,
+    },
+    #[cfg(not(any(unix, windows)))]
     CreationTime {
         before_unix_epoch: bool,
         seconds: u64,
         nanoseconds: u32,
     },
-    #[cfg(not(unix))]
+    #[cfg(not(any(unix, windows)))]
     Degraded,
 }
 
@@ -475,20 +479,42 @@ impl FilesystemIncarnation {
         {
             false
         }
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            matches!(
+                self,
+                Self::Windows {
+                    reliable: false,
+                    ..
+                }
+            )
+        }
+        #[cfg(not(any(unix, windows)))]
         {
             matches!(self, Self::Degraded)
         }
     }
 }
 
+#[cfg(not(windows))]
 fn filesystem_incarnation(path: &Path) -> WorkspaceResult<FilesystemIncarnation> {
     let metadata = fs::metadata(path).map_err(|error| identity_io_error(path, error))?;
-    Ok(platform_filesystem_incarnation(&metadata))
+    Ok(platform_filesystem_incarnation(path, &metadata))
+}
+
+#[cfg(windows)]
+fn filesystem_incarnation(path: &Path) -> WorkspaceResult<FilesystemIncarnation> {
+    let identity = crate::fs_support::windows_path_identity(path)
+        .map_err(|error| identity_io_error(path, error))?;
+    Ok(FilesystemIncarnation::Windows {
+        volume: identity.legacy_volume,
+        file_index: identity.legacy_file_index,
+        reliable: identity.workspace_reliable,
+    })
 }
 
 #[cfg(unix)]
-fn platform_filesystem_incarnation(metadata: &fs::Metadata) -> FilesystemIncarnation {
+fn platform_filesystem_incarnation(_path: &Path, metadata: &fs::Metadata) -> FilesystemIncarnation {
     use std::os::unix::fs::MetadataExt;
 
     FilesystemIncarnation::Unix {
@@ -497,22 +523,12 @@ fn platform_filesystem_incarnation(metadata: &fs::Metadata) -> FilesystemIncarna
     }
 }
 
-#[cfg(windows)]
-fn platform_filesystem_incarnation(metadata: &fs::Metadata) -> FilesystemIncarnation {
-    use std::os::windows::fs::MetadataExt;
-
-    match (metadata.volume_serial_number(), metadata.file_index()) {
-        (Some(volume), Some(file_index)) => FilesystemIncarnation::Windows { volume, file_index },
-        _ => creation_time_incarnation(metadata),
-    }
-}
-
 #[cfg(not(any(unix, windows)))]
-fn platform_filesystem_incarnation(metadata: &fs::Metadata) -> FilesystemIncarnation {
+fn platform_filesystem_incarnation(_path: &Path, metadata: &fs::Metadata) -> FilesystemIncarnation {
     creation_time_incarnation(metadata)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn creation_time_incarnation(metadata: &fs::Metadata) -> FilesystemIncarnation {
     use std::time::UNIX_EPOCH;
 
@@ -554,12 +570,18 @@ fn update_hasher_with_incarnation(hasher: &mut Sha256, incarnation: &FilesystemI
             hasher.update(inode.to_be_bytes());
         }
         #[cfg(windows)]
-        FilesystemIncarnation::Windows { volume, file_index } => {
+        FilesystemIncarnation::Windows {
+            volume,
+            file_index,
+            reliable: _,
+        } => {
+            // Preserve the original Windows workspace-key encoding so existing
+            // repository and worktree policy state remains addressable.
             hasher.update(b"windows");
             hasher.update(volume.to_be_bytes());
             hasher.update(file_index.to_be_bytes());
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         FilesystemIncarnation::CreationTime {
             before_unix_epoch,
             seconds,
@@ -570,7 +592,7 @@ fn update_hasher_with_incarnation(hasher: &mut Sha256, incarnation: &FilesystemI
             hasher.update(seconds.to_be_bytes());
             hasher.update(nanoseconds.to_be_bytes());
         }
-        #[cfg(not(unix))]
+        #[cfg(not(any(unix, windows)))]
         FilesystemIncarnation::Degraded => hasher.update(b"path-only-degraded"),
     }
 }
@@ -637,3 +659,30 @@ impl fmt::Display for WorkspaceIdentityError {
 }
 
 impl std::error::Error for WorkspaceIdentityError {}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::{FilesystemIncarnation, hash_key};
+    use std::path::Path;
+
+    #[test]
+    fn degraded_windows_identity_preserves_legacy_workspace_key() {
+        let reliable = FilesystemIncarnation::Windows {
+            volume: 7,
+            file_index: 11,
+            reliable: true,
+        };
+        let degraded = FilesystemIncarnation::Windows {
+            volume: 7,
+            file_index: 11,
+            reliable: false,
+        };
+
+        assert!(!reliable.is_degraded());
+        assert!(degraded.is_degraded());
+        assert_eq!(
+            hash_key("workspace-root-v2", &[Path::new("root")], &[&reliable]),
+            hash_key("workspace-root-v2", &[Path::new("root")], &[&degraded]),
+        );
+    }
+}

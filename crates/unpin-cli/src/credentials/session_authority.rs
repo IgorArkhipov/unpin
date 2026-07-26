@@ -1,9 +1,12 @@
+use std::path::Path;
+
+use unpin_core::fixture::{FixtureCredentialPurpose, fixture_credential_key};
 use unpin_core::sessions::SessionAuthorityKey;
+use zeroize::Zeroizing;
 
 use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore};
 
 const SESSION_AUTHORITY_ACCOUNT: &str = "session-authority-key-v1";
-const FIXTURE_SESSION_AUTHORITY_KEY: [u8; 32] = [0x53; 32];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionAuthorityKeyState {
@@ -45,14 +48,16 @@ fn initialize_session_authority_key_with(
             key_id: key.key_id(),
         });
     }
-    let mut bytes = [0_u8; 32];
-    if let Err(error) = fill(&mut bytes) {
-        bytes.fill(0);
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    if let Err(error) = fill(&mut *bytes) {
         return Err(format!("session authority key generation failed: {error}"));
     }
-    let key = SessionAuthorityKey::new(bytes);
-    let store_result = store.set(KEYCHAIN_SERVICE, SESSION_AUTHORITY_ACCOUNT, &bytes);
-    bytes.fill(0);
+    let key = SessionAuthorityKey::new(*bytes);
+    let store_result = store.set(
+        KEYCHAIN_SERVICE,
+        SESSION_AUTHORITY_ACCOUNT,
+        bytes.as_slice(),
+    );
     store_result?;
     Ok(SessionAuthorityKeyInitialization::Created {
         key_id: key.key_id(),
@@ -61,11 +66,13 @@ fn initialize_session_authority_key_with(
 
 pub(crate) fn resolve_session_authority_key(
     fixture_mode: bool,
+    app_state_root: &Path,
 ) -> Result<Option<SessionAuthorityKey>, String> {
     if fixture_mode {
-        return Ok(Some(SessionAuthorityKey::new(
-            FIXTURE_SESSION_AUTHORITY_KEY,
-        )));
+        return Ok(Some(SessionAuthorityKey::new(fixture_credential_key(
+            app_state_root,
+            FixtureCredentialPurpose::SessionAuthority,
+        )?)));
     }
     load_session_authority_key(&KeychainSecretStore)
 }
@@ -73,11 +80,11 @@ pub(crate) fn resolve_session_authority_key(
 fn load_session_authority_key(
     store: &impl SecretStore,
 ) -> Result<Option<SessionAuthorityKey>, String> {
-    let Some(mut secret) = store.get(KEYCHAIN_SERVICE, SESSION_AUTHORITY_ACCOUNT)? else {
+    let Some(secret) = store.get(KEYCHAIN_SERVICE, SESSION_AUTHORITY_ACCOUNT)? else {
         return Ok(None);
     };
+    let secret = Zeroizing::new(secret);
     let key = SessionAuthorityKey::from_bytes(&secret);
-    secret.fill(0);
     key.map(Some)
         .map_err(|error| format!("stored session authority key is invalid: {error}"))
 }

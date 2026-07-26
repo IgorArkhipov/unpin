@@ -1,5 +1,7 @@
-use std::{io::Write, path::Path};
+use std::path::Path;
 
+#[cfg(any(unix, test))]
+use std::io::Write;
 #[cfg(unix)]
 use std::{fs::OpenOptions, io::Read};
 
@@ -8,13 +10,14 @@ use unpin_core::{
         ApprovalExpectation, ApprovalIssuer, ApprovalKey, ApprovalReceipt, ApprovalReceiptClaims,
         ApprovalVerifier, ControlAuthorization, MAX_APPROVAL_LIFETIME_SECONDS, authorize_control,
     },
+    fixture::{FixtureCredentialPurpose, fixture_credential_key},
     state::atomic_json::OwnerGeneration,
 };
+use zeroize::Zeroizing;
 
 use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore};
 
 const APPROVAL_ACCOUNT: &str = "transition-approval-key-v1";
-const FIXTURE_APPROVAL_KEY: [u8; 32] = [0x24; 32];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovalKeyState {
@@ -37,10 +40,13 @@ pub(crate) fn approval_key_status(store: &impl SecretStore) -> Result<ApprovalKe
     }
 }
 
-pub(crate) fn approval_key_status_for_mode(fixture_mode: bool) -> Result<ApprovalKeyState, String> {
+pub(crate) fn approval_key_status_for_mode(
+    fixture_mode: bool,
+    app_state_root: &Path,
+) -> Result<ApprovalKeyState, String> {
     if fixture_mode {
         return Ok(ApprovalKeyState::Ready {
-            key_id: ApprovalKey::new(FIXTURE_APPROVAL_KEY).key_id(),
+            key_id: fixture_approval_key(app_state_root)?.key_id(),
         });
     }
     approval_key_status(&KeychainSecretStore)
@@ -63,14 +69,12 @@ fn initialize_approval_key_with(
             key_id: key.key_id(),
         });
     }
-    let mut bytes = [0_u8; 32];
-    if let Err(error) = fill(&mut bytes) {
-        bytes.fill(0);
+    let mut bytes = Zeroizing::new([0_u8; 32]);
+    if let Err(error) = fill(&mut *bytes) {
         return Err(format!("approval key generation failed: {error}"));
     }
-    let key = ApprovalKey::new(bytes);
-    let store_result = store.set(KEYCHAIN_SERVICE, APPROVAL_ACCOUNT, &bytes);
-    bytes.fill(0);
+    let key = ApprovalKey::new(*bytes);
+    let store_result = store.set(KEYCHAIN_SERVICE, APPROVAL_ACCOUNT, bytes.as_slice());
     store_result?;
     Ok(ApprovalKeyInitialization::Created {
         key_id: key.key_id(),
@@ -118,6 +122,7 @@ pub(crate) fn authorize_reviewed_control_decision(
     let approval_state_root = canonical_fixture_root.as_deref().unwrap_or(app_state_root);
     let approval = issue_human_approval(
         fixture_mode,
+        approval_state_root,
         expectation,
         plan_fingerprint,
         reviewed_fingerprint,
@@ -151,19 +156,21 @@ impl HumanApproval {
 
 pub(crate) fn issue_human_approval(
     fixture_mode: bool,
+    app_state_root: &Path,
     expectation: &ApprovalExpectation,
     plan_fingerprint: &str,
     reviewed_fingerprint: Option<&str>,
     now_unix: i64,
 ) -> Result<HumanApproval, String> {
     if fixture_mode {
+        let key = fixture_approval_key(app_state_root)?;
         return issue_human_approval_with(
             expectation,
             plan_fingerprint,
             reviewed_fingerprint,
             now_unix,
             &FixtureHumanPresence,
-            || Ok(Some(ApprovalKey::new(FIXTURE_APPROVAL_KEY))),
+            || Ok(Some(key)),
             random_suffix,
         );
     }
@@ -176,6 +183,10 @@ pub(crate) fn issue_human_approval(
         || load_approval_key(&KeychainSecretStore),
         random_suffix,
     )
+}
+
+fn fixture_approval_key(app_state_root: &Path) -> Result<ApprovalKey, String> {
+    fixture_credential_key(app_state_root, FixtureCredentialPurpose::Approval).map(ApprovalKey::new)
 }
 
 trait HumanPresence {
@@ -336,6 +347,7 @@ fn validate_prompt_value(label: &str, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn approval_challenge(plan_fingerprint: &str) -> String {
     format!(
         "approve {}",
@@ -343,6 +355,7 @@ fn approval_challenge(plan_fingerprint: &str) -> String {
     )
 }
 
+#[cfg(any(unix, test))]
 fn render_human_approval_prompt(
     output: &mut impl Write,
     expectation: &ApprovalExpectation,
@@ -413,6 +426,7 @@ fn read_human_presence_response(input: &mut impl Read) -> Result<String, String>
     String::from_utf8(response).map_err(|_| "human approval response is invalid".to_string())
 }
 
+#[cfg(any(unix, test))]
 fn validate_human_presence_response(response: &str, plan_fingerprint: &str) -> Result<(), String> {
     if response == approval_challenge(plan_fingerprint) {
         Ok(())
@@ -430,11 +444,11 @@ fn random_suffix() -> Result<String, String> {
 }
 
 fn load_approval_key(store: &impl SecretStore) -> Result<Option<ApprovalKey>, String> {
-    let Some(mut secret) = store.get(KEYCHAIN_SERVICE, APPROVAL_ACCOUNT)? else {
+    let Some(secret) = store.get(KEYCHAIN_SERVICE, APPROVAL_ACCOUNT)? else {
         return Ok(None);
     };
+    let secret = Zeroizing::new(secret);
     let key = ApprovalKey::from_bytes(&secret);
-    secret.fill(0);
     key.map(Some)
         .map_err(|error| format!("stored approval key is invalid: {error}"))
 }

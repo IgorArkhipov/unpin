@@ -37,7 +37,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run -p unpin-cli --locked -- --help
-cargo audit --no-yanked
+cargo audit --deny warnings
+cargo deny check
 cargo machete
 ```
 

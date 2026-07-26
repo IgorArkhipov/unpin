@@ -1,6 +1,8 @@
 use std::{
     fs,
+    ops::{Deref, DerefMut},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use rusqlite::Connection;
@@ -13,8 +15,9 @@ use unpin_core::{
     discovery::{DiscoveryKind, DiscoveryRoots, ProviderId, discover_all},
     hooks::{HookTrustRecord, HookTrustStore},
     mcp::{
-        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, UNPIN_MCP_TOOL_NAMES,
-        handle_mcp_request, handle_stdio_request_once, handle_stdio_requests,
+        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, McpDiscoveryCache,
+        McpProviderScope, UNPIN_MCP_TOOL_NAMES, handle_mcp_request, handle_stdio_request_once,
+        handle_stdio_requests,
     },
     mutation::{BackupAuthenticationKey, authenticate_legacy_backup},
     profiles::{
@@ -34,17 +37,32 @@ fn fixtures_root() -> PathBuf {
         .join("fixtures")
 }
 
-fn context() -> McpContext {
-    let backup_authentication_key = BackupAuthenticationKey::new([0x42; 32]);
-    McpContext {
-        discovery_roots: DiscoveryRoots::fixture_root(fixtures_root()),
-        fixture_root: Some(fixtures_root()),
-        package_root: Path::new(env!("CARGO_MANIFEST_DIR")).to_path_buf(),
-        app_state_root: fixtures_root().join("app-state"),
-        project_root: fixtures_root().join("cursor").join("project"),
-        authentication: authentication_readiness(Some(backup_authentication_key.key_id())),
-        backup_authentication_key: Some(backup_authentication_key),
-        session_authority_key: Some(SessionAuthorityKey::new([0x53; 32])),
+struct TestMcpContext {
+    context: McpContext,
+    _app_state: TempDir,
+}
+
+impl Deref for TestMcpContext {
+    type Target = McpContext;
+
+    fn deref(&self) -> &Self::Target {
+        &self.context
+    }
+}
+
+impl DerefMut for TestMcpContext {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.context
+    }
+}
+
+fn context() -> TestMcpContext {
+    let app_state = TempDir::new().expect("temporary MCP app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical MCP app state");
+    let context = context_with_roots(&fixtures_root(), &app_state_root);
+    TestMcpContext {
+        context,
+        _app_state: app_state,
     }
 }
 
@@ -59,7 +77,15 @@ fn context_with_roots(fixture_root: &Path, app_state_root: &Path) -> McpContext 
         authentication: authentication_readiness(Some(backup_authentication_key.key_id())),
         backup_authentication_key: Some(backup_authentication_key),
         session_authority_key: Some(SessionAuthorityKey::new([0x53; 32])),
+        provider_scope: McpProviderScope::All,
+        discovery_cache: McpDiscoveryCache::default(),
     }
+}
+
+fn context_for_provider(provider: ProviderId) -> TestMcpContext {
+    let mut context = context();
+    context.provider_scope = McpProviderScope::Provider(provider);
+    context
 }
 
 fn authentication_readiness(backup_key_id: Option<String>) -> McpAuthenticationReadiness {
@@ -1428,6 +1454,36 @@ fn control_mcp_reuses_profile_gateway_and_hook_models_with_human_handoff() {
 }
 
 #[test]
+fn discovery_backed_mcp_tools_report_advisory_warnings() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state = TempDir::new().expect("app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    fs::write(&config_path, "[plugins.incomplete\nenabled = true\n")
+        .expect("malformed Codex config");
+    let context = context_with_roots(fixture_copy.path(), &app_state_root);
+
+    for (tool, arguments) in [
+        ("unpin_get_control_status", json!({})),
+        ("unpin_list_catalog", json!({})),
+        ("unpin_list_hooks", json!({"provider": "codex"})),
+        ("unpin_get_capability_locks", json!({"provider": "codex"})),
+    ] {
+        let response = call_tool(&context, tool, arguments);
+        assert_eq!(response["status"], "ok", "{tool} status");
+        assert!(
+            response["warnings"]
+                .as_array()
+                .expect("warnings")
+                .iter()
+                .any(|warning| warning["code"] == "invalid-toml-table-header"),
+            "{tool} omitted discovery warnings"
+        );
+    }
+}
+
+#[test]
 fn catalog_adoption_mcp_plans_exact_transition_and_hands_off_without_writing() {
     let root = TempDir::new().expect("temporary root");
     let root = fs::canonicalize(root.path()).expect("canonical root");
@@ -2524,6 +2580,55 @@ fn same_state_single_toggle_plan_is_planned_but_apply_is_no_op() {
 }
 
 #[test]
+fn toggle_planning_refreshes_discovery_after_external_provider_changes() {
+    let temp = TempDir::new().expect("temporary MCP fixture");
+    let fixture_root = temp.path().join("fixtures");
+    let app_state_root = temp.path().join("state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(&app_state_root).expect("create app state");
+    let mut context = context_with_roots(&fixture_root, &app_state_root);
+    context.discovery_cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+
+    let selector = json!({
+        "provider": "codex",
+        "kind": "plugin",
+        "layer": "global",
+        "id": "codex:global:plugin-config:config:connector-kit@example-marketplace",
+        "targetEnabled": false
+    });
+    let first = call_tool(&context, "unpin_plan_toggle_item", selector);
+    assert_eq!(first["status"], "planned");
+    assert_eq!(first["selection"]["enabled"], true);
+
+    let config_path = fixture_root
+        .join("codex")
+        .join("global")
+        .join("config.toml");
+    let before = fs::read_to_string(&config_path).expect("read Codex fixture");
+    let enabled_entry = "[plugins.\"connector-kit@example-marketplace\"]\nenabled = true";
+    let disabled_entry = "[plugins.\"connector-kit@example-marketplace\"]\nenabled = false";
+    let after = before.replacen(enabled_entry, disabled_entry, 1);
+    assert_ne!(after, before, "connector fixture entry must be replaced");
+    fs::write(&config_path, after).expect("externally update Codex fixture");
+
+    let reverse = call_tool(
+        &context,
+        "unpin_plan_toggle_item",
+        json!({
+            "provider": "codex",
+            "kind": "plugin",
+            "layer": "global",
+            "id": "codex:global:plugin-config:config:connector-kit@example-marketplace",
+            "targetEnabled": true
+        }),
+    );
+    assert_eq!(reverse["status"], "planned");
+    assert_eq!(reverse["selection"]["enabled"], false);
+    assert_ne!(reverse["operations"], json!([]));
+    assert_eq!(reverse["operation"]["lifecycle"], "planned");
+}
+
+#[test]
 fn returns_inventory_summary_and_doctor_structured_content() {
     let summary = handle_mcp_request(
         &context(),
@@ -2603,6 +2708,164 @@ fn returns_inventory_summary_and_doctor_structured_content() {
                 && provider["status"] == "ok"
                 && provider["issues"] == json!([]))
     );
+}
+
+#[test]
+fn provider_scoped_mcp_defaults_and_filters_read_contracts() {
+    let context = context_for_provider(ProviderId::Zed);
+    let initialized = handle_mcp_request(
+        &context,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize"
+        }),
+    );
+    assert_eq!(
+        initialized["result"]["capabilities"]["experimental"]["unpinControl"]["providerScope"],
+        "zed"
+    );
+
+    let tools = handle_mcp_request(
+        &context,
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "method": "tools/list"
+        }),
+    );
+    let toggle = tools["result"]["tools"]
+        .as_array()
+        .expect("tools")
+        .iter()
+        .find(|tool| tool["name"] == "unpin_plan_toggle_item")
+        .expect("toggle descriptor");
+    assert_eq!(
+        toggle["inputSchema"]["properties"]["provider"]["enum"],
+        json!(["zed"])
+    );
+    assert!(
+        !toggle["inputSchema"]["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "provider")
+    );
+
+    let summary = call_tool(&context, "unpin_get_inventory_summary", json!({}));
+    assert_eq!(summary["providerScope"], "zed");
+    assert_eq!(
+        summary["inventory"]["providers"]
+            .as_array()
+            .expect("providers")
+            .len(),
+        1
+    );
+    assert_eq!(summary["inventory"]["providers"][0]["provider"], "zed");
+
+    let items = call_tool(&context, "unpin_list_items", json!({}));
+    assert!(
+        items["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .all(|item| item["provider"] == "zed")
+    );
+    assert!(
+        items["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .all(|warning| warning["provider"] == "zed")
+    );
+
+    let doctor = call_tool(&context, "unpin_run_doctor", json!({}));
+    assert_eq!(
+        doctor["providers"]
+            .as_array()
+            .expect("doctor providers")
+            .len(),
+        1
+    );
+    assert_eq!(doctor["providers"][0]["provider"], "zed");
+    let expected_zed_items = discover_all(&DiscoveryRoots::fixture_root(fixtures_root()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .filter(|item| item.provider == ProviderId::Zed)
+        .count();
+    assert_eq!(doctor["itemsDiscovered"], expected_zed_items);
+
+    let status = call_tool(&context, "unpin_get_control_status", json!({}));
+    for field in ["gateways", "sessions", "hooks"] {
+        assert!(
+            status["control"][field]
+                .as_array()
+                .expect("provider-scoped control rows")
+                .iter()
+                .all(|row| row["provider"] == "zed")
+        );
+    }
+    for scope in ["global", "repository", "workspace", "session"] {
+        let Some(providers) = status["control"]["policies"][scope]["providers"].as_object() else {
+            continue;
+        };
+        assert!(providers.keys().all(|provider| provider == "zed"));
+    }
+}
+
+#[test]
+fn provider_scoped_mcp_defaults_required_provider_and_rejects_widening() {
+    let context = context_for_provider(ProviderId::Zed);
+    let item = discover_all(&context.discovery_roots)
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.provider == ProviderId::Zed)
+        .expect("zed item");
+    let planned = call_tool(
+        &context,
+        "unpin_plan_toggle_item",
+        json!({
+            "kind": item.kind.as_str(),
+            "layer": item.layer.as_str(),
+            "id": item.id,
+            "targetEnabled": item.enabled
+        }),
+    );
+    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["selection"]["provider"], "zed");
+
+    for arguments in [
+        json!({"provider": "claude"}),
+        json!({"providers": ["zed", "claude"]}),
+        json!({"selector": {"providers": ["claude"]}}),
+    ] {
+        let name = if arguments.get("provider").is_some() {
+            "unpin_list_hooks"
+        } else if arguments.get("selector").is_some() {
+            "unpin_list_items"
+        } else {
+            "unpin_get_inventory_summary"
+        };
+        let response = handle_mcp_request(
+            &context,
+            &json!({
+                "jsonrpc": "2.0",
+                "id": "scope",
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }),
+        );
+        assert_eq!(response["error"]["code"], -32000);
+        assert_eq!(
+            response["error"]["message"],
+            "provider claude is outside MCP provider scope zed"
+        );
+    }
 }
 
 #[test]
@@ -2843,6 +3106,7 @@ fn mcp_restore_confirmation_returns_handoff_and_never_writes_target() {
         Some("entries/entry-1/payload"),
     );
     manifest["entries"][0]["target"]["path"] = json!(target.to_string_lossy());
+    manifest["affectedTargets"][0]["path"] = json!(target.to_string_lossy());
     write_backup_manifest(app_state.path(), "backup-handoff", manifest);
     let payload = app_state
         .path()

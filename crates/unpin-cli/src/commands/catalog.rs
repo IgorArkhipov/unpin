@@ -226,7 +226,10 @@ fn adopt(
     ) {
         return command_error_exit(options.json, "blocked", &error);
     }
-    let backup_key = match credentials::resolve_backup_authentication_key(fixture_mode) {
+    let backup_key = match credentials::resolve_backup_authentication_key(
+        fixture_mode,
+        &config.app_state_root,
+    ) {
         Ok(Some(key)) => key,
         Ok(None) => {
             return command_error_exit(
@@ -237,23 +240,25 @@ fn adopt(
         }
         Err(error) => return command_error_exit(options.json, "blocked", &error),
     };
-    let session_authority_key = match credentials::resolve_session_authority_key(fixture_mode) {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return command_error_exit(
-                options.json,
-                "blocked",
-                "session authority key missing; run `unpin auth session init`",
-            );
-        }
-        Err(error) => return command_error_exit(options.json, "blocked", &error),
-    };
+    let session_authority_key =
+        match credentials::resolve_session_authority_key(fixture_mode, &config.app_state_root) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return command_error_exit(
+                    options.json,
+                    "blocked",
+                    "session authority key missing; run `unpin auth session init`",
+                );
+            }
+            Err(error) => return command_error_exit(options.json, "blocked", &error),
+        };
     let now_unix = unix_now();
     let expectation = planned
         .transition
         .approval_expectation(APPROVAL_ISSUER, APPROVAL_AUDIENCE);
     let approval = match credentials::issue_human_approval(
         fixture_mode,
+        &config.app_state_root,
         &expectation,
         fingerprint,
         reviewed_fingerprint,

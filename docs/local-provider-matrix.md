@@ -92,6 +92,10 @@ Use explicit roots when current directory or Cursor profile is ambiguous:
   --json
 ```
 
+The explicit Cursor root above is the macOS path. GNU/Linux uses
+`$HOME/.config/Cursor/User`; omit the flag to select the current platform's
+default.
+
 `list`, `doctor`, and a toggle without `--apply` are read-only. Cursor marketplace
 plugins remain read-only inventory even when Cursor is authenticated. Unpin
 does not rewrite Cursor-owned marketplace cache or SQLite state.
@@ -305,9 +309,9 @@ MCP control plane.
 
 ## Reproduce local provider matrix
 
-Runner reads installed provider state, hashes every discovered live source/state
-path before and after dry-run planning, mutates only isolated copies of committed
-fixtures, and restores every copy byte-for-byte:
+Runner reads installed provider state, hashes each selected item's live
+source/state paths immediately before and after its dry-run plan, mutates only
+isolated copies of committed fixtures, and restores every copy byte-for-byte:
 
 ```bash
 python3 scripts/run_local_provider_matrix.py

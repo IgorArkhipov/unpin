@@ -216,7 +216,8 @@ fn read_pinned_skill(
     let opened_metadata = file
         .metadata()
         .map_err(|_| GatewayError::SkillContentInvalid)?;
-    if !same_file_identity(&opened_metadata, &path_metadata)
+    if !crate::fs_support::path_matches_open_file(source_path, &file)
+        .map_err(|_| GatewayError::SkillContentInvalid)?
         || opened_metadata.len() > maximum_bytes as u64
     {
         return Err(GatewayError::SkillContentInvalid);
@@ -233,7 +234,8 @@ fn read_pinned_skill(
         fs::symlink_metadata(source_path).map_err(|_| GatewayError::SkillContentInvalid)?;
     if current_metadata.file_type().is_symlink()
         || !current_metadata.is_file()
-        || !same_file_identity(&opened_metadata, &current_metadata)
+        || !crate::fs_support::path_matches_open_file(source_path, &file)
+            .map_err(|_| GatewayError::SkillContentInvalid)?
     {
         return Err(GatewayError::SkillContentInvalid);
     }
@@ -252,18 +254,4 @@ fn valid_source_fingerprint(value: &str) -> bool {
         && digest
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-        && left.is_file() == right.is_file()
 }

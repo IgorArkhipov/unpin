@@ -23,8 +23,9 @@ use unpin_core::{
     },
     state::atomic_json::OwnerGeneration,
     transitions::{
-        EffectAuthority, TransitionContext, TransitionEffect, TransitionEffectKind,
-        TransitionJournalStore, TransitionKind, TransitionLifecycle, TransitionPlan,
+        EffectAuthority, EffectCheckpointStatus, TransitionContext, TransitionEffect,
+        TransitionEffectKind, TransitionJournalStore, TransitionKind, TransitionLifecycle,
+        TransitionPlan,
     },
 };
 
@@ -44,6 +45,52 @@ fn backup_authentication_key() -> BackupAuthenticationKey {
 
 fn session_authority_key() -> SessionAuthorityKey {
     SessionAuthorityKey::new([0x53; 32])
+}
+
+#[test]
+fn apply_audit_failure_preserves_recovery_evidence_after_directory_move() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("Claude skill");
+    let source_path = PathBuf::from(&item.state_path);
+    fs::create_dir_all(app_state.path().join("audit/log.jsonl"))
+        .expect("audit log path that rejects append");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(result.status, ToggleStatus::RecoveryRequired);
+    let backup_id = result
+        .backup_id
+        .as_deref()
+        .expect("failed apply must expose its backup id");
+    assert!(
+        result
+            .writes
+            .as_deref()
+            .is_some_and(|writes| writes.contains("may already have been performed"))
+    );
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("recovery-required"))
+    );
+    assert!(app_state.path().join("backups").join(backup_id).is_dir());
+    assert!(
+        !source_path.exists(),
+        "the test must reach the post-mutation audit failure"
+    );
 }
 
 fn sha256_hex(value: &[u8]) -> String {
@@ -866,6 +913,108 @@ fn legacy_backup_is_inventory_only_until_explicitly_authenticated() {
 }
 
 #[test]
+fn restore_rejects_entries_outside_the_reviewed_target_allowlist() {
+    let app_state = TempDir::new().expect("temp app state");
+    let backup_id = "backup-hidden-target";
+    let reviewed_target = app_state.path().join("live/settings.json");
+    let hidden_target = app_state.path().join("live/hidden.json");
+    let backup_root = app_state.path().join("backups").join(backup_id);
+    fs::create_dir_all(backup_root.join("entries/entry-1")).expect("backup entry");
+    fs::write(backup_root.join("entries/entry-1/payload"), "reviewed\n").expect("backup payload");
+    write_file_restore_manifest(&backup_root, backup_id, &reviewed_target);
+
+    let manifest_path = backup_root.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["entries"]
+        .as_array_mut()
+        .expect("manifest entries")
+        .push(serde_json::json!({
+            "entryId": "entry-hidden",
+            "target": {
+                "targetType": "path",
+                "path": hidden_target.to_string_lossy()
+            },
+            "existed": false
+        }));
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode manifest"),
+    )
+    .expect("write hidden target manifest");
+
+    let key = backup_authentication_key();
+    assert_eq!(
+        authenticate_legacy_backup(app_state.path(), backup_id, &key),
+        Err(
+            "backup entry entry-hidden target is not declared in the restore allowlist".to_string()
+        )
+    );
+    let summaries = load_backup_summaries_authenticated(app_state.path(), Some(&key));
+    assert_eq!(
+        summaries[0].authentication,
+        BackupAuthenticationStatus::Failed
+    );
+    assert!(!summaries[0].restorable);
+
+    let restored = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: backup_id.to_string(),
+        backup_authentication_key: Some(key),
+    });
+    assert_eq!(restored.status, RestoreStatus::Failed);
+    assert_eq!(
+        restored.reason.as_deref(),
+        Some("backup entry entry-hidden target is not declared in the restore allowlist")
+    );
+    assert!(!reviewed_target.exists());
+    assert!(!hidden_target.exists());
+}
+
+#[test]
+fn version_two_backup_manifests_are_not_accepted() {
+    let app_state = TempDir::new().expect("temp app state");
+    let backup_id = "backup-version-two";
+    let target_path = app_state.path().join("live/settings.json");
+    let backup_root = app_state.path().join("backups").join(backup_id);
+    fs::create_dir_all(backup_root.join("entries/entry-1")).expect("backup entry");
+    fs::write(backup_root.join("entries/entry-1/payload"), "legacy\n").expect("backup payload");
+    write_file_restore_manifest(&backup_root, backup_id, &target_path);
+
+    let manifest_path = backup_root.join("manifest.json");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&fs::read_to_string(&manifest_path).expect("read manifest"))
+            .expect("manifest json");
+    manifest["version"] = serde_json::json!(2);
+    fs::write(
+        &manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("encode manifest"),
+    )
+    .expect("write version two manifest");
+
+    let key = backup_authentication_key();
+    let summaries = load_backup_summaries_authenticated(app_state.path(), Some(&key));
+    assert_eq!(
+        summaries[0].authentication,
+        BackupAuthenticationStatus::Failed
+    );
+    assert!(!summaries[0].restorable);
+
+    let restored = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: backup_id.to_string(),
+        backup_authentication_key: Some(key),
+    });
+    assert_eq!(restored.status, RestoreStatus::Failed);
+    assert_eq!(
+        restored.reason.as_deref(),
+        Some("unsupported backup manifest version: 2")
+    );
+    assert!(!target_path.exists());
+}
+
+#[test]
 fn plans_skill_disable_as_vault_rename_dry_run() {
     let app_state = TempDir::new().expect("temp app state");
     let discovery =
@@ -1024,10 +1173,21 @@ fn exact_native_toggle_retry_verifies_authenticated_live_post_state() {
         "native-toggle-exact-retry",
         2_000_000_000,
     );
+    let first_decision_digest = authorization.decision_digest().to_string();
     let applied = controller
         .apply(&plan, authorization, &context, key.clone())
         .expect("native toggle apply");
     let backup_id = applied.backup_id.clone().expect("native toggle backup");
+    let committed = TransitionJournalStore::new(&app_state_root)
+        .list()
+        .expect("native toggle journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == plan.transition.operation_id)
+        .expect("committed native toggle journal");
+    assert_eq!(
+        committed.authorization_decision_history,
+        vec![first_decision_digest]
+    );
 
     let exact_retry_authorization = control_authorization(
         &app_state_root,
@@ -1043,7 +1203,7 @@ fn exact_native_toggle_retry_verifies_authenticated_live_post_state() {
 
     let restored = restore_backup(RestoreBackupInput {
         app_state_root: app_state_root.clone(),
-        backup_id,
+        backup_id: backup_id.clone(),
         backup_authentication_key: Some(key.clone()),
     });
     assert_eq!(restored.status, RestoreStatus::Restored);
@@ -1053,13 +1213,204 @@ fn exact_native_toggle_retry_verifies_authenticated_live_post_state() {
         "native-toggle-exact-retry",
         2_000_000_000,
     );
-    let error = controller
+    let recovery = controller
         .apply(&plan, divergent_retry_authorization, &context, key)
-        .expect_err("cached native toggle must reject live post-state drift");
-    assert!(matches!(
-        error,
-        NativeToggleControlError::RecoveryRequired(_)
-    ));
+        .expect("cached native toggle must surface live post-state recovery evidence");
+    assert_eq!(recovery.status, ToggleStatus::RecoveryRequired);
+    assert_eq!(recovery.backup_id.as_deref(), Some(backup_id.as_str()));
+    assert!(
+        recovery
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("post-state diverged"))
+    );
+}
+
+#[test]
+fn interrupted_native_toggle_accepts_refreshed_approval_before_writes() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let first_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-interrupted-first",
+        2_000_000_000,
+    );
+    let first_digest = first_authorization.decision_digest().to_string();
+    let store = TransitionJournalStore::new(&app_state_root);
+    let mut interrupted = store
+        .create_or_attach(
+            &plan.transition,
+            OwnerGeneration::new("native-toggle-control", 1).expect("journal owner"),
+        )
+        .expect("interrupted native toggle journal");
+    interrupted.journal.authorization_decision_digest = Some(first_digest.clone());
+    interrupted
+        .journal
+        .record(TransitionLifecycle::Approved, "approval-recorded", None)
+        .expect("approval checkpoint");
+    interrupted
+        .journal
+        .record(
+            TransitionLifecycle::Locked,
+            "legacy-mutation-lock-delegated",
+            None,
+        )
+        .expect("lock checkpoint");
+    interrupted
+        .journal
+        .record(
+            TransitionLifecycle::Applying,
+            "legacy-apply-started",
+            Some("native-toggle-effect"),
+        )
+        .expect("apply checkpoint");
+    store
+        .save(&mut interrupted)
+        .expect("save interrupted journal");
+
+    let refreshed_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-interrupted-refreshed",
+        2_000_000_000,
+    );
+    let refreshed_digest = refreshed_authorization.decision_digest().to_string();
+    let result = controller
+        .apply(
+            &plan,
+            refreshed_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect("safe pre-write interruption must accept refreshed approval");
+
+    assert_eq!(result.status, ToggleStatus::Applied);
+    let committed = store
+        .list()
+        .expect("native toggle journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == plan.transition.operation_id)
+        .expect("committed native toggle journal");
+    assert_eq!(
+        committed.authorization_decision_history,
+        vec![first_digest, refreshed_digest.clone()]
+    );
+    assert_eq!(
+        committed.authorization_decision_digest.as_deref(),
+        Some(refreshed_digest.as_str())
+    );
+    assert!(
+        committed
+            .audit
+            .iter()
+            .any(|event| event.code == "approval-refreshed")
+    );
+}
+
+#[test]
+fn interrupted_native_toggle_with_provider_drift_requires_recovery() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-interrupted-drift",
+        2_000_000_000,
+    );
+    let store = TransitionJournalStore::new(&app_state_root);
+    let mut interrupted = store
+        .create_or_attach(
+            &plan.transition,
+            OwnerGeneration::new("native-toggle-control", 1).expect("journal owner"),
+        )
+        .expect("interrupted native toggle journal");
+    interrupted.journal.authorization_decision_digest =
+        Some(authorization.decision_digest().to_string());
+    interrupted
+        .journal
+        .authorization_decision_history
+        .push(authorization.decision_digest().to_string());
+    interrupted
+        .journal
+        .record(TransitionLifecycle::Approved, "approval-recorded", None)
+        .expect("approval checkpoint");
+    interrupted
+        .journal
+        .record(
+            TransitionLifecycle::Locked,
+            "legacy-mutation-lock-delegated",
+            None,
+        )
+        .expect("lock checkpoint");
+    interrupted
+        .journal
+        .record(
+            TransitionLifecycle::Applying,
+            "legacy-apply-started",
+            Some("native-toggle-effect"),
+        )
+        .expect("apply checkpoint");
+    store
+        .save(&mut interrupted)
+        .expect("save interrupted journal");
+
+    fs::write(
+        PathBuf::from(&plan.preview.selection.state_path).join("SKILL.md"),
+        "# drifted during interrupted apply\n",
+    )
+    .expect("drift provider state");
+
+    let recovery = controller
+        .apply(&plan, authorization, &context, backup_authentication_key())
+        .expect("interrupted provider drift must surface recovery evidence");
+
+    assert_eq!(recovery.status, ToggleStatus::RecoveryRequired);
+    let repaired = store
+        .load(
+            &plan.transition,
+            OwnerGeneration::new("verify-native-toggle", 1).expect("verify owner"),
+        )
+        .expect("needs-repair native toggle journal");
+    assert_eq!(repaired.journal.lifecycle, TransitionLifecycle::NeedsRepair);
+    assert_eq!(
+        repaired.journal.terminal_code.as_deref(),
+        Some("legacy-resume-state-diverged")
+    );
 }
 
 #[test]
@@ -1276,15 +1627,21 @@ fn native_toggle_backup_without_checkpoint_requires_recovery() {
         2_000_000_000,
     );
 
-    let error = controller
+    let recovery = controller
         .apply(&plan, authorization, &context, backup_authentication_key())
-        .expect_err("interrupted backup must require recovery");
+        .expect("interrupted backup must surface recovery evidence");
 
-    assert!(matches!(
-        error,
-        NativeToggleControlError::RecoveryRequired(ref reason)
-            if reason.contains("backup exists without a committed checkpoint")
-    ));
+    assert_eq!(recovery.status, ToggleStatus::RecoveryRequired);
+    assert_eq!(
+        recovery.backup_id.as_deref(),
+        Some(handle.journal.backup_id.as_str())
+    );
+    assert!(
+        recovery
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("backup exists without a committed checkpoint"))
+    );
     let journal = TransitionJournalStore::new(&app_state_root)
         .load(
             &plan.transition,
@@ -1292,6 +1649,632 @@ fn native_toggle_backup_without_checkpoint_requires_recovery() {
         )
         .expect("needs-repair journal");
     assert_eq!(journal.journal.lifecycle, TransitionLifecycle::NeedsRepair);
+}
+
+#[test]
+fn native_toggle_provider_write_without_checkpoint_requires_recovery() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-interrupted-provider-write",
+        2_000_000_000,
+    );
+    let store = TransitionJournalStore::new(&app_state_root);
+    let mut handle = store
+        .create_or_attach(
+            &plan.transition,
+            OwnerGeneration::new("native-toggle-control", 1).expect("journal owner"),
+        )
+        .expect("interrupted native toggle journal");
+    handle.journal.authorization_decision_digest =
+        Some(authorization.decision_digest().to_string());
+    handle
+        .journal
+        .authorization_decision_history
+        .push(authorization.decision_digest().to_string());
+    handle
+        .journal
+        .record(TransitionLifecycle::Approved, "approval-recorded", None)
+        .expect("approval checkpoint");
+    handle
+        .journal
+        .record(
+            TransitionLifecycle::Locked,
+            "legacy-mutation-lock-delegated",
+            None,
+        )
+        .expect("lock checkpoint");
+    handle
+        .journal
+        .record(
+            TransitionLifecycle::Applying,
+            "legacy-apply-started",
+            Some("native-toggle-effect"),
+        )
+        .expect("apply checkpoint");
+    store.save(&mut handle).expect("save interrupted journal");
+
+    let backup_root = app_state_root
+        .join("backups")
+        .join(&handle.journal.backup_id);
+    fs::create_dir_all(&backup_root).expect("interrupted backup root");
+    let operation = plan.preview.operations.first().expect("rename operation");
+    let source_path = PathBuf::from(operation.from_path.as_deref().expect("rename source path"));
+    let destination_path = PathBuf::from(
+        operation
+            .to_path
+            .as_deref()
+            .expect("rename destination path"),
+    );
+    fs::create_dir_all(destination_path.parent().expect("destination parent"))
+        .expect("create vault parent");
+    fs::rename(&source_path, &destination_path).expect("simulate completed provider write");
+
+    let recovery = controller
+        .apply(&plan, authorization, &context, backup_authentication_key())
+        .expect("post-write interruption must surface recovery evidence");
+
+    assert_eq!(recovery.status, ToggleStatus::RecoveryRequired);
+    assert_eq!(
+        recovery.backup_id.as_deref(),
+        Some(handle.journal.backup_id.as_str())
+    );
+    assert!(
+        recovery
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("recovery-required: "))
+    );
+    assert!(
+        recovery
+            .writes
+            .as_deref()
+            .is_some_and(|writes| writes.contains("may already have been performed"))
+    );
+    let journal = store
+        .load(
+            &plan.transition,
+            OwnerGeneration::new("verify-native-toggle", 1).expect("verify owner"),
+        )
+        .expect("needs-repair journal");
+    assert_eq!(journal.journal.lifecycle, TransitionLifecycle::NeedsRepair);
+    assert_eq!(
+        journal.journal.terminal_code.as_deref(),
+        Some("legacy-recovery-required")
+    );
+}
+
+#[test]
+fn fresh_native_toggle_preview_drift_does_not_create_journal() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-fresh-preview-drift",
+        2_000_000_000,
+    );
+    fs::write(
+        PathBuf::from(&plan.preview.selection.state_path).join("SKILL.md"),
+        "# drifted skill\n",
+    )
+    .expect("drift skill after review");
+
+    let error = controller
+        .apply(&plan, authorization, &context, backup_authentication_key())
+        .expect_err("fresh preview drift must block the toggle");
+
+    assert!(matches!(error, NativeToggleControlError::Blocked(_)));
+    assert!(
+        TransitionJournalStore::new(&app_state_root)
+            .list()
+            .expect("native toggle journals")
+            .is_empty(),
+        "a rejected fresh preview must not leave a journal"
+    );
+}
+
+#[test]
+fn pre_lock_native_toggle_contention_with_later_drift_stays_blocked() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let first_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-pre-backup-failure",
+        2_000_000_000,
+    );
+    let live_pid = process::id();
+    let held_lock = hold_mutation_lock(
+        &app_state_root,
+        &format!(r#"{{"pid":{live_pid},"acquiredAt":"2026-06-20T12:00:00Z"}}"#),
+    );
+
+    let first_error = controller
+        .apply(
+            &plan,
+            first_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect_err("held mutation lock must block before backup");
+    assert!(matches!(
+        first_error,
+        NativeToggleControlError::Blocked(ref reason)
+            if reason.contains("mutation lock is already held")
+    ));
+    assert_eq!(backup_count(&app_state_root), 0);
+    let store = TransitionJournalStore::new(&app_state_root);
+    assert!(
+        store
+            .list()
+            .expect("native toggle journals after contention")
+            .is_empty(),
+        "pre-lock contention must not create or update a transition journal"
+    );
+    drop(held_lock);
+
+    fs::write(
+        PathBuf::from(&plan.preview.selection.state_path).join("SKILL.md"),
+        "# drifted after pre-backup failure\n",
+    )
+    .expect("drift skill after interrupted apply");
+    let retry_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-pre-backup-drift-retry",
+        2_000_000_000,
+    );
+
+    let retry_error = controller
+        .apply(
+            &plan,
+            retry_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect_err("drift after pre-lock contention must remain an ordinary blocked retry");
+    assert!(matches!(retry_error, NativeToggleControlError::Blocked(_)));
+    assert!(
+        store
+            .list()
+            .expect("native toggle journals after drift")
+            .is_empty(),
+        "drift after pre-lock contention must not leave recovery state"
+    );
+    assert_eq!(backup_count(&app_state_root), 0);
+}
+
+#[test]
+fn pre_lock_native_toggle_contention_accepts_new_approval_on_retry() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let first_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-pre-backup-retry-first",
+        2_000_000_000,
+    );
+    let live_pid = process::id();
+    let held_lock = hold_mutation_lock(
+        &app_state_root,
+        &format!(r#"{{"pid":{live_pid},"acquiredAt":"2026-06-20T12:00:00Z"}}"#),
+    );
+
+    let first_error = controller
+        .apply(
+            &plan,
+            first_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect_err("held mutation lock must block before backup");
+    assert!(matches!(
+        first_error,
+        NativeToggleControlError::Blocked(ref reason)
+            if reason.contains("mutation lock is already held")
+    ));
+    assert_eq!(backup_count(&app_state_root), 0);
+    drop(held_lock);
+
+    let retry_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-pre-backup-retry-refreshed",
+        2_000_000_000,
+    );
+    let retry_digest = retry_authorization.decision_digest().to_string();
+    let applied = controller
+        .apply(
+            &plan,
+            retry_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect("a new approval must apply after pre-lock contention clears");
+
+    assert_eq!(applied.status, ToggleStatus::Applied);
+    let committed = TransitionJournalStore::new(&app_state_root)
+        .load(
+            &plan.transition,
+            OwnerGeneration::new("verify-native-toggle", 1).expect("verify owner"),
+        )
+        .expect("committed native toggle journal");
+    assert_eq!(
+        committed.journal.authorization_decision_history,
+        vec![retry_digest.clone()]
+    );
+    assert_eq!(
+        committed.journal.authorization_decision_digest.as_deref(),
+        Some(retry_digest.as_str())
+    );
+    assert_eq!(committed.journal.lifecycle, TransitionLifecycle::Committed);
+    assert!(
+        committed
+            .journal
+            .audit
+            .iter()
+            .all(|event| event.code != "approval-refreshed")
+    );
+}
+
+#[test]
+fn recovering_native_toggle_with_checkpointed_effect_rejects_refreshed_approval() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let first_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-recovering-checkpointed-first",
+        2_000_000_000,
+    );
+    let first_digest = first_authorization.decision_digest().to_string();
+    let store = TransitionJournalStore::new(&app_state_root);
+    let mut recovering = store
+        .create_or_attach(
+            &plan.transition,
+            OwnerGeneration::new("native-toggle-control", 1).expect("journal owner"),
+        )
+        .expect("recovering native toggle journal");
+    recovering.journal.authorization_decision_digest = Some(first_digest.clone());
+    recovering
+        .journal
+        .authorization_decision_history
+        .push(first_digest.clone());
+    recovering
+        .journal
+        .record(TransitionLifecycle::Approved, "approval-recorded", None)
+        .expect("approval checkpoint");
+    recovering
+        .journal
+        .record(
+            TransitionLifecycle::Locked,
+            "legacy-mutation-lock-delegated",
+            None,
+        )
+        .expect("lock checkpoint");
+    recovering.journal.effects[0].status = EffectCheckpointStatus::BackedUp;
+    recovering
+        .journal
+        .record(
+            TransitionLifecycle::Recovering,
+            "legacy-apply-blocked",
+            Some("native-toggle-effect"),
+        )
+        .expect("recovery checkpoint");
+    store
+        .save(&mut recovering)
+        .expect("save recovering journal");
+    let refreshed_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-recovering-checkpointed-refreshed",
+        2_000_000_000,
+    );
+
+    let error = controller
+        .apply(
+            &plan,
+            refreshed_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect_err("checkpointed recovery must reject refreshed approval");
+
+    assert!(matches!(
+        error,
+        NativeToggleControlError::Blocked(ref reason)
+            if reason == "native toggle is bound to another approval decision"
+    ));
+    let unchanged = store
+        .load(
+            &plan.transition,
+            OwnerGeneration::new("verify-native-toggle", 1).expect("verify owner"),
+        )
+        .expect("unchanged recovering journal");
+    assert_eq!(
+        unchanged.journal.authorization_decision_digest.as_deref(),
+        Some(first_digest.as_str())
+    );
+    assert_eq!(
+        unchanged.journal.authorization_decision_history,
+        vec![first_digest]
+    );
+    assert_eq!(unchanged.journal.lifecycle, TransitionLifecycle::Recovering);
+}
+
+#[test]
+fn recovering_native_toggle_bounds_approval_refresh_history() {
+    const MAX_REFRESH_HISTORY: usize = 32;
+
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let store = TransitionJournalStore::new(&app_state_root);
+    let mut recovering = store
+        .create_or_attach(
+            &plan.transition,
+            OwnerGeneration::new("native-toggle-control", 1).expect("journal owner"),
+        )
+        .expect("recovering native toggle journal");
+    recovering.journal.authorization_decision_history = (0..MAX_REFRESH_HISTORY)
+        .map(|index| format!("bounded-approval-{index}"))
+        .collect();
+    recovering.journal.authorization_decision_digest = recovering
+        .journal
+        .authorization_decision_history
+        .last()
+        .cloned();
+    recovering
+        .journal
+        .record(TransitionLifecycle::Approved, "approval-recorded", None)
+        .expect("approval checkpoint");
+    recovering
+        .journal
+        .record(
+            TransitionLifecycle::Locked,
+            "legacy-mutation-lock-delegated",
+            None,
+        )
+        .expect("lock checkpoint");
+    recovering
+        .journal
+        .record(
+            TransitionLifecycle::Recovering,
+            "legacy-apply-blocked",
+            Some("native-toggle-effect"),
+        )
+        .expect("recovery checkpoint");
+    store
+        .save(&mut recovering)
+        .expect("save bounded recovery journal");
+    let overflow_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        "native-toggle-refresh-limit-overflow",
+        2_000_000_000,
+    );
+    let recovery = controller
+        .apply(
+            &plan,
+            overflow_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect("approval history overflow must surface recovery evidence");
+
+    assert_eq!(recovery.status, ToggleStatus::RecoveryRequired);
+    let bounded = store
+        .load(
+            &plan.transition,
+            OwnerGeneration::new("verify-native-toggle", 1).expect("verify owner"),
+        )
+        .expect("bounded native toggle journal");
+    assert_eq!(
+        bounded.journal.authorization_decision_history.len(),
+        MAX_REFRESH_HISTORY
+    );
+    assert_eq!(bounded.journal.lifecycle, TransitionLifecycle::NeedsRepair);
+    assert_eq!(
+        bounded.journal.terminal_code.as_deref(),
+        Some("approval-refresh-limit")
+    );
+}
+
+#[test]
+fn contended_native_toggle_retries_do_not_create_journals() {
+    const CONTENDED_RETRIES: usize = 64;
+
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "claude:project:skill:example-claude-skill")
+        .expect("claude skill");
+    let context = control_context("test-repository", "test-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let expectation = plan
+        .approval_expectation(&context)
+        .expect("native toggle expectation");
+    let live_pid = process::id();
+    let held_lock = hold_mutation_lock(
+        &app_state_root,
+        &format!(r#"{{"pid":{live_pid},"acquiredAt":"2026-06-20T12:00:00Z"}}"#),
+    );
+
+    let authorization_marker = "native-toggle-exact-retry-limit";
+    let first_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        authorization_marker,
+        2_000_000_000,
+    );
+    let first_error = controller
+        .apply(
+            &plan,
+            first_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect_err("pre-lock contention must block without starting an apply");
+    assert!(matches!(first_error, NativeToggleControlError::Blocked(_)));
+    let store = TransitionJournalStore::new(&app_state_root);
+    assert!(
+        store
+            .list()
+            .expect("native toggle journals after initial contention")
+            .is_empty(),
+        "contention must be rejected before journal creation"
+    );
+
+    for _ in 1..CONTENDED_RETRIES {
+        let authorization = control_authorization(
+            &app_state_root,
+            &expectation,
+            authorization_marker,
+            2_000_000_000,
+        );
+        let error = controller
+            .apply(&plan, authorization, &context, backup_authentication_key())
+            .expect_err("exact retry must remain safely blocked before lock acquisition");
+        assert!(matches!(error, NativeToggleControlError::Blocked(_)));
+    }
+
+    assert!(
+        store
+            .list()
+            .expect("native toggle journals after repeated contention")
+            .is_empty(),
+        "repeated contention must not grow approval or audit evidence"
+    );
+
+    drop(held_lock);
+    let final_authorization = control_authorization(
+        &app_state_root,
+        &expectation,
+        authorization_marker,
+        2_000_000_000,
+    );
+    let applied = controller
+        .apply(
+            &plan,
+            final_authorization,
+            &context,
+            backup_authentication_key(),
+        )
+        .expect("contention must not permanently block the approved toggle");
+    assert_eq!(applied.status, ToggleStatus::Applied);
 }
 
 #[test]
@@ -1535,6 +2518,128 @@ fn plans_codex_plugin_disable_as_native_file_rewrite() {
     assert_eq!(result.writes.as_deref(), Some("no writes were performed"));
 }
 
+#[cfg(unix)]
+#[test]
+fn blocks_provider_config_symlink_replacement_before_toggle() {
+    use std::os::unix::fs::symlink;
+
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let external_path = fixture_copy.path().join("external-config.toml");
+    let original = fs::read(&config_path).expect("original config");
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("codex plugin config")
+        .clone();
+
+    fs::write(&external_path, &original).expect("external config");
+    fs::remove_file(&config_path).expect("remove provider config");
+    symlink(&external_path, &config_path).expect("replace provider config with symlink");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: false,
+        backup_authentication_key: None,
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("provider config path is a symlink"))
+    );
+    assert_eq!(
+        fs::read(&external_path).expect("external config remains"),
+        original
+    );
+}
+
+#[test]
+fn blocks_non_regular_provider_config_before_toggle() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("codex plugin config")
+        .clone();
+
+    fs::remove_file(&config_path).expect("remove provider config");
+    fs::create_dir(&config_path).expect("replace provider config with directory");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: false,
+        backup_authentication_key: None,
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("provider config path is not a regular file"))
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn blocks_provider_config_with_symlinked_parent_before_toggle() {
+    use std::os::unix::fs::symlink;
+
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_parent = fixture_copy.path().join("codex/global");
+    let external_parent = fixture_copy.path().join("external-codex-global");
+    let config_path = config_parent.join("config.toml");
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("codex plugin config")
+        .clone();
+    let original = fs::read(&config_path).expect("original config");
+
+    fs::rename(&config_parent, &external_parent).expect("move provider config parent");
+    symlink(&external_parent, &config_parent).expect("replace provider config parent with symlink");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: false,
+        backup_authentication_key: None,
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("mutation target parent contains a symlink"))
+    );
+    assert_eq!(
+        fs::read(external_parent.join("config.toml")).expect("external config remains"),
+        original
+    );
+}
+
 #[test]
 fn applies_and_restores_codex_connector_plugin_without_moving_bundle() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
@@ -1662,6 +2767,205 @@ fn blocks_codex_plugin_toggle_when_section_drifted() {
 }
 
 #[test]
+fn blocks_codex_plugin_toggle_when_nested_subtable_drifted() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let raw = fs::read_to_string(&config_path).expect("config");
+    let raw = raw.replace(
+        "[plugins.safe-shell]\nenabled = true",
+        concat!(
+            "[plugins.safe-shell]\n",
+            "enabled = true\n",
+            "[plugins.safe-shell.environment]\n",
+            "MODE = \"reviewed\"",
+        ),
+    );
+    fs::write(&config_path, &raw).expect("config with plugin subtable");
+
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("Codex plugin")
+        .clone();
+    let drifted = raw.replace("MODE = \"reviewed\"", "MODE = \"changed\"");
+    fs::write(&config_path, &drifted).expect("drift plugin subtable");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .expect("blocked reason")
+            .contains("source drifted")
+    );
+    assert_eq!(
+        fs::read_to_string(config_path).expect("unchanged config"),
+        drifted
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+}
+
+#[test]
+fn blocks_codex_toggle_when_any_standard_table_is_duplicated() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("Codex plugin")
+        .clone();
+    let raw = fs::read_to_string(&config_path).expect("config");
+    fs::write(
+        &config_path,
+        format!("{raw}\n[mcp_servers.github]\nenabled = false\n"),
+    )
+    .expect("duplicate unrelated table");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .expect("blocked reason")
+            .contains("duplicate TOML table declarations")
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+}
+
+#[test]
+fn blocks_codex_toggle_when_enabled_key_is_duplicated() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("Codex plugin")
+        .clone();
+    let raw = fs::read_to_string(&config_path).expect("config");
+    let raw = raw.replace(
+        "[plugins.safe-shell]\nenabled = true",
+        "[plugins.safe-shell]\nenabled = true\n\"enabled\" = false",
+    );
+    fs::write(&config_path, &raw).expect("duplicate normalized enabled key");
+
+    let rediscovery = discover_all(&roots).expect("rediscovery");
+    assert!(rediscovery.warnings.iter().any(|warning| {
+        warning.code == "duplicate-toml-key" && warning.message.contains("plugins.safe-shell")
+    }));
+    assert!(
+        !rediscovery
+            .items
+            .iter()
+            .any(|candidate| candidate.id == item.id)
+    );
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .expect("blocked reason")
+            .contains("duplicate enabled keys")
+    );
+    assert_eq!(
+        fs::read_to_string(config_path).expect("unchanged config"),
+        raw
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+}
+
+#[test]
+fn blocks_codex_toggle_when_table_header_is_malformed() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("Codex plugin")
+        .clone();
+    let mut raw = fs::read_to_string(&config_path).expect("config");
+    raw.push_str("\n[mcp_servers.incomplete\ncommand = \"unsafe\"\n");
+    fs::write(&config_path, &raw).expect("malformed TOML table header");
+
+    let rediscovery = discover_all(&roots).expect("rediscovery");
+    assert!(rediscovery.warnings.iter().any(|warning| {
+        warning.code == "invalid-toml-table-header"
+            && warning.message.contains("malformed TOML table headers")
+    }));
+    assert!(
+        !rediscovery
+            .items
+            .iter()
+            .any(|candidate| candidate.id == item.id)
+    );
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .expect("blocked reason")
+            .contains("malformed TOML table headers")
+    );
+    assert_eq!(
+        fs::read_to_string(config_path).expect("unchanged config"),
+        raw
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+}
+
+#[test]
 fn plans_codex_configured_mcp_disable_as_file_rewrite_dry_run() {
     let app_state = TempDir::new().expect("temp app state");
     let discovery =
@@ -1749,6 +3053,89 @@ fn applies_codex_configured_mcp_native_enabled_toggle() {
     assert!(enabled_config.contains("[mcp_servers.github]\nenabled = true\n"));
     assert!(enabled_config.contains("[plugins.safe-shell]"));
     assert_ne!(enabled_config, original);
+}
+
+#[test]
+fn discovers_and_toggles_codex_quoted_dotted_table_ids() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    fs::write(
+        &config_path,
+        concat!(
+            "[mcp_servers.\"docs.example\"]\n",
+            "command = \"docs\"\n\n",
+            "[plugins.'connector.example']\n",
+            "enabled = true\n",
+        ),
+    )
+    .expect("write quoted Codex config");
+
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:configured-mcp:docs.example")
+        .expect("quoted dotted Codex MCP");
+    assert!(
+        discovery
+            .items
+            .iter()
+            .any(|item| { item.id == "codex:global:plugin-config:config:connector.example" })
+    );
+
+    let applied = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(applied.status, ToggleStatus::Applied);
+    let rewritten = fs::read_to_string(config_path).expect("rewritten Codex config");
+    assert!(
+        rewritten.contains("[mcp_servers.\"docs.example\"]\nenabled = false\ncommand = \"docs\"")
+    );
+    assert!(rewritten.contains("[plugins.'connector.example']\nenabled = true"));
+}
+
+#[test]
+fn discovers_and_toggles_codex_quoted_enabled_key() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    fs::write(
+        &config_path,
+        concat!(
+            "[plugins.safe-shell]\n",
+            "\"enabled\" = false # preserve this comment\n",
+        ),
+    )
+    .expect("write quoted-key Codex config");
+
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:plugin-config:config:safe-shell")
+        .expect("Codex plugin with quoted enabled key");
+    assert!(!item.enabled);
+
+    let applied = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(applied.status, ToggleStatus::Applied);
+    let rewritten = fs::read_to_string(config_path).expect("rewritten Codex config");
+    assert!(rewritten.contains("\"enabled\" = true # preserve this comment"));
+    assert!(!rewritten.contains("\nenabled = "));
 }
 
 #[test]
@@ -1897,6 +3284,57 @@ fn applies_codex_skill_native_config_toggle_without_moving_admin_source() {
     let restored_config = fs::read_to_string(&config_path).expect("restored Codex config");
     assert!(restored_config.contains("enabled = false"));
     assert!(skill_path.is_file());
+}
+
+#[test]
+fn blocks_codex_skill_toggle_when_native_config_has_duplicate_paths() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let skill_path = fixture_copy
+        .path()
+        .join("codex/admin/skills/example-codex-admin-skill/SKILL.md");
+    let config = fs::read_to_string(&config_path).expect("Codex config fixture");
+    fs::write(
+        &config_path,
+        format!(
+            "{config}\n[[skills.config]]\npath = {:?}\nenabled = true\n\n[[skills.config]]\npath = {:?}\nenabled = false\n",
+            skill_path.to_string_lossy(),
+            skill_path.to_string_lossy(),
+        ),
+    )
+    .expect("write duplicate Codex skill config");
+
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
+        .expect("Codex skill");
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: false,
+        backup_authentication_key: None,
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("duplicate skills.config path"))
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("unchanged Codex config"),
+        format!(
+            "{config}\n[[skills.config]]\npath = {:?}\nenabled = true\n\n[[skills.config]]\npath = {:?}\nenabled = false\n",
+            skill_path.to_string_lossy(),
+            skill_path.to_string_lossy(),
+        )
+    );
 }
 
 #[test]
@@ -2572,7 +4010,11 @@ fn shared_skills_move_to_vault_and_restore_origin() {
             apply: true,
             backup_authentication_key: Some(backup_authentication_key()),
         });
-        assert_eq!(enabled_apply.status, ToggleStatus::Applied, "{id}");
+        assert_eq!(
+            enabled_apply.status,
+            ToggleStatus::Applied,
+            "{id}: {enabled_apply:#?}"
+        );
         assert_eq!(
             fs::read_to_string(&original_skill_path).expect("re-enabled shared skill"),
             original,
@@ -4726,6 +6168,55 @@ fn applies_and_restores_claude_all_project_mcp_flag_enable() {
 }
 
 #[test]
+fn codex_toggle_ignores_enabled_assignments_inside_multiline_strings() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let original = fs::read_to_string(&config_path).expect("fixture config");
+    let multiline_values = concat!(
+        "description = \"\"\"\n",
+        "enabled = true\n",
+        "\"\"\"\n",
+        "literal_description = '''\n",
+        "enabled = true\n",
+        "'''\n",
+    );
+    let configured = original.replacen(
+        "[mcp_servers.github]\n",
+        &format!("[mcp_servers.github]\n{multiline_values}"),
+        1,
+    );
+    fs::write(&config_path, configured).expect("write multiline TOML fixture");
+
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:configured-mcp:github")
+        .expect("Codex MCP")
+        .clone();
+    assert!(item.enabled, "text inside multiline values is not state");
+
+    let applied = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(applied.status, ToggleStatus::Applied);
+
+    let rewritten = fs::read_to_string(config_path).expect("rewritten config");
+    assert!(
+        rewritten.contains(&format!(
+            "[mcp_servers.github]\nenabled = false\n{multiline_values}"
+        )),
+        "the real state must be inserted without rewriting multiline values:\n{rewritten}"
+    );
+}
+
+#[test]
 fn applies_and_restores_codex_configured_mcp_native_disable() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
@@ -4858,6 +6349,88 @@ fn native_codex_configured_mcp_toggle_ignores_legacy_vault_directory() {
     assert_eq!(entry["event"], "apply");
     assert_eq!(entry["selection"]["id"], item.id);
     assert_eq!(entry["targetEnabled"], false);
+}
+
+#[test]
+fn legacy_codex_vault_reenable_preserves_live_trailing_bytes() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let config_path = fixture_copy
+        .path()
+        .join("codex")
+        .join("global")
+        .join("config.toml");
+    let live_raw = "[plugins.safe-shell]\nenabled = true\r\n \t\r\n";
+    fs::write(&config_path, live_raw).expect("write live Codex config");
+
+    let vault_root = app_state_root
+        .join("vault/codex/global/configured-mcp")
+        .join("codex%3Aglobal%3Aconfigured-mcp%3Agithub");
+    let vault_payload = vault_root.join("payload");
+    fs::create_dir_all(&vault_root).expect("create legacy vault");
+    let section = "[mcp_servers.github]\r\ncommand = \"npx\"\r\n";
+    fs::write(&vault_payload, section).expect("write legacy vault payload");
+    fs::write(
+        vault_root.join("entry.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "version": 1,
+            "provider": "codex",
+            "kind": "configured-mcp",
+            "layer": "global",
+            "itemId": "codex:global:configured-mcp:github",
+            "displayName": "github",
+            "originalPath": config_path,
+            "vaultedPath": vault_payload,
+            "payloadKind": "text-payload"
+        }))
+        .expect("legacy vault entry"),
+    )
+    .expect("write legacy vault entry");
+
+    let roots =
+        DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(&app_state_root);
+    let item = discover_all(&roots)
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "codex:global:configured-mcp:github")
+        .expect("legacy vaulted Codex MCP");
+    assert!(!item.enabled);
+    assert_eq!(item.display_name, "github");
+    assert_eq!(item.source_path, config_path.to_string_lossy());
+    assert_eq!(
+        item.state_path,
+        vault_root.join("entry.json").to_string_lossy()
+    );
+
+    let applied = plan_toggle(TogglePlanInput {
+        app_state_root,
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(
+        applied.status,
+        ToggleStatus::Applied,
+        "{:?}",
+        applied.reason
+    );
+    let rewritten = fs::read_to_string(config_path).expect("reenabled Codex config");
+    assert!(
+        rewritten.ends_with("\r\n \t\r\n"),
+        "existing trailing bytes must remain at the end:\n{rewritten:?}"
+    );
+    assert!(
+        rewritten.contains(section),
+        "vaulted section bytes must be restored exactly:\n{rewritten:?}"
+    );
+    assert!(
+        rewritten.find(section).expect("restored section") < rewritten.len() - "\r\n \t\r\n".len(),
+        "the restored section must be inserted before the original trailing suffix"
+    );
 }
 
 #[test]
@@ -6883,6 +8456,53 @@ fn applies_and_restores_cursor_configured_mcp_workspace_disabled_state_enable() 
 }
 
 #[test]
+fn cursor_workspace_audit_failure_reports_committed_database_write_and_backup() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let cursor_root = fixture_copy.path().join("cursor").join("global");
+    let project_root = fixture_copy.path().join("cursor").join("project");
+    let database_path = write_cursor_workspace_disabled_servers(
+        &cursor_root,
+        &project_root,
+        &["user-modern-global", "user-other"],
+    );
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+        .expect("cursor workspace MCP");
+    fs::create_dir_all(app_state.path().join("audit/log.jsonl"))
+        .expect("audit log path that rejects append");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(result.status, ToggleStatus::RecoveryRequired);
+    let backup_id = result
+        .backup_id
+        .as_deref()
+        .expect("failed audit must retain the Cursor backup id");
+    assert!(app_state.path().join("backups").join(backup_id).is_dir());
+    assert!(
+        result
+            .writes
+            .as_deref()
+            .is_some_and(|writes| writes.contains("may already have been performed"))
+    );
+    assert_eq!(
+        read_cursor_workspace_disabled_servers(&database_path),
+        vec!["user-other".to_string()],
+        "the test must reach the post-commit audit failure"
+    );
+}
+
+#[test]
 fn cursor_workspace_toggle_plan_does_not_create_missing_database() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
@@ -6905,13 +8525,223 @@ fn cursor_workspace_toggle_plan_does_not_create_missing_database() {
 
     let result = plan_toggle(TogglePlanInput {
         app_state_root: app_state.path().to_path_buf(),
-        item,
+        item: item.clone(),
         apply: false,
         backup_authentication_key: None,
     });
 
     assert_eq!(result.status, ToggleStatus::Blocked);
     assert!(!database_path.exists());
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("workspace database not found"))
+    );
+    assert!(!database_path.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_workspace_toggle_rejects_symlinked_database() {
+    use std::os::unix::fs::symlink;
+
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let cursor_root = fixture_copy.path().join("cursor").join("global");
+    let project_root = fixture_copy.path().join("cursor").join("project");
+    let database_path = write_cursor_workspace_disabled_servers(
+        &cursor_root,
+        &project_root,
+        &["user-modern-global"],
+    );
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+        .expect("cursor workspace MCP");
+    let external_database = fixture_copy.path().join("external-state.vscdb");
+    fs::rename(&database_path, &external_database).expect("move workspace database");
+    symlink(&external_database, &database_path).expect("symlink workspace database");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: false,
+        backup_authentication_key: None,
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("database path is a symlink"))
+    );
+    assert_eq!(
+        read_cursor_workspace_disabled_servers(&external_database),
+        vec!["user-modern-global".to_string()]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cursor_workspace_toggle_rejects_symlinked_database_parent() {
+    use std::os::unix::fs::symlink;
+
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let cursor_root = fixture_copy.path().join("cursor").join("global");
+    let project_root = fixture_copy.path().join("cursor").join("project");
+    let database_path = write_cursor_workspace_disabled_servers(
+        &cursor_root,
+        &project_root,
+        &["user-modern-global"],
+    );
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+        .expect("cursor workspace MCP");
+    let database_parent = database_path.parent().expect("database parent");
+    let external_parent = fixture_copy.path().join("external-workspace-state");
+    fs::rename(database_parent, &external_parent).expect("move workspace database parent");
+    symlink(&external_parent, database_parent).expect("symlink workspace database parent");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: false,
+        backup_authentication_key: None,
+    });
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("mutation target parent contains a symlink"))
+    );
+    assert_eq!(
+        read_cursor_workspace_disabled_servers(&external_parent.join("state.vscdb")),
+        vec!["user-modern-global".to_string()]
+    );
+}
+
+#[test]
+fn cursor_workspace_toggle_reports_host_busy_without_writes() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let cursor_root = fixture_copy.path().join("cursor").join("global");
+    let project_root = fixture_copy.path().join("cursor").join("project");
+    let database_path = write_cursor_workspace_disabled_servers(
+        &cursor_root,
+        &project_root,
+        &["user-modern-global"],
+    );
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+        .expect("cursor workspace MCP");
+
+    let blocker = Connection::open(&database_path).expect("open blocker connection");
+    blocker
+        .execute_batch("BEGIN EXCLUSIVE")
+        .expect("lock Cursor workspace database");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("unlock Cursor workspace database");
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cursor-host-busy"))
+    );
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("close Cursor"))
+    );
+    assert!(!app_state.path().join("backups").exists());
+}
+
+#[test]
+fn cursor_workspace_toggle_reserves_write_before_creating_backup() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let cursor_root = fixture_copy.path().join("cursor").join("global");
+    let project_root = fixture_copy.path().join("cursor").join("project");
+    let database_path = write_cursor_workspace_disabled_servers(
+        &cursor_root,
+        &project_root,
+        &["user-modern-global", "user-other"],
+    );
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+        .expect("cursor workspace MCP");
+
+    let blocker = Connection::open(&database_path).expect("open blocker connection");
+    blocker
+        .execute_batch("BEGIN IMMEDIATE")
+        .expect("reserve Cursor workspace database write access");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    blocker
+        .execute_batch("ROLLBACK")
+        .expect("unlock Cursor workspace database");
+
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("cursor-host-busy"))
+    );
+    assert!(
+        !app_state.path().join("backups").exists(),
+        "write reservation failure must happen before backup artifacts are created"
+    );
+    assert_eq!(
+        read_cursor_workspace_disabled_servers(&database_path),
+        vec!["user-modern-global".to_string(), "user-other".to_string()]
+    );
 }
 
 #[test]
@@ -8005,6 +9835,53 @@ fn restore_rejects_file_target_replaced_by_symlink() {
     assert_eq!(
         fs::read_link(&target_path).expect("target remains symlink"),
         external_file
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn restore_rejects_file_target_with_symlinked_parent() {
+    use std::os::unix::fs::symlink;
+
+    let app_state = TempDir::new().expect("temp app state");
+    let live_root = app_state.path().join("live");
+    let external_parent = app_state.path().join("external-live");
+    let linked_parent = live_root.join("linked");
+    let target_path = linked_parent.join("settings.json");
+    let external_file = external_parent.join("settings.json");
+    let backup_root = app_state
+        .path()
+        .join("backups")
+        .join("backup-file-parent-symlink");
+    fs::create_dir_all(&live_root).expect("live root");
+    fs::create_dir_all(&external_parent).expect("external parent");
+    fs::create_dir_all(backup_root.join("entries/entry-1")).expect("backup entry");
+    fs::write(&external_file, "external live\n").expect("external file");
+    fs::write(
+        backup_root.join("entries/entry-1/payload"),
+        "backup payload\n",
+    )
+    .expect("backup payload");
+    symlink(&external_parent, &linked_parent).expect("symlinked restore target parent");
+    write_file_restore_manifest(&backup_root, "backup-file-parent-symlink", &target_path);
+    authenticate_backup(app_state.path(), "backup-file-parent-symlink");
+
+    let restored = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: "backup-file-parent-symlink".to_string(),
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+
+    assert_eq!(restored.status, RestoreStatus::Failed);
+    assert!(
+        restored
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.contains("mutation target parent contains a symlink"))
+    );
+    assert_eq!(
+        fs::read_to_string(&external_file).expect("external file unchanged"),
+        "external live\n"
     );
 }
 

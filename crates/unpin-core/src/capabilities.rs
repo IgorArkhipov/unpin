@@ -9,8 +9,8 @@ use serde_json::Value;
 pub use crate::providers::registry::{CAPABILITY_ROWS, CapabilityRow};
 
 use crate::{
-    discovery::parse_codex_table_header, pi_packages::pi_package_extension_state,
-    providers::registry::provider_registry,
+    pi_packages::pi_package_extension_state, providers::registry::provider_registry,
+    toml_syntax::table_header,
 };
 
 const CAPABILITY_FIELDS: &[&str] = &[
@@ -660,12 +660,13 @@ fn validate_codex_config(raw: &str) -> Vec<String> {
 }
 
 fn valid_codex_section_header(line: &str) -> bool {
-    let Some(header) = parse_codex_table_header(line) else {
+    let Some(header) = table_header(line) else {
         return false;
     };
 
     ["plugins.", "mcp_servers."].iter().any(|prefix| {
         header
+            .name
             .strip_prefix(prefix)
             .is_some_and(|path| !path.is_empty() && !path.starts_with('.') && !path.ends_with('.'))
     })

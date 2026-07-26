@@ -165,18 +165,20 @@ fn change(options: GatewayChangeOptions, action: GatewayModeAction) -> ExitCode 
         Err(error) => return command_error_exit(options.target.json, "failed", &error),
     };
     let fixture_mode = options.target.roots.fixture_root.is_some();
-    let backup_authentication_key =
-        match credentials::resolve_backup_authentication_key(fixture_mode) {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                return command_error_exit(
-                    options.target.json,
-                    "blocked",
-                    "backup authentication key missing; run `unpin auth backup init`",
-                );
-            }
-            Err(error) => return command_error_exit(options.target.json, "blocked", &error),
-        };
+    let backup_authentication_key = match credentials::resolve_backup_authentication_key(
+        fixture_mode,
+        &context.config.app_state_root,
+    ) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return command_error_exit(
+                options.target.json,
+                "blocked",
+                "backup authentication key missing; run `unpin auth backup init`",
+            );
+        }
+        Err(error) => return command_error_exit(options.target.json, "blocked", &error),
+    };
     let workflow_controller = GatewayWorkflowController::with_authority_keys(
         &context.config.app_state_root,
         context.session_authority_key.clone(),
@@ -360,11 +362,11 @@ struct GatewayContext {
 
 fn gateway_context(options: &GatewayTargetOptions) -> Result<GatewayContext, String> {
     let config = resolve_config(&options.roots, options.app_state_root.clone())?;
-    let authority_key =
-        credentials::resolve_session_authority_key(options.roots.fixture_root.is_some())?
-            .ok_or_else(|| {
-                "session authority key missing; run `unpin auth session init`".to_string()
-            })?;
+    let authority_key = credentials::resolve_session_authority_key(
+        options.roots.fixture_root.is_some(),
+        &config.app_state_root,
+    )?
+    .ok_or_else(|| "session authority key missing; run `unpin auth session init`".to_string())?;
     let provider = options
         .provider
         .as_deref()

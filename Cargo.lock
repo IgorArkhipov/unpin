@@ -3086,6 +3086,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "time",
+ "zeroize",
 ]
 
 [[package]]

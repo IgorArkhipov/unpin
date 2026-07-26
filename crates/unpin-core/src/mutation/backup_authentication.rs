@@ -8,11 +8,12 @@ use std::{
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use super::{
     BACKUP_AUTHENTICATION_ALGORITHM, BACKUP_MANIFEST_VERSION, BackupAuthenticity, BackupManifest,
-    BackupPayloadDigest, LEGACY_AUTHENTICATED_BACKUP_MANIFEST_VERSION, backup_payload_path,
-    decode_hex, encode_hex, validate_backup_payload_evidence,
+    BackupPayloadDigest, backup_payload_path, decode_hex, encode_hex,
+    validate_backup_payload_evidence,
 };
 
 const BACKUP_MANIFEST_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-backup-manifest-authentication-v3\0";
@@ -87,7 +88,7 @@ impl std::fmt::Debug for BackupAuthenticationKey {
 
 impl Drop for BackupAuthenticationKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -194,6 +195,12 @@ pub(super) fn verify_backup_authentication(
     manifest: &BackupManifest,
     backup_authentication_key: &BackupAuthenticationKey,
 ) -> Result<(), String> {
+    if manifest.version != BACKUP_MANIFEST_VERSION {
+        return Err(format!(
+            "unsupported backup manifest version: {}",
+            manifest.version
+        ));
+    }
     let authenticity = manifest
         .authenticity
         .as_ref()
@@ -203,23 +210,13 @@ pub(super) fn verify_backup_authentication(
     }
 
     let message = backup_authentication_message(manifest)?;
-    if manifest.version == LEGACY_AUTHENTICATED_BACKUP_MANIFEST_VERSION {
-        let tag = decode_hex(&authenticity.tag)?;
-        let mut mac =
-            <Hmac<Sha256> as KeyInit>::new_from_slice(backup_authentication_key.as_bytes())
-                .map_err(|error| error.to_string())?;
-        mac.update(&message);
-        mac.verify_slice(&tag)
-            .map_err(|_| "backup manifest authentication failed".to_string())?;
-    } else {
-        backup_authentication_key
-            .verify_purpose(
-                BACKUP_MANIFEST_AUTHENTICATION_PURPOSE,
-                &message,
-                &authenticity.tag,
-            )
-            .map_err(|_| "backup manifest authentication failed".to_string())?;
-    }
+    backup_authentication_key
+        .verify_purpose(
+            BACKUP_MANIFEST_AUTHENTICATION_PURPOSE,
+            &message,
+            &authenticity.tag,
+        )
+        .map_err(|_| "backup manifest authentication failed".to_string())?;
 
     let payload_digests = calculate_backup_payload_digests(backup_root, manifest)
         .map_err(|error| error.to_string())?;
@@ -355,7 +352,6 @@ fn native_path_bytes(path: &Path) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::LEGACY_BACKUP_AUTHENTICATION_ALGORITHM;
     use super::*;
     use crate::discovery::{
         DiscoveryCategory, DiscoveryItem, DiscoveryKind, DiscoveryLayer, DiscoveryMutability,
@@ -365,7 +361,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn version_three_authentication_vector_stays_stable() {
+    fn version_three_authentication_vector_stays_stable_and_rejects_version_two() {
         let app_state = TempDir::new().expect("temp app state");
         let backup_root = app_state.path().join("backups/backup-vector");
         let payload_path = backup_root.join("entries/entry-1/payload");
@@ -415,16 +411,18 @@ mod tests {
         verify_backup_authentication(&backup_root, &manifest, &key)
             .expect("verify purpose-bound manifest");
         let mut legacy = manifest.clone();
-        legacy.version = LEGACY_AUTHENTICATED_BACKUP_MANIFEST_VERSION;
+        legacy.version = 2;
         let legacy_authenticity = legacy.authenticity.as_mut().expect("backup authenticity");
-        legacy_authenticity.algorithm = LEGACY_BACKUP_AUTHENTICATION_ALGORITHM.to_string();
+        legacy_authenticity.algorithm = "hmac-sha256".to_string();
         legacy_authenticity.tag.clear();
         let legacy_message = backup_authentication_message(&legacy).expect("legacy message");
         let mut legacy_mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key.as_bytes()).unwrap();
         legacy_mac.update(&legacy_message);
         legacy.authenticity.as_mut().unwrap().tag = encode_hex(&legacy_mac.finalize().into_bytes());
-        verify_backup_authentication(&backup_root, &legacy, &key)
-            .expect("verify compatible version-two manifest");
+        assert_eq!(
+            verify_backup_authentication(&backup_root, &legacy, &key),
+            Err("unsupported backup manifest version: 2".to_string())
+        );
 
         let authenticity = manifest.authenticity.as_ref().expect("backup authenticity");
 

@@ -151,6 +151,10 @@ An exact retry may return a cached terminal result only after revalidating
 current state. Divergence becomes `recovery-required`; it is never reported as
 success.
 
+Native toggle failures after backup creation also return
+`recovery-required`, including the backup ID and a possible-write warning.
+Inspect or restore that backup before attempting another mutation.
+
 ### Backups and restore
 
 New provider mutation backups use manifest v3. The manifest authentication is
@@ -168,6 +172,22 @@ not claim strict enforcement when the provider adapter cannot prove it.
 
 MCP is a control plane, not an approval oracle. It can inventory and prepare
 reviewed handoffs, but persistent writes are completed through the CLI or TUI.
+
+### Session diagnostics
+
+Use `unpin auth session status`, `unpin session list --json`, and
+`unpin gateway status --scope workspace --json` from the affected physical
+worktree. The session inventory is deliberately worktree-scoped and redacted.
+Compare desired and observed exposure revisions, then inspect `liveStatus`,
+`coverage`, `lifecycle`, and `inFlightCalls`; degraded coverage or matching
+revision strings alone must not be described as verified native attachment.
+
+Session shutdown is plan-first through `unpin session end --id SESSION_ID
+--json`, followed by the exact `--apply --confirm --plan-fingerprint` handoff.
+Fencing closes admission, while the owner process retains cleanup
+responsibility. Never repair a session by deleting Unpin-owned lease, overlay,
+transaction, backup, or audit files. Preserve those files and stop when the
+terminal status is `recovery-required`.
 
 ## Guided code tour
 
@@ -223,7 +243,7 @@ focused changes and run the nearest integration suite when touching these areas:
    cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
    cargo test --workspace --all-features --locked
    cargo run -p unpin-cli --locked -- --help
-   cargo audit --no-yanked
+   cargo audit --deny warnings
    cargo machete
    ```
 
@@ -234,5 +254,6 @@ focused changes and run the nearest integration suite when touching these areas:
 Automated tests and examples must never read or mutate real home-directory
 provider state. Use committed fixtures and temporary directories, and never use
 `.env*` files. The explicit local matrix is the exception for read-only host
-validation: it hashes live paths before and after no-write plans, persists only
-aggregates, and performs all mutations against isolated fixture copies.
+validation: it hashes each selected item's live source/state paths immediately
+before and after its no-write plan, persists only aggregates, and performs all
+mutations against isolated fixture copies.

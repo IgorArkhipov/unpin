@@ -33,6 +33,10 @@ Do not reintroduce legacy app-version support or historical provider paths unles
 - Do not read or mutate real home-directory provider state in tests or examples.
 - Use committed fixtures and temporary directories for discovery and mutation tests.
 - Any write path should preserve the safety model: dry-run planning, explicit confirmation where appropriate, locking/drift protection, backup evidence, audit evidence, and restore behavior.
+- Treat repository-owned `.unpin.json` as untrusted. It must never select
+  `projectRoot`, `appStateRoot`, or `cursorRoot`, or otherwise redirect
+  discovery, provider mutation, approval, policy, backup, session, or audit
+  state; those roots belong to user config or explicit CLI overrides.
 - Do not log secrets, private paths beyond what tests intentionally create, or provider payloads that could contain sensitive user data.
 - Ask before adding runtime dependencies.
 
@@ -66,7 +70,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run -p unpin-cli --locked -- --help
-cargo audit --no-yanked
+cargo audit --deny warnings
+cargo deny check
 cargo machete
 ```
 

@@ -1,19 +1,30 @@
-use std::{fmt, path::PathBuf};
+use std::{collections::BTreeMap, fmt, path::PathBuf};
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use zeroize::Zeroize;
 
 use crate::{
-    config::get_approval_nonce_path,
-    state::atomic_json::{AtomicJsonStore, OwnerGeneration, StateError},
+    config::{
+        get_approval_nonce_ledger_path, get_approval_nonce_ledger_shard_path,
+        get_approval_nonce_path,
+    },
+    state::atomic_json::{AtomicJsonStore, OwnerGeneration, StateError, StateSnapshot},
 };
 
 const APPROVAL_RECEIPT_VERSION: u32 = 1;
 const APPROVAL_ALGORITHM: &str = "hmac-sha256";
 const APPROVAL_KEY_PURPOSE: &[u8] = b"unpin-transition-approval-v1\0";
 const NONCE_SCHEMA_VERSION: u32 = 1;
+const NONCE_LEDGER_UPDATE_ATTEMPTS: usize = 32;
 pub const MAX_APPROVAL_LIFETIME_SECONDS: i64 = 15 * 60;
+/// Retains consumed approvals beyond their short receipt lifetime so durable
+/// transitions can recover, while a later consumption prunes older evidence.
+pub const APPROVAL_NONCE_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+/// Bounds each ledger-shard rewrite cost and fails closed instead of allowing
+/// unbounded approval history to exhaust memory or disk.
+pub const MAX_APPROVAL_NONCE_LEDGER_ENTRIES: usize = 4_096;
 pub const CONTROL_APPROVAL_ISSUER: &str = "unpin-cli-human";
 pub const CONTROL_APPROVAL_AUDIENCE: &str = "unpin-core-control";
 
@@ -53,7 +64,7 @@ impl fmt::Debug for ApprovalKey {
 
 impl Drop for ApprovalKey {
     fn drop(&mut self) {
-        self.0.fill(0);
+        self.0.zeroize();
     }
 }
 
@@ -422,6 +433,12 @@ struct ConsumedNonce {
     consumed_at_unix: i64,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ConsumedNonceLedger {
+    entries: BTreeMap<String, ConsumedNonce>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ApprovalNonceStore {
     app_state_root: PathBuf,
@@ -448,31 +465,130 @@ impl ApprovalNonceStore {
             return Err(ApprovalError::Expired);
         }
         let nonce_digest = crate::encode_lower_hex(&Sha256::digest(approval.nonce.as_bytes()));
-        let store = AtomicJsonStore::new(
-            get_approval_nonce_path(&self.app_state_root, &nonce_digest),
-            NONCE_SCHEMA_VERSION,
-        );
         let record = ConsumedNonce {
             operation_id: approval.operation_id.clone(),
             decision_digest: approval.decision_digest.clone(),
             consumed_at_unix,
         };
-        match store.compare_and_swap(None, owner, &record) {
-            Ok(_) => Ok(NonceConsumption::Consumed),
-            Err(StateError::StaleRevision { .. }) => {
-                let existing = store
-                    .load::<ConsumedNonce>()?
-                    .ok_or(ApprovalError::NonceStateMissing)?;
-                if existing.value.operation_id == record.operation_id
-                    && existing.value.decision_digest == record.decision_digest
-                {
-                    Ok(NonceConsumption::AttachedToSameOperation)
-                } else {
-                    Err(ApprovalError::Replay)
-                }
-            }
-            Err(error) => Err(error.into()),
+        let legacy = self.legacy_nonce(&nonce_digest)?;
+        let recovery_cutoff = consumed_at_unix.saturating_sub(APPROVAL_NONCE_RETENTION_SECONDS);
+        let recovery = self
+            .recovery_nonce(&nonce_digest)?
+            .filter(|consumed| consumed.consumed_at_unix >= recovery_cutoff);
+        let active_cutoff = consumed_at_unix.saturating_sub(MAX_APPROVAL_LIFETIME_SECONDS);
+        let active = self
+            .active_ledger_nonce(&nonce_digest)?
+            .filter(|consumed| consumed.consumed_at_unix > active_cutoff);
+        let mut canonical = Some(record);
+        for candidate in [
+            active,
+            recovery.clone(),
+            legacy.as_ref().map(|snapshot| snapshot.value.clone()),
+        ] {
+            canonical = reconcile_consumed_nonce(canonical, candidate)?;
         }
+        let record = canonical.expect("new nonce record is always present");
+        let mut recovery_entries = BTreeMap::new();
+        recovery_entries.insert(nonce_digest.clone(), record.clone());
+        self.merge_recovery_entries(&recovery_entries, &owner, recovery_cutoff)?;
+        let consumption = self.reserve_active_nonce(
+            &nonce_digest,
+            &record,
+            consumed_at_unix,
+            &owner,
+            &legacy,
+            &recovery,
+        )?;
+        if let Some(legacy) = &legacy {
+            let _ = self
+                .legacy_store(&nonce_digest)
+                .remove_if_revision(&legacy.revision);
+        }
+        Ok(consumption)
+    }
+
+    fn reserve_active_nonce(
+        &self,
+        nonce_digest: &str,
+        record: &ConsumedNonce,
+        consumed_at_unix: i64,
+        owner: &OwnerGeneration,
+        legacy: &Option<StateSnapshot<ConsumedNonce>>,
+        recovery: &Option<ConsumedNonce>,
+    ) -> Result<NonceConsumption, ApprovalError> {
+        let store = self.active_ledger_store();
+        let active_cutoff = consumed_at_unix.saturating_sub(MAX_APPROVAL_LIFETIME_SECONDS);
+        let recovery_cutoff = consumed_at_unix.saturating_sub(APPROVAL_NONCE_RETENTION_SECONDS);
+        let mut last_stale = None;
+
+        for _ in 0..NONCE_LEDGER_UPDATE_ATTEMPTS {
+            let snapshot = store.load::<ConsumedNonceLedger>()?;
+            let expected = snapshot.as_ref().map(|snapshot| snapshot.revision.clone());
+            let current_owner = snapshot.as_ref().map(|snapshot| snapshot.owner.clone());
+            let mut ledger =
+                snapshot.map_or_else(ConsumedNonceLedger::default, |value| value.value);
+            validate_nonce_ledger(&ledger, None)?;
+            let recovery_entries = ledger
+                .entries
+                .iter()
+                .filter(|(_, consumed)| {
+                    consumed.consumed_at_unix <= active_cutoff
+                        && consumed.consumed_at_unix >= recovery_cutoff
+                })
+                .map(|(nonce_digest, consumed)| (nonce_digest.clone(), consumed.clone()))
+                .collect::<BTreeMap<_, _>>();
+            self.merge_recovery_entries(&recovery_entries, owner, recovery_cutoff)?;
+            let original_len = ledger.entries.len();
+            ledger
+                .entries
+                .retain(|_, consumed| consumed.consumed_at_unix > active_cutoff);
+            let pruned = ledger.entries.len() != original_len;
+
+            let mut existing = None;
+            for candidate in [
+                ledger.entries.get(nonce_digest).cloned(),
+                recovery_entries.get(nonce_digest).cloned(),
+                recovery.clone(),
+                legacy.as_ref().map(|snapshot| snapshot.value.clone()),
+            ] {
+                existing = reconcile_consumed_nonce(existing, candidate)?;
+            }
+            let consumption = match existing {
+                Some(existing) if same_nonce_decision(&existing, record) => {
+                    if !pruned && ledger.entries.get(nonce_digest) == Some(&existing) {
+                        return Ok(NonceConsumption::AttachedToSameOperation);
+                    }
+                    if !ledger.entries.contains_key(nonce_digest)
+                        && ledger.entries.len() >= MAX_APPROVAL_NONCE_LEDGER_ENTRIES
+                    {
+                        return Err(ApprovalError::NonceLedgerCapacity);
+                    }
+                    ledger.entries.insert(nonce_digest.to_string(), existing);
+                    NonceConsumption::AttachedToSameOperation
+                }
+                Some(_) => return Err(ApprovalError::Replay),
+                None => {
+                    if ledger.entries.len() >= MAX_APPROVAL_NONCE_LEDGER_ENTRIES {
+                        return Err(ApprovalError::NonceLedgerCapacity);
+                    }
+                    ledger
+                        .entries
+                        .insert(nonce_digest.to_string(), record.clone());
+                    NonceConsumption::Consumed
+                }
+            };
+
+            let ledger_owner = nonce_ledger_owner(current_owner.as_ref(), owner)?;
+            match store.compare_and_swap(expected.as_ref(), ledger_owner, &ledger) {
+                Ok(_) => return Ok(consumption),
+                Err(error @ StateError::StaleRevision { .. }) => last_stale = Some(error),
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(last_stale
+            .expect("nonce ledger update attempts record stale state")
+            .into())
     }
 
     pub fn attach_existing(
@@ -480,23 +596,227 @@ impl ApprovalNonceStore {
         approval: &VerifiedApproval,
     ) -> Result<NonceConsumption, ApprovalError> {
         let nonce_digest = crate::encode_lower_hex(&Sha256::digest(approval.nonce.as_bytes()));
-        let store = AtomicJsonStore::new(
-            get_approval_nonce_path(&self.app_state_root, &nonce_digest),
-            NONCE_SCHEMA_VERSION,
-        );
-        let existing = store
-            .load::<ConsumedNonce>()?
-            .ok_or(ApprovalError::NonceNotConsumed)?;
-        if existing.value.operation_id == approval.operation_id
-            && existing.value.decision_digest == approval.decision_digest
-            && existing.value.consumed_at_unix >= approval.issued_at_unix
-            && existing.value.consumed_at_unix < approval.expires_at_unix
+        let mut existing = None;
+        for candidate in [
+            self.recovery_nonce(&nonce_digest)?,
+            self.active_ledger_nonce(&nonce_digest)?,
+            self.legacy_nonce(&nonce_digest)?
+                .map(|snapshot| snapshot.value),
+        ] {
+            existing = reconcile_consumed_nonce(existing, candidate)?;
+        }
+        let existing = existing.ok_or(ApprovalError::NonceNotConsumed)?;
+        if existing.operation_id == approval.operation_id
+            && existing.decision_digest == approval.decision_digest
+            && existing.consumed_at_unix >= approval.issued_at_unix
+            && existing.consumed_at_unix < approval.expires_at_unix
         {
             Ok(NonceConsumption::AttachedToSameOperation)
         } else {
             Err(ApprovalError::Replay)
         }
     }
+
+    fn ledger_store(&self, nonce_digest: &str) -> Result<AtomicJsonStore, ApprovalError> {
+        let shard = nonce_ledger_shard(nonce_digest)?;
+        Ok(AtomicJsonStore::new(
+            get_approval_nonce_ledger_shard_path(&self.app_state_root, shard),
+            NONCE_SCHEMA_VERSION,
+        ))
+    }
+
+    fn active_ledger_store(&self) -> AtomicJsonStore {
+        AtomicJsonStore::new(
+            get_approval_nonce_ledger_path(&self.app_state_root),
+            NONCE_SCHEMA_VERSION,
+        )
+    }
+
+    fn active_ledger_nonce(
+        &self,
+        nonce_digest: &str,
+    ) -> Result<Option<ConsumedNonce>, ApprovalError> {
+        let Some(snapshot) = self.active_ledger_store().load::<ConsumedNonceLedger>()? else {
+            return Ok(None);
+        };
+        validate_nonce_ledger(&snapshot.value, None)?;
+        Ok(snapshot.value.entries.get(nonce_digest).cloned())
+    }
+
+    fn recovery_nonce(&self, nonce_digest: &str) -> Result<Option<ConsumedNonce>, ApprovalError> {
+        let Some(snapshot) = self
+            .ledger_store(nonce_digest)?
+            .load::<ConsumedNonceLedger>()?
+        else {
+            return Ok(None);
+        };
+        validate_nonce_ledger(&snapshot.value, Some(nonce_ledger_shard(nonce_digest)?))?;
+        Ok(snapshot.value.entries.get(nonce_digest).cloned())
+    }
+
+    fn merge_recovery_entries(
+        &self,
+        entries: &BTreeMap<String, ConsumedNonce>,
+        owner: &OwnerGeneration,
+        cutoff: i64,
+    ) -> Result<(), ApprovalError> {
+        let mut shards = BTreeMap::<String, BTreeMap<String, ConsumedNonce>>::new();
+        for (nonce_digest, consumed) in entries {
+            shards
+                .entry(nonce_ledger_shard(nonce_digest)?.to_string())
+                .or_default()
+                .insert(nonce_digest.clone(), consumed.clone());
+        }
+        for entries in shards.values() {
+            self.merge_recovery_shard(entries, owner, cutoff)?;
+        }
+        Ok(())
+    }
+
+    fn merge_recovery_shard(
+        &self,
+        entries: &BTreeMap<String, ConsumedNonce>,
+        owner: &OwnerGeneration,
+        cutoff: i64,
+    ) -> Result<(), ApprovalError> {
+        let Some((nonce_digest, _)) = entries.first_key_value() else {
+            return Ok(());
+        };
+        let shard = nonce_ledger_shard(nonce_digest)?;
+        let store = self.ledger_store(nonce_digest)?;
+        let mut last_stale = None;
+
+        for _ in 0..NONCE_LEDGER_UPDATE_ATTEMPTS {
+            let snapshot = store.load::<ConsumedNonceLedger>()?;
+            let expected = snapshot.as_ref().map(|snapshot| snapshot.revision.clone());
+            let current_owner = snapshot.as_ref().map(|snapshot| snapshot.owner.clone());
+            let mut ledger =
+                snapshot.map_or_else(ConsumedNonceLedger::default, |value| value.value);
+            validate_nonce_ledger(&ledger, Some(shard))?;
+            let original_len = ledger.entries.len();
+            ledger
+                .entries
+                .retain(|_, consumed| consumed.consumed_at_unix >= cutoff);
+            let mut changed = ledger.entries.len() != original_len;
+            for (nonce_digest, consumed) in entries {
+                match ledger.entries.get(nonce_digest).cloned() {
+                    Some(existing) => {
+                        let canonical = reconcile_consumed_nonce(
+                            Some(existing.clone()),
+                            Some(consumed.clone()),
+                        )?
+                        .expect("two nonce records reconcile to one record");
+                        if canonical != existing {
+                            ledger.entries.insert(nonce_digest.clone(), canonical);
+                            changed = true;
+                        }
+                    }
+                    None => {
+                        if ledger.entries.len() >= MAX_APPROVAL_NONCE_LEDGER_ENTRIES {
+                            return Err(ApprovalError::NonceLedgerCapacity);
+                        }
+                        ledger
+                            .entries
+                            .insert(nonce_digest.clone(), consumed.clone());
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                return Ok(());
+            }
+
+            let ledger_owner = nonce_ledger_owner(current_owner.as_ref(), owner)?;
+            match store.compare_and_swap(expected.as_ref(), ledger_owner, &ledger) {
+                Ok(_) => return Ok(()),
+                Err(error @ StateError::StaleRevision { .. }) => last_stale = Some(error),
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        Err(last_stale
+            .expect("nonce recovery ledger update attempts record stale state")
+            .into())
+    }
+
+    fn legacy_store(&self, nonce_digest: &str) -> AtomicJsonStore {
+        AtomicJsonStore::new(
+            get_approval_nonce_path(&self.app_state_root, nonce_digest),
+            NONCE_SCHEMA_VERSION,
+        )
+    }
+
+    fn legacy_nonce(
+        &self,
+        nonce_digest: &str,
+    ) -> Result<Option<StateSnapshot<ConsumedNonce>>, ApprovalError> {
+        self.legacy_store(nonce_digest)
+            .load::<ConsumedNonce>()
+            .map_err(Into::into)
+    }
+}
+
+fn same_nonce_decision(left: &ConsumedNonce, right: &ConsumedNonce) -> bool {
+    left.operation_id == right.operation_id && left.decision_digest == right.decision_digest
+}
+
+fn reconcile_consumed_nonce(
+    existing: Option<ConsumedNonce>,
+    candidate: Option<ConsumedNonce>,
+) -> Result<Option<ConsumedNonce>, ApprovalError> {
+    match (existing, candidate) {
+        (Some(existing), Some(candidate)) if same_nonce_decision(&existing, &candidate) => {
+            if candidate.consumed_at_unix < existing.consumed_at_unix {
+                Ok(Some(candidate))
+            } else {
+                Ok(Some(existing))
+            }
+        }
+        (Some(_), Some(_)) => Err(ApprovalError::Replay),
+        (Some(existing), None) => Ok(Some(existing)),
+        (None, Some(candidate)) => Ok(Some(candidate)),
+        (None, None) => Ok(None),
+    }
+}
+
+fn nonce_ledger_shard(nonce_digest: &str) -> Result<&str, ApprovalError> {
+    if nonce_digest.len() != 64
+        || !nonce_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(ApprovalError::InvalidNonceLedger);
+    }
+    Ok(&nonce_digest[..2])
+}
+
+fn validate_nonce_ledger(
+    ledger: &ConsumedNonceLedger,
+    expected_shard: Option<&str>,
+) -> Result<(), ApprovalError> {
+    for nonce_digest in ledger.entries.keys() {
+        let shard = nonce_ledger_shard(nonce_digest)?;
+        if expected_shard.is_some_and(|expected| expected != shard) {
+            return Err(ApprovalError::InvalidNonceLedger);
+        }
+    }
+    Ok(())
+}
+
+fn nonce_ledger_owner(
+    current: Option<&OwnerGeneration>,
+    requested: &OwnerGeneration,
+) -> Result<OwnerGeneration, ApprovalError> {
+    let generation = current.map_or(requested.generation, |current| {
+        if current.owner_id == requested.owner_id {
+            requested.generation.max(current.generation)
+        } else {
+            requested
+                .generation
+                .max(current.generation.saturating_add(1))
+        }
+    });
+    OwnerGeneration::new(requested.owner_id.clone(), generation).map_err(Into::into)
 }
 
 fn sign_claims(key: &ApprovalKey, claims: &ApprovalReceiptClaims) -> Result<String, ApprovalError> {
@@ -604,6 +924,8 @@ pub enum ApprovalError {
     Replay,
     NonceStateMissing,
     NonceNotConsumed,
+    NonceLedgerCapacity,
+    InvalidNonceLedger,
     State(StateError),
 }
 
@@ -647,6 +969,12 @@ impl fmt::Display for ApprovalError {
                 formatter.write_str("approval nonce state disappeared after consumption")
             }
             Self::NonceNotConsumed => formatter.write_str("approval nonce has not been consumed"),
+            Self::NonceLedgerCapacity => {
+                formatter.write_str("approval nonce ledger reached its safe capacity")
+            }
+            Self::InvalidNonceLedger => {
+                formatter.write_str("approval nonce ledger contains an invalid entry")
+            }
             Self::State(error) => error.fmt(formatter),
         }
     }

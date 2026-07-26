@@ -30,6 +30,7 @@ from local_provider_matrix_support import (
     MATRIX,
     REPO_ROOT,
     SCREENSHOTS,
+    MatrixCommandTimeout,
     MatrixFailure,
     digest_path,
     installed_hosts,
@@ -47,6 +48,7 @@ from local_provider_matrix_support import (
 )
 
 REPOSITORY_TMP_ROOT = (REPO_ROOT / "tmp").resolve()
+QUALITY_GATE_TIMEOUT_SECONDS = 1_200
 
 
 def count_inventory(items: list[dict[str, Any]]) -> dict[str, Any]:
@@ -66,22 +68,19 @@ def count_inventory(items: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
-def inventory_paths(items: list[dict[str, Any]]) -> list[Path]:
-    candidates = {
-        Path(os.path.abspath(Path(item[field]).expanduser()))
-        for item in items
-        for field in ("sourcePath", "statePath")
-        if item.get(field)
-    }
-    minimal: list[Path] = []
-    for candidate in sorted(candidates, key=lambda path: (len(path.parts), path.as_posix())):
-        if not any(candidate == parent or candidate.is_relative_to(parent) for parent in minimal):
-            minimal.append(candidate)
-    return minimal
-
-
 def digest_paths(paths: list[Path]) -> dict[str, str]:
     return {str(path): digest_path(path) for path in paths}
+
+
+def live_plan_state_paths(item: dict[str, Any]) -> list[Path]:
+    return sorted(
+        {
+            Path(os.path.abspath(Path(item[field]).expanduser()))
+            for field in ("sourcePath", "statePath")
+            if item.get(field)
+        },
+        key=lambda path: path.as_posix(),
+    )
 
 
 def inventory_item_paths(item: dict[str, Any]) -> list[Path]:
@@ -181,8 +180,6 @@ def capture_live_inventory(
             excluded_items[reason] += 1
         else:
             items.append(item)
-    provider_paths = inventory_paths(items)
-    provider_baseline = digest_paths(provider_paths)
     plans: list[dict[str, Any]] = []
     provider_state_unchanged = True
     for scenario in MATRIX:
@@ -224,12 +221,8 @@ def capture_live_inventory(
                 )
             )
         selected = candidates[0]
-        state_paths = {
-            Path(os.path.abspath(Path(selected["statePath"]).expanduser())),
-            Path(os.path.abspath(Path(selected["sourcePath"]).expanduser())),
-        }
-        if digest_paths(provider_paths) != provider_baseline:
-            raise MatrixFailure("live provider state drifted before dry-run plan")
+        state_paths = live_plan_state_paths(selected)
+        selected_baseline = digest_paths(state_paths)
         command: list[str | Path] = [
             binary,
             "toggle",
@@ -283,8 +276,8 @@ def capture_live_inventory(
                 for known in state_paths
             )
         ]
-        current_provider_digests = digest_paths(provider_paths)
-        provider_digests_unchanged = current_provider_digests == provider_baseline
+        current_provider_digests = digest_paths(state_paths)
+        provider_digests_unchanged = current_provider_digests == selected_baseline
         changed_path_classes = sorted(
             {
                 path_class(
@@ -292,9 +285,9 @@ def capture_live_inventory(
                     artifact_root=artifact_root,
                     home_root=home_root,
                 )
-                for path in provider_paths
+                for path in state_paths
                 if current_provider_digests[str(path)]
-                != provider_baseline[str(path)]
+                != selected_baseline[str(path)]
             }
         )
         backup_directory_absent = not (app_state_root / "backups").exists()
@@ -333,6 +326,7 @@ def capture_live_inventory(
             {
                 "status": "planned",
                 "stateUnchanged": unchanged,
+                "checkedPathCount": len(state_paths),
                 "selectedPathClasses": sorted(
                     {
                         path_class(
@@ -424,7 +418,40 @@ def run_quality_gates(
     results: dict[str, Any] = {}
     for name, command in gates:
         started = dt.datetime.now(dt.timezone.utc)
-        process = run_command(command, check=False)
+        try:
+            process = run_command(
+                command,
+                check=False,
+                timeout_seconds=QUALITY_GATE_TIMEOUT_SECONDS,
+            )
+        except MatrixCommandTimeout as error:
+            duration = (dt.datetime.now(dt.timezone.utc) - started).total_seconds()
+            write_text(
+                artifact_root / "raw/verification" / f"{name}.stdout.txt",
+                sanitize_path(
+                    error.stdout,
+                    artifact_root=artifact_root,
+                    home_root=Path.home(),
+                ),
+            )
+            write_text(
+                artifact_root / "raw/verification" / f"{name}.stderr.txt",
+                sanitize_path(
+                    error.stderr,
+                    artifact_root=artifact_root,
+                    home_root=Path.home(),
+                ),
+            )
+            results[name] = {
+                "status": "timed-out",
+                "exitCode": None,
+                "timeoutSeconds": error.timeout_seconds,
+                "durationSeconds": round(duration, 3),
+            }
+            if error.termination_issue is not None:
+                results[name]["terminationIssue"] = error.termination_issue
+            write_json(artifact_root / "raw/verification.json", results)
+            raise
         duration = (dt.datetime.now(dt.timezone.utc) - started).total_seconds()
         write_text(
             artifact_root / "raw/verification" / f"{name}.stdout.txt",
@@ -449,6 +476,7 @@ def run_quality_gates(
             )
             results[name]["testsPassed"] = sum(int(match) for match in matches)
         if process.returncode != 0:
+            write_json(artifact_root / "raw/verification.json", results)
             raise MatrixFailure(f"quality gate failed: {name}")
     write_json(artifact_root / "raw/verification.json", results)
     return results
@@ -570,7 +598,7 @@ def render_report(
                 f"- Items discovered: **{live['total']}**",
                 f"- Writable items discovered: **{live['writable']}**",
                 f"- Discovery warnings: **{live['warnings']}**",
-                f"- Provider state unchanged after dry-run matrix: **{str(live['providerStateUnchanged']).lower()}**",
+                f"- Selected provider state unchanged after every dry-run plan: **{str(live['providerStateUnchanged']).lower()}**",
             ]
         )
     report_lines.extend(
@@ -701,7 +729,7 @@ def render_report(
     )
     live_announcement = (
         f"- Live inventory: {live['total']} items discovered read-only; provider state "
-        "unchanged after every live dry-run plan."
+        "for each selection remained unchanged after its live dry-run plan."
         if live
         else "- Live inventory: skipped by request."
     )

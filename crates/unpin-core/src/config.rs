@@ -1,12 +1,16 @@
 use std::{
-    fmt, fs,
+    fmt,
     path::{Component, Path, PathBuf},
 };
 
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use crate::fs_support::read_optional_string;
+
 pub type ConfigResult<T> = Result<T, ConfigError>;
+
+const CONFIG_SCHEMA_VERSION: u8 = 1;
 
 #[derive(Debug)]
 pub struct ConfigError {
@@ -68,7 +72,7 @@ impl UnpinConfig {
 
 #[derive(Debug, Clone, Default)]
 struct UnpinConfigDocument {
-    version: Option<u64>,
+    version: Option<u8>,
     app_state_root: Option<PathBuf>,
     cursor_root: Option<PathBuf>,
     project_root: Option<PathBuf>,
@@ -127,24 +131,32 @@ pub fn resolve_app_state_root(
     }
 }
 
-pub fn default_cursor_root(home_dir: impl AsRef<Path>) -> PathBuf {
-    home_dir
-        .as_ref()
-        .join("Library")
-        .join("Application Support")
-        .join("Cursor")
-        .join("User")
+pub fn default_cursor_root(home_dir: impl AsRef<Path>) -> ConfigResult<PathBuf> {
+    cursor_root_for_os(home_dir.as_ref(), std::env::consts::OS)
+}
+
+fn cursor_root_for_os(home_dir: &Path, operating_system: &str) -> ConfigResult<PathBuf> {
+    match operating_system {
+        "macos" => Ok(home_dir.join("Library/Application Support/Cursor/User")),
+        "windows" => Ok(home_dir.join("AppData/Roaming/Cursor/User")),
+        "linux" => Ok(home_dir.join(".config/Cursor/User")),
+        _ => Err(ConfigError::new(format!(
+            "unsupported operating system for Cursor root discovery: {operating_system}; configure cursorRoot or pass --cursor-root explicitly"
+        ))),
+    }
 }
 
 pub fn resolve_cursor_root(
     cwd: impl AsRef<Path>,
     home_dir: impl AsRef<Path>,
     configured_cursor_root: Option<&Path>,
-) -> PathBuf {
+) -> ConfigResult<PathBuf> {
     match configured_cursor_root {
-        Some(configured_cursor_root) => {
-            normalize_absolute_path(configured_cursor_root, cwd, home_dir)
-        }
+        Some(configured_cursor_root) => Ok(normalize_absolute_path(
+            configured_cursor_root,
+            cwd,
+            home_dir,
+        )),
         None => default_cursor_root(home_dir),
     }
 }
@@ -273,6 +285,24 @@ pub fn get_approval_nonce_path(app_state_root: impl AsRef<Path>, nonce_digest: &
         .join(format!("{}.json", crate::encode_path_segment(nonce_digest)))
 }
 
+pub fn get_approval_nonce_ledger_path(app_state_root: impl AsRef<Path>) -> PathBuf {
+    app_state_root
+        .as_ref()
+        .join("approvals")
+        .join("nonces.json")
+}
+
+pub fn get_approval_nonce_ledger_shard_path(
+    app_state_root: impl AsRef<Path>,
+    shard: &str,
+) -> PathBuf {
+    app_state_root
+        .as_ref()
+        .join("approvals")
+        .join("nonce-ledgers")
+        .join(format!("{}.json", crate::encode_path_segment(shard)))
+}
+
 pub fn get_hook_trust_path(app_state_root: impl AsRef<Path>, operation_id: &str) -> PathBuf {
     app_state_root
         .as_ref()
@@ -348,7 +378,7 @@ pub fn get_session_overlay_root(app_state_root: impl AsRef<Path>, session_id: &s
 
 pub fn load_config(options: LoadConfigOptions) -> ConfigResult<UnpinConfig> {
     let defaults = UnpinConfigDocument {
-        version: Some(1),
+        version: Some(CONFIG_SCHEMA_VERSION),
         project_root: Some(options.cwd.clone()),
         ..UnpinConfigDocument::default()
     };
@@ -372,12 +402,28 @@ pub fn load_config(options: LoadConfigOptions) -> ConfigResult<UnpinConfig> {
     );
     let project_config_path = project_config_lookup_root.join(".unpin.json");
     let project_config = load_optional_config_document(&project_config_path)?;
+    for (field, configured) in [
+        ("projectRoot", project_config.project_root.is_some()),
+        ("appStateRoot", project_config.app_state_root.is_some()),
+        ("cursorRoot", project_config.cursor_root.is_some()),
+    ] {
+        if configured {
+            return Err(ConfigError::new(format!(
+                "{} {field} is not allowed in project config; configure command roots in {} or pass the corresponding CLI root explicitly",
+                project_config_path.display(),
+                user_config_path.display()
+            )));
+        }
+    }
 
     let merged =
         merge_config_documents(&defaults, &user_config, &project_config, &options.overrides);
+    let version = merged.version.ok_or_else(|| {
+        ConfigError::new("Unpin config schema version is missing after configuration merge")
+    })?;
 
     Ok(UnpinConfig {
-        version: 1,
+        version,
         project_root: resolve_project_root(
             &options.cwd,
             &options.home_dir,
@@ -392,7 +438,7 @@ pub fn load_config(options: LoadConfigOptions) -> ConfigResult<UnpinConfig> {
             &options.cwd,
             &options.home_dir,
             merged.cursor_root.as_deref(),
-        ),
+        )?,
         config_paths: UnpinConfigPaths {
             user_config_path,
             project_config_path,
@@ -401,12 +447,11 @@ pub fn load_config(options: LoadConfigOptions) -> ConfigResult<UnpinConfig> {
 }
 
 fn load_optional_config_document(path: &Path) -> ConfigResult<UnpinConfigDocument> {
-    if !path.exists() {
+    let Some(raw) = read_optional_string(path)
+        .map_err(|error| ConfigError::new(format!("{}: {error}", path.display())))?
+    else {
         return Ok(UnpinConfigDocument::default());
-    }
-
-    let raw = fs::read_to_string(path)
-        .map_err(|error| ConfigError::new(format!("{}: {error}", path.display())))?;
+    };
     parse_config_document(&raw, &path.display().to_string())
 }
 
@@ -419,16 +464,15 @@ fn parse_config_document(raw: &str, label: &str) -> ConfigResult<UnpinConfigDocu
 
     let version = match object.get("version") {
         Some(value) => {
-            let version = value
-                .as_u64()
-                .filter(|_| value.is_u64())
-                .ok_or_else(|| ConfigError::new(format!("{label} version must be an integer")))?;
-            if version > 1 {
+            let version = value.as_u64().ok_or_else(|| {
+                ConfigError::new(format!("{label} version must be the integer 1"))
+            })?;
+            if version != u64::from(CONFIG_SCHEMA_VERSION) {
                 return Err(ConfigError::new(format!(
                     "Unsupported unpin config schema version: {version}"
                 )));
             }
-            Some(version)
+            Some(CONFIG_SCHEMA_VERSION)
         }
         None => None,
     };
@@ -475,19 +519,16 @@ fn merge_config_documents(
         project_root: overrides
             .project_root
             .clone()
-            .or_else(|| project_config.project_root.clone())
             .or_else(|| user_config.project_root.clone())
             .or_else(|| defaults.project_root.clone()),
         app_state_root: overrides
             .app_state_root
             .clone()
-            .or_else(|| project_config.app_state_root.clone())
             .or_else(|| user_config.app_state_root.clone())
             .or_else(|| defaults.app_state_root.clone()),
         cursor_root: overrides
             .cursor_root
             .clone()
-            .or_else(|| project_config.cursor_root.clone())
             .or_else(|| user_config.cursor_root.clone())
             .or_else(|| defaults.cursor_root.clone()),
     }
@@ -535,5 +576,37 @@ pub(crate) fn normalize_path(path: impl AsRef<Path>) -> PathBuf {
         PathBuf::from(".")
     } else {
         normalized
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::cursor_root_for_os;
+
+    #[test]
+    fn cursor_root_defaults_follow_supported_host_layouts() {
+        let home = Path::new("/home/example");
+        assert_eq!(
+            cursor_root_for_os(home, "macos").expect("macOS is supported"),
+            home.join("Library/Application Support/Cursor/User")
+        );
+        assert_eq!(
+            cursor_root_for_os(home, "linux").expect("Linux is supported"),
+            home.join(".config/Cursor/User")
+        );
+        assert_eq!(
+            cursor_root_for_os(home, "windows").expect("Windows is supported"),
+            home.join("AppData/Roaming/Cursor/User")
+        );
+    }
+
+    #[test]
+    fn unsupported_cursor_platform_requires_an_explicit_root() {
+        let error = cursor_root_for_os(Path::new("/home/example"), "plan9")
+            .expect_err("unsupported platform");
+        assert!(error.to_string().contains("unsupported operating system"));
+        assert!(error.to_string().contains("--cursor-root"));
     }
 }
