@@ -16,9 +16,15 @@ pub use crate::providers::ProviderId;
 use crate::{
     config::normalize_path,
     encode_path_segment,
+    fs_support::read_optional_string,
     hooks::{HookInventoryMetadata, parse_hook_document},
     pi_packages::{pi_disabled_package_entry, pi_package_extension_state},
     providers::registry::provider_registry,
+    toml_syntax::{
+        all_table_sections, duplicate_standard_table_names, duplicate_top_level_key_tables,
+        find_array_table_sections, find_table_section, malformed_table_header_lines,
+        table_child_ids, table_subtree_content,
+    },
 };
 
 pub type DiscoveryError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -828,8 +834,7 @@ pub(crate) fn discover_codex(
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<(), DiscoveryError> {
     let config_path = roots.codex_global.join("config.toml");
-    let skill_config_states = if config_path.exists() {
-        let raw = fs::read_to_string(&config_path)?;
+    let skill_config_states = if let Some(raw) = read_optional_string(&config_path)? {
         match parse_codex_skill_config_states(&raw) {
             Ok(states) => states,
             Err(error) => {
@@ -1134,42 +1139,22 @@ fn parse_codex_skill_config_states(raw: &str) -> Result<BTreeMap<String, bool>, 
             Some(raw_enabled) => parse_toml_bool(raw_enabled)?,
             None => true,
         };
-        states.insert(path, enabled);
+        if states.insert(path, enabled).is_some() {
+            return Err("duplicate skills.config path".to_string());
+        }
     }
     Ok(states)
 }
 
 fn codex_array_table_sections<'a>(raw: &'a str, target: &str) -> Vec<&'a str> {
-    let mut sections = Vec::new();
-    let mut matching_start = None;
-    let mut offset = 0;
-
-    for line in raw.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-        let Some(header) = parse_codex_table_header(line) else {
-            continue;
-        };
-
-        if let Some(start) = matching_start.take() {
-            sections.push(&raw[start..line_start]);
-        }
-        if line.trim_start().starts_with("[[") && header == target {
-            matching_start = Some(line_start);
-        }
-    }
-
-    if let Some(start) = matching_start {
-        sections.push(&raw[start..]);
-    }
-    sections
+    find_array_table_sections(raw, target)
+        .into_iter()
+        .map(|section| section.content)
+        .collect()
 }
 
 fn toml_assignment_value<'a>(section: &'a str, key: &str) -> Option<&'a str> {
-    section.lines().skip(1).find_map(|line| {
-        let (candidate, value) = line.split_once('=')?;
-        (candidate.trim() == key).then_some(value.trim())
-    })
+    crate::toml_syntax::top_level_assignment(section, key).map(|assignment| assignment.value)
 }
 
 fn parse_toml_bool(raw: &str) -> Result<bool, String> {
@@ -1238,11 +1223,9 @@ fn discover_codex_config_file(
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<BTreeSet<String>, DiscoveryError> {
     let mut live_mcp_ids = BTreeSet::new();
-    if !config_path.exists() {
+    let Some(raw) = read_optional_string(config_path)? else {
         return Ok(live_mcp_ids);
-    }
-
-    let raw = fs::read_to_string(config_path)?;
+    };
     items.push(provider_setting_item(
         ProviderId::Codex,
         spec.layer,
@@ -1250,6 +1233,52 @@ fn discover_codex_config_file(
         spec.setting_display_name,
         config_path,
     ));
+    let malformed_table_headers = malformed_table_header_lines(&raw);
+    if !malformed_table_headers.is_empty() {
+        warnings.push(DiscoveryWarning {
+            provider: ProviderId::Codex,
+            layer: Some(spec.layer),
+            code: "invalid-toml-table-header".to_string(),
+            message: format!(
+                "{} contains malformed TOML table headers on lines: {}",
+                config_path.display(),
+                malformed_table_headers
+                    .iter()
+                    .map(usize::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        });
+        return Ok(live_mcp_ids);
+    }
+    let duplicate_tables = duplicate_standard_table_names(&raw);
+    if !duplicate_tables.is_empty() {
+        warnings.push(DiscoveryWarning {
+            provider: ProviderId::Codex,
+            layer: Some(spec.layer),
+            code: "duplicate-toml-table".to_string(),
+            message: format!(
+                "{} contains duplicate TOML table declarations: {}",
+                config_path.display(),
+                duplicate_tables.join(", ")
+            ),
+        });
+        return Ok(live_mcp_ids);
+    }
+    let duplicate_enabled_keys = duplicate_top_level_key_tables(&raw, "enabled");
+    if !duplicate_enabled_keys.is_empty() {
+        warnings.push(DiscoveryWarning {
+            provider: ProviderId::Codex,
+            layer: Some(spec.layer),
+            code: "duplicate-toml-key".to_string(),
+            message: format!(
+                "{} contains duplicate enabled keys in TOML tables: {}",
+                config_path.display(),
+                duplicate_enabled_keys.join(", ")
+            ),
+        });
+        return Ok(live_mcp_ids);
+    }
     items.extend(codex_inline_hook_items(
         config_path,
         &raw,
@@ -1265,10 +1294,9 @@ fn discover_codex_config_file(
             spec.id_scope
         );
         live_mcp_ids.insert(id.clone());
-        let section = find_codex_table_section(&raw, "mcp_servers", &server_id);
+        let section = find_table_section(&raw, "mcp_servers", &server_id);
         let enabled = section
-            .as_deref()
-            .map(codex_section_enabled)
+            .map(|section| codex_section_enabled(section.content))
             .unwrap_or(true);
         let mut item = configured_mcp_item(
             ProviderId::Codex,
@@ -1279,16 +1307,16 @@ fn discover_codex_config_file(
             config_path,
             config_path,
         );
-        item.source_fingerprint = section.map(|section| source_fingerprint(&section));
+        item.source_fingerprint = table_subtree_content(&raw, "mcp_servers", &server_id)
+            .map(|content| source_fingerprint(&content));
         items.push(item);
     }
 
     if spec.layer == DiscoveryLayer::Global {
         for plugin_id in parse_codex_section_ids(&raw, "plugins") {
-            let section = find_codex_table_section(&raw, "plugins", &plugin_id);
+            let section = find_table_section(&raw, "plugins", &plugin_id);
             let enabled = section
-                .as_deref()
-                .map(codex_section_enabled)
+                .map(|section| codex_section_enabled(section.content))
                 .unwrap_or(true);
             let mut item = plugin_config_item(
                 ProviderId::Codex,
@@ -1298,7 +1326,8 @@ fn discover_codex_config_file(
                 enabled,
                 config_path,
             );
-            item.source_fingerprint = section.map(|section| source_fingerprint(&section));
+            item.source_fingerprint = table_subtree_content(&raw, "plugins", &plugin_id)
+                .map(|content| source_fingerprint(&content));
             items.push(item);
         }
     }
@@ -1307,25 +1336,9 @@ fn discover_codex_config_file(
 }
 
 fn codex_section_enabled(section: &str) -> bool {
-    section
-        .lines()
-        .skip(1)
-        .find_map(codex_enabled_line)
+    toml_assignment_value(section, "enabled")
+        .and_then(|value| parse_toml_bool(value).ok())
         .unwrap_or(true)
-}
-
-fn codex_enabled_line(line: &str) -> Option<bool> {
-    let line = line.split('#').next()?.trim();
-    let (key, value) = line.split_once('=')?;
-    if key.trim() != "enabled" {
-        return None;
-    }
-
-    match value.trim() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
 }
 
 pub(crate) fn discover_cursor(
@@ -2635,11 +2648,9 @@ fn read_json_if_exists<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    if !path.exists() {
+    let Some(raw) = read_optional_string(path)? else {
         return Ok(None);
-    }
-
-    let raw = fs::read_to_string(path)?;
+    };
     match serde_json::from_str(&raw) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
@@ -2663,11 +2674,9 @@ fn read_jsonc_if_exists<T>(
 where
     T: for<'de> Deserialize<'de>,
 {
-    if !path.exists() {
+    let Some(raw) = read_optional_string(path)? else {
         return Ok(None);
-    }
-
-    let raw = fs::read_to_string(path)?;
+    };
     match jsonc_parser::parse_to_serde_value(&raw, &Default::default()) {
         Ok(value) => Ok(Some(value)),
         Err(error) => {
@@ -4745,26 +4754,11 @@ fn codex_inline_hook_document(raw: &str) -> serde_json::Value {
 }
 
 fn codex_hook_table_sections(raw: &str) -> Vec<(String, String)> {
-    let mut sections = Vec::new();
-    let mut current = None::<(String, usize)>;
-    let mut offset = 0;
-    for line in raw.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-        let Some(header) = parse_codex_table_header(line) else {
-            continue;
-        };
-        if let Some((current_header, start)) = current.take() {
-            sections.push((current_header, raw[start..line_start].to_string()));
-        }
-        if header.starts_with("hooks.") {
-            current = Some((header, line_start));
-        }
-    }
-    if let Some((header, start)) = current {
-        sections.push((header, raw[start..].to_string()));
-    }
-    sections
+    all_table_sections(raw)
+        .into_iter()
+        .filter(|(header, _)| header.name.starts_with("hooks."))
+        .map(|(header, section)| (header.name, section.content.to_string()))
+        .collect()
 }
 
 fn discover_cursor_plugin_manifests(
@@ -5033,99 +5027,7 @@ fn cursor_plugin_path_mutability(
 }
 
 fn parse_codex_section_ids(raw: &str, section_prefix: &str) -> Vec<String> {
-    let mut ids = raw
-        .lines()
-        .filter_map(parse_codex_table_header)
-        .filter_map(|header| codex_table_child_id(&header, section_prefix))
-        .collect::<Vec<_>>();
-    ids.sort();
-    ids.dedup();
-    ids
-}
-
-fn find_codex_table_section(raw: &str, table_prefix: &str, table_id: &str) -> Option<String> {
-    let mut matching_start = None;
-    let mut offset = 0;
-
-    for line in raw.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-
-        if let Some(header) = parse_codex_table_header(line) {
-            if let Some(start) = matching_start {
-                return Some(raw[start..line_start].to_string());
-            }
-
-            if codex_table_child_id(&header, table_prefix).as_deref() == Some(table_id) {
-                matching_start = Some(line_start);
-            }
-        }
-    }
-
-    matching_start.map(|start| raw[start..].to_string())
-}
-
-pub(crate) fn parse_codex_table_header(line: &str) -> Option<String> {
-    let trimmed = toml_line_without_comment(line).trim();
-    let inner = if let Some(array_inner) = trimmed
-        .strip_prefix("[[")
-        .and_then(|value| value.strip_suffix("]]"))
-    {
-        array_inner.trim()
-    } else {
-        trimmed.strip_prefix('[')?.strip_suffix(']')?.trim()
-    };
-
-    if inner.is_empty() {
-        return None;
-    }
-
-    Some(inner.to_string())
-}
-
-fn toml_line_without_comment(line: &str) -> &str {
-    let mut in_basic_string = false;
-    let mut in_literal_string = false;
-    let mut escaped = false;
-
-    for (index, character) in line.char_indices() {
-        if in_basic_string {
-            if escaped {
-                escaped = false;
-            } else {
-                match character {
-                    '\\' => escaped = true,
-                    '"' => in_basic_string = false,
-                    _ => {}
-                }
-            }
-            continue;
-        }
-        if in_literal_string {
-            if character == '\'' {
-                in_literal_string = false;
-            }
-            continue;
-        }
-
-        match character {
-            '"' => in_basic_string = true,
-            '\'' => in_literal_string = true,
-            '#' => return &line[..index],
-            _ => {}
-        }
-    }
-
-    line
-}
-
-fn codex_table_child_id(header: &str, table_prefix: &str) -> Option<String> {
-    let child = header.strip_prefix(table_prefix)?.strip_prefix('.')?;
-    if child.is_empty() || child.contains('.') {
-        return None;
-    }
-
-    Some(child.trim_matches('"').to_string())
+    table_child_ids(raw, section_prefix)
 }
 
 pub(crate) fn source_fingerprint(raw: &str) -> String {

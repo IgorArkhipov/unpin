@@ -5,6 +5,7 @@ use std::{
     io::{Read, Write},
     process::ExitCode,
 };
+use zeroize::Zeroizing;
 
 mod commands;
 mod credentials;
@@ -25,8 +26,8 @@ use unpin_core::{
     },
     discovery::{DiscoveryItem, DiscoveryOutput, DiscoveryRoots, DiscoveryWarning, discover_all},
     mcp::{
-        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, McpProviderScope,
-        handle_stdio_request_once, handle_stdio_requests,
+        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, McpDiscoveryCache,
+        McpProviderScope, handle_stdio_request_once, handle_stdio_requests,
     },
     mutation::{
         BackupAuthenticationKey, MutationOperation, MutationTarget, NativeToggleControlError,
@@ -266,6 +267,8 @@ enum Commands {
         #[arg(long)]
         control_file: PathBuf,
         #[arg(long, hide = true)]
+        app_state_root: PathBuf,
+        #[arg(long, hide = true)]
         fixture_mode: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<OsString>,
@@ -432,6 +435,9 @@ fn main() -> ExitCode {
                     match render_list(&filtered, json) {
                         Ok(output) => {
                             println!("{output}");
+                            if !json && !filtered.warnings.is_empty() {
+                                eprintln!("{}", render_discovery_warnings(&filtered.warnings));
+                            }
                             ExitCode::SUCCESS
                         }
                         Err(error) => {
@@ -595,7 +601,7 @@ fn main() -> ExitCode {
                                             } else {
                                                 config.app_state_root.clone()
                                             };
-                                            let controller = match credentials::resolve_session_authority_key(fixture_mode) {
+                                            let controller = match credentials::resolve_session_authority_key(fixture_mode, &toggle_state_root) {
                                                 Ok(Some(key)) => NativeToggleController::with_session_authority_key(&toggle_state_root, key),
                                                 Ok(None) if apply => return command_error_exit(
                                                     json,
@@ -666,7 +672,7 @@ fn main() -> ExitCode {
                                                         json, "blocked", &error,
                                                     );
                                                 }
-                                                let backup_authentication_key = match credentials::resolve_backup_authentication_key(fixture_mode) {
+                                                let backup_authentication_key = match credentials::resolve_backup_authentication_key(fixture_mode, &toggle_state_root) {
                                                 Ok(Some(key)) => key,
                                                 Ok(None) => return command_error_exit(json, "blocked", "backup authentication key missing; run `unpin auth backup init`"),
                                                 Err(error) => return command_error_exit(json, "blocked", &error),
@@ -713,10 +719,11 @@ fn main() -> ExitCode {
                                             &expectation,
                                             &plan.plan_fingerprint,
                                             plan.transition.effects[0].activation,
-                                            if status == ToggleStatus::Applied {
-                                                ControlOperationLifecycle::Applied
-                                            } else {
-                                                ControlOperationLifecycle::Planned
+                                            match status {
+                                                ToggleStatus::Applied => ControlOperationLifecycle::Applied,
+                                                ToggleStatus::RecoveryRequired => ControlOperationLifecycle::RecoveryRequired,
+                                                ToggleStatus::Blocked => ControlOperationLifecycle::Blocked,
+                                                ToggleStatus::DryRun => ControlOperationLifecycle::Planned,
                                             },
                                             (status == ToggleStatus::DryRun).then(|| ControlHumanAction {
                                                 code: "confirm-and-apply".to_string(),
@@ -735,7 +742,11 @@ fn main() -> ExitCode {
                                             ) {
                                                 Ok(output) => {
                                                     println!("{output}");
-                                                    if status == ToggleStatus::Blocked {
+                                                    if matches!(
+                                                        status,
+                                                        ToggleStatus::Blocked
+                                                            | ToggleStatus::RecoveryRequired
+                                                    ) {
                                                         ExitCode::FAILURE
                                                     } else {
                                                         ExitCode::SUCCESS
@@ -809,18 +820,20 @@ fn main() -> ExitCode {
                 Ok(context) => context,
                 Err(error) => return command_error_exit(json, "failed", &error.to_string()),
             };
-            let backup_authentication_key =
-                match credentials::resolve_backup_authentication_key(fixture_mode) {
-                    Ok(Some(key)) => key,
-                    Ok(None) => {
-                        return command_error_exit(
-                            json,
-                            "blocked",
-                            "backup authentication key missing; run `unpin auth backup init`",
-                        );
-                    }
-                    Err(error) => return command_error_exit(json, "failed", &error),
-                };
+            let backup_authentication_key = match credentials::resolve_backup_authentication_key(
+                fixture_mode,
+                &config.app_state_root,
+            ) {
+                Ok(Some(key)) => key,
+                Ok(None) => {
+                    return command_error_exit(
+                        json,
+                        "blocked",
+                        "backup authentication key missing; run `unpin auth backup init`",
+                    );
+                }
+                Err(error) => return command_error_exit(json, "failed", &error),
+            };
             let restore_state_root = if fixture_mode {
                 match std::fs::canonicalize(&config.app_state_root) {
                     Ok(root) => root,
@@ -836,7 +849,10 @@ fn main() -> ExitCode {
                 config.app_state_root.clone()
             };
             let controller = if apply {
-                match credentials::resolve_session_authority_key(fixture_mode) {
+                match credentials::resolve_session_authority_key(
+                    fixture_mode,
+                    &config.app_state_root,
+                ) {
                     Ok(Some(key)) => {
                         RestoreController::with_session_authority_key(restore_state_root, key)
                     }
@@ -1015,9 +1031,14 @@ fn main() -> ExitCode {
                     match discover_all(&discovery_roots) {
                         Ok(discovery) => {
                             let backup_authentication_key =
-                                resolve_optional_backup_authentication_key(fixture_mode);
-                            let session_authority_key =
-                                resolve_optional_session_authority_key(fixture_mode);
+                                resolve_optional_backup_authentication_key(
+                                    fixture_mode,
+                                    &config.app_state_root,
+                                );
+                            let session_authority_key = resolve_optional_session_authority_key(
+                                fixture_mode,
+                                &config.app_state_root,
+                            );
                             if headless {
                                 println!(
                                     "{}",
@@ -1082,8 +1103,9 @@ fn main() -> ExitCode {
                 }
             };
             let (backup_authentication_key, authentication) =
-                resolve_mcp_authentication_readiness(fixture_mode);
-            let session_authority_key = resolve_optional_session_authority_key(fixture_mode);
+                resolve_mcp_authentication_readiness(fixture_mode, &config.app_state_root);
+            let session_authority_key =
+                resolve_optional_session_authority_key(fixture_mode, &config.app_state_root);
             let app_state_root = if fixture_mode {
                 match std::fs::canonicalize(&config.app_state_root) {
                     Ok(root) => root,
@@ -1105,6 +1127,7 @@ fn main() -> ExitCode {
                 session_authority_key,
                 authentication,
                 provider_scope: provider.into(),
+                discovery_cache: McpDiscoveryCache::default(),
             };
 
             if once {
@@ -1133,20 +1156,24 @@ fn main() -> ExitCode {
         }
         Some(Commands::SessionChildWrapper {
             control_file,
+            app_state_root,
             fixture_mode,
             command,
         }) => {
-            let authority_key = match credentials::resolve_session_authority_key(fixture_mode) {
-                Ok(Some(key)) => key,
-                Ok(None) => {
-                    eprintln!("session child wrapper failed: session authority key is unavailable");
-                    return ExitCode::FAILURE;
-                }
-                Err(error) => {
-                    eprintln!("session child wrapper failed: {error}");
-                    return ExitCode::FAILURE;
-                }
-            };
+            let authority_key =
+                match credentials::resolve_session_authority_key(fixture_mode, &app_state_root) {
+                    Ok(Some(key)) => key,
+                    Ok(None) => {
+                        eprintln!(
+                            "session child wrapper failed: session authority key is unavailable"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Err(error) => {
+                        eprintln!("session child wrapper failed: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
             match session_process::run_child_wrapper(&control_file, command, &authority_key) {
                 Ok(()) => ExitCode::SUCCESS,
                 Err(error) => {
@@ -1377,12 +1404,11 @@ fn store_cursor_dashboard_credential(
     store: &impl credentials::SecretStore,
     json: bool,
 ) -> ExitCode {
-    let mut secret = Vec::new();
+    let mut secret = Zeroizing::new(Vec::new());
     let read = io::stdin()
         .take((credentials::MAX_CURSOR_DASHBOARD_COOKIE_BYTES + 2) as u64)
         .read_to_end(&mut secret);
     if let Err(error) = read {
-        secret.fill(0);
         return command_error_exit(json, "failed", &format!("credential input failed: {error}"));
     }
     if secret.last() == Some(&b'\n') {
@@ -1392,7 +1418,6 @@ fn store_cursor_dashboard_credential(
         }
     }
     let result = credentials::store_cursor_dashboard_cookie(store, &secret);
-    secret.fill(0);
     match result {
         Ok(credentials::CursorDashboardCredentialUpdate::Created) => {
             render_cursor_dashboard_credential_status(json, "created")
@@ -1427,8 +1452,9 @@ fn render_cursor_dashboard_credential_status(json: bool, status: &str) -> ExitCo
 
 fn resolve_optional_backup_authentication_key(
     fixture_mode: bool,
+    app_state_root: &Path,
 ) -> Option<BackupAuthenticationKey> {
-    match credentials::resolve_backup_authentication_key(fixture_mode) {
+    match credentials::resolve_backup_authentication_key(fixture_mode, app_state_root) {
         Ok(key) => key,
         Err(error) => {
             eprintln!("backup authentication unavailable; writes disabled: {error}");
@@ -1439,8 +1465,9 @@ fn resolve_optional_backup_authentication_key(
 
 fn resolve_optional_session_authority_key(
     fixture_mode: bool,
+    app_state_root: &Path,
 ) -> Option<unpin_core::sessions::SessionAuthorityKey> {
-    match credentials::resolve_session_authority_key(fixture_mode) {
+    match credentials::resolve_session_authority_key(fixture_mode, app_state_root) {
         Ok(key) => key,
         Err(error) => {
             eprintln!("session authority unavailable; session controls disabled: {error}");
@@ -1451,9 +1478,10 @@ fn resolve_optional_session_authority_key(
 
 fn resolve_mcp_authentication_readiness(
     fixture_mode: bool,
+    app_state_root: &Path,
 ) -> (Option<BackupAuthenticationKey>, McpAuthenticationReadiness) {
     let (backup_authentication_key, backup_authentication) =
-        match credentials::resolve_backup_authentication_key(fixture_mode) {
+        match credentials::resolve_backup_authentication_key(fixture_mode, app_state_root) {
             Ok(Some(key)) => {
                 let readiness = McpCredentialReadiness::ready(Some(key.key_id()));
                 (Some(key), readiness)
@@ -1464,16 +1492,17 @@ fn resolve_mcp_authentication_readiness(
                 (None, McpCredentialReadiness::unavailable())
             }
         };
-    let approval_signing = match credentials::approval_key_status_for_mode(fixture_mode) {
-        Ok(credentials::ApprovalKeyState::Ready { key_id }) => {
-            McpCredentialReadiness::ready(Some(key_id))
-        }
-        Ok(credentials::ApprovalKeyState::Missing) => McpCredentialReadiness::missing(),
-        Err(error) => {
-            eprintln!("approval signing unavailable: {error}");
-            McpCredentialReadiness::unavailable()
-        }
-    };
+    let approval_signing =
+        match credentials::approval_key_status_for_mode(fixture_mode, app_state_root) {
+            Ok(credentials::ApprovalKeyState::Ready { key_id }) => {
+                McpCredentialReadiness::ready(Some(key_id))
+            }
+            Ok(credentials::ApprovalKeyState::Missing) => McpCredentialReadiness::missing(),
+            Err(error) => {
+                eprintln!("approval signing unavailable: {error}");
+                McpCredentialReadiness::unavailable()
+            }
+        };
     let cursor_dashboard = if fixture_mode {
         McpCredentialReadiness::missing()
     } else {
@@ -1606,16 +1635,17 @@ fn render_list(result: &DiscoveryOutput, json: bool) -> Result<String, serde_jso
         }
     }
 
-    if !result.warnings.is_empty() {
-        lines.push(String::new());
-        lines.push("Warnings:".to_string());
-        lines.push(String::new());
-        for warning in &result.warnings {
-            lines.push(format!("- {}", render_warning_label(warning)));
-        }
-    }
-
     Ok(lines.join("\n"))
+}
+
+fn render_discovery_warnings(warnings: &[DiscoveryWarning]) -> String {
+    let mut lines = vec!["Warnings:".to_string(), String::new()];
+    lines.extend(
+        warnings
+            .iter()
+            .map(|warning| format!("- {}", render_warning_label(warning))),
+    );
+    lines.join("\n")
 }
 
 fn render_warning_label(warning: &DiscoveryWarning) -> String {
@@ -1992,9 +2022,7 @@ fn toggle_json_value(result: &ToggleResult) -> serde_json::Value {
     if let Some(backup_id) = &result.backup_id {
         value["backupId"] = serde_json::json!(backup_id);
     }
-    if result.status == ToggleStatus::DryRun
-        && let Some(writes) = &result.writes
-    {
+    if let Some(writes) = &result.writes {
         value["writes"] = serde_json::json!(writes);
     }
 
@@ -2040,6 +2068,7 @@ fn toggle_status_name(status: ToggleStatus) -> &'static str {
         ToggleStatus::DryRun => "dry-run",
         ToggleStatus::Applied => "applied",
         ToggleStatus::Blocked => "blocked",
+        ToggleStatus::RecoveryRequired => "recovery-required",
     }
 }
 

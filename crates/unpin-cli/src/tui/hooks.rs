@@ -298,6 +298,7 @@ impl HookWorkflow {
         let now = unix_now();
         let approval = credentials::issue_human_approval(
             fixture_mode,
+            app_state_root,
             &reviewed.expectation,
             &reviewed.fingerprint,
             Some(&reviewed.fingerprint),

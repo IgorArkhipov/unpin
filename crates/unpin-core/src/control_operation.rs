@@ -10,7 +10,7 @@ use crate::{
     state::atomic_json::OwnerGeneration,
     transitions::{
         EffectActivation, JournalError, JournalHandle, TransitionJournalStore, TransitionLifecycle,
-        TransitionPlan,
+        TransitionPlan, journal::MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES,
     },
 };
 
@@ -193,6 +193,27 @@ impl DurableControlJournal {
         let resumed = handle.journal.lifecycle == TransitionLifecycle::Applying;
         match &handle.journal.authorization_decision_digest {
             Some(existing) if existing != authorization.decision_digest() && resumed => {
+                let decisions_to_append = usize::from(
+                    handle.journal.authorization_decision_history.last() != Some(existing),
+                ) + 1;
+                if handle
+                    .journal
+                    .authorization_decision_history
+                    .len()
+                    .saturating_add(decisions_to_append)
+                    > MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES
+                {
+                    handle.journal.terminal_code = Some("approval-refresh-limit".to_string());
+                    handle.journal.record(
+                        TransitionLifecycle::NeedsRepair,
+                        "approval-refresh-limit",
+                        None,
+                    )?;
+                    self.store.save(&mut handle)?;
+                    return Err(DurableControlError::RecoveryRequired(
+                        handle.journal.operation_id.clone(),
+                    ));
+                }
                 if handle.journal.authorization_decision_history.last() != Some(existing) {
                     handle
                         .journal
@@ -513,6 +534,49 @@ mod tests {
                 .audit
                 .iter()
                 .any(|event| event.code == "approval-refreshed")
+        );
+    }
+
+    #[test]
+    fn resumed_operation_bounds_approval_decision_history() {
+        const MAX_REFRESH_HISTORY: usize = 32;
+
+        let temp = TempDir::new().expect("temporary state root");
+        let root = temp.path().canonicalize().expect("canonical state root");
+        let plan = plan("operation-resume-approval-limit", "resource", 'b');
+        let journal = DurableControlJournal::new(&root);
+
+        for index in 0..MAX_REFRESH_HISTORY {
+            let authorization = authorization(&root, &plan, &format!("refresh-limit-{index}"));
+            let DurableControlStart::Apply(handle) = journal
+                .begin(&plan, &authorization, "retry-actor")
+                .expect("approval history has bounded capacity")
+            else {
+                panic!("interrupted operation must remain resumable within its history bound");
+            };
+            drop(handle);
+        }
+
+        let overflow = authorization(&root, &plan, "refresh-limit-overflow");
+        assert!(matches!(
+            journal.begin(&plan, &overflow, "overflow-actor"),
+            Err(DurableControlError::RecoveryRequired(operation_id))
+                if operation_id == plan.operation_id
+        ));
+        let stored = TransitionJournalStore::new(&root)
+            .list()
+            .expect("transition journals")
+            .into_iter()
+            .find(|candidate| candidate.operation_id == plan.operation_id)
+            .expect("bounded journal");
+        assert_eq!(
+            stored.authorization_decision_history.len(),
+            MAX_REFRESH_HISTORY
+        );
+        assert_eq!(stored.lifecycle, TransitionLifecycle::NeedsRepair);
+        assert_eq!(
+            stored.terminal_code.as_deref(),
+            Some("approval-refresh-limit")
         );
     }
 

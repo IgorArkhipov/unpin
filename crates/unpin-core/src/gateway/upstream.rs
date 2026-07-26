@@ -63,6 +63,7 @@ pub struct PreparedStdioExecution {
     arguments: Vec<String>,
     environment: BTreeMap<String, String>,
     files: Vec<fs::File>,
+    #[cfg(unix)]
     inherited_file_indexes: Vec<usize>,
     cleanup_paths: Vec<PathBuf>,
 }
@@ -200,7 +201,7 @@ impl UpstreamIdentity {
     ) -> Result<PreparedStdioExecution, UpstreamValidationError> {
         #[cfg(not(unix))]
         {
-            return Err(UpstreamValidationError::UnsupportedStdioExecution);
+            Err(UpstreamValidationError::UnsupportedStdioExecution)
         }
         #[cfg(unix)]
         {
@@ -415,11 +416,53 @@ struct ExecutionChainEntry {
 struct ResolvedStdioExecution {
     endpoint: String,
     entries: Vec<ExecutionChainEntry>,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "non-Unix stdio preparation is rejected before resolved launch material is read"
+        )
+    )]
     files: Vec<fs::File>,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "non-Unix stdio preparation is rejected before resolved launch material is read"
+        )
+    )]
     launch_paths: Vec<PathBuf>,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "non-Unix stdio preparation is rejected before resolved launch material is read"
+        )
+    )]
     inherited_file_indexes: Vec<usize>,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "non-Unix stdio preparation is rejected before resolved launch material is read"
+        )
+    )]
     cleanup_paths: Vec<PathBuf>,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "non-Unix stdio preparation is rejected before resolved launch material is read"
+        )
+    )]
     program_index: usize,
+    #[cfg_attr(
+        not(unix),
+        expect(
+            dead_code,
+            reason = "non-Unix stdio preparation is rejected before resolved launch material is read"
+        )
+    )]
     arguments: Vec<String>,
 }
 
@@ -764,13 +807,15 @@ fn open_executable(
     let mut file = fs::File::open(&canonical).map_err(executable_unavailable)?;
     let opened_metadata = file.metadata().map_err(executable_unavailable)?;
     let after_open_metadata = fs::symlink_metadata(&canonical).map_err(executable_unavailable)?;
-    if !same_file(&opened_metadata, &after_open_metadata)
+    if !crate::fs_support::path_matches_open_file(&canonical, &file)
+        .map_err(executable_unavailable)?
         || !same_file_state(&opened_metadata, &after_open_metadata)
     {
         return Err(UpstreamValidationError::IdentityMismatch);
     }
     if !requested_metadata.file_type().is_symlink()
-        && !same_file(&requested_metadata, &opened_metadata)
+        && !crate::fs_support::path_matches_open_file(requested, &file)
+            .map_err(executable_unavailable)?
     {
         return Err(UpstreamValidationError::IdentityMismatch);
     }
@@ -984,11 +1029,6 @@ fn descriptor_path(file: &fs::File) -> Result<PathBuf, UpstreamValidationError> 
     Ok(root.join(file.as_raw_fd().to_string()))
 }
 
-#[cfg(not(unix))]
-fn descriptor_path(_file: &fs::File) -> Result<PathBuf, UpstreamValidationError> {
-    Err(UpstreamValidationError::UnsupportedStdioExecution)
-}
-
 #[cfg(unix)]
 fn path_is_stable(path: &Path) -> bool {
     // SAFETY: geteuid has no arguments and no memory-safety preconditions.
@@ -1026,19 +1066,8 @@ unsafe extern "C" {
 const W_OK: std::ffi::c_int = 2;
 
 #[cfg(unix)]
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len() && left.modified().ok() == right.modified().ok()
-}
-
-#[cfg(unix)]
 fn same_file_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    same_file(left, right)
-        && left.len() == right.len()
+    left.len() == right.len()
         && left.mode() == right.mode()
         && left.mtime() == right.mtime()
         && left.mtime_nsec() == right.mtime_nsec()
@@ -1048,7 +1077,9 @@ fn same_file_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn same_file_state(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    same_file(left, right)
+    // Callers either compare the same open handle or first establish the
+    // path-to-handle identity separately; this check detects content-state drift.
+    left.len() == right.len() && left.modified().ok() == right.modified().ok()
 }
 
 fn executable_unavailable(error: std::io::Error) -> UpstreamValidationError {

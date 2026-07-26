@@ -2,15 +2,19 @@ use std::{collections::BTreeSet, fs};
 
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
+#[cfg(unix)]
 use unpin_core::{
-    bridges::{
-        BridgeError, BridgeInstaller, BridgeIntegrity, BridgeLifecycle, HookBridgeAdapter,
-        HookCoverageStatus, MANAGED_COMPONENT_REFERENCE,
-    },
+    bridges::MANAGED_COMPONENT_REFERENCE,
     hooks::{
         HookAction, HookEventFamily, HookFailurePolicy, HookHandlerSpec, HookMatcher,
         HookOwnership, HookPolicy, HookPolicyLimits, HookRouteOwner, HookSourceLayer,
         HookTransformCapabilities,
+    },
+};
+use unpin_core::{
+    bridges::{
+        BridgeError, BridgeInstaller, BridgeIntegrity, BridgeLifecycle, HookBridgeAdapter,
+        HookCoverageStatus,
     },
     providers::{ProviderId, registry::provider_registry},
     state::atomic_json::OwnerGeneration,
@@ -366,6 +370,7 @@ fn detaching_recovery_preserves_exact_asset_or_finishes_after_completed_unlink()
     assert_eq!(recovered.integrity, BridgeIntegrity::Exact);
 }
 
+#[cfg(unix)]
 fn managed_spec(reference: &str) -> HookHandlerSpec {
     HookHandlerSpec {
         id: "managed-opencode-before".to_string(),

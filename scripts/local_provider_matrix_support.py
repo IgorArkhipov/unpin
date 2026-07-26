@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import collections
+import contextlib
 import datetime as dt
 import hashlib
 import json
 import os
 import plistlib
+import signal
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +22,8 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = (REPO_ROOT / "crates/unpin-core/tests/fixtures").resolve()
 FIXTURE_TEMP_ROOT = Path("/tmp").resolve()
+_PLATFORM = os.name
+_GRACEFUL_TERMINATION_SECONDS = 2
 CAPABILITY_MATRIX = json.loads(
     (FIXTURE_ROOT / "capability-matrix.json").read_text(encoding="utf-8")
 )["providers"]
@@ -341,6 +346,25 @@ class MatrixFailure(RuntimeError):
     pass
 
 
+class MatrixCommandTimeout(MatrixFailure):
+    def __init__(
+        self,
+        command: list[str],
+        timeout_seconds: float,
+        stdout: str,
+        stderr: str,
+        termination_issue: str | None = None,
+    ) -> None:
+        self.command = command
+        self.timeout_seconds = timeout_seconds
+        self.stdout = stdout
+        self.stderr = stderr
+        self.termination_issue = termination_issue
+        super().__init__(
+            f"command timed out after {timeout_seconds}s: {' '.join(command)}"
+        )
+
+
 def parse_args() -> argparse.Namespace:
     timestamp = dt.datetime.now().astimezone().strftime("%Y-%m-%d-%H%M%S")
     parser = argparse.ArgumentParser(
@@ -446,27 +470,186 @@ def run_command(
     environment = (
         fixture_subprocess_environment() if "--fixture-root" in rendered else None
     )
-    try:
-        process = subprocess.run(
+    process_options: dict[str, Any] = {}
+    if _PLATFORM == "posix":
+        process_options["start_new_session"] = True
+    elif _PLATFORM == "nt":
+        process_options["creationflags"] = getattr(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0
+        )
+    with contextlib.ExitStack() as capture_stack:
+        stdout_capture = capture_stack.enter_context(
+            tempfile.TemporaryFile(mode="w+b")
+        )
+        stderr_capture = capture_stack.enter_context(
+            tempfile.TemporaryFile(mode="w+b")
+        )
+        process = subprocess.Popen(
             rendered,
             cwd=REPO_ROOT,
-            input=input_text,
+            stdin=subprocess.PIPE if input_text is not None else subprocess.DEVNULL,
+            stdout=stdout_capture,
+            stderr=stderr_capture,
             text=True,
-            capture_output=True,
-            check=False,
+            encoding="utf-8",
+            errors="replace",
             env=environment,
-            timeout=timeout_seconds,
+            **process_options,
         )
-    except subprocess.TimeoutExpired as error:
+        try:
+            process.communicate(
+                input=input_text,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired as error:
+            _close_process_stdin(process)
+            termination_issues = _terminate_and_wait(process)
+            stdout = _read_capture(stdout_capture)
+            stderr = _read_capture(stderr_capture)
+            raise MatrixCommandTimeout(
+                rendered,
+                timeout_seconds,
+                stdout,
+                stderr,
+                "; ".join(termination_issues) if termination_issues else None,
+            ) from error
+        except BaseException:
+            _close_process_stdin(process)
+            _terminate_and_wait(process)
+            raise
+        finally:
+            _close_process_stdin(process)
+        stdout = _read_capture(stdout_capture)
+        stderr = _read_capture(stderr_capture)
+    completed = subprocess.CompletedProcess(
+        rendered,
+        process.returncode,
+        stdout,
+        stderr,
+    )
+    if check and completed.returncode != 0:
         raise MatrixFailure(
-            f"command timed out after {timeout_seconds}s: {' '.join(rendered)}"
-        ) from error
-    if check and process.returncode != 0:
-        raise MatrixFailure(
-            f"command failed ({process.returncode}): {' '.join(rendered)}\n"
-            f"stdout:\n{process.stdout[-4000:]}\nstderr:\n{process.stderr[-4000:]}"
+            f"command failed ({completed.returncode}): {' '.join(rendered)}\n"
+            f"stdout:\n{completed.stdout[-4000:]}\nstderr:\n{completed.stderr[-4000:]}"
         )
-    return process
+    return completed
+
+
+def _read_capture(capture: Any) -> str:
+    capture.flush()
+    capture.seek(0)
+    decoded = capture.read().decode(errors="replace")
+    return decoded.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _close_process_stdin(process: subprocess.Popen[str]) -> None:
+    if process.stdin is not None:
+        with contextlib.suppress(OSError, ValueError):
+            process.stdin.close()
+
+
+def _signal_process_tree(
+    process: subprocess.Popen[str],
+    *,
+    force: bool,
+) -> list[str]:
+    issues: list[str] = []
+    if process.poll() is not None:
+        return issues
+    tree_signalled = False
+    if _PLATFORM == "posix":
+        try:
+            process_group = os.getpgid(process.pid)
+            if process_group != process.pid:
+                issues.append("process-group identity changed before termination")
+            elif process.poll() is None:
+                os.killpg(
+                    process_group,
+                    signal.SIGKILL if force else signal.SIGTERM,
+                )
+                tree_signalled = True
+        except OSError as error:
+            issues.append(f"process-group signal failed: {error.__class__.__name__}")
+    elif _PLATFORM == "nt":
+        try:
+            command = ["taskkill", "/PID", str(process.pid), "/T"]
+            if force:
+                command.append("/F")
+            tree_kill = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+            if tree_kill.returncode == 0:
+                tree_signalled = True
+            elif process.poll() is None:
+                issues.append(
+                    f"process-tree signal failed with exit code {tree_kill.returncode}"
+                )
+        except (OSError, subprocess.SubprocessError) as error:
+            issues.append(f"process-tree signal failed: {error.__class__.__name__}")
+    if not tree_signalled and process.poll() is None:
+        try:
+            if force:
+                process.kill()
+            else:
+                process.terminate()
+        except OSError as error:
+            issues.append(f"direct process signal failed: {error.__class__.__name__}")
+    return issues
+
+
+def _terminate_and_wait(process: subprocess.Popen[str]) -> list[str]:
+    if _PLATFORM == "nt":
+        try:
+            issues = _signal_process_tree(process, force=True)
+        except Exception as error:
+            issues = [f"forced process-tree cleanup failed: {error.__class__.__name__}"]
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+            issues.append(f"forced process wait failed: {error.__class__.__name__}")
+        return issues
+
+    process_group: int | None = None
+    if _PLATFORM == "posix" and process.poll() is None:
+        try:
+            candidate = os.getpgid(process.pid)
+            if candidate == process.pid:
+                process_group = candidate
+        except OSError:
+            pass
+    try:
+        issues = _signal_process_tree(process, force=False)
+    except Exception as error:
+        issues = [f"process-tree cleanup failed: {error.__class__.__name__}"]
+    try:
+        process.wait(timeout=_GRACEFUL_TERMINATION_SECONDS)
+    except subprocess.TimeoutExpired:
+        pass
+    except (OSError, ValueError) as error:
+        issues.append(f"process wait failed: {error.__class__.__name__}")
+
+    if process_group is not None:
+        try:
+            os.killpg(process_group, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            issues.append(f"forced process-group cleanup failed: {error.__class__.__name__}")
+    elif process.poll() is None:
+        try:
+            issues.extend(_signal_process_tree(process, force=True))
+        except Exception as error:
+            issues.append(f"forced process-tree cleanup failed: {error.__class__.__name__}")
+
+    if process.poll() is None:
+        try:
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+            issues.append(f"forced process wait failed: {error.__class__.__name__}")
+    return issues
 
 
 def parse_json_output(output: str) -> Any:

@@ -3,7 +3,11 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
-    process::{Command as StdCommand, Output, Stdio},
+    process::{Command as StdCommand, Output},
+};
+#[cfg(unix)]
+use std::{
+    process::Stdio,
     thread,
     time::{Duration, Instant},
 };
@@ -18,24 +22,42 @@ use unpin_core::{
         DiscoveryCategory, DiscoveryItem, DiscoveryKind, DiscoveryLayer, DiscoveryMutability,
         DiscoveryRoots, ProviderId, discover_all,
     },
+    fixture::{FixtureCredentialPurpose, fixture_credential_key},
     mutation::{
         BackupAuthenticationKey, NativeToggleController, ToggleStatus, authenticate_legacy_backup,
     },
     profiles::{
-        PROFILE_DEFINITION_VERSION, PolicyStore, PolicyTarget, ProfileDefinition,
-        ProfileSourceScope, ProfileStore, compile_profile,
+        PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope, ProfileStore,
+        compile_profile,
     },
     sessions::{
-        BootstrapRequest, ConnectionClaim, CoverageLevel, GatewayModeManager, GatewayModeTarget,
-        IsolationLevel, LeaseLifecycle, PinnedExposure, PinnedProfile, ProcessEvidence,
-        SessionAuthorityKey, SessionManager,
+        BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, LeaseLifecycle,
+        PinnedExposure, PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
     },
     state::atomic_json::OwnerGeneration,
     state::workspace::resolve_workspace_identity,
 };
+#[cfg(unix)]
+use unpin_core::{
+    profiles::{PolicyStore, PolicyTarget},
+    sessions::{GatewayModeManager, GatewayModeTarget},
+};
 
-fn session_authority_key() -> SessionAuthorityKey {
-    SessionAuthorityKey::new([0x53; 32])
+fn session_authority_key(app_state_root: &Path) -> SessionAuthorityKey {
+    SessionAuthorityKey::new(
+        fixture_credential_key(app_state_root, FixtureCredentialPurpose::SessionAuthority)
+            .expect("fixture session authority key"),
+    )
+}
+
+fn backup_authentication_key(app_state_root: &Path) -> BackupAuthenticationKey {
+    BackupAuthenticationKey::new(
+        fixture_credential_key(
+            app_state_root,
+            FixtureCredentialPurpose::BackupAuthentication,
+        )
+        .expect("fixture backup authentication key"),
+    )
 }
 
 fn fixtures_root() -> PathBuf {
@@ -104,6 +126,7 @@ fn detached_unpin_command() -> StdCommand {
     command
 }
 
+#[cfg(unix)]
 fn wait_for_path(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
@@ -199,8 +222,10 @@ fn apply_native_toggle_for_test(
 ) -> unpin_core::mutation::ToggleResult {
     let context =
         ControlApprovalContext::new("test-repository", "test-workspace").expect("context");
-    let controller =
-        NativeToggleController::with_session_authority_key(app_state_root, session_authority_key());
+    let controller = NativeToggleController::with_session_authority_key(
+        app_state_root,
+        session_authority_key(app_state_root),
+    );
     let plan = controller.plan(item, &context).expect("native toggle plan");
     let expectation = plan
         .approval_expectation(&context)
@@ -246,7 +271,7 @@ fn apply_native_toggle_for_test(
             &plan,
             authorization,
             &context,
-            BackupAuthenticationKey::new([0x42; 32]),
+            backup_authentication_key(app_state_root),
         )
         .expect("native toggle apply")
 }
@@ -644,7 +669,7 @@ fn session_end_uses_reviewed_plan_and_fences_future_admission() {
     fs::create_dir(&project).expect("project directory");
     run_git(&project, &["init", "-q"]);
     let identity = resolve_workspace_identity(&project).expect("workspace identity");
-    let manager = SessionManager::with_authority_key(&state, session_authority_key());
+    let manager = SessionManager::with_authority_key(&state, session_authority_key(&state));
     let now_unix = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .expect("system time")
@@ -701,7 +726,12 @@ fn session_end_uses_reviewed_plan_and_fences_future_admission() {
         .args(common)
         .output()
         .unwrap();
-    assert!(planned.status.success());
+    assert!(
+        planned.status.success(),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&planned.stdout),
+        String::from_utf8_lossy(&planned.stderr)
+    );
     let planned: serde_json::Value = serde_json::from_slice(&planned.stdout).unwrap();
     assert_eq!(planned["status"], "planned");
     let fingerprint = planned["plan"]["planFingerprint"].as_str().unwrap();
@@ -1443,7 +1473,8 @@ fn session_launch_respects_mode_admission_fence_and_removes_pending_state() {
     .expect("fenced host script");
     fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).expect("fenced host executable");
     let identity = resolve_workspace_identity(&project).expect("workspace identity");
-    let sessions = SessionManager::with_authority_key(&app_state, session_authority_key());
+    let sessions =
+        SessionManager::with_authority_key(&app_state, session_authority_key(&app_state));
     GatewayModeManager::new(&app_state, sessions.clone())
         .install(
             GatewayModeTarget::repository_provider(identity.repository_key, ProviderId::Codex)
@@ -1534,7 +1565,7 @@ fn failed_child_exec_still_cleans_session_lease_and_overlay() {
     assert_eq!(result["cleanupComplete"], true);
     assert_eq!(result["cleanupFailures"], serde_json::json!([]));
     assert!(
-        SessionManager::with_authority_key(&app_state, session_authority_key())
+        SessionManager::with_authority_key(&app_state, session_authority_key(&app_state))
             .list()
             .expect("post-failure sessions")
             .is_empty()
@@ -1708,7 +1739,7 @@ while [ ! -f "$release" ]; do sleep 0.02; done
         scoped_sessions[0]["workspaceKey"],
         scoped_sessions[1]["workspaceKey"]
     );
-    let leases = SessionManager::with_authority_key(&app_state, session_authority_key())
+    let leases = SessionManager::with_authority_key(&app_state, session_authority_key(&app_state))
         .list()
         .expect("authenticated concurrent leases");
     assert_eq!(leases.len(), 2);
@@ -2031,13 +2062,54 @@ fn list_renders_provider_warnings_from_malformed_json() {
         .output()
         .expect("list output");
 
-    assert!(output.status.success(), "list should exit successfully");
+    assert!(
+        output.status.success(),
+        "list warnings are advisory and should not fail the command"
+    );
     let stdout = String::from_utf8(output.stdout).expect("list stdout is utf8");
+    let stderr = String::from_utf8(output.stderr).expect("list stderr is utf8");
     assert!(stdout.contains("Discovered items:"));
     assert!(stdout.contains("codex global skill example-shared-global-skill"));
-    assert!(stdout.contains("Warnings:"));
-    assert!(stdout.contains("- cursor global json-parse-error:"));
-    assert!(stdout.contains("hooks.json"));
+    assert!(!stdout.contains("Warnings:"));
+    assert!(stderr.contains("Warnings:"));
+    assert!(stderr.contains("- cursor global json-parse-error:"));
+    assert!(stderr.contains("hooks.json"));
+
+    let json_output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["list", "--fixture-root"])
+        .arg(fixture_copy.path())
+        .arg("--json")
+        .output()
+        .expect("list JSON output");
+    assert!(
+        json_output.status.success(),
+        "JSON list warnings are advisory and should not fail the command"
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&json_output.stdout).expect("list JSON stdout");
+    assert_eq!(json["warnings"][0]["provider"], "cursor");
+    assert_eq!(json["warnings"][0]["code"], "json-parse-error");
+
+    let kind_output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["list", "--fixture-root"])
+        .arg(fixture_copy.path())
+        .args(["--kind", "skill", "--json"])
+        .output()
+        .expect("kind-filtered list JSON output");
+    assert!(kind_output.status.success());
+    let kind_json: serde_json::Value =
+        serde_json::from_slice(&kind_output.stdout).expect("kind-filtered list JSON stdout");
+    assert_eq!(kind_json["warnings"][0]["provider"], "cursor");
+    assert_eq!(kind_json["warnings"][0]["code"], "json-parse-error");
+    assert!(
+        kind_json["items"]
+            .as_array()
+            .expect("kind-filtered items")
+            .iter()
+            .all(|item| item["kind"] == "skill")
+    );
 }
 
 #[test]
@@ -2495,7 +2567,7 @@ fn tui_headless_renders_backup_summaries() {
     authenticate_legacy_backup(
         app_state.path(),
         "backup-new",
-        &BackupAuthenticationKey::new([0x42; 32]),
+        &backup_authentication_key(app_state.path()),
     )
     .expect("authenticate backup");
 
@@ -4200,16 +4272,17 @@ fn restore_renders_json_with_string_targets() {
 }
 
 #[test]
-fn restore_uses_project_config_app_state_when_app_state_arg_is_omitted() {
+fn restore_uses_user_config_app_state_when_app_state_arg_is_omitted() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let temp = TempDir::new().expect("temp config roots");
     let home_root = temp.path().join("home");
     let project_root = temp.path().join("configured-project");
     let app_state = temp.path().join("configured-state");
+    fs::create_dir_all(&project_root).expect("create configured project");
     fs::create_dir_all(&app_state).expect("create configured app state");
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     write_text(
-        &project_root.join(".unpin.json"),
+        &home_root.join(".config/unpin/config.json"),
         &serde_json::json!({
             "appStateRoot": app_state
         })
@@ -4267,7 +4340,7 @@ fn restore_uses_project_config_app_state_when_app_state_arg_is_omitted() {
 
     assert!(
         restore.status.success(),
-        "restore should use project config app-state root; stdout=\n{}\nstderr=\n{}",
+        "restore should use user config app-state root; stdout=\n{}\nstderr=\n{}",
         String::from_utf8_lossy(&restore.stdout),
         String::from_utf8_lossy(&restore.stderr)
     );

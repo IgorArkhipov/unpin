@@ -2039,6 +2039,7 @@ fn toggle_status_label(status: ToggleStatus) -> &'static str {
         ToggleStatus::DryRun => "dry-run",
         ToggleStatus::Applied => "applied",
         ToggleStatus::Blocked => "blocked",
+        ToggleStatus::RecoveryRequired => "recovery-required",
     }
 }
 

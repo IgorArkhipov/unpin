@@ -13,6 +13,7 @@ use crate::{
 use super::plan::TransitionPlan;
 
 pub const TRANSITION_JOURNAL_SCHEMA_VERSION: u32 = 1;
+pub(crate) const MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES: usize = 32;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

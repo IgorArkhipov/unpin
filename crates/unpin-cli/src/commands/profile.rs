@@ -322,18 +322,20 @@ fn change_capability_lock(
     ) {
         return command_error_exit(options.json, "blocked", &error);
     }
-    let session_authority_key =
-        match credentials::resolve_session_authority_key(options.roots.fixture_root.is_some()) {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                return command_error_exit(
-                    options.json,
-                    "blocked",
-                    "session authority key missing; run `unpin auth session init`",
-                );
-            }
-            Err(error) => return command_error_exit(options.json, "blocked", &error),
-        };
+    let session_authority_key = match credentials::resolve_session_authority_key(
+        options.roots.fixture_root.is_some(),
+        &config.app_state_root,
+    ) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return command_error_exit(
+                options.json,
+                "blocked",
+                "session authority key missing; run `unpin auth session init`",
+            );
+        }
+        Err(error) => return command_error_exit(options.json, "blocked", &error),
+    };
     let authorization = match credentials::authorize_reviewed_control_decision(
         options.roots.fixture_root.is_some(),
         &config.app_state_root,
@@ -779,18 +781,20 @@ fn apply_profile(
     ) {
         return command_error_exit(options.json, "blocked", &error);
     }
-    let session_authority_key =
-        match credentials::resolve_session_authority_key(options.roots.fixture_root.is_some()) {
-            Ok(Some(key)) => key,
-            Ok(None) => {
-                return command_error_exit(
-                    options.json,
-                    "blocked",
-                    "session authority key missing; run `unpin auth session init`",
-                );
-            }
-            Err(error) => return command_error_exit(options.json, "blocked", &error),
-        };
+    let session_authority_key = match credentials::resolve_session_authority_key(
+        options.roots.fixture_root.is_some(),
+        &config.app_state_root,
+    ) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return command_error_exit(
+                options.json,
+                "blocked",
+                "session authority key missing; run `unpin auth session init`",
+            );
+        }
+        Err(error) => return command_error_exit(options.json, "blocked", &error),
+    };
     let expectation = match plan.approval_expectation(&approval_context) {
         Ok(expectation) => expectation,
         Err(error) => return command_error_exit(options.json, "blocked", &error.to_string()),

@@ -3,11 +3,13 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
     path::{Component, Path, PathBuf},
+    sync::Arc,
+};
+
+#[cfg(unix)]
+use std::{
     process,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use serde::{Deserialize, Serialize};
@@ -38,6 +40,7 @@ const BACKUP_MANIFEST_SCHEMA_VERSION: u32 = 1;
 const ADOPTION_BACKUP_PURPOSE: &[u8] = b"unpin-adoption-backup-v1\0";
 const ADOPTION_MARKER_PURPOSE: &[u8] = b"unpin-adoption-marker-v1\0";
 const ADOPTION_RECORD_PURPOSE: &[u8] = b"unpin-adoption-record-v1\0";
+#[cfg(unix)]
 static MARKER_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
@@ -1905,6 +1908,7 @@ fn verify_private_permissions(path: &Path, _metadata: &fs::Metadata) -> Result<(
     ))
 }
 
+#[cfg(unix)]
 fn write_json_atomically<T: Serialize>(
     path: &Path,
     value: &T,
@@ -1918,11 +1922,8 @@ fn write_json_atomically<T: Serialize>(
     ));
     let mut options = OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
+    use std::os::unix::fs::OpenOptionsExt;
+    options.mode(0o600);
     let result = (|| {
         let mut file = options
             .open(&temporary)
@@ -1935,7 +1936,6 @@ fn write_json_atomically<T: Serialize>(
             .map_err(|error| io_error(&temporary, error))?;
         file.sync_all()
             .map_err(|error| io_error(&temporary, error))?;
-        #[cfg(unix)]
         if replace {
             fs::rename(&temporary, path).map_err(|error| io_error(path, error))?;
         } else {
@@ -1948,16 +1948,23 @@ fn write_json_atomically<T: Serialize>(
             })?;
             fs::remove_file(&temporary).map_err(|error| io_error(&temporary, error))?;
         }
-        #[cfg(not(unix))]
-        return Err(AdoptionError::PrivatePermissionsUnsupported(
-            path.to_path_buf(),
-        ));
         sync_directory(parent)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+#[cfg(not(unix))]
+fn write_json_atomically<T: Serialize>(
+    path: &Path,
+    _value: &T,
+    _replace: bool,
+) -> Result<(), AdoptionError> {
+    Err(AdoptionError::PrivatePermissionsUnsupported(
+        path.to_path_buf(),
+    ))
 }
 
 fn remove_owned_tree(path: &Path) -> Result<(), AdoptionError> {

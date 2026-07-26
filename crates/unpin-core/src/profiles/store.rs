@@ -331,11 +331,10 @@ fn read_workspace_definition(path: &Path) -> Result<Option<ProfileDefinition>, P
         .into());
     }
     let mut file = fs::File::open(path).map_err(ProfileStoreError::Io)?;
-    let opened = file.metadata().map_err(ProfileStoreError::Io)?;
     let current = fs::symlink_metadata(path).map_err(ProfileStoreError::Io)?;
     if current.file_type().is_symlink()
         || !current.is_file()
-        || !same_file_identity(&opened, &current)
+        || !crate::fs_support::path_matches_open_file(path, &file).map_err(ProfileStoreError::Io)?
     {
         return Err(ProfileStoreError::UnsafeDefinitionEntry);
     }
@@ -354,18 +353,4 @@ fn read_workspace_definition(path: &Path) -> Result<Option<ProfileDefinition>, P
     ProfileDefinition::from_json(&raw)
         .map(Some)
         .map_err(Into::into)
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-        && left.created().ok() == right.created().ok()
 }

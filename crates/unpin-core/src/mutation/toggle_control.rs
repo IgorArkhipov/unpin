@@ -146,7 +146,10 @@ impl NativeToggleController {
             &authorization,
             &reviewed.preview,
         );
-        if result.status == ToggleStatus::Applied {
+        if matches!(
+            result.status,
+            ToggleStatus::Applied | ToggleStatus::RecoveryRequired
+        ) {
             Ok(result)
         } else {
             let reason = result

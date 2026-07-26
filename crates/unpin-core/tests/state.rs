@@ -71,6 +71,7 @@ fn owner(id: &str, generation: u64) -> OwnerGeneration {
     OwnerGeneration::new(id, generation).expect("valid owner generation")
 }
 
+#[cfg(unix)]
 fn lock_path(store: &AtomicJsonStore) -> PathBuf {
     let resource_id = store.physical_resource_id().expect("physical resource id");
     store
@@ -417,8 +418,8 @@ fn workspace_identity_changes_when_same_path_is_recreated() {
     let first_repository =
         resolve_workspace_identity(&repository).expect("first repository identity");
 
-    fs::remove_dir_all(&repository).expect("remove first repository");
-    fs::create_dir(temp.path().join("inode-spacer")).expect("consume replacement identity");
+    fs::rename(&repository, temp.path().join("first-repository"))
+        .expect("move first repository aside");
     create_repository(&repository);
     let second_repository =
         resolve_workspace_identity(&repository).expect("second repository identity");
@@ -434,9 +435,7 @@ fn workspace_identity_changes_when_same_path_is_recreated() {
     let plain = temp.path().join("plain");
     fs::create_dir(&plain).expect("first plain root");
     let first_plain = resolve_workspace_identity(&plain).expect("first plain identity");
-    fs::remove_dir(&plain).expect("remove first plain root");
-    fs::create_dir(temp.path().join("plain-inode-spacer"))
-        .expect("consume plain replacement identity");
+    fs::rename(&plain, temp.path().join("first-plain")).expect("move first plain root aside");
     fs::create_dir(&plain).expect("second plain root");
     let second_plain = resolve_workspace_identity(&plain).expect("second plain identity");
     assert_ne!(first_plain.repository_key, second_plain.repository_key);

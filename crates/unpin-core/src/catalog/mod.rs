@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs::{self, File},
-    io::Read,
+    io::{ErrorKind, Read},
     path::{Path, PathBuf},
 };
 
@@ -345,11 +345,16 @@ fn read_static_manifest(path: &Path) -> ManifestRead {
     let Ok(current_path_metadata) = fs::symlink_metadata(path) else {
         return ManifestRead::Invalid;
     };
-    if current_path_metadata.file_type().is_symlink()
-        || !current_path_metadata.is_file()
-        || !same_file_identity(&opened_metadata, &current_path_metadata)
-    {
+    if current_path_metadata.file_type().is_symlink() || !current_path_metadata.is_file() {
         return ManifestRead::Invalid;
+    }
+    match crate::fs_support::path_matches_open_file(path, &file) {
+        Ok(true) => {}
+        Ok(false) => return ManifestRead::Invalid,
+        Err(error) if error.kind() == ErrorKind::Unsupported => {
+            return ManifestRead::DynamicOrUnknown;
+        }
+        Err(_) => return ManifestRead::Invalid,
     }
     if opened_metadata.len() > MAX_MANIFEST_BYTES {
         return ManifestRead::Oversized;
@@ -372,20 +377,6 @@ fn read_static_manifest(path: &Path) -> ManifestRead {
         Ok(declared) => ManifestRead::Declared(declared),
         Err(()) => ManifestRead::Invalid,
     }
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len()
-        && left.modified().ok() == right.modified().ok()
-        && left.created().ok() == right.created().ok()
 }
 
 fn declared_contributions(value: &Value) -> Result<Vec<DeclaredContribution>, ()> {

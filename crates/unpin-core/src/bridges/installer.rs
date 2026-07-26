@@ -496,8 +496,7 @@ fn remove_verified_asset(path: &Path, expected_fingerprint: &str) -> Result<(), 
         return Err(BridgeError::IntegrityMismatch);
     }
     let mut file = File::open(path).map_err(BridgeError::Io)?;
-    let open_metadata = file.metadata().map_err(BridgeError::Io)?;
-    if !same_file_identity(&path_metadata, &open_metadata) {
+    if !crate::fs_support::path_matches_open_file(path, &file).map_err(BridgeError::Io)? {
         return Err(BridgeError::IntegrityMismatch);
     }
     let mut bytes = Vec::new();
@@ -508,25 +507,11 @@ fn remove_verified_asset(path: &Path, expected_fingerprint: &str) -> Result<(), 
     let final_metadata = fs::symlink_metadata(path).map_err(BridgeError::Io)?;
     if final_metadata.file_type().is_symlink()
         || !final_metadata.is_file()
-        || !same_file_identity(&open_metadata, &final_metadata)
+        || !crate::fs_support::path_matches_open_file(path, &file).map_err(BridgeError::Io)?
     {
         return Err(BridgeError::IntegrityMismatch);
     }
     fs::remove_file(path).map_err(BridgeError::Io)
-}
-
-#[cfg(unix)]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    use std::os::unix::fs::MetadataExt;
-
-    left.dev() == right.dev() && left.ino() == right.ino()
-}
-
-#[cfg(not(unix))]
-fn same_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
-    left.len() == right.len()
-        && left.created().ok() == right.created().ok()
-        && left.modified().ok() == right.modified().ok()
 }
 
 fn record_integrity(record: &BridgeInstallationRecord) -> BridgeIntegrity {

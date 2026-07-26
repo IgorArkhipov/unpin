@@ -7,13 +7,14 @@ use std::{
 
 use unpin_core::gateway::{GatewayError, GatewayService};
 
-use unpin_cli::mcp_runtime::{
-    GatewayMcpServer, GatewayRuntimeError, GatewayRuntimeTimeouts, NoGatewayCredentials,
-    serve_gateway_io,
-};
+use unpin_cli::mcp_runtime::GatewayRuntimeError;
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+#[cfg(unix)]
+use unpin_cli::mcp_runtime::{
+    GatewayMcpServer, GatewayRuntimeTimeouts, NoGatewayCredentials, serve_gateway_io,
+};
 
 pub(crate) struct GatewaySessionRuntime {
     gateway: Arc<GatewayService>,
@@ -235,8 +236,10 @@ pub(crate) enum GatewaySessionError {
     Io(io::Error),
     Gateway(GatewayError),
     Runtime(GatewayRuntimeError),
+    #[cfg(unix)]
     InvalidSocket,
     RuntimePanicked,
+    #[cfg(unix)]
     ProxyPanicked,
     #[cfg(not(unix))]
     PlatformUnsupported,
@@ -260,8 +263,10 @@ impl std::fmt::Display for GatewaySessionError {
             Self::Io(error) => write!(formatter, "session gateway I/O failed: {error}"),
             Self::Gateway(error) => write!(formatter, "session gateway cleanup failed: {error}"),
             Self::Runtime(error) => write!(formatter, "session gateway failed: {error}"),
+            #[cfg(unix)]
             Self::InvalidSocket => formatter.write_str("session gateway socket is invalid"),
             Self::RuntimePanicked => formatter.write_str("session gateway runtime panicked"),
+            #[cfg(unix)]
             Self::ProxyPanicked => formatter.write_str("session gateway proxy panicked"),
             #[cfg(not(unix))]
             Self::PlatformUnsupported => {

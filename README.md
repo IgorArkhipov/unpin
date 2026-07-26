@@ -120,6 +120,11 @@ server instead, use `--kind mcp` and the exact MCP item ID returned by `list`.
 Change `--provider` for another supported agent. Unpin refuses unsupported or
 read-only combinations rather than inventing provider state.
 
+Cursor can store a configured MCP server's disabled state in its workspace
+database. Close Cursor before applying or restoring an item whose `statePath`
+ends in `state.vscdb`, then reopen it after the change. Unpin never creates the
+database or its schema and reports `cursor-host-busy` if Cursor keeps it locked.
+
 ### Connect Unpin to an agent
 
 Agents connect by launching Unpin's local stdio server:
@@ -200,9 +205,57 @@ Every persistent profile, capability-lock, gateway, session-end, adoption, trust
 
 Exact terminal retries revalidate live policy, provider, adopted-view, and restored-target state before returning cached success. Divergence reports `recovery-required`. Catalog adoption reports rolled-back and needs-repair outcomes explicitly and exits nonzero for both.
 
+If a native toggle fails after its backup is created, Unpin returns
+`recovery-required`, preserves the backup ID, and warns that provider writes
+may already have occurred. Treat that result as a recovery handoff: inspect or
+restore the reported backup instead of retrying the mutation blindly.
+
 `profile propose --prompt ...` ranks profile metadata locally and returns a confirmation-required session proposal. It emits only the prompt digest, never prompt text, and does not mutate policy or start a session.
 
 Fixture-backed `session launch` creates one private lease, Unix-socket gateway, and overlay per child harness. Lease protection binds every applicable global, repository, and workspace gateway-mode and policy target, current mutable native-item transitions, authenticated restorable backups, and adopted-view resources, including global views shared by another worktree. Gateway, restore, and native-toggle apply acquire the same transition conflict guard before mutation. All live launches require backup and session authentication so adopted and restorable resources cannot be silently omitted from the lease. Live profile-scoped launch currently fails closed until each provider adapter can prove strict native masking and gateway attachment. Native launches remain available after those authentication prerequisites. Repository identity groups shared blast radius; physical worktree identity isolates workspace policy; opaque session identity isolates exposure. Separate worktrees remain required when agents also need source-file edit isolation.
+
+### Diagnose protected sessions
+
+Run diagnostics from the same repository and physical worktree as the session:
+
+```bash
+unpin auth session status
+unpin session list --json
+unpin gateway status --scope workspace --json
+```
+
+`session list` is intentionally scoped to the current repository and worktree.
+Its JSON keeps secret material out while reporting the provider, pinned profile,
+desired and observed exposure revisions, live exposure status, isolation,
+coverage, lifecycle, and in-flight call count.
+
+- Matching desired and observed revisions describe the last authenticated
+  observation; they do not prove native provider attachment beyond the reported
+  coverage.
+- `external-degraded` coverage is not strict isolation. Read its reasons before
+  relying on the session boundary.
+- A non-active lifecycle or a desired/observed mismatch means callers should
+  stop admitting new work and establish a fresh session after resolving the
+  cause.
+- `inFlightCalls` greater than zero explains why reviewed shutdown or gateway
+  drain may still be waiting.
+
+End a session through the reviewed workflow; do not delete lease, overlay,
+transaction, backup, or audit files manually:
+
+```bash
+unpin session end --id SESSION_ID --json
+unpin session end \
+  --id SESSION_ID \
+  --apply \
+  --confirm \
+  --plan-fingerprint FINGERPRINT \
+  --json
+```
+
+The owner process remains responsible for cleanup after fencing. If a command
+returns `recovery-required`, preserve the reported state and evidence and stop
+before retrying or editing Unpin-owned runtime files.
 
 Hook inventory records individual handlers and honest provider coverage. Trust receipts bind handler invocation fingerprint, compiled profile digest, provider, workspace, and session. Gateway-routed MCP hook policy is fixture-contract verified. Native dispatcher/managed-bridge host activation still requires live-provider wiring and verification; Zed built-in hooks remain unsupported.
 
@@ -228,16 +281,24 @@ cargo run -p unpin-cli -- list \
   --cursor-root "$HOME/Library/Application Support/Cursor/User"
 ```
 
+On GNU/Linux, Cursor's default app-support root is
+`$HOME/.config/Cursor/User`; omit `--cursor-root` to use the platform default.
+
 ## Configuration
 
 Unpin resolves command roots in this order:
 
-1. Defaults: current directory for the project root, `~/.config/unpin` for Unpin-owned state, `$HOME/.cursor/mcp.json` for Cursor global MCP config, `<project>/.cursor/mcp.json` for Cursor project MCP config, and the macOS Cursor user-data directory for Cursor app-support state.
+1. Defaults: current directory for the project root, `~/.config/unpin` for Unpin-owned state, `$HOME/.cursor/mcp.json` for Cursor global MCP config, `<project>/.cursor/mcp.json` for Cursor project MCP config, and the platform Cursor user-data directory for Cursor app-support state (`~/Library/Application Support/Cursor/User` on macOS or `~/.config/Cursor/User` on GNU/Linux).
 2. User config: `~/.config/unpin/config.json`.
-3. Project config: `<projectRoot>/.unpin.json`.
-4. CLI flags such as `--project-root`, `--app-state-root`, and `--cursor-root`.
+3. CLI flags such as `--project-root`, `--app-state-root`, and `--cursor-root`.
 
-Config files are JSON and may contain:
+Repository-owned `<projectRoot>/.unpin.json` is untrusted. It cannot set
+`projectRoot`, `appStateRoot`, or `cursorRoot`; put command roots in the user
+config or pass the corresponding CLI flags explicitly. Unpin rejects these
+fields in project config so repositories cannot redirect discovery, provider
+mutation, approval, policy, backup, session, or audit state.
+
+The user config is JSON and may contain:
 
 ```json
 {
@@ -294,7 +355,10 @@ New backup manifests use version 3 with purpose-separated HMAC-SHA256 authentica
 
 TUI header reports backup-auth readiness. MCP inventory summary exposes `writeSafety.backupAuthentication` and `writeSafety.writesEnabled`, allowing agents to preflight write availability without attempting mutation.
 
-Fixture commands use deterministic fixture key and never access OS keychain. Keep `--fixture-root` on fixture-backed restore, TUI, and MCP checks so they verify fixture-created backups with same key.
+Fixture commands derive deterministic, domain-separated credentials from the
+fixture state root and never access the OS keychain. Keep `--fixture-root` and
+the same `--app-state-root` on fixture-backed restore, TUI, and MCP checks so
+they verify evidence created for that isolated fixture run.
 
 Plan a no-write skill toggle:
 
@@ -415,7 +479,8 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 cargo run -p unpin-cli --locked -- --help
-cargo audit --no-yanked
+cargo audit --deny warnings
+cargo deny check
 cargo machete
 ```
 

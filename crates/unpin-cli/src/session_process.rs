@@ -9,6 +9,7 @@ use std::{
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+use zeroize::Zeroizing;
 
 use unpin_core::{
     approval::ControlApprovalContext,
@@ -258,7 +259,12 @@ pub fn launch(
     let manager =
         SessionManager::with_authority_key(&request.app_state_root, request.authority_key.clone());
     let control_path = launch_control_path(&request.app_state_root)?;
-    let mut child = spawn_wrapper(&control_path, &request.command, request.fixture_mode)?;
+    let mut child = spawn_wrapper(
+        &request.app_state_root,
+        &control_path,
+        &request.command,
+        request.fixture_mode,
+    )?;
     let result = establish_and_wait(&manager, &request, &control_path, &mut child, now_unix);
     if result.is_err() {
         let _ = child.kill();
@@ -346,14 +352,13 @@ fn build_gateway_service(
 }
 
 fn duplicate_session_handle(handle: &SessionHandle) -> Result<SessionHandle, SessionProcessError> {
-    let mut encoded_secret = Vec::with_capacity(64);
-    handle.write_secret(&mut encoded_secret)?;
+    let mut encoded_secret = Zeroizing::new(Vec::with_capacity(64));
+    handle.write_secret(&mut *encoded_secret)?;
     let duplicate = SessionHandle::read_secret(
         handle.session_id().to_string(),
         handle.owner_id().to_string(),
         encoded_secret.as_slice(),
     );
-    encoded_secret.fill(0);
     duplicate.map_err(SessionProcessError::Io)
 }
 
@@ -759,6 +764,7 @@ fn startup_failure_after_claim(
 }
 
 fn spawn_wrapper(
+    app_state_root: &Path,
     control_path: &Path,
     command: &[OsString],
     fixture_mode: bool,
@@ -768,7 +774,9 @@ fn spawn_wrapper(
     wrapper
         .arg("session-child-wrapper")
         .arg("--control-file")
-        .arg(control_path);
+        .arg(control_path)
+        .arg("--app-state-root")
+        .arg(app_state_root);
     if fixture_mode {
         wrapper.arg("--fixture-mode");
     }

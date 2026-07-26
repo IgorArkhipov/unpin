@@ -5,14 +5,8 @@ use std::{
     io::{self, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     process,
-    time::{SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
-
-use rusqlite::{Connection, OpenFlags, OptionalExtension, types::Value as SqliteValue};
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use sha2::{Digest, Sha256};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 use jsonc_parser::{
     CollectOptions, ParseOptions,
@@ -21,21 +15,36 @@ use jsonc_parser::{
     cst::{CstInputValue, CstRootNode},
     tokens::Token as JsoncToken,
 };
+use rusqlite::{
+    Connection, Error as SqliteError, ErrorCode as SqliteErrorCode, OpenFlags, OptionalExtension,
+    TransactionBehavior, types::Value as SqliteValue,
+};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::approval::ControlAuthorization;
+use crate::clock::{current_timestamp, unix_nanos_id};
 use crate::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, ProviderId,
     claude_local_scope_token, codex_skill_config_enabled, codex_skill_config_path,
-    json_value_source_fingerprint, parse_codex_table_header as parse_toml_table_header,
-    skill_payload_has_skill, source_fingerprint,
+    json_value_source_fingerprint, skill_payload_has_skill, source_fingerprint,
 };
 use crate::encode_path_segment;
+use crate::fs_support::read_optional_string;
 use crate::pi_packages::{pi_disabled_package_entry, pi_package_extension_state};
 use crate::sessions::SessionManager;
 use crate::state::atomic_json::OwnerGeneration;
+use crate::toml_syntax::{
+    duplicate_standard_table_names, duplicate_top_level_key_tables,
+    find_array_table_sections as find_toml_array_table_sections,
+    find_table_section as find_toml_table_section, malformed_table_header_lines,
+    table_subtree_content as toml_table_subtree_content,
+};
 use crate::transitions::{
     EffectCheckpointStatus, JournalHandle, TransitionConflictChecker, TransitionJournal,
-    TransitionJournalStore, TransitionLifecycle, TransitionPlan, journal::JournalError,
+    TransitionJournalStore, TransitionLifecycle, TransitionPlan,
+    journal::{JournalError, MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES},
 };
 
 mod restore_control;
@@ -69,13 +78,13 @@ const CLAUDE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured
 const CLAUDE_ALL_PROJECT_MCP_SERVERS_ID: &str =
     "claude:project:configured-mcp:all-project-mcp-servers";
 const CURSOR_WORKSPACE_DISABLED_SERVERS_KEY: &str = "cursor/disabledMcpServers";
-const LEGACY_AUTHENTICATED_BACKUP_MANIFEST_VERSION: u8 = 2;
-const LEGACY_BACKUP_AUTHENTICATION_ALGORITHM: &str = "hmac-sha256";
+const CURSOR_WORKSPACE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKUP_MANIFEST_VERSION: u8 = 3;
 const BACKUP_AUTHENTICATION_ALGORITHM: &str = "hmac-sha256-unpin-backup-v1";
 
 thread_local! {
     static TRANSITION_BACKUP_ID_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static TRANSITION_MUTATION_LOCK_ROOT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +115,7 @@ pub enum ToggleStatus {
     DryRun,
     Applied,
     Blocked,
+    RecoveryRequired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -194,6 +204,23 @@ pub fn plan_toggle(request: TogglePlanRequest) -> ToggleResult {
 }
 
 fn plan_toggle_inner(input: TogglePlanInput) -> ToggleResult {
+    let apply = input.apply;
+    if input.item.mutability == DiscoveryMutability::ReadWrite
+        && is_live_provider_config_state_path(&input.item)
+        && let Err(reason) = ensure_provider_config_target(Path::new(&input.item.state_path))
+    {
+        return blocked(input.item, reason);
+    }
+
+    let result = plan_toggle_dispatch(input);
+    if apply {
+        result
+    } else {
+        validate_mutation_plan_targets(result)
+    }
+}
+
+fn plan_toggle_dispatch(input: TogglePlanInput) -> ToggleResult {
     if input.item.mutability != DiscoveryMutability::ReadWrite {
         return blocked(input.item, "read-only item cannot be planned for toggle");
     }
@@ -398,6 +425,145 @@ fn plan_toggle_inner(input: TogglePlanInput) -> ToggleResult {
     )
 }
 
+fn is_live_provider_config_state_path(item: &DiscoveryItem) -> bool {
+    !item.state_path.ends_with("entry.json")
+        && !is_cursor_workspace_state_path(item)
+        && (matches!(
+            item.category,
+            DiscoveryCategory::PluginConfig | DiscoveryCategory::ConfiguredMcp
+        ) || (is_supported_codex_skill(item) && !item.is_shared_skill_source()))
+}
+
+fn validate_mutation_plan_targets(plan: ToggleResult) -> ToggleResult {
+    match validate_mutation_plan_target_paths(&plan) {
+        Ok(()) => plan,
+        Err(reason) => blocked_result_from_plan(plan, reason),
+    }
+}
+
+fn validate_mutation_plan_target_paths(plan: &ToggleResult) -> Result<(), String> {
+    for operation in &plan.operations {
+        match operation.operation_type.as_str() {
+            "replaceFile" | "replaceJsonValue" => {
+                let Some(path) = operation.path.as_deref().or(operation.from_path.as_deref())
+                else {
+                    continue;
+                };
+                ensure_provider_config_target(Path::new(path))?;
+            }
+            "renamePath" => {
+                for path in [operation.from_path.as_deref(), operation.to_path.as_deref()]
+                    .into_iter()
+                    .flatten()
+                {
+                    ensure_target_parent_has_no_symlink_components(Path::new(path))?;
+                }
+            }
+            "replaceSqliteItemTableValue" => {
+                if let Some(path) = operation.path.as_deref() {
+                    ensure_target_parent_has_no_symlink_components(Path::new(path))?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn ensure_provider_config_target(path: &Path) -> Result<(), String> {
+    ensure_target_parent_has_no_symlink_components(path)?;
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "provider config path is a symlink and will not be mutated: {}",
+            path.display()
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(()),
+        Ok(_) => Err(format!(
+            "provider config path is not a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "provider config path could not be validated: {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn ensure_target_parent_has_no_symlink_components(path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("mutation target has no parent: {}", path.display()))?;
+    let mut current = PathBuf::new();
+    let mut missing_ancestor = false;
+    for component in parent.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                current.push(component.as_os_str());
+            }
+            Component::CurDir => continue,
+            Component::ParentDir => {
+                return Err(format!(
+                    "mutation target path is not normalized: {}",
+                    path.display()
+                ));
+            }
+        }
+        if missing_ancestor {
+            continue;
+        }
+        match fs::symlink_metadata(&current) {
+            Ok(metadata)
+                if metadata.file_type().is_symlink() && !allowed_platform_root_alias(&current) =>
+            {
+                return Err(format!(
+                    "mutation target parent contains a symlink: {}",
+                    current.display()
+                ));
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() => {}
+            Ok(metadata) if metadata.is_dir() => {}
+            Ok(_) => {
+                return Err(format!(
+                    "mutation target parent is not a directory: {}",
+                    current.display()
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                missing_ancestor = true;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "mutation target parent could not be validated: {}: {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn allowed_platform_root_alias(path: &Path) -> bool {
+    matches!(path.to_str(), Some("/etc" | "/tmp" | "/var"))
+}
+
+#[cfg(not(target_os = "macos"))]
+fn allowed_platform_root_alias(_path: &Path) -> bool {
+    false
+}
+
+fn write_provider_config(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+    ensure_provider_config_target(path).map_err(io::Error::other)?;
+    fs::write(path, contents)
+}
+
+fn rename_mutation_path(from: &Path, to: &Path) -> io::Result<()> {
+    ensure_target_parent_has_no_symlink_components(from).map_err(io::Error::other)?;
+    ensure_target_parent_has_no_symlink_components(to).map_err(io::Error::other)?;
+    fs::rename(from, to)
+}
+
 fn apply_authorized_toggle_transaction(
     input: TogglePlanInput,
     transition: &TransitionPlan,
@@ -451,8 +617,12 @@ fn apply_authorized_toggle_transaction(
             return blocked_result_from_plan(reviewed_preview.clone(), error.to_string());
         }
     };
+    let mutation_lock = match acquire_mutation_lock(&app_state_root) {
+        Ok(lock) => lock,
+        Err(reason) => return blocked_result_from_plan(reviewed_preview.clone(), reason),
+    };
     let store = TransitionJournalStore::new(&journal_app_state_root);
-    match store.load(transition, owner.clone()) {
+    let mut existing_handle = match store.load(transition, owner.clone()) {
         Ok(handle) if handle.journal.lifecycle.is_terminal() => {
             return cached_native_toggle_result(
                 &app_state_root,
@@ -461,11 +631,28 @@ fn apply_authorized_toggle_transaction(
                 reviewed_preview.clone(),
             );
         }
-        Ok(_) | Err(JournalError::JournalDisappeared) => {}
+        Ok(handle) => Some(handle),
+        Err(JournalError::JournalDisappeared) => None,
         Err(error) => {
             return blocked_result_from_plan(reviewed_preview.clone(), error.to_string());
         }
+    };
+    if let Some(handle) = existing_handle.as_mut() {
+        let backup_root = input
+            .app_state_root
+            .join("backups")
+            .join(&handle.journal.backup_id);
+        if backup_root.exists() {
+            return mark_native_toggle_needs_repair(
+                &store,
+                handle,
+                reviewed_preview.clone(),
+                "legacy-recovery-required",
+                "legacy transition backup exists without a committed checkpoint; manual recovery required",
+            );
+        }
     }
+
     let dry_run = plan_toggle_inner(TogglePlanInput {
         app_state_root: input.app_state_root.clone(),
         item: input.item.clone(),
@@ -474,17 +661,49 @@ fn apply_authorized_toggle_transaction(
         session_authority_key: None,
     });
     if dry_run.status != ToggleStatus::DryRun {
+        if existing_handle.as_ref().is_some_and(|handle| {
+            matches!(
+                handle.journal.lifecycle,
+                TransitionLifecycle::Applying | TransitionLifecycle::Recovering
+            )
+        }) {
+            return mark_native_toggle_needs_repair(
+                &store,
+                existing_handle.as_mut().expect("checked existing journal"),
+                dry_run,
+                "legacy-resume-state-diverged",
+                "legacy transition resumed from an interrupted apply but current provider state could not be revalidated; manual recovery required",
+            );
+        }
         return dry_run;
     }
     if dry_run != *reviewed_preview {
-        return blocked_result_from_plan(
+        let blocked = blocked_result_from_plan(
             dry_run,
             "reviewed native toggle preview no longer matches current state",
         );
+        if existing_handle.as_ref().is_some_and(|handle| {
+            matches!(
+                handle.journal.lifecycle,
+                TransitionLifecycle::Applying | TransitionLifecycle::Recovering
+            )
+        }) {
+            return mark_native_toggle_needs_repair(
+                &store,
+                existing_handle.as_mut().expect("checked existing journal"),
+                blocked,
+                "legacy-resume-state-diverged",
+                "legacy transition resumed from an interrupted apply but current provider state diverged from the reviewed preview; manual recovery required",
+            );
+        }
+        return blocked;
     }
-    let mut handle = match store.create_or_attach(transition, owner.clone()) {
-        Ok(handle) => handle,
-        Err(error) => return blocked_result_from_plan(dry_run, error.to_string()),
+    let mut handle = match existing_handle {
+        Some(handle) => handle,
+        None => match store.create_or_attach(transition, owner.clone()) {
+            Ok(handle) => handle,
+            Err(error) => return blocked_result_from_plan(dry_run, error.to_string()),
+        },
     };
     if handle.journal.lifecycle.is_terminal() {
         return cached_native_toggle_result(
@@ -518,50 +737,126 @@ fn apply_authorized_toggle_transaction(
             "legacy transition backup exists without a committed checkpoint; manual recovery required",
         );
     }
-
-    if handle
-        .journal
-        .authorization_decision_digest
-        .as_deref()
-        .is_some_and(|digest| digest != authorization.decision_digest())
-    {
-        return blocked_result_from_plan(
-            dry_run,
-            "native toggle is bound to another approval decision",
-        );
-    }
-    if handle.journal.authorization_decision_digest.is_none() {
-        handle.journal.authorization_decision_digest =
-            Some(authorization.decision_digest().to_string());
-        if let Err(error) = handle
-            .journal
-            .record(TransitionLifecycle::Approved, "approval-recorded", None)
-            .and_then(|()| {
-                handle.journal.record(
-                    TransitionLifecycle::Locked,
-                    "legacy-mutation-lock-delegated",
-                    None,
-                )
-            })
-            .and_then(|()| store.save(&mut handle))
-        {
-            return blocked_result_from_plan(dry_run, error.to_string());
+    let decision_digest = authorization.decision_digest();
+    match handle.journal.authorization_decision_digest.clone() {
+        Some(existing) if existing != decision_digest => {
+            let refreshable = matches!(
+                handle.journal.lifecycle,
+                TransitionLifecycle::Approved
+                    | TransitionLifecycle::Locked
+                    | TransitionLifecycle::Applying
+                    | TransitionLifecycle::Recovering
+            ) && handle
+                .journal
+                .effects
+                .iter()
+                .all(|effect| effect.status == EffectCheckpointStatus::Pending);
+            if !refreshable {
+                return blocked_result_from_plan(
+                    dry_run,
+                    "native toggle is bound to another approval decision",
+                );
+            }
+            let decisions_to_append = usize::from(
+                handle.journal.authorization_decision_history.last() != Some(&existing),
+            ) + 1;
+            if handle
+                .journal
+                .authorization_decision_history
+                .len()
+                .saturating_add(decisions_to_append)
+                > MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES
+            {
+                return mark_native_toggle_needs_repair(
+                    &store,
+                    &mut handle,
+                    dry_run,
+                    "approval-refresh-limit",
+                    "native toggle exceeded its bounded approval refresh history; manual recovery required",
+                );
+            }
+            if handle.journal.authorization_decision_history.last() != Some(&existing) {
+                handle.journal.authorization_decision_history.push(existing);
+            }
+            handle
+                .journal
+                .authorization_decision_history
+                .push(decision_digest.to_string());
+            handle.journal.authorization_decision_digest = Some(decision_digest.to_string());
+            let lifecycle = handle.journal.lifecycle;
+            if let Err(error) = handle
+                .journal
+                .record(lifecycle, "approval-refreshed", None)
+                .and_then(|()| store.save(&mut handle))
+            {
+                return blocked_result_from_plan(dry_run, error.to_string());
+            }
+        }
+        Some(_) => {}
+        None => {
+            handle.journal.authorization_decision_digest = Some(decision_digest.to_string());
+            handle
+                .journal
+                .authorization_decision_history
+                .push(decision_digest.to_string());
+            if let Err(error) = handle
+                .journal
+                .record(TransitionLifecycle::Approved, "approval-recorded", None)
+                .and_then(|()| {
+                    handle.journal.record(
+                        TransitionLifecycle::Locked,
+                        "legacy-mutation-lock-delegated",
+                        None,
+                    )
+                })
+                .and_then(|()| store.save(&mut handle))
+            {
+                return blocked_result_from_plan(dry_run, error.to_string());
+            }
         }
     }
 
-    if let Err(error) = handle
+    let revalidated = validate_mutation_plan_targets(dry_run.clone());
+    if revalidated.status == ToggleStatus::Blocked {
+        if matches!(
+            handle.journal.lifecycle,
+            TransitionLifecycle::Applying | TransitionLifecycle::Recovering
+        ) {
+            return mark_native_toggle_needs_repair(
+                &store,
+                &mut handle,
+                revalidated,
+                "legacy-resume-state-diverged",
+                "legacy transition resumed from an interrupted apply but its mutation targets could not be revalidated; manual recovery required",
+            );
+        }
+        return revalidated;
+    }
+
+    let retrying_prewrite_attempt = matches!(
+        handle.journal.lifecycle,
+        TransitionLifecycle::Applying | TransitionLifecycle::Recovering
+    ) && handle
         .journal
-        .record(
-            TransitionLifecycle::Applying,
-            "legacy-apply-started",
-            Some("native-toggle-effect"),
-        )
-        .and_then(|()| store.save(&mut handle))
+        .effects
+        .iter()
+        .all(|effect| effect.status == EffectCheckpointStatus::Pending);
+    if !retrying_prewrite_attempt
+        && let Err(error) = handle
+            .journal
+            .record(
+                TransitionLifecycle::Applying,
+                "legacy-apply-started",
+                Some("native-toggle-effect"),
+            )
+            .and_then(|()| store.save(&mut handle))
     {
         return blocked_result_from_plan(dry_run, error.to_string());
     }
 
-    let applied = with_transition_backup_id(&backup_id, || plan_toggle_inner(input));
+    let applied = with_transition_mutation_lock(&app_state_root, &mutation_lock, || {
+        with_transition_backup_id(&backup_id, || plan_toggle_inner(input))
+    });
     if applied.status != ToggleStatus::Applied {
         if backup_root.exists() {
             let reason = applied
@@ -576,12 +871,14 @@ fn apply_authorized_toggle_transaction(
                 reason,
             );
         }
-        let _ = handle.journal.record(
-            TransitionLifecycle::Recovering,
-            "legacy-apply-blocked",
-            Some("native-toggle-effect"),
-        );
-        let _ = store.save(&mut handle);
+        if handle.journal.lifecycle != TransitionLifecycle::Recovering {
+            let _ = handle.journal.record(
+                TransitionLifecycle::Recovering,
+                "legacy-apply-blocked",
+                Some("native-toggle-effect"),
+            );
+            let _ = store.save(&mut handle);
+        }
         return applied;
     }
     if applied.backup_id.as_deref() != Some(backup_id.as_str()) {
@@ -737,7 +1034,7 @@ fn recover_native_toggle_checkpoint_failure(
 fn mark_native_toggle_needs_repair(
     store: &TransitionJournalStore,
     handle: &mut JournalHandle,
-    result: ToggleResult,
+    mut result: ToggleResult,
     code: &str,
     reason: impl Into<String>,
 ) -> ToggleResult {
@@ -753,6 +1050,9 @@ fn mark_native_toggle_needs_repair(
     let mut reason = reason.into();
     if let Err(error) = journal_result {
         reason.push_str(&format!("; recovery journal update failed: {error}"));
+    }
+    if result.backup_id.is_none() {
+        result.backup_id = Some(handle.journal.backup_id.clone());
     }
     native_toggle_recovery_after_possible_write(result, reason)
 }
@@ -861,7 +1161,11 @@ mod checkpoint_recovery_tests {
             "injected checkpoint failure".to_string(),
         );
 
-        assert_eq!(result.status, ToggleStatus::Blocked);
+        assert_eq!(result.status, ToggleStatus::RecoveryRequired);
+        assert_eq!(
+            result.backup_id.as_deref(),
+            Some(handle.journal.backup_id.as_str())
+        );
         assert!(
             result
                 .reason
@@ -909,7 +1213,11 @@ mod checkpoint_recovery_tests {
             "injected checkpoint uncertainty".to_string(),
         );
 
-        assert_eq!(result.status, ToggleStatus::Blocked);
+        assert_eq!(result.status, ToggleStatus::RecoveryRequired);
+        assert_eq!(
+            result.backup_id.as_deref(),
+            Some(handle.journal.backup_id.as_str())
+        );
         assert!(
             result
                 .reason
@@ -927,8 +1235,9 @@ fn cached_native_toggle_result(
     app_state_root: &Path,
     backup_authentication_key: &BackupAuthenticationKey,
     journal: &TransitionJournal,
-    preview: ToggleResult,
+    mut preview: ToggleResult,
 ) -> ToggleResult {
+    preview.backup_id = Some(journal.backup_id.clone());
     match journal.lifecycle {
         TransitionLifecycle::Committed => {}
         TransitionLifecycle::NeedsRepair => {
@@ -1020,10 +1329,14 @@ fn native_toggle_post_state_fingerprint(manifest: &BackupManifest) -> Result<Str
 }
 
 fn native_toggle_recovery_required(
-    preview: ToggleResult,
+    mut preview: ToggleResult,
     reason: impl Into<String>,
 ) -> ToggleResult {
-    blocked_result_from_plan(preview, format!("recovery-required: {}", reason.into()))
+    preview.status = ToggleStatus::RecoveryRequired;
+    preview.reason = Some(format!("recovery-required: {}", reason.into()));
+    preview.writes =
+        Some("writes may already have been performed; manual recovery is required".to_string());
+    preview
 }
 
 fn blocked_result_from_plan(mut plan: ToggleResult, reason: impl Into<String>) -> ToggleResult {
@@ -1079,6 +1392,32 @@ fn with_transition_backup_id<T>(backup_id: &str, operation: impl FnOnce() -> T) 
     operation()
 }
 
+fn with_transition_mutation_lock<T>(
+    app_state_root: &Path,
+    lock: &MutationLock,
+    operation: impl FnOnce() -> T,
+) -> T {
+    struct ResetMutationLockRoot(Option<PathBuf>);
+    impl Drop for ResetMutationLockRoot {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            TRANSITION_MUTATION_LOCK_ROOT.with(|slot| *slot.borrow_mut() = previous);
+        }
+    }
+
+    assert!(
+        lock._file.is_some(),
+        "only a real mutation lock may delegate nested acquisition"
+    );
+    let canonical_root = canonical_existing_root(app_state_root);
+    let previous = TRANSITION_MUTATION_LOCK_ROOT.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.replace(canonical_root)
+    });
+    let _reset = ResetMutationLockRoot(previous);
+    operation()
+}
+
 fn plan_codex_skill_toggle(item: DiscoveryItem) -> ToggleResult {
     if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
         let current_fingerprint = match fs::read_to_string(&item.source_path) {
@@ -1102,15 +1441,12 @@ fn plan_codex_skill_toggle(item: DiscoveryItem) -> ToggleResult {
     }
 
     let config_path = PathBuf::from(&item.state_path);
-    let raw = if config_path.exists() {
-        match fs::read_to_string(&config_path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                return blocked(item, format!("Codex config could not be read: {error}"));
-            }
+    let raw = match read_optional_string(&config_path) {
+        Ok(Some(raw)) => raw,
+        Ok(None) => String::new(),
+        Err(error) => {
+            return blocked(item, format!("Codex config could not be read: {error}"));
         }
-    } else {
-        String::new()
     };
     let current_enabled = match codex_skill_config_enabled(&raw, Path::new(&item.source_path)) {
         Ok(enabled) => enabled,
@@ -1169,24 +1505,13 @@ fn apply_codex_skill_toggle(
     }
 
     let config_path = PathBuf::from(&item.state_path);
-    let config_existed = config_path.exists();
-    if config_existed && !config_path.is_file() {
-        drop(lock);
-        return blocked(
-            item,
-            format!("Codex config is not a file: {}", config_path.display()),
-        );
-    }
-    let raw = if config_existed {
-        match fs::read_to_string(&config_path) {
-            Ok(raw) => raw,
-            Err(error) => {
-                drop(lock);
-                return blocked(item, format!("Codex config could not be read: {error}"));
-            }
+    let (config_existed, raw) = match read_optional_string(&config_path) {
+        Ok(Some(raw)) => (true, raw),
+        Ok(None) => (false, String::new()),
+        Err(error) => {
+            drop(lock);
+            return blocked(item, format!("Codex config could not be read: {error}"));
         }
-    } else {
-        String::new()
     };
     let rewritten = match set_codex_skill_config_enabled(
         &raw,
@@ -1200,8 +1525,10 @@ fn apply_codex_skill_toggle(
         }
     };
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     if backup_root.exists() {
@@ -1254,7 +1581,7 @@ fn apply_codex_skill_toggle(
         if let Some(parent) = config_path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(&config_path, rewritten)?;
+        write_provider_config(&config_path, rewritten)?;
         append_audit_entry(
             &app_state_root,
             &ApplyAuditEntry {
@@ -1272,7 +1599,7 @@ fn apply_codex_skill_toggle(
 
     drop(lock);
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
     ToggleResult {
         status: ToggleStatus::Applied,
@@ -1456,10 +1783,7 @@ fn validate_backup_manifest_structure(
     backup_dir_name: &str,
     manifest: &BackupManifest,
 ) -> Result<(), String> {
-    if !matches!(
-        manifest.version,
-        1 | LEGACY_AUTHENTICATED_BACKUP_MANIFEST_VERSION | BACKUP_MANIFEST_VERSION
-    ) {
+    if !matches!(manifest.version, 1 | BACKUP_MANIFEST_VERSION) {
         return Err(format!(
             "unsupported backup manifest version: {}",
             manifest.version
@@ -1470,16 +1794,10 @@ fn validate_backup_manifest_structure(
         (1, Some(_)) => {
             return Err("legacy backup manifest must not declare authenticity".to_string());
         }
-        (LEGACY_AUTHENTICATED_BACKUP_MANIFEST_VERSION, Some(authenticity)) => {
-            validate_backup_authenticity_structure(
-                authenticity,
-                LEGACY_BACKUP_AUTHENTICATION_ALGORITHM,
-            )?;
-        }
         (BACKUP_MANIFEST_VERSION, Some(authenticity)) => {
             validate_backup_authenticity_structure(authenticity, BACKUP_AUTHENTICATION_ALGORITHM)?;
         }
-        (LEGACY_AUTHENTICATED_BACKUP_MANIFEST_VERSION | BACKUP_MANIFEST_VERSION, None) => {
+        (BACKUP_MANIFEST_VERSION, None) => {
             return Err("authenticated backup manifest is missing authenticity".to_string());
         }
         _ => unreachable!("manifest version checked above"),
@@ -1511,7 +1829,6 @@ fn validate_backup_manifest_structure(
                 entry.entry_id, entry.target.path
             ));
         }
-
         match entry.target.target_type.as_str() {
             "path" => validate_path_backup_entry(entry)?,
             "sqlite-item" => validate_sqlite_backup_entry(entry)?,
@@ -1647,6 +1964,7 @@ fn validate_backup_payload_evidence(
     backup_root: &Path,
     manifest: &BackupManifest,
 ) -> Result<(), String> {
+    validate_backup_restore_target_allowlist(backup_root, manifest)?;
     for entry in manifest.entries.iter().filter(|entry| entry.existed) {
         let payload = entry
             .payload
@@ -1679,6 +1997,47 @@ fn validate_backup_payload_evidence(
         }
     }
 
+    Ok(())
+}
+
+fn validate_backup_restore_target_allowlist(
+    backup_root: &Path,
+    manifest: &BackupManifest,
+) -> Result<(), String> {
+    let backups_root = backup_root
+        .parent()
+        .filter(|path| path.file_name() == Some(std::ffi::OsStr::new("backups")))
+        .ok_or_else(|| "backup root is outside the application backup directory".to_string())?;
+    let app_state_root = backups_root
+        .parent()
+        .ok_or_else(|| "application state root is unavailable".to_string())?;
+    let reviewed_paths = manifest
+        .affected_targets
+        .iter()
+        .map(|target| canonical_existing_root(Path::new(&target.path)))
+        .collect::<BTreeSet<_>>();
+    let vault_root = vault_root_path(app_state_root, &manifest.selection);
+    let mut internal_paths = ["entry.json", "payload", "payload.json"]
+        .map(|name| canonical_existing_root(&vault_root.join(name)))
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let app_vault_root = canonical_existing_root(&app_state_root.join("vault"));
+    let selection_state_path = canonical_existing_root(Path::new(&manifest.selection.state_path));
+    if selection_state_path.file_name() == Some(std::ffi::OsStr::new("entry.json"))
+        && selection_state_path.starts_with(&app_vault_root)
+    {
+        internal_paths.insert(selection_state_path);
+    }
+
+    for entry in &manifest.entries {
+        let target = canonical_existing_root(Path::new(&entry.target.path));
+        if !reviewed_paths.contains(&target) && !internal_paths.contains(&target) {
+            return Err(format!(
+                "backup entry {} target is not declared in the restore allowlist",
+                entry.entry_id
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1969,8 +2328,10 @@ fn apply_directory_toggle(
         drop(lock);
         return plan;
     }
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let source_path = PathBuf::from(&item.state_path);
@@ -2044,7 +2405,7 @@ fn apply_directory_toggle(
         )?;
 
         fs::create_dir_all(&vault_root)?;
-        fs::rename(&source_path, &vault_payload)?;
+        rename_mutation_path(&source_path, &vault_payload)?;
 
         let entry = VaultEntry {
             version: 1,
@@ -2079,7 +2440,7 @@ fn apply_directory_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -2110,8 +2471,10 @@ fn apply_disabled_directory_toggle(
         return plan;
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
     let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
@@ -2222,7 +2585,7 @@ fn apply_disabled_directory_toggle(
         if let Some(parent) = restore_target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(&vault_payload, &restore_target)?;
+        rename_mutation_path(&vault_payload, &restore_target)?;
         if vault_root.exists() {
             fs::remove_dir_all(&vault_root)?;
         }
@@ -2246,7 +2609,7 @@ fn apply_disabled_directory_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -2385,8 +2748,10 @@ fn apply_path_file_toggle(
         drop(lock);
         return plan;
     }
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let source_path = PathBuf::from(&item.state_path);
@@ -2461,7 +2826,7 @@ fn apply_path_file_toggle(
         )?;
 
         fs::create_dir_all(&vault_root)?;
-        fs::rename(&source_path, &vault_payload)?;
+        rename_mutation_path(&source_path, &vault_payload)?;
 
         let entry = VaultEntry {
             version: 1,
@@ -2496,7 +2861,7 @@ fn apply_path_file_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -2526,8 +2891,10 @@ fn apply_disabled_path_file_toggle(
         return plan;
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
     let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
@@ -2634,7 +3001,7 @@ fn apply_disabled_path_file_toggle(
         if let Some(parent) = restore_target.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(&vault_payload, &restore_target)?;
+        rename_mutation_path(&vault_payload, &restore_target)?;
         if vault_root.exists() {
             fs::remove_dir_all(&vault_root)?;
         }
@@ -2658,7 +3025,7 @@ fn apply_disabled_path_file_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -2756,8 +3123,10 @@ fn apply_claude_plugin_config_toggle(
         return blocked(item, reason);
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
 
@@ -2811,7 +3180,7 @@ fn apply_claude_plugin_config_toggle(
         )?;
 
         let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        fs::write(&source_path, format!("{rendered}\n"))?;
+        write_provider_config(&source_path, format!("{rendered}\n"))?;
 
         append_audit_entry(
             &app_state_root,
@@ -2832,7 +3201,7 @@ fn apply_claude_plugin_config_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -2919,8 +3288,10 @@ fn apply_claude_all_project_mcp_servers_toggle(
         return blocked(item, reason);
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
 
@@ -2974,7 +3345,7 @@ fn apply_claude_all_project_mcp_servers_toggle(
         )?;
 
         let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        fs::write(&source_path, format!("{rendered}\n"))?;
+        write_provider_config(&source_path, format!("{rendered}\n"))?;
 
         append_audit_entry(
             &app_state_root,
@@ -2995,7 +3366,7 @@ fn apply_claude_all_project_mcp_servers_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -3139,8 +3510,10 @@ fn apply_claude_configured_mcp_toggle(
         return blocked(item, reason);
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
 
@@ -3194,7 +3567,7 @@ fn apply_claude_configured_mcp_toggle(
         )?;
 
         let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        fs::write(&source_path, format!("{rendered}\n"))?;
+        write_provider_config(&source_path, format!("{rendered}\n"))?;
 
         append_audit_entry(
             &app_state_root,
@@ -3215,7 +3588,7 @@ fn apply_claude_configured_mcp_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -3277,6 +3650,9 @@ fn plan_codex_toml_table_toggle(
             return blocked(item, format!("Codex config could not be read: {}", error));
         }
     };
+    if let Err(reason) = ensure_unique_standard_toml_tables(&raw) {
+        return blocked(item, reason);
+    }
 
     let section = match find_toml_table_section(&raw, table_prefix, table_id) {
         Some(section) => section,
@@ -3287,7 +3663,7 @@ fn plan_codex_toml_table_toggle(
             );
         }
     };
-    let current_enabled = match toml_table_bool(&section.content, "enabled") {
+    let current_enabled = match toml_table_bool(section.content, "enabled") {
         Ok(enabled) => enabled.unwrap_or(true),
         Err(reason) => return blocked(item, reason),
     };
@@ -3302,7 +3678,13 @@ fn plan_codex_toml_table_toggle(
         );
     }
     if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-        let current_fingerprint = source_fingerprint(&section.content);
+        let Some(current_content) = toml_table_subtree_content(&raw, table_prefix, table_id) else {
+            return blocked(
+                item,
+                format!("Codex {item_description} table subtree is ambiguous for {table_id}"),
+            );
+        };
+        let current_fingerprint = source_fingerprint(&current_content);
         if current_fingerprint != discovered_fingerprint {
             return blocked(
                 item,
@@ -3363,6 +3745,9 @@ fn plan_disabled_codex_configured_mcp_toggle(
             return blocked(item, format!("Codex config could not be read: {}", error));
         }
     };
+    if let Err(reason) = ensure_unique_standard_toml_tables(&raw) {
+        return blocked(item, reason);
+    }
     if find_toml_table_section(&raw, "mcp_servers", server_id).is_some() {
         return blocked(
             item,
@@ -3386,6 +3771,9 @@ fn plan_disabled_codex_configured_mcp_toggle(
             );
         }
     };
+    if let Err(reason) = ensure_unique_standard_toml_tables(&payload_raw) {
+        return blocked(item, format!("vault payload is ambiguous: {reason}"));
+    }
     if find_toml_table_section(&payload_raw, "mcp_servers", server_id).is_none() {
         return blocked(
             item,
@@ -3540,8 +3928,10 @@ fn apply_codex_toml_table_toggle(
             return blocked(item, reason);
         }
     };
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
 
@@ -3594,7 +3984,7 @@ fn apply_codex_toml_table_toggle(
             backup_authentication_key,
         )?;
 
-        fs::write(&source_path, rewritten)?;
+        write_provider_config(&source_path, rewritten)?;
 
         append_audit_entry(
             &app_state_root,
@@ -3615,7 +4005,7 @@ fn apply_codex_toml_table_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -3664,6 +4054,10 @@ fn apply_disabled_codex_configured_mcp_toggle(
             return blocked(item, format!("Codex config could not be read: {}", error));
         }
     };
+    if let Err(reason) = ensure_unique_standard_toml_tables(&raw) {
+        drop(lock);
+        return blocked(item, reason);
+    }
     if find_toml_table_section(&raw, "mcp_servers", &server_id).is_some() {
         drop(lock);
         return blocked(
@@ -3689,6 +4083,10 @@ fn apply_disabled_codex_configured_mcp_toggle(
             );
         }
     };
+    if let Err(reason) = ensure_unique_standard_toml_tables(&payload_raw) {
+        drop(lock);
+        return blocked(item, format!("vault payload is ambiguous: {reason}"));
+    }
     let section = match find_toml_table_section(&payload_raw, "mcp_servers", &server_id) {
         Some(section) => section,
         None => {
@@ -3699,10 +4097,12 @@ fn apply_disabled_codex_configured_mcp_toggle(
             );
         }
     };
-    let rewritten = append_toml_table_section(&raw, &section.content);
+    let rewritten = append_toml_table_section(&raw, section.content);
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
@@ -3799,7 +4199,7 @@ fn apply_disabled_codex_configured_mcp_toggle(
             backup_authentication_key,
         )?;
 
-        fs::write(&source_path, rewritten)?;
+        write_provider_config(&source_path, rewritten)?;
         if vault_root.exists() {
             fs::remove_dir_all(&vault_root)?;
         }
@@ -3823,7 +4223,7 @@ fn apply_disabled_codex_configured_mcp_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -4211,8 +4611,10 @@ fn apply_json_configured_mcp_toggle(
         }
     };
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let vault_root = vault_root_path(&app_state_root, &item);
@@ -4302,7 +4704,7 @@ fn apply_json_configured_mcp_toggle(
         write_json_file(&vault_root.join("entry.json"), &entry)?;
 
         let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        fs::write(&source_path, format!("{rendered}\n"))?;
+        write_provider_config(&source_path, format!("{rendered}\n"))?;
 
         append_audit_entry(
             &app_state_root,
@@ -4323,7 +4725,7 @@ fn apply_json_configured_mcp_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -4374,9 +4776,46 @@ fn apply_cursor_workspace_configured_mcp_toggle(
         return blocked(item, reason);
     }
 
-    let workspace_raw = match read_cursor_workspace_disabled_server_ids_raw(&workspace_path) {
-        Ok(workspace_raw) => workspace_raw,
+    let mut workspace_connection = match open_cursor_workspace_database(
+        &workspace_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        "begin write transaction for",
+    ) {
+        Ok(connection) => connection,
         Err(reason) => {
+            drop(lock);
+            return blocked(item, reason);
+        }
+    };
+    let workspace_transaction = match workspace_connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+    {
+        Ok(transaction) => transaction,
+        Err(error) => {
+            let reason =
+                cursor_workspace_database_error(&workspace_path, "reserve write access to", &error);
+            drop(lock);
+            return blocked(item, reason);
+        }
+    };
+    let workspace_raw = match read_cursor_workspace_disabled_server_ids_raw_from_connection(
+        &workspace_transaction,
+        &workspace_path,
+    ) {
+        Ok(Some(workspace_raw)) => workspace_raw,
+        Ok(None) => {
+            drop(workspace_transaction);
+            drop(lock);
+            return blocked(
+                item,
+                format!(
+                    "Cursor workspace state is missing {CURSOR_WORKSPACE_DISABLED_SERVERS_KEY} in {}",
+                    workspace_path.display()
+                ),
+            );
+        }
+        Err(reason) => {
+            drop(workspace_transaction);
             drop(lock);
             return blocked(item, reason);
         }
@@ -4385,36 +4824,57 @@ fn apply_cursor_workspace_configured_mcp_toggle(
         match parse_cursor_workspace_disabled_server_ids(&workspace_path, &workspace_raw) {
             Ok(disabled_server_ids) => disabled_server_ids,
             Err(reason) => {
+                drop(workspace_transaction);
                 drop(lock);
                 return blocked(item, reason);
             }
         };
     let workspace_server_id = cursor_workspace_server_id(&server_id);
+    if !disabled_server_ids
+        .iter()
+        .any(|server_id| server_id == &workspace_server_id)
+    {
+        drop(workspace_transaction);
+        drop(lock);
+        return blocked(
+            item,
+            format!(
+                "Cursor workspace state drifted for {server_id}: {workspace_server_id} is no longer disabled"
+            ),
+        );
+    }
     let next_disabled_server_ids = disabled_server_ids
         .into_iter()
         .filter(|server_id| server_id != &workspace_server_id)
         .collect::<Vec<_>>();
+    let next_workspace_raw = match serde_json::to_vec(&next_disabled_server_ids) {
+        Ok(raw) => raw,
+        Err(error) => {
+            drop(workspace_transaction);
+            drop(lock);
+            return blocked(item, error.to_string());
+        }
+    };
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => {
+            drop(workspace_transaction);
+            drop(lock);
+            return blocked(item, reason);
+        }
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
-
-    if !workspace_path.is_file() {
-        let reason = format!(
-            "Cursor workspace database not found: {}",
-            workspace_path.display()
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
 
     if has_json_disabled && !source_path.is_file() {
         let reason = format!("Cursor mcp.json file not found: {}", source_path.display());
+        drop(workspace_transaction);
         drop(lock);
         return blocked(item, reason);
     }
 
     if backup_root.exists() {
+        drop(workspace_transaction);
         drop(lock);
         return blocked(item, format!("backup already exists: {backup_id}"));
     }
@@ -4491,10 +4951,21 @@ fn apply_cursor_workspace_configured_mcp_toggle(
 
         if has_json_disabled {
             let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-            fs::write(&source_path, format!("{rendered}\n"))?;
+            write_provider_config(&source_path, format!("{rendered}\n"))?;
         }
-        write_cursor_workspace_disabled_server_ids(&workspace_path, &next_disabled_server_ids)
-            .map_err(io::Error::other)?;
+        write_cursor_workspace_disabled_server_ids_raw_on_connection(
+            &workspace_transaction,
+            &workspace_path,
+            &next_workspace_raw,
+        )
+        .map_err(io::Error::other)?;
+        workspace_transaction.commit().map_err(|error| {
+            io::Error::other(cursor_workspace_database_error(
+                &workspace_path,
+                "commit write transaction for",
+                &error,
+            ))
+        })?;
 
         append_audit_entry(
             &app_state_root,
@@ -4515,7 +4986,7 @@ fn apply_cursor_workspace_configured_mcp_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -4613,8 +5084,10 @@ fn apply_disabled_json_configured_mcp_vault_toggle(
         return blocked(item, reason);
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
@@ -4715,7 +5188,7 @@ fn apply_disabled_json_configured_mcp_vault_toggle(
         )?;
 
         let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        fs::write(&source_path, format!("{rendered}\n"))?;
+        write_provider_config(&source_path, format!("{rendered}\n"))?;
         if vault_root.exists() {
             fs::remove_dir_all(&vault_root)?;
         }
@@ -4739,7 +5212,7 @@ fn apply_disabled_json_configured_mcp_vault_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -4787,8 +5260,10 @@ fn apply_cursor_configured_mcp_disabled_flag_enable(
         return blocked(item, reason);
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
 
@@ -4842,7 +5317,7 @@ fn apply_cursor_configured_mcp_disabled_flag_enable(
         )?;
 
         let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        fs::write(&source_path, format!("{rendered}\n"))?;
+        write_provider_config(&source_path, format!("{rendered}\n"))?;
 
         append_audit_entry(
             &app_state_root,
@@ -4863,7 +5338,7 @@ fn apply_cursor_configured_mcp_disabled_flag_enable(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -4987,8 +5462,10 @@ fn apply_opencode_configured_mcp_toggle(
         );
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     if backup_root.exists() {
@@ -5032,7 +5509,7 @@ fn apply_opencode_configured_mcp_toggle(
             &mut manifest,
             backup_authentication_key,
         )?;
-        fs::write(&source_path, rendered)?;
+        write_provider_config(&source_path, rendered)?;
         append_audit_entry(
             &app_state_root,
             &ApplyAuditEntry {
@@ -5050,7 +5527,7 @@ fn apply_opencode_configured_mcp_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
     ToggleResult {
         status: ToggleStatus::Applied,
@@ -5229,8 +5706,10 @@ fn apply_pi_package_extension_disable(
         );
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries/entry-1/payload");
     let vault_root = vault_root_path(&app_state_root, &item);
@@ -5314,7 +5793,7 @@ fn apply_pi_package_extension_disable(
                 jsonc_format: None,
             },
         )?;
-        fs::write(&source_path, rewrite.rendered)?;
+        write_provider_config(&source_path, rewrite.rendered)?;
         append_audit_entry(
             &app_state_root,
             &ApplyAuditEntry {
@@ -5332,7 +5811,7 @@ fn apply_pi_package_extension_disable(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
     ToggleResult {
         status: ToggleStatus::Applied,
@@ -5404,8 +5883,10 @@ fn apply_pi_package_extension_enable(
         );
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries/entry-1/payload");
     let backup_vault_payload = backup_root.join("entries/entry-2/payload");
@@ -5498,7 +5979,7 @@ fn apply_pi_package_extension_enable(
             backup_authentication_key,
         )?;
 
-        fs::write(&source_path, rewrite.rendered)?;
+        write_provider_config(&source_path, rewrite.rendered)?;
         if vault.is_some() {
             fs::remove_dir_all(&vault_root)?;
         }
@@ -5519,7 +6000,7 @@ fn apply_pi_package_extension_enable(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
     ToggleResult {
         status: ToggleStatus::Applied,
@@ -5721,8 +6202,10 @@ fn apply_opencode_plugin_config_toggle(
         );
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let vault_root = vault_root_path(&app_state_root, &item);
@@ -5797,7 +6280,7 @@ fn apply_opencode_plugin_config_toggle(
             jsonc_format: removal.jsonc_format,
         };
         write_json_file(&vault_root.join("entry.json"), &entry)?;
-        fs::write(&source_path, &removal.rendered)?;
+        write_provider_config(&source_path, &removal.rendered)?;
         append_audit_entry(
             &app_state_root,
             &ApplyAuditEntry {
@@ -5815,7 +6298,7 @@ fn apply_opencode_plugin_config_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
     ToggleResult {
         status: ToggleStatus::Applied,
@@ -5889,8 +6372,10 @@ fn apply_disabled_opencode_plugin_config_toggle(
         );
     }
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
@@ -5980,7 +6465,7 @@ fn apply_disabled_opencode_plugin_config_toggle(
             backup_authentication_key,
         )?;
 
-        fs::write(&source_path, rendered)?;
+        write_provider_config(&source_path, rendered)?;
         if vault_root.exists() {
             fs::remove_dir_all(&vault_root)?;
         }
@@ -6001,7 +6486,7 @@ fn apply_disabled_opencode_plugin_config_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
     ToggleResult {
         status: ToggleStatus::Applied,
@@ -6198,8 +6683,10 @@ fn apply_zed_configured_mcp_toggle(
     let vaulted_server_raw = removal.value_raw;
     let jsonc_format = removal.format;
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let vault_root = vault_root_path(&app_state_root, &item);
@@ -6288,7 +6775,7 @@ fn apply_zed_configured_mcp_toggle(
         };
         write_json_file(&vault_root.join("entry.json"), &entry)?;
 
-        fs::write(&source_path, &rendered)?;
+        write_provider_config(&source_path, &rendered)?;
 
         append_audit_entry(
             &app_state_root,
@@ -6309,7 +6796,7 @@ fn apply_zed_configured_mcp_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -6382,8 +6869,10 @@ fn apply_disabled_zed_configured_mcp_vault_toggle(
         }
     };
 
-    let backup_id = current_backup_id();
-    let created_at = current_timestamp();
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
     let backup_root = app_state_root.join("backups").join(&backup_id);
     let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
     let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
@@ -6480,7 +6969,7 @@ fn apply_disabled_zed_configured_mcp_vault_toggle(
             backup_authentication_key,
         )?;
 
-        fs::write(&source_path, &rendered)?;
+        write_provider_config(&source_path, &rendered)?;
         if vault_root.exists() {
             fs::remove_dir_all(&vault_root)?;
         }
@@ -6504,7 +6993,7 @@ fn apply_disabled_zed_configured_mcp_vault_toggle(
     drop(lock);
 
     if let Err(error) = apply_result {
-        return blocked(item, error.to_string());
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
     ToggleResult {
@@ -6526,6 +7015,29 @@ fn blocked(item: DiscoveryItem, reason: impl Into<String>) -> ToggleResult {
         reason: Some(reason.into()),
         writes: Some("no writes were performed".to_string()),
     }
+}
+
+fn apply_failure_result(
+    mut plan: ToggleResult,
+    backup_id: String,
+    backup_root: &Path,
+    reason: impl Into<String>,
+) -> ToggleResult {
+    let reason = reason.into();
+    if backup_root.exists() {
+        plan.status = ToggleStatus::RecoveryRequired;
+        plan.backup_id = Some(backup_id.clone());
+        plan.reason = Some(format!(
+            "apply failed after backup {backup_id}; recovery-required: {reason}"
+        ));
+        plan.writes =
+            Some("writes may already have been performed; manual recovery is required".to_string());
+    } else {
+        plan.status = ToggleStatus::Blocked;
+        plan.reason = Some(reason);
+        plan.writes = Some("no writes were performed".to_string());
+    }
+    plan
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -6824,10 +7336,18 @@ struct FailedApplyAuditEntry {
 }
 
 pub(crate) struct MutationLock {
-    _file: File,
+    _file: Option<File>,
 }
 
 pub(crate) fn acquire_mutation_lock(app_state_root: &Path) -> Result<MutationLock, String> {
+    let canonical_root = canonical_existing_root(app_state_root);
+    let delegated = TRANSITION_MUTATION_LOCK_ROOT
+        .with(|slot| slot.borrow().as_deref() == Some(canonical_root.as_path()));
+    if delegated {
+        return Ok(MutationLock { _file: None });
+    }
+
+    let acquired_at = current_timestamp()?;
     let lock_dir = app_state_root.join("locks");
     let lock_path = lock_dir.join("mutation.lock");
     fs::create_dir_all(&lock_dir).map_err(|error| error.to_string())?;
@@ -6840,7 +7360,7 @@ pub(crate) fn acquire_mutation_lock(app_state_root: &Path) -> Result<MutationLoc
 
     let payload = serde_json::json!({
         "pid": process::id(),
-        "acquiredAt": current_timestamp(),
+        "acquiredAt": acquired_at,
     });
     lock_file.set_len(0).map_err(|error| error.to_string())?;
     lock_file
@@ -6854,7 +7374,9 @@ pub(crate) fn acquire_mutation_lock(app_state_root: &Path) -> Result<MutationLoc
     .map_err(|error| error.to_string())?;
     lock_file.flush().map_err(|error| error.to_string())?;
 
-    Ok(MutationLock { _file: lock_file })
+    Ok(MutationLock {
+        _file: Some(lock_file),
+    })
 }
 
 fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
@@ -6866,18 +7388,55 @@ fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
     {
         Ok(file) => Ok(file),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(lock_path).map_err(|error| error.to_string())?;
-            if !metadata.file_type().is_file() {
-                return Err("mutation lock path is not a regular file".to_string());
-            }
-            OpenOptions::new()
+            let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .truncate(false)
                 .open(lock_path)
-                .map_err(|error| error.to_string())
+                .map_err(|error| error.to_string())?;
+            validate_open_mutation_lock_file(lock_path, &file)?;
+            Ok(file)
         }
         Err(error) => Err(error.to_string()),
+    }
+}
+
+fn validate_open_mutation_lock_file(lock_path: &Path, file: &File) -> Result<(), String> {
+    let path_metadata = fs::symlink_metadata(lock_path).map_err(|error| error.to_string())?;
+    let file_metadata = file.metadata().map_err(|error| error.to_string())?;
+    if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
+        return Err("mutation lock path is not a regular file".to_string());
+    }
+    if !crate::fs_support::path_matches_open_file(lock_path, file)
+        .map_err(|error| error.to_string())?
+    {
+        return Err("mutation lock path changed while it was being opened".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod mutation_lock_file_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn rejects_open_file_descriptor_for_a_different_lock_path() {
+        let root = TempDir::new().expect("temporary root");
+        let opened_path = root.path().join("opened.lock");
+        let current_path = root.path().join("current.lock");
+        fs::write(&opened_path, "opened").expect("opened lock");
+        fs::write(&current_path, "current").expect("current lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(opened_path)
+            .expect("open first lock");
+
+        assert_eq!(
+            validate_open_mutation_lock_file(&current_path, &file),
+            Err("mutation lock path changed while it was being opened".to_string())
+        );
     }
 }
 
@@ -7257,11 +7816,9 @@ fn load_backup_manifest(
     let backup_root = app_state_root.join("backups").join(backup_id);
     let manifest_path = backup_root.join("manifest.json");
 
-    if !manifest_path.exists() {
-        return Err(format!("backup manifest not found for {backup_id}"));
-    }
-
-    let raw = fs::read_to_string(&manifest_path).map_err(|error| error.to_string())?;
+    let raw = read_optional_string(&manifest_path)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("backup manifest not found for {backup_id}"))?;
     let manifest: BackupManifest = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
     if manifest.backup_id != backup_id {
         return Err(format!(
@@ -7285,6 +7842,7 @@ fn restore_manifest_transaction(
     app_state_root: &Path,
     manifest: &BackupManifest,
 ) -> Result<Option<String>, String> {
+    let created_at = current_timestamp()?;
     let backup_root = app_state_root.join("backups").join(&manifest.backup_id);
     let rollback_root = backup_root.join("rollback");
     validate_restore_manifest_preconditions(manifest)?;
@@ -7335,7 +7893,7 @@ fn restore_manifest_transaction(
         &RestoreAuditEntry {
             version: 1,
             event: "restore".to_string(),
-            created_at: current_timestamp(),
+            created_at,
             backup_id: manifest.backup_id.clone(),
             affected_targets: manifest.affected_targets.clone(),
         },
@@ -7621,6 +8179,7 @@ fn restore_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Result<(), S
     }
 
     let target_path = PathBuf::from(&entry.target.path);
+    ensure_target_parent_has_no_symlink_components(&target_path)?;
     if !entry.existed {
         remove_path_if_present(&target_path)?;
         return Ok(());
@@ -7673,6 +8232,7 @@ fn restore_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Result<(), S
 }
 
 fn remove_path_if_present(target_path: &Path) -> Result<(), String> {
+    ensure_target_parent_has_no_symlink_components(target_path)?;
     match fs::symlink_metadata(target_path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
             fs::remove_dir_all(target_path).map_err(|error| error.to_string())
@@ -7684,6 +8244,7 @@ fn remove_path_if_present(target_path: &Path) -> Result<(), String> {
 }
 
 fn ensure_restore_target_absent(target_path: &Path) -> Result<(), String> {
+    ensure_target_parent_has_no_symlink_components(target_path)?;
     match fs::symlink_metadata(target_path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
@@ -7695,6 +8256,7 @@ fn ensure_restore_target_absent(target_path: &Path) -> Result<(), String> {
 }
 
 fn ensure_restore_file_target_is_not_symlink(target_path: &Path) -> Result<(), String> {
+    ensure_target_parent_has_no_symlink_components(target_path)?;
     match fs::symlink_metadata(target_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
             "restore target is a symlink: {}",
@@ -7719,6 +8281,7 @@ fn ensure_regular_backup_file_payload(payload_path: &Path) -> Result<(), String>
 
 fn restore_sqlite_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Result<(), String> {
     let target_path = PathBuf::from(&entry.target.path);
+    ensure_target_parent_has_no_symlink_components(&target_path)?;
     if !entry.existed {
         return delete_cursor_workspace_disabled_server_ids(&target_path);
     }
@@ -8168,47 +8731,41 @@ fn read_cursor_workspace_disabled_server_ids(database_path: &Path) -> Result<Vec
 }
 
 fn read_cursor_workspace_disabled_server_ids_raw(database_path: &Path) -> Result<Vec<u8>, String> {
-    Ok(
-        read_cursor_workspace_disabled_server_ids_raw_optional(database_path)?
-            .unwrap_or_else(|| b"[]".to_vec()),
-    )
+    read_cursor_workspace_disabled_server_ids_raw_optional(database_path)?.ok_or_else(|| {
+        format!(
+            "Cursor workspace database not found: {}",
+            database_path.display()
+        )
+    })
 }
 
 fn read_cursor_workspace_disabled_server_ids_raw_optional(
     database_path: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
-    if !database_path.is_file() {
+    if !ensure_cursor_workspace_database_target(database_path)? {
         return Ok(None);
     }
-    let connection = Connection::open_with_flags(
+    let connection = open_cursor_workspace_database(
         database_path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|_| {
-        format!(
-            "invalid Cursor workspace state at {}; could not read {CURSOR_WORKSPACE_DISABLED_SERVERS_KEY}",
-            database_path.display()
-        )
-    })?;
+        "read",
+    )?;
+    read_cursor_workspace_disabled_server_ids_raw_from_connection(&connection, database_path)
+}
+
+fn read_cursor_workspace_disabled_server_ids_raw_from_connection(
+    connection: &Connection,
+    database_path: &Path,
+) -> Result<Option<Vec<u8>>, String> {
     let mut statement = connection
         .prepare("SELECT value FROM ItemTable WHERE key = ?1")
-        .map_err(|_| {
-            format!(
-                "invalid Cursor workspace state at {}; could not read {CURSOR_WORKSPACE_DISABLED_SERVERS_KEY}",
-                database_path.display()
-            )
-        })?;
+        .map_err(|error| cursor_workspace_database_error(database_path, "read", &error))?;
     let value = statement
         .query_row([CURSOR_WORKSPACE_DISABLED_SERVERS_KEY], |row| {
             row.get::<_, SqliteValue>(0)
         })
         .optional()
-        .map_err(|_| {
-            format!(
-                "invalid Cursor workspace state at {}; could not read {CURSOR_WORKSPACE_DISABLED_SERVERS_KEY}",
-                database_path.display()
-            )
-        })?;
+        .map_err(|error| cursor_workspace_database_error(database_path, "read", &error))?;
     let Some(value) = value else {
         return Ok(None);
     };
@@ -8234,50 +8791,115 @@ fn parse_cursor_workspace_disabled_server_ids(
     })
 }
 
-fn write_cursor_workspace_disabled_server_ids(
-    database_path: &Path,
-    disabled_server_ids: &[String],
-) -> Result<(), String> {
-    let raw = serde_json::to_vec(disabled_server_ids).map_err(|error| error.to_string())?;
-    write_cursor_workspace_disabled_server_ids_raw(database_path, &raw)
-}
-
 fn write_cursor_workspace_disabled_server_ids_raw(
     database_path: &Path,
     raw: &[u8],
 ) -> Result<(), String> {
-    if let Some(parent) = database_path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    if !ensure_cursor_workspace_database_target(database_path)? {
+        return Err(format!(
+            "Cursor workspace database not found: {}",
+            database_path.display()
+        ));
     }
-    let connection = Connection::open(database_path).map_err(|error| error.to_string())?;
-    connection
-        .execute(
-            "CREATE TABLE IF NOT EXISTS ItemTable (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
-            [],
-        )
-        .map_err(|error| error.to_string())?;
+    let connection = open_cursor_workspace_database(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        "write",
+    )?;
+    write_cursor_workspace_disabled_server_ids_raw_on_connection(&connection, database_path, raw)
+}
+
+fn write_cursor_workspace_disabled_server_ids_raw_on_connection(
+    connection: &Connection,
+    database_path: &Path,
+    raw: &[u8],
+) -> Result<(), String> {
     connection
         .execute(
             "INSERT INTO ItemTable (key, value) VALUES (?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (CURSOR_WORKSPACE_DISABLED_SERVERS_KEY, raw),
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| cursor_workspace_database_error(database_path, "write", &error))?;
     Ok(())
 }
 
 fn delete_cursor_workspace_disabled_server_ids(database_path: &Path) -> Result<(), String> {
-    if !database_path.exists() {
+    if !ensure_cursor_workspace_database_target(database_path)? {
         return Ok(());
     }
-    let connection = Connection::open(database_path).map_err(|error| error.to_string())?;
+    let connection = open_cursor_workspace_database(
+        database_path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        "delete",
+    )?;
     connection
         .execute(
             "DELETE FROM ItemTable WHERE key = ?1",
             [CURSOR_WORKSPACE_DISABLED_SERVERS_KEY],
         )
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| cursor_workspace_database_error(database_path, "delete", &error))?;
     Ok(())
+}
+
+fn open_cursor_workspace_database(
+    database_path: &Path,
+    flags: OpenFlags,
+    action: &str,
+) -> Result<Connection, String> {
+    if !ensure_cursor_workspace_database_target(database_path)? {
+        return Err(format!(
+            "Cursor workspace database not found: {}",
+            database_path.display()
+        ));
+    }
+    let connection = Connection::open_with_flags(database_path, flags)
+        .map_err(|error| cursor_workspace_database_error(database_path, action, &error))?;
+    connection
+        .busy_timeout(CURSOR_WORKSPACE_BUSY_TIMEOUT)
+        .map_err(|error| cursor_workspace_database_error(database_path, action, &error))?;
+    Ok(connection)
+}
+
+fn ensure_cursor_workspace_database_target(database_path: &Path) -> Result<bool, String> {
+    ensure_target_parent_has_no_symlink_components(database_path)?;
+    match fs::symlink_metadata(database_path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
+            "Cursor workspace database path is a symlink and will not be mutated: {}",
+            database_path.display()
+        )),
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(format!(
+            "Cursor workspace database path is not a regular file: {}",
+            database_path.display()
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "Cursor workspace database path could not be validated: {}: {error}",
+            database_path.display()
+        )),
+    }
+}
+
+fn cursor_workspace_database_error(
+    database_path: &Path,
+    action: &str,
+    error: &SqliteError,
+) -> String {
+    if matches!(
+        error.sqlite_error_code(),
+        Some(SqliteErrorCode::DatabaseBusy | SqliteErrorCode::DatabaseLocked)
+    ) {
+        return format!(
+            "cursor-host-busy: close Cursor and retry; could not {action} {CURSOR_WORKSPACE_DISABLED_SERVERS_KEY} in {}",
+            database_path.display()
+        );
+    }
+
+    format!(
+        "invalid Cursor workspace state at {}; could not {action} {CURSOR_WORKSPACE_DISABLED_SERVERS_KEY}: {error}",
+        database_path.display()
+    )
 }
 
 fn sqlite_value_to_bytes(value: SqliteValue) -> Option<Vec<u8>> {
@@ -9802,96 +10424,24 @@ fn insert_zed_context_server_jsonc(
     Ok(rendered)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TomlTableSection {
-    start: usize,
-    end: usize,
-    content: String,
-}
-
-fn find_toml_table_section(
-    raw: &str,
-    table_prefix: &str,
-    table_id: &str,
-) -> Option<TomlTableSection> {
-    let mut matching_start = None;
-    let mut offset = 0;
-
-    for line in raw.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-
-        if let Some(header) = parse_toml_table_header(line) {
-            if let Some(start) = matching_start {
-                return Some(TomlTableSection {
-                    start,
-                    end: line_start,
-                    content: raw[start..line_start].to_string(),
-                });
-            }
-
-            if toml_table_child_id(&header, table_prefix).as_deref() == Some(table_id) {
-                matching_start = Some(line_start);
-            }
-        }
-    }
-
-    matching_start.map(|start| TomlTableSection {
-        start,
-        end: raw.len(),
-        content: raw[start..].to_string(),
-    })
-}
-
-fn find_toml_array_table_sections(raw: &str, target: &str) -> Vec<TomlTableSection> {
-    let mut sections = Vec::new();
-    let mut matching_start = None;
-    let mut offset = 0;
-
-    for line in raw.split_inclusive('\n') {
-        let line_start = offset;
-        offset += line.len();
-        let Some(header) = parse_toml_table_header(line) else {
-            continue;
-        };
-
-        if let Some(start) = matching_start.take() {
-            sections.push(TomlTableSection {
-                start,
-                end: line_start,
-                content: raw[start..line_start].to_string(),
-            });
-        }
-        if line.trim_start().starts_with("[[") && header == target {
-            matching_start = Some(line_start);
-        }
-    }
-
-    if let Some(start) = matching_start {
-        sections.push(TomlTableSection {
-            start,
-            end: raw.len(),
-            content: raw[start..].to_string(),
-        });
-    }
-    sections
-}
-
 fn set_codex_skill_config_enabled(
     raw: &str,
     skill_path: &Path,
     enabled: bool,
 ) -> Result<String, String> {
+    ensure_unique_standard_toml_tables(raw)?;
     let skill_path_string = path_string(skill_path.to_path_buf());
-    for section in find_toml_array_table_sections(raw, "skills.config")
-        .into_iter()
-        .rev()
-    {
-        if codex_skill_config_path(&section.content)?.as_deref() != Some(&skill_path_string) {
-            continue;
+    let mut matching_sections = Vec::new();
+    for section in find_toml_array_table_sections(raw, "skills.config") {
+        if codex_skill_config_path(section.content)?.as_deref() == Some(&skill_path_string) {
+            matching_sections.push(section);
         }
-
-        let rewritten_section = set_toml_section_bool(&section.content, "enabled", enabled)?;
+    }
+    if matching_sections.len() > 1 {
+        return Err("Codex config contains duplicate skills.config path".to_string());
+    }
+    if let Some(section) = matching_sections.pop() {
+        let rewritten_section = set_toml_section_bool(section.content, "enabled", enabled)?;
         let mut rewritten = String::with_capacity(raw.len() + rewritten_section.len());
         rewritten.push_str(&raw[..section.start]);
         rewritten.push_str(&rewritten_section);
@@ -9917,23 +10467,20 @@ fn set_codex_skill_config_enabled(
 }
 
 fn toml_table_bool(section: &str, key: &str) -> Result<Option<bool>, String> {
-    for line in section.lines().skip(1) {
-        let uncommented = line.split('#').next().unwrap_or_default();
-        let Some((candidate, raw_value)) = uncommented.split_once('=') else {
-            continue;
-        };
-        if candidate.trim() != key {
-            continue;
-        }
-
-        return match raw_value.trim() {
-            "true" => Ok(Some(true)),
-            "false" => Ok(Some(false)),
-            value => Err(format!("{key} must be true or false, got {value}")),
-        };
+    let Some(assignment) = crate::toml_syntax::top_level_assignment(section, key) else {
+        return Ok(None);
+    };
+    match assignment
+        .value
+        .split('#')
+        .next()
+        .unwrap_or_default()
+        .trim()
+    {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        value => Err(format!("{key} must be true or false, got {value}")),
     }
-
-    Ok(None)
 }
 
 fn set_toml_table_bool(
@@ -9943,9 +10490,10 @@ fn set_toml_table_bool(
     key: &str,
     value: bool,
 ) -> Result<String, String> {
+    ensure_unique_standard_toml_tables(raw)?;
     let section = find_toml_table_section(raw, table_prefix, table_id)
         .ok_or_else(|| format!("TOML section not found: [{table_prefix}.{table_id}]"))?;
-    let rewritten_section = set_toml_section_bool(&section.content, key, value)?;
+    let rewritten_section = set_toml_section_bool(section.content, key, value)?;
 
     let mut rewritten = String::with_capacity(raw.len() + rewritten_section.len());
     rewritten.push_str(&raw[..section.start]);
@@ -9954,40 +10502,58 @@ fn set_toml_table_bool(
     Ok(rewritten)
 }
 
+fn ensure_unique_standard_toml_tables(raw: &str) -> Result<(), String> {
+    let malformed_table_headers = malformed_table_header_lines(raw);
+    if !malformed_table_headers.is_empty() {
+        return Err(format!(
+            "Codex config contains malformed TOML table headers on lines: {}",
+            malformed_table_headers
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+
+    let duplicates = duplicate_standard_table_names(raw);
+    if !duplicates.is_empty() {
+        return Err(format!(
+            "Codex config contains duplicate TOML table declarations: {}",
+            duplicates.join(", ")
+        ));
+    }
+
+    let duplicate_enabled_keys = duplicate_top_level_key_tables(raw, "enabled");
+    if !duplicate_enabled_keys.is_empty() {
+        return Err(format!(
+            "Codex config contains duplicate enabled keys in TOML tables: {}",
+            duplicate_enabled_keys.join(", ")
+        ));
+    }
+
+    Ok(())
+}
+
 fn set_toml_section_bool(section: &str, key: &str, value: bool) -> Result<String, String> {
     let rendered_value = if value { "true" } else { "false" };
-    let mut offset = 0;
-    for (index, line) in section.split_inclusive('\n').enumerate() {
-        let line_start = offset;
-        offset += line.len();
-        if index == 0 {
-            continue;
-        }
-
-        let uncommented = line.split('#').next().unwrap_or_default();
-        let Some((candidate, raw_value)) = uncommented.split_once('=') else {
-            continue;
-        };
-        if candidate.trim() != key {
-            continue;
-        }
-
-        let leading_whitespace = raw_value.len() - raw_value.trim_start().len();
-        let value_start = line_start + candidate.len() + 1 + leading_whitespace;
-        let trimmed_value = raw_value.trim_start();
-        let existing_len = if trimmed_value.starts_with("true") {
+    if let Some(assignment) = crate::toml_syntax::top_level_assignment(section, key) {
+        let existing_len = if assignment.value.starts_with("true")
+            && valid_toml_bool_tail(&assignment.value[4..])
+        {
             4
-        } else if trimmed_value.starts_with("false") {
+        } else if assignment.value.starts_with("false")
+            && valid_toml_bool_tail(&assignment.value[5..])
+        {
             5
         } else {
             return Err(format!(
                 "{key} must be true or false, got {}",
-                raw_value.trim()
+                assignment.value
             ));
         };
-        let value_end = value_start + existing_len;
+        let value_end = assignment.value_start + existing_len;
         let mut rewritten = String::with_capacity(section.len());
-        rewritten.push_str(&section[..value_start]);
+        rewritten.push_str(&section[..assignment.value_start]);
         rewritten.push_str(rendered_value);
         rewritten.push_str(&section[value_end..]);
         return Ok(rewritten);
@@ -10012,39 +10578,44 @@ fn set_toml_section_bool(section: &str, key: &str, value: bool) -> Result<String
     Ok(rewritten)
 }
 
-fn toml_table_child_id(header: &str, table_prefix: &str) -> Option<String> {
-    let child = header.strip_prefix(table_prefix)?.strip_prefix('.')?;
-    if child.is_empty() || child.contains('.') {
-        return None;
-    }
-
-    Some(child.trim_matches('"').to_string())
+fn valid_toml_bool_tail(tail: &str) -> bool {
+    let tail = tail.trim_start();
+    tail.is_empty() || tail.starts_with('#')
 }
 
 fn append_toml_table_section(raw: &str, section: &str) -> String {
-    let raw = raw.trim_end();
-    let section = section.trim();
-
-    if raw.is_empty() {
-        format!("{section}\n")
+    let trailing_start = raw
+        .char_indices()
+        .rev()
+        .find(|(_, character)| !character.is_whitespace())
+        .map_or(0, |(index, character)| index + character.len_utf8());
+    let (body, trailing) = raw.split_at(trailing_start);
+    let newline = if raw.contains("\r\n") || section.contains("\r\n") {
+        "\r\n"
     } else {
-        format!("{raw}\n\n{section}\n")
+        "\n"
+    };
+    let mut rewritten = String::with_capacity(raw.len() + section.len() + newline.len() * 2);
+    rewritten.push_str(body);
+    if !body.is_empty() {
+        rewritten.push_str(newline);
+        rewritten.push_str(newline);
     }
+    rewritten.push_str(section);
+    if !section.ends_with('\n') && !trailing.starts_with(['\r', '\n']) {
+        rewritten.push_str(newline);
+    }
+    rewritten.push_str(trailing);
+    rewritten
 }
 
-fn current_timestamp() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .expect("UTC timestamp formats as RFC3339")
+fn current_backup_metadata() -> Result<(String, String), String> {
+    Ok((current_backup_id()?, current_timestamp()?))
 }
 
-fn current_backup_id() -> String {
+fn current_backup_id() -> Result<String, String> {
     if let Some(backup_id) = TRANSITION_BACKUP_ID_OVERRIDE.with(|slot| slot.borrow().clone()) {
-        return backup_id;
+        return Ok(backup_id);
     }
-    let nanos = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("current time is after unix epoch")
-        .as_nanos();
-    format!("backup-{nanos}")
+    unix_nanos_id("backup")
 }

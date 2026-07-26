@@ -1,4 +1,5 @@
 use super::{KEYCHAIN_SERVICE, SecretStore};
+use zeroize::Zeroizing;
 
 const CURSOR_DASHBOARD_ACCOUNT: &str = "cursor-dashboard-cookie-v1";
 const CURSOR_DASHBOARD_CREDENTIAL_PREFIX: &[u8] = b"unpin-cursor-dashboard-cookie-v1\0origin=https://cursor.com\0purpose=marketplace-plugin-mutation\0";
@@ -26,11 +27,11 @@ pub(crate) fn cursor_dashboard_credential_status(
     store: &impl SecretStore,
 ) -> Result<CursorDashboardCredentialState, String> {
     match store.get(KEYCHAIN_SERVICE, CURSOR_DASHBOARD_ACCOUNT)? {
-        Some(mut secret) => {
+        Some(secret) => {
+            let secret = Zeroizing::new(secret);
             let valid = decode_cursor_dashboard_cookie(&secret)
                 .and_then(validate_cursor_dashboard_cookie)
                 .is_ok();
-            secret.fill(0);
             if valid {
                 Ok(CursorDashboardCredentialState::Ready)
             } else {
@@ -47,17 +48,18 @@ pub(crate) fn store_cursor_dashboard_cookie(
 ) -> Result<CursorDashboardCredentialUpdate, String> {
     validate_cursor_dashboard_cookie(secret)?;
     let existed = match store.get(KEYCHAIN_SERVICE, CURSOR_DASHBOARD_ACCOUNT)? {
-        Some(mut existing) => {
-            existing.fill(0);
+        Some(existing) => {
+            let _existing = Zeroizing::new(existing);
             true
         }
         None => false,
     };
-    let mut stored = Vec::with_capacity(CURSOR_DASHBOARD_CREDENTIAL_PREFIX.len() + secret.len());
+    let mut stored = Zeroizing::new(Vec::with_capacity(
+        CURSOR_DASHBOARD_CREDENTIAL_PREFIX.len() + secret.len(),
+    ));
     stored.extend_from_slice(CURSOR_DASHBOARD_CREDENTIAL_PREFIX);
     stored.extend_from_slice(secret);
     let store_result = store.set(KEYCHAIN_SERVICE, CURSOR_DASHBOARD_ACCOUNT, &stored);
-    stored.fill(0);
     store_result?;
     Ok(if existed {
         CursorDashboardCredentialUpdate::Updated

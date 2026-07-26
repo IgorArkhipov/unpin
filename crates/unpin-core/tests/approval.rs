@@ -7,14 +7,20 @@ use std::{
     time::{Duration, Instant},
 };
 
+use sha2::Digest;
 use tempfile::TempDir as RawTempDir;
 use unpin_core::{
     approval::{
-        ApprovalError, ApprovalExpectation, ApprovalIssuer, ApprovalKey, ApprovalNonceStore,
-        ApprovalReceipt, ApprovalReceiptClaims, ApprovalResourceBinding, ApprovalVerifier,
+        APPROVAL_NONCE_RETENTION_SECONDS, ApprovalError, ApprovalExpectation, ApprovalIssuer,
+        ApprovalKey, ApprovalNonceStore, ApprovalReceipt, ApprovalReceiptClaims,
+        ApprovalResourceBinding, ApprovalVerifier, MAX_APPROVAL_NONCE_LEDGER_ENTRIES,
         NonceConsumption,
     },
-    state::atomic_json::OwnerGeneration,
+    config::{
+        get_approval_nonce_ledger_path, get_approval_nonce_ledger_shard_path,
+        get_approval_nonce_path,
+    },
+    state::atomic_json::{AtomicJsonStore, OwnerGeneration},
 };
 
 struct TempDir {
@@ -45,6 +51,17 @@ impl TempDir {
 
 fn digest(character: char) -> String {
     std::iter::repeat_n(character, 64).collect()
+}
+
+fn nonce_digest(nonce: &str) -> String {
+    sha2::Sha256::digest(nonce.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn nonce_shard(nonce: &str) -> String {
+    nonce_digest(nonce)[..2].to_string()
 }
 
 fn resources() -> Vec<ApprovalResourceBinding> {
@@ -249,6 +266,593 @@ fn nonce_consumption_is_atomic_and_duplicate_retry_attaches_only_to_same_decisio
     let replay = verifier()
         .verify(&replay_receipt, &expectation(&replay_receipt), 1_050)
         .expect("cryptographically valid replay");
+    assert!(matches!(
+        store.consume_or_attach(&replay, 1_050, owner()),
+        Err(ApprovalError::Replay)
+    ));
+}
+
+#[test]
+fn duplicate_retry_preserves_the_original_recovery_timestamp() {
+    let temp = TempDir::new();
+    let receipt = issuer()
+        .issue(claims("operation-retry", "nonce-retry"))
+        .expect("issued receipt");
+    let verified = verifier()
+        .verify(&receipt, &expectation(&receipt), 1_050)
+        .expect("verified receipt");
+    let store = ApprovalNonceStore::new(temp.path());
+
+    assert_eq!(
+        store
+            .consume_or_attach(&verified, 1_050, owner())
+            .expect("initial consumption"),
+        NonceConsumption::Consumed
+    );
+    assert_eq!(
+        store
+            .consume_or_attach(&verified, 1_051, owner())
+            .expect("exact retry at a later instant"),
+        NonceConsumption::AttachedToSameOperation
+    );
+
+    let ledger: serde_json::Value = serde_json::from_slice(
+        &fs::read(get_approval_nonce_ledger_shard_path(
+            temp.path(),
+            &nonce_shard("nonce-retry"),
+        ))
+        .expect("recovery ledger shard"),
+    )
+    .expect("recovery ledger JSON");
+    assert_eq!(
+        ledger["value"]["entries"][nonce_digest("nonce-retry")]["consumedAtUnix"],
+        1_050
+    );
+}
+
+#[test]
+fn recovery_shard_replay_rejection_does_not_reserve_the_conflicting_decision() {
+    let temp = TempDir::new();
+    let store = ApprovalNonceStore::new(temp.path());
+    let original_receipt = issuer()
+        .issue(claims("operation-original", "nonce-recovery-only"))
+        .expect("original receipt");
+    let original = verifier()
+        .verify(&original_receipt, &expectation(&original_receipt), 1_050)
+        .expect("original verified receipt");
+    store
+        .consume_or_attach(&original, 1_050, owner())
+        .expect("consume original nonce");
+
+    let current_time = 1_050 + unpin_core::approval::MAX_APPROVAL_LIFETIME_SECONDS + 1;
+    let mut cleanup_claims = claims("operation-cleanup", "nonce-cleanup");
+    cleanup_claims.issued_at_unix = current_time - 50;
+    cleanup_claims.expires_at_unix = current_time + 50;
+    let cleanup_receipt = issuer().issue(cleanup_claims).expect("cleanup receipt");
+    let cleanup = verifier()
+        .verify(
+            &cleanup_receipt,
+            &expectation(&cleanup_receipt),
+            current_time,
+        )
+        .expect("cleanup verified receipt");
+    store
+        .consume_or_attach(&cleanup, current_time, owner())
+        .expect("prune original from active ledger");
+
+    let original_digest = nonce_digest("nonce-recovery-only");
+    let active_path = get_approval_nonce_ledger_path(temp.path());
+    let active_before: serde_json::Value =
+        serde_json::from_slice(&fs::read(&active_path).expect("active nonce ledger"))
+            .expect("active nonce ledger JSON");
+    assert!(active_before["value"]["entries"][&original_digest].is_null());
+
+    let mut replay_claims = claims("operation-conflicting", "nonce-recovery-only");
+    replay_claims.issued_at_unix = current_time - 50;
+    replay_claims.expires_at_unix = current_time + 50;
+    let replay_receipt = issuer().issue(replay_claims).expect("replay receipt");
+    let replay = verifier()
+        .verify(&replay_receipt, &expectation(&replay_receipt), current_time)
+        .expect("cryptographically valid replay");
+    assert!(matches!(
+        store.consume_or_attach(&replay, current_time, owner()),
+        Err(ApprovalError::Replay)
+    ));
+
+    let active_after: serde_json::Value =
+        serde_json::from_slice(&fs::read(active_path).expect("active nonce ledger"))
+            .expect("active nonce ledger JSON");
+    assert!(
+        active_after["value"]["entries"][&original_digest].is_null(),
+        "recovery-ledger replay rejection must happen before active reservation"
+    );
+    assert_eq!(
+        store
+            .attach_existing(&original)
+            .expect("original recovery evidence remains authoritative"),
+        NonceConsumption::AttachedToSameOperation
+    );
+}
+
+#[test]
+fn nonce_reuse_after_recovery_retention_becomes_a_new_consumption() {
+    let temp = TempDir::new();
+    let store = ApprovalNonceStore::new(temp.path());
+    let original_receipt = issuer()
+        .issue(claims("operation-retained", "nonce-retained"))
+        .expect("original receipt");
+    let original = verifier()
+        .verify(&original_receipt, &expectation(&original_receipt), 1_050)
+        .expect("original verified receipt");
+    store
+        .consume_or_attach(&original, 1_050, owner())
+        .expect("consume original nonce");
+
+    let current_time = 1_050 + APPROVAL_NONCE_RETENTION_SECONDS + 1;
+    let mut current_claims = claims("operation-after-retention", "nonce-retained");
+    current_claims.issued_at_unix = current_time - 50;
+    current_claims.expires_at_unix = current_time + 50;
+    let current_receipt = issuer().issue(current_claims).expect("current receipt");
+    let current = verifier()
+        .verify(
+            &current_receipt,
+            &expectation(&current_receipt),
+            current_time,
+        )
+        .expect("current verified receipt");
+
+    assert_eq!(
+        store
+            .consume_or_attach(&current, current_time, owner())
+            .expect("consume nonce after retention"),
+        NonceConsumption::Consumed
+    );
+    assert!(matches!(
+        store.attach_existing(&original),
+        Err(ApprovalError::Replay)
+    ));
+    assert_eq!(
+        store
+            .attach_existing(&current)
+            .expect("new consumption is authoritative"),
+        NonceConsumption::AttachedToSameOperation
+    );
+}
+
+#[test]
+fn nonce_ledger_records_the_supplied_owner_generation() {
+    let temp = TempDir::new();
+    let store = ApprovalNonceStore::new(temp.path());
+    let first_nonce = "nonce-first-owner".to_string();
+    let shard = nonce_shard(&first_nonce);
+    let second_nonce = (0..10_000)
+        .map(|index| format!("nonce-second-owner-{index}"))
+        .find(|nonce| nonce_shard(nonce) == shard)
+        .expect("nonce in the same ledger shard");
+
+    for (operation, nonce, owner_id) in [
+        ("operation-first-owner", first_nonce.as_str(), "first-owner"),
+        (
+            "operation-second-owner",
+            second_nonce.as_str(),
+            "second-owner",
+        ),
+    ] {
+        let receipt = issuer()
+            .issue(claims(operation, nonce))
+            .expect("issued receipt");
+        let verified = verifier()
+            .verify(&receipt, &expectation(&receipt), 1_050)
+            .expect("verified receipt");
+        store
+            .consume_or_attach(
+                &verified,
+                1_050,
+                OwnerGeneration::new(owner_id, 1).expect("owner"),
+            )
+            .expect("consume nonce");
+    }
+
+    let ledger: serde_json::Value = serde_json::from_slice(
+        &fs::read(get_approval_nonce_ledger_shard_path(temp.path(), &shard))
+            .expect("nonce ledger shard"),
+    )
+    .expect("nonce ledger shard JSON");
+    assert_eq!(ledger["owner"]["ownerId"], "second-owner");
+    assert_eq!(ledger["owner"]["generation"], 2);
+}
+
+#[test]
+fn nonce_ledger_fails_closed_at_its_bounded_capacity() {
+    let temp = TempDir::new();
+    let target_nonce = "nonce-over-capacity";
+    let target_digest = nonce_digest(target_nonce);
+    let shard = nonce_shard(target_nonce);
+    let entries = (0..MAX_APPROVAL_NONCE_LEDGER_ENTRIES)
+        .map(|index| {
+            (
+                format!("{shard}{index:062x}"),
+                serde_json::json!({
+                    "operationId": format!("seed-{index}"),
+                    "decisionDigest": digest('a'),
+                    "consumedAtUnix": 1_050
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    assert!(!entries.contains_key(&target_digest));
+    AtomicJsonStore::new(get_approval_nonce_ledger_shard_path(temp.path(), &shard), 1)
+        .compare_and_swap(
+            None,
+            owner(),
+            &serde_json::json!({
+                "entries": entries
+            }),
+        )
+        .expect("seed bounded nonce ledger");
+
+    let receipt = issuer()
+        .issue(claims("operation-over-capacity", target_nonce))
+        .expect("issued receipt");
+    let verified = verifier()
+        .verify(&receipt, &expectation(&receipt), 1_050)
+        .expect("verified receipt");
+    let store = ApprovalNonceStore::new(temp.path());
+    assert!(matches!(
+        store.consume_or_attach(&verified, 1_050, owner()),
+        Err(ApprovalError::NonceLedgerCapacity)
+    ));
+
+    let active_path = get_approval_nonce_ledger_path(temp.path());
+    if active_path.exists() {
+        let active: serde_json::Value =
+            serde_json::from_slice(&fs::read(&active_path).expect("active nonce ledger"))
+                .expect("active nonce ledger JSON");
+        assert!(
+            active["value"]["entries"][&target_digest].is_null(),
+            "failed recovery persistence must not reserve active nonce state"
+        );
+    }
+
+    let available_nonce = (0..10_000)
+        .map(|index| format!("nonce-available-shard-{index}"))
+        .find(|nonce| nonce_shard(nonce) != shard)
+        .expect("nonce outside full recovery shard");
+    let available_receipt = issuer()
+        .issue(claims("operation-available-shard", &available_nonce))
+        .expect("available-shard receipt");
+    let available = verifier()
+        .verify(&available_receipt, &expectation(&available_receipt), 1_050)
+        .expect("available-shard verified receipt");
+    assert_eq!(
+        store
+            .consume_or_attach(&available, 1_050, owner())
+            .expect("full shard must not pollute active capacity"),
+        NonceConsumption::Consumed
+    );
+}
+
+#[test]
+fn active_nonce_capacity_failure_preserves_recovery_evidence() {
+    let temp = TempDir::new();
+    let target_nonce = "nonce-active-capacity";
+    let target_digest = nonce_digest(target_nonce);
+    let entries = (0..MAX_APPROVAL_NONCE_LEDGER_ENTRIES)
+        .map(|index| {
+            (
+                format!("{index:064x}"),
+                serde_json::json!({
+                    "operationId": format!("seed-{index}"),
+                    "decisionDigest": digest('a'),
+                    "consumedAtUnix": 1_050
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    assert!(!entries.contains_key(&target_digest));
+    AtomicJsonStore::new(get_approval_nonce_ledger_path(temp.path()), 1)
+        .compare_and_swap(
+            None,
+            owner(),
+            &serde_json::json!({
+                "entries": entries
+            }),
+        )
+        .expect("seed bounded active nonce ledger");
+
+    let receipt = issuer()
+        .issue(claims("operation-active-capacity", target_nonce))
+        .expect("issued receipt");
+    let verified = verifier()
+        .verify(&receipt, &expectation(&receipt), 1_050)
+        .expect("verified receipt");
+    let store = ApprovalNonceStore::new(temp.path());
+    assert!(matches!(
+        store.consume_or_attach(&verified, 1_050, owner()),
+        Err(ApprovalError::NonceLedgerCapacity)
+    ));
+    assert_eq!(
+        store
+            .attach_existing(&verified)
+            .expect("capacity failure must preserve recovery evidence"),
+        NonceConsumption::AttachedToSameOperation
+    );
+
+    let conflicting_receipt = issuer()
+        .issue(claims("operation-active-capacity-conflict", target_nonce))
+        .expect("conflicting receipt");
+    let conflicting = verifier()
+        .verify(
+            &conflicting_receipt,
+            &expectation(&conflicting_receipt),
+            1_050,
+        )
+        .expect("conflicting verified receipt");
+    assert!(matches!(
+        store.attach_existing(&conflicting),
+        Err(ApprovalError::Replay)
+    ));
+}
+
+#[test]
+fn full_active_nonce_ledger_recovers_after_the_receipt_window() {
+    let temp = TempDir::new();
+    let entries = (0..MAX_APPROVAL_NONCE_LEDGER_ENTRIES)
+        .map(|index| {
+            (
+                format!("{index:064x}"),
+                serde_json::json!({
+                    "operationId": format!("seed-{index}"),
+                    "decisionDigest": digest('a'),
+                    "consumedAtUnix": 1_050
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    AtomicJsonStore::new(get_approval_nonce_ledger_path(temp.path()), 1)
+        .compare_and_swap(
+            None,
+            owner(),
+            &serde_json::json!({
+                "entries": entries
+            }),
+        )
+        .expect("seed full active nonce ledger");
+
+    let nonce = (0..10_000)
+        .map(|index| format!("nonce-after-receipt-window-{index}"))
+        .find(|nonce| nonce_shard(nonce) != "00")
+        .expect("nonce outside seeded recovery shard");
+    let current_time = 1_050 + unpin_core::approval::MAX_APPROVAL_LIFETIME_SECONDS + 1;
+    let mut current_claims = claims("operation-after-receipt-window", &nonce);
+    current_claims.issued_at_unix = current_time - 50;
+    current_claims.expires_at_unix = current_time + 50;
+    let receipt = issuer().issue(current_claims).expect("issued receipt");
+    let verified = verifier()
+        .verify(&receipt, &expectation(&receipt), current_time)
+        .expect("verified receipt");
+
+    assert_eq!(
+        ApprovalNonceStore::new(temp.path())
+            .consume_or_attach(&verified, current_time, owner())
+            .expect("consume after rolling replay window"),
+        NonceConsumption::Consumed
+    );
+    let active: serde_json::Value = serde_json::from_slice(
+        &fs::read(get_approval_nonce_ledger_path(temp.path())).expect("active nonce ledger"),
+    )
+    .expect("active nonce ledger JSON");
+    assert_eq!(
+        active["value"]["entries"]
+            .as_object()
+            .expect("active entries")
+            .len(),
+        1
+    );
+    assert!(
+        get_approval_nonce_ledger_shard_path(temp.path(), "00").exists(),
+        "pruned replay records remain available for durable recovery"
+    );
+}
+
+#[test]
+fn full_nonce_ledger_shard_does_not_block_other_shards() {
+    let temp = TempDir::new();
+    let full_shard = "00";
+    let entries = (0..MAX_APPROVAL_NONCE_LEDGER_ENTRIES)
+        .map(|index| {
+            (
+                format!("{full_shard}{index:062x}"),
+                serde_json::json!({
+                    "operationId": format!("seed-{index}"),
+                    "decisionDigest": digest('a'),
+                    "consumedAtUnix": 1_050
+                }),
+            )
+        })
+        .collect::<serde_json::Map<_, _>>();
+    AtomicJsonStore::new(
+        get_approval_nonce_ledger_shard_path(temp.path(), full_shard),
+        1,
+    )
+    .compare_and_swap(
+        None,
+        owner(),
+        &serde_json::json!({
+            "entries": entries
+        }),
+    )
+    .expect("seed full nonce ledger shard");
+
+    let nonce = (0..10_000)
+        .map(|index| format!("nonce-other-shard-{index}"))
+        .find(|nonce| nonce_shard(nonce) != full_shard)
+        .expect("nonce outside full shard");
+    let receipt = issuer()
+        .issue(claims("operation-other-shard", &nonce))
+        .expect("issued receipt");
+    let verified = verifier()
+        .verify(&receipt, &expectation(&receipt), 1_050)
+        .expect("verified receipt");
+    assert_eq!(
+        ApprovalNonceStore::new(temp.path())
+            .consume_or_attach(&verified, 1_050, owner())
+            .expect("consume nonce in available shard"),
+        NonceConsumption::Consumed
+    );
+}
+
+#[test]
+fn nonce_ledger_prunes_records_past_the_recovery_retention_window() {
+    let temp = TempDir::new();
+    let store = ApprovalNonceStore::new(temp.path());
+
+    let old_receipt = issuer()
+        .issue(claims("operation-old", "nonce-old"))
+        .expect("old receipt");
+    let old_verified = verifier()
+        .verify(&old_receipt, &expectation(&old_receipt), 1_050)
+        .expect("old verified receipt");
+    assert_eq!(
+        store
+            .consume_or_attach(&old_verified, 1_050, owner())
+            .expect("consume old nonce"),
+        NonceConsumption::Consumed
+    );
+
+    let current_time = 1_050 + APPROVAL_NONCE_RETENTION_SECONDS + 1;
+    let old_shard = nonce_shard("nonce-old");
+    let current_nonce = (0..10_000)
+        .map(|index| format!("nonce-current-{index}"))
+        .find(|nonce| nonce_shard(nonce) == old_shard)
+        .expect("current nonce in the same ledger shard");
+    let mut current_claims = claims("operation-current", &current_nonce);
+    current_claims.issued_at_unix = current_time - 50;
+    current_claims.expires_at_unix = current_time + 50;
+    let current_receipt = issuer().issue(current_claims).expect("current receipt");
+    let current_verified = verifier()
+        .verify(
+            &current_receipt,
+            &expectation(&current_receipt),
+            current_time,
+        )
+        .expect("current verified receipt");
+    assert_eq!(
+        store
+            .consume_or_attach(&current_verified, current_time, owner())
+            .expect("consume current nonce"),
+        NonceConsumption::Consumed
+    );
+
+    assert!(matches!(
+        store.attach_existing(&old_verified),
+        Err(ApprovalError::NonceNotConsumed)
+    ));
+    assert_eq!(
+        store
+            .attach_existing(&current_verified)
+            .expect("attach current nonce"),
+        NonceConsumption::AttachedToSameOperation
+    );
+    assert!(
+        !temp.path().join("approvals/nonces").exists(),
+        "new nonce consumption must use bounded shard ledgers, not per-nonce files"
+    );
+}
+
+#[test]
+fn active_nonce_ledger_is_copied_into_the_recovery_shard() {
+    let temp = TempDir::new();
+    let receipt = issuer()
+        .issue(claims("operation-legacy-ledger", "nonce-legacy-ledger"))
+        .expect("legacy ledger receipt");
+    let verified = verifier()
+        .verify(&receipt, &expectation(&receipt), 1_050)
+        .expect("legacy ledger verified receipt");
+    let digest = nonce_digest("nonce-legacy-ledger");
+    let legacy_path = get_approval_nonce_ledger_path(temp.path());
+    AtomicJsonStore::new(&legacy_path, 1)
+        .compare_and_swap(
+            None,
+            owner(),
+            &serde_json::json!({
+                "entries": {
+                    (digest): {
+                        "operationId": verified.operation_id(),
+                        "decisionDigest": verified.decision_digest(),
+                        "consumedAtUnix": 1_050
+                    }
+                }
+            }),
+        )
+        .expect("legacy singleton ledger");
+
+    let store = ApprovalNonceStore::new(temp.path());
+    assert_eq!(
+        store
+            .consume_or_attach(&verified, 1_050, owner())
+            .expect("migrate singleton ledger"),
+        NonceConsumption::AttachedToSameOperation
+    );
+    assert!(
+        legacy_path.exists(),
+        "the rolling ledger remains the cross-version replay authority"
+    );
+    assert!(
+        get_approval_nonce_ledger_shard_path(temp.path(), &nonce_shard("nonce-legacy-ledger"))
+            .exists()
+    );
+
+    let replay_receipt = issuer()
+        .issue(claims("operation-replay", "nonce-legacy-ledger"))
+        .expect("replay receipt");
+    let replay = verifier()
+        .verify(&replay_receipt, &expectation(&replay_receipt), 1_050)
+        .expect("verified replay receipt");
+    assert!(matches!(
+        store.consume_or_attach(&replay, 1_050, owner()),
+        Err(ApprovalError::Replay)
+    ));
+}
+
+#[test]
+fn nonce_ledger_migrates_matching_legacy_nonce_state() {
+    let temp = TempDir::new();
+    let receipt = issuer()
+        .issue(claims("operation-legacy", "nonce-legacy"))
+        .expect("legacy receipt");
+    let verified = verifier()
+        .verify(&receipt, &expectation(&receipt), 1_050)
+        .expect("legacy verified receipt");
+    let nonce_digest = nonce_digest("nonce-legacy");
+    let legacy_path = get_approval_nonce_path(temp.path(), &nonce_digest);
+    AtomicJsonStore::new(&legacy_path, 1)
+        .compare_and_swap(
+            None,
+            owner(),
+            &serde_json::json!({
+                "operationId": verified.operation_id(),
+                "decisionDigest": verified.decision_digest(),
+                "consumedAtUnix": 1_050
+            }),
+        )
+        .expect("legacy nonce state");
+
+    let store = ApprovalNonceStore::new(temp.path());
+    assert_eq!(
+        store
+            .consume_or_attach(&verified, 1_050, owner())
+            .expect("migrate legacy nonce"),
+        NonceConsumption::AttachedToSameOperation
+    );
+    assert!(!legacy_path.exists());
+
+    let replay_receipt = issuer()
+        .issue(claims("operation-replay", "nonce-legacy"))
+        .expect("replay receipt");
+    let replay = verifier()
+        .verify(&replay_receipt, &expectation(&replay_receipt), 1_050)
+        .expect("verified replay receipt");
     assert!(matches!(
         store.consume_or_attach(&replay, 1_050, owner()),
         Err(ApprovalError::Replay)

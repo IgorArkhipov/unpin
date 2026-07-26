@@ -1,6 +1,8 @@
 use std::{
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
@@ -82,6 +84,7 @@ const HOOK_TRUST_APPROVAL_ISSUER: &str = "unpin-cli-human";
 const HOOK_TRUST_APPROVAL_AUDIENCE: &str = "unpin-core-hook-trust";
 const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const UNPIN_CONTROL_CONTRACT_VERSION: u32 = 2;
+const DEFAULT_MCP_DISCOVERY_CACHE_TTL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -144,6 +147,239 @@ pub struct McpContext {
     pub session_authority_key: Option<SessionAuthorityKey>,
     pub authentication: McpAuthenticationReadiness,
     pub provider_scope: McpProviderScope,
+    pub discovery_cache: McpDiscoveryCache,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpDiscoveryCache {
+    ttl: Duration,
+    state: Arc<Mutex<DiscoveryCacheState>>,
+}
+
+impl Default for McpDiscoveryCache {
+    fn default() -> Self {
+        Self::with_ttl(DEFAULT_MCP_DISCOVERY_CACHE_TTL)
+    }
+}
+
+impl McpDiscoveryCache {
+    #[must_use]
+    pub fn with_ttl(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            state: Arc::new(Mutex::new(DiscoveryCacheState::default())),
+        }
+    }
+
+    pub fn invalidate(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        state.entry = None;
+    }
+
+    fn get_or_discover(&self, roots: &DiscoveryRoots) -> Result<DiscoveryOutput, String> {
+        self.get_or_update(|| discover_all(roots).map_err(|error| error.to_string()))
+    }
+
+    fn refresh(&self, roots: &DiscoveryRoots) -> Result<DiscoveryOutput, String> {
+        self.refresh_with(|| discover_all(roots).map_err(|error| error.to_string()))
+    }
+
+    fn get_or_update(
+        &self,
+        load: impl FnOnce() -> Result<DiscoveryOutput, String>,
+    ) -> Result<DiscoveryOutput, String> {
+        let now = Instant::now();
+        let generation = {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(cached) = state.entry.as_ref()
+                && now.saturating_duration_since(cached.refreshed_at) < self.ttl
+            {
+                return Ok(cached.discovery.clone());
+            }
+            state.generation
+        };
+
+        let discovery = load()?;
+        let refreshed_at = Instant::now();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation != generation {
+            return Ok(discovery);
+        }
+        if let Some(cached) = state.entry.as_ref()
+            && refreshed_at.saturating_duration_since(cached.refreshed_at) < self.ttl
+        {
+            return Ok(cached.discovery.clone());
+        }
+        state.entry = Some(CachedDiscovery {
+            refreshed_at,
+            discovery: discovery.clone(),
+        });
+        Ok(discovery)
+    }
+
+    fn refresh_with(
+        &self,
+        load: impl FnOnce() -> Result<DiscoveryOutput, String>,
+    ) -> Result<DiscoveryOutput, String> {
+        let generation = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation;
+        let discovery = load()?;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.generation == generation {
+            state.entry = Some(CachedDiscovery {
+                refreshed_at: Instant::now(),
+                discovery: discovery.clone(),
+            });
+        }
+        Ok(discovery)
+    }
+}
+
+#[derive(Debug, Default)]
+struct DiscoveryCacheState {
+    generation: u64,
+    entry: Option<CachedDiscovery>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedDiscovery {
+    refreshed_at: Instant,
+    discovery: DiscoveryOutput,
+}
+
+#[cfg(test)]
+mod discovery_cache_tests {
+    use std::cell::Cell;
+
+    use crate::discovery::DiscoveryWarning;
+
+    use super::*;
+
+    #[test]
+    fn reuses_successful_discovery_until_invalidated() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+        let loads = Cell::new(0);
+        let first = cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        let second = cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Err("cached result should be reused".to_string())
+            })
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(loads.get(), 1);
+
+        cache.invalidate();
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        assert_eq!(loads.get(), 2);
+    }
+
+    #[test]
+    fn zero_ttl_refreshes_and_failures_are_not_cached() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::ZERO);
+        let loads = Cell::new(0);
+        assert_eq!(
+            cache.get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Err("transient discovery failure".to_string())
+            }),
+            Err("transient discovery failure".to_string())
+        );
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+        assert_eq!(loads.get(), 3);
+    }
+
+    #[test]
+    fn explicit_refresh_replaces_a_live_cached_entry() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+        let loads = Cell::new(0);
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .unwrap();
+
+        let refreshed = DiscoveryOutput {
+            warnings: vec![DiscoveryWarning {
+                provider: ProviderId::Codex,
+                layer: None,
+                code: "refreshed".to_string(),
+                message: "refreshed".to_string(),
+            }],
+            ..DiscoveryOutput::default()
+        };
+        cache
+            .refresh_with(|| {
+                loads.set(loads.get() + 1);
+                Ok(refreshed.clone())
+            })
+            .unwrap();
+        let cached = cache
+            .get_or_update(|| Err("refreshed entry should be reused".to_string()))
+            .unwrap();
+
+        assert_eq!(cached, refreshed);
+        assert_eq!(loads.get(), 2);
+    }
+
+    #[test]
+    fn discovery_load_runs_without_holding_the_cache_mutex() {
+        let cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+        let invalidating_cache = cache.clone();
+        cache
+            .get_or_update(|| {
+                invalidating_cache.invalidate();
+                Ok(DiscoveryOutput::default())
+            })
+            .expect("discovery can invalidate without deadlocking");
+
+        let loads = Cell::new(0);
+        cache
+            .get_or_update(|| {
+                loads.set(loads.get() + 1);
+                Ok(DiscoveryOutput::default())
+            })
+            .expect("invalidation during discovery leaves no stale cache entry");
+        assert_eq!(loads.get(), 1);
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -550,7 +786,7 @@ fn structured_result(value: Value) -> Result<Value, String> {
 
 fn get_inventory_summary(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     validate_selector(arguments)?;
-    let discovery = discover_scoped(context)?;
+    let discovery = discover_scoped_cached(context)?;
     let discovery = filter_summary_discovery(discovery, arguments);
 
     Ok(json!({
@@ -574,7 +810,7 @@ fn get_inventory_summary(context: &McpContext, arguments: &Value) -> Result<Valu
 }
 
 fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> {
-    let discovery = discover_scoped(context)?;
+    let discovery = discover_scoped_cached(context)?;
     let selector = arguments.get("selector").unwrap_or(&Value::Null);
     validate_selector(selector)?;
     let limit = arguments
@@ -603,7 +839,7 @@ fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> 
 
 fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     require_empty_object(arguments)?;
-    let discovery = discover_scoped(context)?;
+    let discovery = discover_scoped_cached(context)?;
     let mut control = build_control_status(
         &discovery,
         &context.app_state_root,
@@ -615,23 +851,29 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
     )
     .map_err(|error| error.to_string())?;
     context.provider_scope.filter_control_status(&mut control);
-    Ok(json!({"status": "ok", "control": control}))
+    Ok(json!({
+        "status": "ok",
+        "control": control,
+        "warnings": discovery.warnings
+    }))
 }
 
 fn list_catalog(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     require_empty_object(arguments)?;
-    let discovery = discover_scoped(context)?;
+    let discovery = discover_scoped_cached(context)?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
     Ok(json!({
         "status": "ok",
         "capabilities": catalog.records.values().collect::<Vec<_>>(),
+        "warnings": discovery.warnings,
     }))
 }
 
 fn list_hooks(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     let provider = optional_provider(context, arguments)?;
     let profile_digest = optional_string(arguments, "profileDigest")?;
-    let discovery = discover_scoped(context)?;
+    let discovery = discover_scoped_cached(context)?;
+    let warnings = discovery.warnings;
     let trust = HookTrustStore::new(&context.app_state_root);
     let hooks = discovery
         .items
@@ -653,7 +895,11 @@ fn list_hooks(context: &McpContext, arguments: &Value) -> Result<Value, String> 
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(json!({"status": "ok", "hooks": hooks}))
+    Ok(json!({
+        "status": "ok",
+        "hooks": hooks,
+        "warnings": warnings
+    }))
 }
 
 fn stored_hook_trust_decision(
@@ -946,7 +1192,7 @@ fn get_capability_locks(context: &McpContext, arguments: &Value) -> Result<Value
     let policies = PolicyStore::new(&context.app_state_root)
         .load_resolution_policies(&identity.repository_key, &identity.workspace_key, None)
         .map_err(|error| error.to_string())?;
-    let discovery = discover_scoped(context)?;
+    let discovery = discover_scoped_cached(context)?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
     let providers = requested_provider.map_or_else(
         || {
@@ -989,7 +1235,11 @@ fn get_capability_locks(context: &McpContext, arguments: &Value) -> Result<Value
             }))
         })
         .collect::<Result<Vec<_>, String>>()?;
-    Ok(json!({"status": "ok", "locks": locks}))
+    Ok(json!({
+        "status": "ok",
+        "locks": locks,
+        "warnings": discovery.warnings
+    }))
 }
 
 fn plan_capability_lock(context: &McpContext, arguments: &Value) -> Result<Value, String> {
@@ -1524,9 +1774,17 @@ fn control_targets(
 }
 
 fn discover_scoped(context: &McpContext) -> Result<DiscoveryOutput, String> {
-    discover_all(&context.discovery_roots)
+    context
+        .discovery_cache
+        .refresh(&context.discovery_roots)
         .map(|discovery| context.provider_scope.filter_discovery(discovery))
-        .map_err(|error| error.to_string())
+}
+
+fn discover_scoped_cached(context: &McpContext) -> Result<DiscoveryOutput, String> {
+    context
+        .discovery_cache
+        .get_or_discover(&context.discovery_roots)
+        .map(|discovery| context.provider_scope.filter_discovery(discovery))
 }
 
 fn optional_provider(
@@ -1694,7 +1952,7 @@ fn run_doctor_structured(context: &McpContext) -> Value {
         });
     }
 
-    match discover_scoped(context) {
+    match discover_scoped_cached(context) {
         Ok(discovery) => {
             let provider_issues = discovery
                 .warnings

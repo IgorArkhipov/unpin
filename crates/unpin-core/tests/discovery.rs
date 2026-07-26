@@ -637,6 +637,40 @@ fn malformed_codex_skill_config_warns_and_keeps_skill_inventory_available() {
 }
 
 #[test]
+fn duplicate_codex_skill_paths_warn_and_keep_skill_inventory_available() {
+    let fixture_copy = tempfile::TempDir::new().expect("temp fixture copy");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let skill_path = fixture_copy
+        .path()
+        .join("codex/admin/skills/example-codex-admin-skill/SKILL.md");
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let config = fs::read_to_string(&config_path).expect("Codex config fixture");
+    fs::write(
+        &config_path,
+        format!(
+            "{config}\n[[skills.config]]\npath = {:?}\nenabled = true\n\n[[skills.config]]\npath = {:?}\nenabled = false\n",
+            skill_path.to_string_lossy(),
+            skill_path.to_string_lossy(),
+        ),
+    )
+    .expect("write duplicate Codex skill config");
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("discovery succeeds");
+    let item = result
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
+        .expect("Codex skill remains discoverable");
+    assert!(item.enabled, "ambiguous native state must not be applied");
+    assert!(result.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Codex
+            && warning.code == "toml-parse-error"
+            && warning.message.contains("duplicate skills.config path")
+    }));
+}
+
+#[test]
 fn malformed_codex_skill_enabled_value_is_redacted_from_warning() {
     let fixture_copy = tempfile::TempDir::new().expect("temp fixture copy");
     copy_dir_all(&fixtures_root(), fixture_copy.path());
@@ -666,6 +700,36 @@ fn malformed_codex_skill_enabled_value_is_redacted_from_warning() {
         "Codex skills.config could not be read: enabled must be true or false"
     );
     assert!(!warning.message.contains("sensitive-token"));
+}
+
+#[test]
+fn duplicate_codex_tables_warn_and_hide_ambiguous_capabilities() {
+    let fixture_copy = tempfile::TempDir::new().expect("temp fixture copy");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let config = fs::read_to_string(&config_path).expect("Codex config fixture");
+    fs::write(
+        &config_path,
+        format!("{config}\n[mcp_servers.\"github\"]\nenabled = false\n"),
+    )
+    .expect("write duplicate Codex table");
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("discovery succeeds");
+    assert!(
+        result
+            .items
+            .iter()
+            .all(|item| item.id != "codex:global:configured-mcp:github")
+    );
+    let warning = result
+        .warnings
+        .iter()
+        .find(|warning| warning.code == "duplicate-toml-table")
+        .expect("duplicate table warning");
+    assert_eq!(warning.provider, ProviderId::Codex);
+    assert_eq!(warning.layer, Some(DiscoveryLayer::Global));
+    assert!(warning.message.contains("mcp_servers.github"));
 }
 
 #[test]

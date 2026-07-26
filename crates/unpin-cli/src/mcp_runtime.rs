@@ -1168,7 +1168,7 @@ struct HookExecutionBatch {
 }
 
 impl HookExecutionBatch {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn outcomes(&self) -> &BTreeMap<String, HookActionOutcome> {
         &self.outcomes
     }
@@ -2118,9 +2118,18 @@ impl From<GatewayError> for GatewayRuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
 
+    #[cfg(unix)]
+    use std::collections::BTreeSet;
+    #[cfg(unix)]
     use tempfile::TempDir;
+    #[cfg(unix)]
+    use unpin_core::hooks::{
+        HookDispatcher, HookMatcher, HookOwnership, HookPolicy, HookPolicyLimits, HookRouteOwner,
+        HookSourceLayer, HookTransformCapabilities,
+    };
+    #[cfg(unix)]
     use unpin_core::{
         approval::{
             ApprovalExpectation, ApprovalIssuer, ApprovalKey, ApprovalReceiptClaims,
@@ -2136,10 +2145,7 @@ mod tests {
             GatewayControlPlane, GatewayExposure, GatewayHookRegistration, GatewayLimits,
             UpstreamToolDescriptor, UpstreamToolRegistration,
         },
-        hooks::{
-            HookDispatcher, HookHandler, HookHandlerSpec, HookMatcher, HookOwnership, HookPolicy,
-            HookPolicyLimits, HookRouteOwner, HookSourceLayer, HookTransformCapabilities,
-        },
+        hooks::{HookHandler, HookHandlerSpec},
         profiles::{
             PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope, compile_profile,
         },
@@ -2154,6 +2160,7 @@ mod tests {
         std::iter::repeat_n(character, 64).collect()
     }
 
+    #[cfg(unix)]
     fn verified_approval(expectation: ApprovalExpectation) -> VerifiedApproval {
         let key = ApprovalKey::new([11; 32]);
         let issuer = ApprovalIssuer::new(
@@ -2186,9 +2193,11 @@ mod tests {
             .expect("verified approval")
     }
 
+    #[cfg(unix)]
     #[derive(Debug)]
     struct StaticHookAuthorizations(Vec<HookRewriteAuthorization>);
 
+    #[cfg(unix)]
     impl GatewayHookAuthorizationSource for StaticHookAuthorizations {
         fn authorizations_for(
             &self,
@@ -2198,6 +2207,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn reviewed_runtime_hook(
         id: &str,
         action: HookAction,
@@ -2240,12 +2250,14 @@ mod tests {
             .expect("review runtime hook")
     }
 
+    #[cfg(unix)]
     fn permit_gateway() -> (TempDir, Arc<GatewayService>, String, i64) {
         permit_gateway_with_identity(
             UpstreamIdentity::streamable_http("cleanup", "https://example.test/mcp").unwrap(),
         )
     }
 
+    #[cfg(unix)]
     fn permit_gateway_with_identity(
         identity: UpstreamIdentity,
     ) -> (TempDir, Arc<GatewayService>, String, i64) {
@@ -2253,6 +2265,7 @@ mod tests {
         (temp, gateway, name, now_unix)
     }
 
+    #[cfg(unix)]
     fn permit_gateway_with_hook_identity(
         identity: UpstreamIdentity,
         hook_record: CatalogRecord,
@@ -2261,6 +2274,7 @@ mod tests {
         permit_gateway_with_optional_hook(identity, Some((hook_record, hook_spec)))
     }
 
+    #[cfg(unix)]
     fn permit_gateway_with_optional_hook(
         identity: UpstreamIdentity,
         hook: Option<(CatalogRecord, HookHandlerSpec)>,
@@ -2438,6 +2452,7 @@ mod tests {
         (temp, gateway, name, now_unix, profile.digest)
     }
 
+    #[cfg(unix)]
     async fn spawn_hook_mcp_fixture()
     -> (String, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -2606,6 +2621,7 @@ mod tests {
         assert_eq!(clients.get(&other_identity), Some(&"other"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn permit_guard_drop_releases_admission_off_reactor() {
         let (_temp, gateway, name, now_unix) = permit_gateway();
@@ -2639,6 +2655,7 @@ mod tests {
         .expect("drop cleanup timeout");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn permit_guard_reuses_after_plan_binding_after_failed_finish() {
         let (temp, gateway, name, now_unix) = permit_gateway();
@@ -2698,6 +2715,7 @@ mod tests {
         assert!(!guard.is_active().expect("permit status"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn permit_guard_drop_releases_admission_after_blocking_step_returns() {
         let (_temp, gateway, name, now_unix) = permit_gateway();
@@ -3426,6 +3444,7 @@ mod tests {
         assert_eq!(gateway.control_plane().status().unwrap().in_flight_calls, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn mcp_hook_action_resolves_only_selected_target_and_releases_nested_admission() {
         let (endpoint, _calls, fixture) = spawn_hook_mcp_fixture().await;

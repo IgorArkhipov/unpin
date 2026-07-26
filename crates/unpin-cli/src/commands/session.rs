@@ -231,35 +231,38 @@ fn launch(
     ) {
         return command_error_exit(json, "blocked", &error);
     }
-    let authority_key = match credentials::resolve_session_authority_key(fixture_mode) {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return command_error_exit(
-                json,
-                "blocked",
-                "session authority key missing; run `unpin auth session init`",
-            );
-        }
-        Err(error) => return command_error_exit(json, "blocked", &error),
-    };
-    let backup_authentication_key =
-        match credentials::resolve_backup_authentication_key(fixture_mode) {
+    let authority_key =
+        match credentials::resolve_session_authority_key(fixture_mode, &config.app_state_root) {
             Ok(Some(key)) => key,
             Ok(None) => {
                 return command_error_exit(
                     json,
                     "blocked",
-                    "backup authentication key missing; run `unpin auth backup init`",
+                    "session authority key missing; run `unpin auth session init`",
                 );
             }
-            Err(error) => {
-                return command_error_exit(
-                    json,
-                    "blocked",
-                    &format!("backup authentication unavailable for protected session: {error}"),
-                );
-            }
+            Err(error) => return command_error_exit(json, "blocked", &error),
         };
+    let backup_authentication_key = match credentials::resolve_backup_authentication_key(
+        fixture_mode,
+        &config.app_state_root,
+    ) {
+        Ok(Some(key)) => key,
+        Ok(None) => {
+            return command_error_exit(
+                json,
+                "blocked",
+                "backup authentication key missing; run `unpin auth backup init`",
+            );
+        }
+        Err(error) => {
+            return command_error_exit(
+                json,
+                "blocked",
+                &format!("backup authentication unavailable for protected session: {error}"),
+            );
+        }
+    };
     let result = session_process::launch(session_process::SessionLaunchRequest {
         app_state_root: config.app_state_root,
         discovery_roots,
@@ -312,17 +315,18 @@ fn list(roots: DiscoveryRootArgs, app_state_root: Option<PathBuf>, json: bool) -
         Ok(config) => config,
         Err(error) => return command_error_exit(json, "failed", &error),
     };
-    let authority_key = match credentials::resolve_session_authority_key(fixture_mode) {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return command_error_exit(
-                json,
-                "blocked",
-                "session authority key missing; run `unpin auth session init`",
-            );
-        }
-        Err(error) => return command_error_exit(json, "blocked", &error),
-    };
+    let authority_key =
+        match credentials::resolve_session_authority_key(fixture_mode, &config.app_state_root) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return command_error_exit(
+                    json,
+                    "blocked",
+                    "session authority key missing; run `unpin auth session init`",
+                );
+            }
+            Err(error) => return command_error_exit(json, "blocked", &error),
+        };
     let identity = match config.workspace_identity() {
         Ok(identity) => identity,
         Err(error) => return command_error_exit(json, "failed", &error.to_string()),
@@ -418,17 +422,18 @@ fn end(
     {
         return command_error_exit(json, "blocked", &error);
     }
-    let authority_key = match credentials::resolve_session_authority_key(fixture_mode) {
-        Ok(Some(key)) => key,
-        Ok(None) => {
-            return command_error_exit(
-                json,
-                "blocked",
-                "session authority key missing; run `unpin auth session init`",
-            );
-        }
-        Err(error) => return command_error_exit(json, "blocked", &error),
-    };
+    let authority_key =
+        match credentials::resolve_session_authority_key(fixture_mode, &config.app_state_root) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return command_error_exit(
+                    json,
+                    "blocked",
+                    "session authority key missing; run `unpin auth session init`",
+                );
+            }
+            Err(error) => return command_error_exit(json, "blocked", &error),
+        };
     let controller =
         SessionEndController::with_authority_key(&config.app_state_root, authority_key);
     let plan = match controller.plan(id, &approval_context) {

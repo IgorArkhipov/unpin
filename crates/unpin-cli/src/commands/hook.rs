@@ -309,6 +309,7 @@ fn trust(
     let now_unix = unix_now();
     let approval = match credentials::issue_human_approval(
         fixture_mode,
+        &context.config.app_state_root,
         &expectation,
         &fingerprint,
         reviewed_fingerprint,

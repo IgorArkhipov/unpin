@@ -10,6 +10,7 @@ use std::{
 use std::process::Command;
 
 use serde::Deserialize;
+use zeroize::Zeroizing;
 
 use crate::{
     config::{
@@ -213,14 +214,14 @@ impl SessionManager {
         request.validate(now_unix).map_err(LeaseError::from)?;
         self.reconcile_stale(now_unix)?;
         let _registry = self.registry_lock()?;
-        let secret = secure_random_secret()?;
-        let mut session_material = Vec::with_capacity(secret.len() + 24);
-        session_material.extend_from_slice(&secret);
+        let secret = Zeroizing::new(secure_random_secret()?);
+        let mut session_material = Zeroizing::new(Vec::with_capacity(secret.len() + 24));
+        session_material.extend_from_slice(&*secret);
         session_material.extend_from_slice(&now_unix.to_le_bytes());
         session_material.extend_from_slice(&std::process::id().to_le_bytes());
         let session_digest = digest_bytes(&session_material);
         let session_id = format!("session-{}", &session_digest[..32]);
-        let authority = BootstrapAuthority::new(session_id.clone(), secret);
+        let authority = BootstrapAuthority::new(session_id.clone(), *secret);
         let pending = PendingBootstrap::from_request(
             session_id.clone(),
             request,
@@ -306,11 +307,11 @@ impl SessionManager {
             return Err(LeaseError::MultiplexedConnection);
         }
 
-        let owner_secret = secure_random_secret()?;
+        let owner_secret = Zeroizing::new(secure_random_secret()?);
         let handle = SessionHandle::new(
             pending.session_id.clone(),
             claim.connection_owner_id.clone(),
-            owner_secret,
+            *owner_secret,
         );
         let lease = pending
             .into_lease(claim, handle.secret_digest(), now_unix, authority_key)
