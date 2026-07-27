@@ -10,6 +10,7 @@ pub mod discovery;
 pub mod fixture;
 mod fs_support;
 pub mod gateway;
+pub mod groups;
 pub mod hooks;
 pub mod mcp;
 pub mod mutation;

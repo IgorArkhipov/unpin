@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "name": "implementation",
+  "members": [
+    {
+      "provider": "claude",
+      "kind": "skill",
+      "category": "skill",
+      "layer": "project",
+      "id": "claude:project:skill:example-claude-skill"
+    },
+    {
+      "provider": "cursor",
+      "kind": "mcp",
+      "category": "configured-mcp",
+      "layer": "project",
+      "id": "cursor:project:configured-mcp:local-docs"
+    },
+    {
+      "provider": "opencode",
+      "kind": "mcp",
+      "category": "configured-mcp",
+      "layer": "project",
+      "id": "opencode:project:configured-mcp:example-project"
+    },
+    {
+      "provider": "zed",
+      "kind": "mcp",
+      "category": "configured-mcp",
+      "layer": "project",
+      "id": "zed:project:configured-mcp:local-docs"
+    }
+  ]
+}

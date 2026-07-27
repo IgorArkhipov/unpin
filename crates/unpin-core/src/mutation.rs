@@ -50,6 +50,8 @@ use crate::transitions::{
 mod restore_control;
 pub use restore_control::*;
 
+pub(crate) mod group_control;
+
 mod toggle_control;
 pub use toggle_control::*;
 
@@ -81,6 +83,8 @@ const CURSOR_WORKSPACE_DISABLED_SERVERS_KEY: &str = "cursor/disabledMcpServers";
 const CURSOR_WORKSPACE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKUP_MANIFEST_VERSION: u8 = 3;
 const BACKUP_AUTHENTICATION_ALGORITHM: &str = "hmac-sha256-unpin-backup-v1";
+
+pub const CONTROL_PLANE_PROTECTED_REASON: &str = "control-plane-protected";
 
 thread_local! {
     static TRANSITION_BACKUP_ID_OVERRIDE: RefCell<Option<String>> = const { RefCell::new(None) };
@@ -201,6 +205,24 @@ pub fn plan_toggle(request: TogglePlanRequest) -> ToggleResult {
         backup_authentication_key: None,
         session_authority_key: None,
     })
+}
+
+#[must_use]
+pub fn is_control_plane_protected_disable(item: &DiscoveryItem, target_enabled: bool) -> bool {
+    if target_enabled
+        || item.category != DiscoveryCategory::ConfiguredMcp
+        || item.kind != crate::discovery::DiscoveryKind::Mcp
+    {
+        return false;
+    }
+    let id_name = item
+        .id
+        .rsplit(':')
+        .next()
+        .unwrap_or(item.id.as_str())
+        .to_ascii_lowercase();
+    let display_name = item.display_name.to_ascii_lowercase();
+    id_name == "unpin" || display_name == "unpin"
 }
 
 fn plan_toggle_inner(input: TogglePlanInput) -> ToggleResult {
@@ -570,6 +592,22 @@ fn apply_authorized_toggle_transaction(
     authorization: &ControlAuthorization,
     reviewed_preview: &ToggleResult,
 ) -> ToggleResult {
+    apply_authorized_toggle_transaction_with_policy(
+        input,
+        transition,
+        authorization,
+        reviewed_preview,
+        crate::transitions::TransitionRecoveryPolicy::ResumeSafe,
+    )
+}
+
+fn apply_authorized_toggle_transaction_with_policy(
+    input: TogglePlanInput,
+    transition: &TransitionPlan,
+    authorization: &ControlAuthorization,
+    reviewed_preview: &ToggleResult,
+    recovery_policy: crate::transitions::TransitionRecoveryPolicy,
+) -> ToggleResult {
     let app_state_root = input.app_state_root.clone();
     let journal_app_state_root = canonical_existing_root(&app_state_root);
     if reviewed_preview.status != ToggleStatus::DryRun {
@@ -637,6 +675,17 @@ fn apply_authorized_toggle_transaction(
             return blocked_result_from_plan(reviewed_preview.clone(), error.to_string());
         }
     };
+    if recovery_policy == crate::transitions::TransitionRecoveryPolicy::NoResumeWrites
+        && let Some(handle) = existing_handle.as_mut()
+    {
+        return mark_native_toggle_needs_repair(
+            &store,
+            handle,
+            reviewed_preview.clone(),
+            "no-resume-writes",
+            "interrupted inventory group child writes are never resumed; create a fresh group plan after repair",
+        );
+    }
     if let Some(handle) = existing_handle.as_mut() {
         let backup_root = input
             .app_state_root
@@ -7836,6 +7885,18 @@ fn load_backup_manifest(
     verify_backup_authentication(&backup_root, &manifest, backup_authentication_key)?;
 
     Ok(manifest)
+}
+
+pub(crate) fn authenticated_backup_manifest_digest(
+    app_state_root: &Path,
+    backup_id: &str,
+    backup_authentication_key: &BackupAuthenticationKey,
+) -> Result<String, String> {
+    let manifest =
+        load_backup_manifest(app_state_root, backup_id, Some(backup_authentication_key))?;
+    serde_json::to_vec(&manifest)
+        .map(|bytes| transition_digest(&bytes))
+        .map_err(|error| error.to_string())
 }
 
 fn restore_manifest_transaction(

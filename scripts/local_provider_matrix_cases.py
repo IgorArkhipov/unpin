@@ -87,6 +87,10 @@ class McpSession:
             "mcp",
             "--fixture-root",
             str(fixture_root),
+            "--home-root",
+            str(fixture_root),
+            "--project-root",
+            str(fixture_root),
             "--app-state-root",
             str(app_state_root),
         ]
@@ -126,6 +130,9 @@ class McpSession:
         tool_names = [tool["name"] for tool in tools.get("tools", [])]
         required_tools = {
             "unpin_get_inventory_summary",
+            "unpin_list_inventory_groups",
+            "unpin_get_inventory_group",
+            "unpin_plan_inventory_group",
             "unpin_plan_toggle_item",
             "unpin_apply_toggle_item",
             "unpin_restore_backup",
@@ -134,6 +141,10 @@ class McpSession:
             raise MatrixFailure("MCP initialize returned unexpected server identity")
         if not required_tools.issubset(tool_names):
             raise MatrixFailure("MCP tools/list omitted required matrix tools")
+        if "unpin_apply_inventory_group" in tool_names:
+            raise MatrixFailure(
+                "default MCP tools/list exposed conditional inventory group apply"
+            )
         self.receipt = {
             "server": initialized["serverInfo"]["name"],
             "protocolVersion": initialized.get("protocolVersion"),
@@ -452,6 +463,103 @@ def mcp_call(
     return session.call_tool(request_id=request_id, name=name, arguments=arguments)
 
 
+def matrix_inventory_group_name(scenario: dict[str, Any]) -> str:
+    sanitized = "".join(
+        character if character.isascii() and (character.isalnum() or character == "-") else "-"
+        for character in str(scenario["slug"]).lower()
+    ).strip("-")
+    sanitized = sanitized[:50].rstrip("-")
+    if not sanitized:
+        raise MatrixFailure("matrix scenario slug cannot form an inventory group name")
+    return f"matrix-{sanitized}"
+
+
+def inventory_group_member_selector(item: dict[str, Any]) -> str:
+    fields = ("provider", "layer", "kind", "category", "id")
+    values = [item.get(field) for field in fields]
+    if not all(isinstance(value, str) and value for value in values):
+        raise MatrixFailure(
+            "inventory group matrix member is missing a full provider/layer/kind/category/id identity"
+        )
+    return ":".join(values)
+
+
+def matrix_inventory_group_members(
+    inventory: dict[str, Any],
+    scenario: dict[str, Any],
+) -> list[dict[str, Any]]:
+    target = find_item(inventory, scenario["id"])
+    if target.get("kind") != "skill":
+        return [target]
+    shared_views = [
+        item
+        for item in inventory["items"]
+        if item.get("kind") == "skill"
+        and item.get("sourcePath") == target.get("sourcePath")
+    ]
+    return shared_views or [target]
+
+
+def create_matrix_inventory_group(
+    binary: Path,
+    case_root: Path,
+    fixture_root: Path,
+    app_state_root: Path,
+    scenario: dict[str, Any],
+) -> str:
+    group_name = matrix_inventory_group_name(scenario)
+    qualified_name = f"personal:{group_name}"
+    inventory = read_full_inventory(binary, fixture_root, app_state_root)
+    members = matrix_inventory_group_members(inventory, scenario)
+    command = [
+        str(binary),
+        "group",
+        "create",
+        "--fixture-root",
+        str(fixture_root),
+        "--home-root",
+        str(fixture_root),
+        "--project-root",
+        str(fixture_root),
+        "--app-state-root",
+        str(app_state_root),
+        "--scope",
+        "personal",
+        "--name",
+        group_name,
+    ]
+    for item in members:
+        command.extend(["--member", inventory_group_member_selector(item)])
+    command.append("--json")
+
+    preview = parse_json_output(run_command(command).stdout)
+    write_json(case_root / "00-group-create-preview.json", preview)
+    if preview.get("status") != "planned" or not preview.get("planFingerprint"):
+        raise MatrixFailure(
+            f"{scenario['slug']} inventory group definition did not produce a reviewable preview"
+        )
+    applied = parse_json_output(
+        run_command(
+            [
+                *command,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                preview["planFingerprint"],
+            ]
+        ).stdout
+    )
+    write_json(case_root / "00-group-create-apply.json", applied)
+    if (
+        applied.get("status") != "created"
+        or applied.get("result", {}).get("qualifiedName") != qualified_name
+    ):
+        raise MatrixFailure(
+            f"{scenario['slug']} inventory group definition was not created"
+        )
+    return qualified_name
+
+
 def run_mcp_scenario(
     binary: Path,
     artifact_root: Path,
@@ -464,6 +572,13 @@ def run_mcp_scenario(
     copy_fixture_tree(fixture_root)
     app_state_root.mkdir(parents=True)
 
+    inventory_group = create_matrix_inventory_group(
+        binary,
+        case_root,
+        fixture_root,
+        app_state_root,
+        scenario,
+    )
     with McpSession(binary, fixture_root, app_state_root) as session:
         write_json(case_root / "00-protocol.json", session.receipt)
         return run_mcp_session(
@@ -474,6 +589,7 @@ def run_mcp_scenario(
             app_state_root,
             scenario,
             canonical_fixture_digest,
+            inventory_group,
         )
 
 
@@ -485,6 +601,7 @@ def run_mcp_session(
     app_state_root: Path,
     scenario: dict[str, Any],
     canonical_fixture_digest: str,
+    inventory_group: str,
 ) -> dict[str, Any]:
 
     initial_inventory = read_inventory(binary, fixture_root, app_state_root, scenario)
@@ -508,6 +625,83 @@ def run_mcp_session(
     ):
         raise MatrixFailure(
             f"{scenario['slug']} MCP did not preserve CLI/TUI human approval boundary"
+        )
+
+    no_write_group_fixture_digest = digest_path(fixture_root)
+    no_write_group_app_state_digest = digest_path(app_state_root)
+    group_list = mcp_call(
+        session,
+        request_id="inventory-group-list",
+        name="unpin_list_inventory_groups",
+        arguments={},
+    )
+    write_json(case_root / "00-inventory-group-list.json", group_list)
+    listed_names = {
+        group.get("qualifiedName") for group in group_list.get("groups", [])
+    }
+    if (
+        group_list.get("status") != "ok"
+        or inventory_group not in listed_names
+    ):
+        raise MatrixFailure(
+            f"{scenario['slug']} MCP inventory group list omitted {inventory_group}"
+        )
+
+    group_get = mcp_call(
+        session,
+        request_id="inventory-group-get",
+        name="unpin_get_inventory_group",
+        arguments={"group": inventory_group},
+    )
+    write_json(case_root / "00-inventory-group-get.json", group_get)
+    if (
+        group_get.get("status") != "ok"
+        or group_get.get("group", {}).get("qualifiedName") != inventory_group
+    ):
+        raise MatrixFailure(
+            f"{scenario['slug']} MCP inventory group get returned the wrong definition"
+        )
+
+    group_plan = mcp_call(
+        session,
+        request_id="inventory-group-plan",
+        name="unpin_plan_inventory_group",
+        arguments={
+            "group": inventory_group,
+            "targetEnabled": target_enabled,
+            "maxMembers": 256,
+        },
+    )
+    write_json(case_root / "01-inventory-group-plan.json", group_plan)
+    inspected_member_keys = {
+        inventory_group_member_selector(member["identity"])
+        for member in group_get.get("group", {}).get("members", [])
+    }
+    planned_members = group_plan.get("plan", {}).get("members", [])
+    planned_member_keys = {
+        inventory_group_member_selector(member["identity"])
+        for member in planned_members
+    }
+    if (
+        group_plan.get("status") != "preview"
+        or group_plan.get("plan", {}).get("disposition") != "preview"
+        or group_plan.get("plan", {}).get("mode") != "preview-only"
+        or not planned_members
+        or planned_member_keys != inspected_member_keys
+        or not any(member.get("outcome") == "changed" for member in planned_members)
+        or any(
+            member.get("outcome") not in {"changed", "already-correct"}
+            or member.get("requestedEnabled") != target_enabled
+            for member in planned_members
+        )
+        or group_plan.get("challenge") is not None
+        or group_plan.get("operationId") is not None
+        or group_plan.get("plan", {}).get("operationId") is not None
+        or digest_path(fixture_root) != no_write_group_fixture_digest
+        or digest_path(app_state_root) != no_write_group_app_state_digest
+    ):
+        raise MatrixFailure(
+            f"{scenario['slug']} MCP inventory group plan was not a read-only preview"
         )
 
     selection = {
@@ -782,6 +976,9 @@ def run_mcp_session(
             "final": final_enabled,
         },
         "mcpWritesEnabled": False,
+        "inventoryGroupPreview": True,
+        "inventoryGroupQualifiedName": inventory_group,
+        "inventoryGroupProvider": scenario["provider"],
         "fixtureDigestRestored": True,
         "backupAuthentication": [
             validate_manifest(app_state_root, first_backup),

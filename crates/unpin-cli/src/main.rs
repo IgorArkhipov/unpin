@@ -4,12 +4,19 @@ use std::{
     env, io,
     io::{Read, Write},
     process::ExitCode,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::Duration,
 };
 use zeroize::Zeroizing;
 
 mod commands;
 mod credentials;
 mod gateway_session;
+mod group_store;
 mod hook_support;
 mod session_process;
 mod tui;
@@ -25,9 +32,13 @@ use unpin_core::{
         DurableControlError,
     },
     discovery::{DiscoveryItem, DiscoveryOutput, DiscoveryRoots, DiscoveryWarning, discover_all},
+    groups::{
+        GroupAccessContext, McpGroupSessionBinding, McpGroupSessionLeaseStore, current_unix_seconds,
+    },
     mcp::{
-        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, McpDiscoveryCache,
-        McpProviderScope, handle_stdio_request_once, handle_stdio_requests,
+        McpApprovedGroupApplyContext, McpAuthenticationReadiness, McpContext,
+        McpCredentialReadiness, McpDiscoveryCache, McpProviderScope, handle_stdio_request_once,
+        handle_stdio_requests,
     },
     mutation::{
         BackupAuthenticationKey, MutationOperation, MutationTarget, NativeToggleControlError,
@@ -226,6 +237,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::profile::ProfileCommands,
     },
+    /// Manage reusable named groups of inventory items.
+    Group {
+        #[command(subcommand)]
+        command: commands::group::GroupCommands,
+    },
     /// Install, inspect, activate, disable, or detach optional gateway routing.
     Gateway {
         #[command(subcommand)]
@@ -249,6 +265,9 @@ enum Commands {
         /// Read one newline-delimited request, write one response, then exit.
         #[arg(long)]
         once: bool,
+        /// Enable persistent-session inventory-group apply with external one-time approval.
+        #[arg(long)]
+        enable_approved_group_apply: bool,
     },
     /// Open the Unpin terminal UI.
     #[command(alias = "dashboard")]
@@ -1010,6 +1029,7 @@ fn main() -> ExitCode {
         Some(Commands::Session { command }) => commands::session::run(command),
         Some(Commands::Catalog { command }) => commands::catalog::run(command),
         Some(Commands::Profile { command }) => commands::profile::run(command),
+        Some(Commands::Group { command }) => commands::group::run(command),
         Some(Commands::Gateway { command }) => commands::gateway::run(command),
         Some(Commands::Hook { command }) => commands::hook::run(command),
         Some(Commands::Tui {
@@ -1086,7 +1106,14 @@ fn main() -> ExitCode {
             app_state_root,
             provider,
             once,
+            enable_approved_group_apply,
         }) => {
+            if once && enable_approved_group_apply {
+                eprintln!(
+                    "--once cannot be combined with --enable-approved-group-apply; approved apply requires a persistent MCP session"
+                );
+                return ExitCode::FAILURE;
+            }
             let fixture_mode = roots.fixture_root.is_some();
             let config = match resolve_config(&roots, app_state_root.clone()) {
                 Ok(config) => config,
@@ -1117,6 +1144,85 @@ fn main() -> ExitCode {
             } else {
                 config.app_state_root.clone()
             };
+            let provider_scope: McpProviderScope = provider.into();
+            let approved_group_apply = if enable_approved_group_apply {
+                if backup_authentication_key.is_none() {
+                    eprintln!(
+                        "approved group apply requires backup authentication; run `unpin auth backup init`"
+                    );
+                    return ExitCode::FAILURE;
+                }
+                let Some(session_key) = session_authority_key.as_ref() else {
+                    eprintln!(
+                        "approved group apply requires session authority; run `unpin auth session init`"
+                    );
+                    return ExitCode::FAILURE;
+                };
+                let approval_key = match credentials::resolve_approval_key(
+                    fixture_mode,
+                    &app_state_root,
+                ) {
+                    Ok(Some(key)) => key,
+                    Ok(None) => {
+                        eprintln!(
+                            "approved group apply requires approval signing; run `unpin auth approval init`"
+                        );
+                        return ExitCode::FAILURE;
+                    }
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let group_access = match GroupAccessContext::from_config(
+                    &config,
+                    &discovery_roots.clone().with_app_state_root(&app_state_root),
+                    provider_scope.provider(),
+                    None,
+                ) {
+                    Ok(context) => context,
+                    Err(error) => {
+                        eprintln!("approved group apply context failed: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                let binding = McpGroupSessionBinding {
+                    provider: provider_scope.provider(),
+                    repository_key: group_access.repository_key().to_string(),
+                    workspace_key: group_access.workspace_key().to_string(),
+                };
+                let now_unix = match current_unix_seconds() {
+                    Ok(now) => now,
+                    Err(error) => {
+                        eprintln!("{error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                if let Err(error) = unpin_core::fixture::require_fixture_write_sandbox(
+                    fixture_mode,
+                    [app_state_root.as_path()],
+                ) {
+                    eprintln!("approved group apply session blocked: {error}");
+                    return ExitCode::FAILURE;
+                }
+                let session = match McpGroupSessionLeaseStore::new(&app_state_root).create(
+                    binding,
+                    session_key,
+                    now_unix,
+                ) {
+                    Ok(session) => session,
+                    Err(error) => {
+                        eprintln!("approved group apply session failed: {error}");
+                        return ExitCode::FAILURE;
+                    }
+                };
+                Some(McpApprovedGroupApplyContext {
+                    session,
+                    approval_key,
+                })
+            } else {
+                None
+            };
             let context = McpContext {
                 discovery_roots: discovery_roots.with_app_state_root(&app_state_root),
                 fixture_root: roots.fixture_root.clone(),
@@ -1126,8 +1232,9 @@ fn main() -> ExitCode {
                 backup_authentication_key,
                 session_authority_key,
                 authentication,
-                provider_scope: provider.into(),
+                provider_scope,
                 discovery_cache: McpDiscoveryCache::default(),
+                approved_group_apply,
             };
 
             if once {
@@ -1145,13 +1252,50 @@ fn main() -> ExitCode {
                         ExitCode::FAILURE
                     }
                 }
-            } else if let Err(error) =
-                handle_stdio_requests(&context, io::stdin().lock(), io::stdout().lock())
-            {
-                eprintln!("mcp failed: {error}");
-                ExitCode::FAILURE
             } else {
-                ExitCode::SUCCESS
+                let heartbeat = context.approved_group_apply.as_ref().and_then(|approved| {
+                    let session_key = context.session_authority_key.clone()?;
+                    let store = McpGroupSessionLeaseStore::new(&context.app_state_root);
+                    let session = approved.session.clone();
+                    let stopped = Arc::new(AtomicBool::new(false));
+                    let worker_stopped = Arc::clone(&stopped);
+                    let handle = thread::spawn(move || {
+                        while !worker_stopped.load(Ordering::Acquire) {
+                            thread::park_timeout(Duration::from_secs(30));
+                            if worker_stopped.load(Ordering::Acquire) {
+                                break;
+                            }
+                            let now_unix = match current_unix_seconds() {
+                                Ok(now_unix) => now_unix,
+                                Err(error) => {
+                                    eprintln!(
+                                        "approved group apply heartbeat clock failed; retrying: {error}"
+                                    );
+                                    continue;
+                                }
+                            };
+                            if let Err(error) = store.renew(&session, &session_key, now_unix) {
+                                eprintln!(
+                                    "approved group apply heartbeat renewal failed; retrying: {error}"
+                                );
+                            }
+                        }
+                    });
+                    Some((stopped, handle))
+                });
+                let result =
+                    handle_stdio_requests(&context, io::stdin().lock(), io::stdout().lock());
+                if let Some((stopped, handle)) = heartbeat {
+                    stopped.store(true, Ordering::Release);
+                    handle.thread().unpark();
+                    let _ = handle.join();
+                }
+                if let Err(error) = result {
+                    eprintln!("mcp failed: {error}");
+                    ExitCode::FAILURE
+                } else {
+                    ExitCode::SUCCESS
+                }
             }
         }
         Some(Commands::SessionChildWrapper {

@@ -16,13 +16,21 @@ use crate::control_operation::{
     ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle, ControlResolvedContext,
 };
 use crate::discovery::{
-    DiscoveryCategory, DiscoveryItem, DiscoveryKind, DiscoveryOutput, DiscoveryRoots, ProviderId,
-    discover_all,
+    DiscoveryItem, DiscoveryKind, DiscoveryOutput, DiscoveryRoots, ProviderId, discover_all,
+};
+use crate::groups::{
+    GroupAccessContext, GroupApplyResult, GroupApprovalArtifactStore, GroupController,
+    GroupOperationAuthorizationLink, GroupOperationStore, GroupPlanDisposition, GroupPlanError,
+    GroupPlanMode, GroupPlanner, GroupRef, GroupResolveError, GroupResolver, GroupTargetState,
+    GroupTogglePlan, McpGroupSessionLeaseStore, PersonalGroupStore, RepositoryGroupStore,
+    current_unix_seconds, index_discovery, issue_group_approval_challenge,
+    verify_group_approval_challenge,
 };
 use crate::hooks::HookTrustStore;
 use crate::mutation::{
-    BackupAuthenticationKey, BackupSummary, NativeToggleController, RestoreController,
-    TogglePlanRequest, ToggleStatus, load_backup_summaries_authenticated, plan_toggle,
+    BackupAuthenticationKey, BackupSummary, CONTROL_PLANE_PROTECTED_REASON, NativeToggleController,
+    RestoreController, TogglePlanRequest, ToggleStatus, is_control_plane_protected_disable,
+    load_backup_summaries_authenticated, plan_toggle,
 };
 use crate::profiles::{
     CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, CompiledProfileRevision,
@@ -37,7 +45,10 @@ use crate::sessions::{
 use crate::snapshots::build_inventory_summary;
 use crate::state::workspace::resolve_workspace_identity;
 use crate::{
-    approval::{ApprovalExpectation, ControlApprovalContext},
+    approval::{
+        ApprovalExpectation, ApprovalKey, ApprovalVerifier, ControlApprovalContext,
+        approval_binding_digest, authorize_control,
+    },
     transitions::{EffectActivation, TransitionContext, TransitionPlan},
 };
 
@@ -45,6 +56,9 @@ use crate::{
 pub const UNPIN_MCP_TOOL_NAMES: &[&str] = &[
     "unpin_get_inventory_summary",
     "unpin_list_items",
+    "unpin_list_inventory_groups",
+    "unpin_get_inventory_group",
+    "unpin_plan_inventory_group",
     "unpin_plan_toggle_item",
     "unpin_apply_toggle_item",
     "unpin_plan_toggle_items",
@@ -73,11 +87,11 @@ pub const UNPIN_MCP_TOOL_NAMES: &[&str] = &[
     "unpin_apply_session_end",
     "unpin_plan_session_launch",
 ];
+pub const UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME: &str = "unpin_apply_inventory_group";
 
 const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
 const LATEST_MCP_PROTOCOL_VERSION: &str = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
-const CONTROL_PLANE_PROTECTED_REASON: &str = "control-plane-protected";
 const ADOPTION_APPROVAL_ISSUER: &str = "unpin-cli-human";
 const ADOPTION_APPROVAL_AUDIENCE: &str = "unpin-core-transition";
 const HOOK_TRUST_APPROVAL_ISSUER: &str = "unpin-cli-human";
@@ -148,6 +162,13 @@ pub struct McpContext {
     pub authentication: McpAuthenticationReadiness,
     pub provider_scope: McpProviderScope,
     pub discovery_cache: McpDiscoveryCache,
+    pub approved_group_apply: Option<McpApprovedGroupApplyContext>,
+}
+
+#[derive(Debug, Clone)]
+pub struct McpApprovedGroupApplyContext {
+    pub session: crate::groups::McpGroupSessionIdentity,
+    pub approval_key: ApprovalKey,
 }
 
 #[derive(Debug, Clone)]
@@ -513,31 +534,41 @@ pub fn handle_mcp_request(context: &McpContext, request: &Value) -> Value {
     };
 
     match method {
-        "initialize" => result_response(
-            id,
-            json!({
-                "protocolVersion": negotiated_protocol_version(request),
-                "serverInfo": {
-                    "name": "unpin",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {
-                    "tools": {},
-                    "experimental": {
-                        "unpinControl": {
-                            "version": UNPIN_CONTROL_CONTRACT_VERSION,
-                            "mutation": "human-handoff-only",
-                            "providerScope": context.provider_scope.as_str()
+        "initialize" => {
+            let mut control = json!({
+                "version": UNPIN_CONTROL_CONTRACT_VERSION,
+                "mutation": "human-handoff-only",
+                "providerScope": context.provider_scope.as_str()
+            });
+            if context.approved_group_apply.is_some() {
+                control["conditionalGroupApply"] = json!("approved-group-apply-v1");
+                control["unattendedWritesEnabled"] = json!(false);
+                control["conditionalProviderWritesEnabled"] = json!(true);
+                control["challengeStoreWrites"] = json!(false);
+                control["sessionLeaseWrites"] = json!(true);
+                control["approvalArtifactRequired"] = json!(true);
+                control["canMintApproval"] = json!(false);
+                control["requiresPersistentSession"] = json!(true);
+            }
+            result_response(
+                id,
+                json!({
+                    "protocolVersion": negotiated_protocol_version(request),
+                    "serverInfo": {
+                        "name": "unpin",
+                        "version": env!("CARGO_PKG_VERSION"),
+                    },
+                    "capabilities": {
+                        "tools": {},
+                        "experimental": {
+                            "unpinControl": control
                         }
                     }
-                }
-            }),
-        ),
+                }),
+            )
+        }
         "notifications/initialized" => result_response(id, json!({})),
-        "tools/list" => result_response(
-            id,
-            json!({ "tools": tool_descriptors(context.provider_scope) }),
-        ),
+        "tools/list" => result_response(id, json!({ "tools": tool_descriptors(context) })),
         "tools/call" => match handle_tool_call(context, request) {
             Ok(result) => result_response(id, result),
             Err(message) => error_response(id, -32000, message),
@@ -651,6 +682,16 @@ fn handle_tool_call(context: &McpContext, request: &Value) -> Result<Value, Stri
             structured_result(get_inventory_summary(context, &arguments)?)
         }
         "unpin_list_items" => structured_result(list_items(context, &arguments)?),
+        "unpin_list_inventory_groups" => {
+            structured_result(list_inventory_groups(context, &arguments)?)
+        }
+        "unpin_get_inventory_group" => structured_result(get_inventory_group(context, &arguments)?),
+        "unpin_plan_inventory_group" => {
+            structured_result(plan_inventory_group(context, &arguments)?)
+        }
+        "unpin_apply_inventory_group" if context.approved_group_apply.is_some() => {
+            structured_result(apply_inventory_group(context, &arguments)?)
+        }
         "unpin_run_doctor" => structured_result(run_doctor_structured(context)),
         "unpin_plan_toggle_item" => structured_result(plan_single_toggle(context, &arguments)),
         "unpin_apply_toggle_item" => structured_result(apply_single_toggle(context, &arguments)),
@@ -732,6 +773,484 @@ fn propose_session_profile(context: &McpContext, arguments: &Value) -> Result<Va
             "guidance": "Ask the user to choose the proposed profile, then use the explicit session launch handoff. This tool never changes exposure.",
         },
     }))
+}
+
+fn list_inventory_groups(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(arguments, &[], "inventory group list arguments")?;
+    let resolver = group_resolver(context)?;
+    let discovery = discover_inventory_groups(context)?;
+    let (groups, mut warnings) = resolver
+        .list_views_with_warnings(&discovery)
+        .map_err(|error| public_group_resolve_error(&error))?;
+    for warning in &mut warnings {
+        warning.message = "inventory group scope is unavailable".to_string();
+    }
+    Ok(json!({
+        "status": "ok",
+        "groups": groups,
+        "count": groups.len(),
+        "warnings": warnings,
+    }))
+}
+
+fn get_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(arguments, &["group"], "inventory group get arguments")?;
+    let reference =
+        GroupRef::parse(required_string(arguments, "group")?).map_err(|error| error.to_string())?;
+    let resolver = group_resolver(context)?;
+    let discovery = discover_inventory_groups(context)?;
+    let view = match resolver.inspect(&reference, &discovery) {
+        Ok(view) => view,
+        Err(GroupResolveError::Ambiguous { candidates, .. }) => {
+            return Ok(ambiguous_group_value(&candidates));
+        }
+        Err(error) => return Err(public_group_resolve_error(&error)),
+    };
+    Ok(json!({
+        "status": if view.context_compatible { "ok" } else { "context-mismatch" },
+        "group": view,
+    }))
+}
+
+fn plan_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(
+        arguments,
+        &["group", "targetEnabled", "maxMembers"],
+        "inventory group plan arguments",
+    )?;
+    let reference =
+        GroupRef::parse(required_string(arguments, "group")?).map_err(|error| error.to_string())?;
+    let target = if arguments
+        .get("targetEnabled")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| "missing required field: targetEnabled".to_string())?
+    {
+        GroupTargetState::Enable
+    } else {
+        GroupTargetState::Disable
+    };
+    let max_members = arguments
+        .get("maxMembers")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .ok_or_else(|| "maxMembers must be a positive integer".to_string())?;
+    let actionable = context.approved_group_apply.is_some()
+        && context.backup_authentication_key.is_some()
+        && context.session_authority_key.is_some();
+    let mode = if actionable {
+        GroupPlanMode::McpHandoff
+    } else {
+        GroupPlanMode::PreviewOnly
+    };
+    let planner = GroupPlanner::new(group_resolver(context)?);
+    let plan = match planner.plan(&reference, target, max_members, mode) {
+        Ok(plan) => plan,
+        Err(GroupPlanError::Resolve(GroupResolveError::Ambiguous { candidates, .. })) => {
+            return Ok(ambiguous_group_value(&candidates));
+        }
+        Err(error) => return Err(public_group_plan_error(&error)),
+    };
+    let (status, approval, guidance) = match plan.disposition {
+        GroupPlanDisposition::Preview => (
+            "preview",
+            "unavailable",
+            Some(
+                "Start persistent MCP with approved group apply enabled to request an authorizable plan.",
+            ),
+        ),
+        GroupPlanDisposition::NoOp => ("no-op", "not-required", None),
+        GroupPlanDisposition::Blocked => ("blocked", "not-required", None),
+        GroupPlanDisposition::Actionable => (
+            "actionable",
+            "required",
+            Some(
+                "Review this complete plan in `unpin group approve`, then call unpin_apply_inventory_group with the exact operation, fingerprint, challenge, and one-time artifact.",
+            ),
+        ),
+    };
+    let mut response = json!({
+        "status": status,
+        "approval": approval,
+        "plan": plan,
+        "humanAction": guidance.map(|guidance| json!({
+            "code": if actionable { "approve-for-mcp-apply" } else { "approved-group-mode-required" },
+            "guidance": guidance,
+        })),
+    });
+    if plan.disposition == GroupPlanDisposition::Actionable {
+        let approved = context
+            .approved_group_apply
+            .as_ref()
+            .ok_or_else(|| "approved-group MCP session is unavailable".to_string())?;
+        let session_key = context
+            .session_authority_key
+            .as_ref()
+            .ok_or_else(|| "session authority credential is unavailable".to_string())?;
+        let now_unix = current_unix_seconds()
+            .map_err(|_| "inventory group approval is unavailable".to_string())?;
+        let lease_expires_at = McpGroupSessionLeaseStore::new(&context.app_state_root)
+            .verify(&approved.session, session_key, now_unix)
+            .map_err(|_| "inventory group approval is unavailable".to_string())?;
+        let challenge = issue_group_approval_challenge(
+            plan.clone(),
+            approved.session.clone(),
+            lease_expires_at,
+            session_key,
+            now_unix,
+        )
+        .map_err(|_| "inventory group approval is unavailable".to_string())?;
+        response["challenge"] = json!(challenge);
+        response["operationId"] = json!(plan.operation_id);
+        response["planFingerprint"] = json!(plan.plan_fingerprint);
+    }
+    Ok(response)
+}
+
+fn apply_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(
+        arguments,
+        &[
+            "operationId",
+            "planFingerprint",
+            "challenge",
+            "approvalArtifact",
+        ],
+        "inventory group apply arguments",
+    )?;
+    let approved = context
+        .approved_group_apply
+        .as_ref()
+        .ok_or_else(|| "approved-group MCP apply is unavailable".to_string())?;
+    let backup_key = context
+        .backup_authentication_key
+        .as_ref()
+        .ok_or_else(|| "backup authentication credential is unavailable".to_string())?;
+    let session_key = context
+        .session_authority_key
+        .as_ref()
+        .ok_or_else(|| "session authority credential is unavailable".to_string())?;
+    let operation_id = required_string(arguments, "operationId")?;
+    let plan_fingerprint = required_string(arguments, "planFingerprint")?;
+    let challenge = required_string(arguments, "challenge")?;
+    let artifact_id = required_string(arguments, "approvalArtifact")?;
+    let now_unix = current_unix_seconds()
+        .map_err(|_| "inventory group approval is unavailable".to_string())?;
+    let lease_expires_at = McpGroupSessionLeaseStore::new(&context.app_state_root)
+        .verify(&approved.session, session_key, now_unix)
+        .map_err(|_| "inventory group approval is unavailable".to_string())?;
+    let claims = verify_group_approval_challenge(
+        challenge,
+        &approved.session,
+        lease_expires_at,
+        session_key,
+        now_unix,
+    )
+    .map_err(|_| "inventory group approval is unavailable".to_string())?;
+    if claims.plan.operation_id.as_deref() != Some(operation_id)
+        || claims.plan.plan_fingerprint != plan_fingerprint
+    {
+        return Ok(blocked_value("inventory group approval binding mismatch"));
+    }
+    let resolver = group_resolver(context)?;
+    let planner = GroupPlanner::new(resolver);
+    let approval_context = ControlApprovalContext::new(
+        planner.resolver().context().repository_key(),
+        planner.resolver().context().workspace_key(),
+    )
+    .map_err(|_| "inventory group approval is unavailable".to_string())?;
+    let expectation = claims
+        .plan
+        .approval_expectation(&approval_context)
+        .map_err(|_| "inventory group approval is unavailable".to_string())?;
+    let artifact_store = GroupApprovalArtifactStore::new(&context.app_state_root);
+    let (receipt, consumed_decision_digest, consume_artifact) = match artifact_store.load_ready(
+        artifact_id,
+        operation_id,
+        plan_fingerprint,
+        challenge,
+        &approved.session,
+        session_key,
+        now_unix,
+    ) {
+        Ok(artifact) => (artifact.receipt, None, true),
+        Err(_) => {
+            let consumed = artifact_store
+                .load_consumed(
+                    artifact_id,
+                    operation_id,
+                    plan_fingerprint,
+                    challenge,
+                    &approved.session,
+                    session_key,
+                    now_unix,
+                )
+                .map_err(|_| "inventory group approval artifact is unavailable".to_string())?;
+            (consumed.receipt, Some(consumed.decision_digest), false)
+        }
+    };
+    let verifier = ApprovalVerifier::new(approved.approval_key.clone());
+    let verified = verifier
+        .verify(&receipt, &expectation, now_unix)
+        .map_err(|_| "inventory group approval is unavailable".to_string())?;
+    let decision_digest = verified.decision_digest().to_string();
+    if consumed_decision_digest
+        .as_deref()
+        .is_some_and(|consumed| consumed != decision_digest)
+    {
+        return Err("inventory group approval artifact is unavailable".to_string());
+    }
+    let mut fixture_write_paths = vec![context.app_state_root.clone()];
+    let existing_operation =
+        GroupOperationStore::new(context.app_state_root.clone(), backup_key.clone())
+            .load(operation_id)
+            .map_err(|_| "inventory group operation evidence is unavailable".to_string())?
+            .map(|snapshot| snapshot.value);
+    let status_only = existing_operation.as_ref().is_some_and(|operation| {
+        operation.provider_writes_started || operation.terminal_result.is_some()
+    });
+    if existing_operation.is_some() {
+        let discovery = discover_inventory_groups(context)?;
+        let discovery_index = index_discovery(&discovery);
+        for member in &claims.plan.members {
+            if member.outcome != crate::groups::GroupMemberPlanOutcome::Changed {
+                continue;
+            }
+            let matches = discovery_index
+                .get(&member.identity)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            let item = match matches {
+                [] => {
+                    return Ok(blocked_value(
+                        "inventory group member disappeared before apply",
+                    ));
+                }
+                [item] => *item,
+                _ => {
+                    return Ok(blocked_value(
+                        "inventory group member became ambiguous before apply",
+                    ));
+                }
+            };
+            fixture_write_paths.extend(
+                [item.source_path.as_str(), item.state_path.as_str()]
+                    .into_iter()
+                    .filter(|path| !path.is_empty())
+                    .map(PathBuf::from),
+            );
+        }
+    } else {
+        let revalidated = planner
+            .revalidate(&claims.plan)
+            .map_err(|error| public_group_plan_error(&error))?;
+        if revalidated.plan_fingerprint != claims.plan.plan_fingerprint {
+            return Ok(blocked_value(
+                "inventory group plan no longer matches current state",
+            ));
+        }
+        for member in &revalidated.members {
+            if member.outcome != crate::groups::GroupMemberPlanOutcome::Changed {
+                continue;
+            }
+            let native = member.native_plan.as_ref().ok_or_else(|| {
+                "actionable inventory group member has no sealed native plan".to_string()
+            })?;
+            fixture_write_paths.extend(
+                native
+                    .preview
+                    .affected_targets
+                    .iter()
+                    .map(|target| PathBuf::from(&target.path)),
+            );
+        }
+    }
+    crate::fixture::require_fixture_write_sandbox(
+        context.fixture_root.is_some(),
+        fixture_write_paths.iter().map(PathBuf::as_path),
+    )
+    .map_err(|_| "inventory group apply is outside the fixture write sandbox".to_string())?;
+    let controller = GroupController::new(planner, backup_key.clone(), session_key.clone());
+    if !status_only {
+        controller
+            .seal_authorizing_operation(
+                &claims.plan,
+                &decision_digest,
+                GroupOperationAuthorizationLink {
+                    artifact_digest: approval_binding_digest(artifact_id),
+                    nonce_digest: approval_binding_digest(&receipt.claims.nonce),
+                    session_id: approved.session.session_id.clone(),
+                    session_generation: approved.session.generation,
+                },
+            )
+            .map_err(|_| "inventory group operation evidence is unavailable".to_string())?;
+    }
+    let authorization = authorize_control(
+        &context.app_state_root,
+        &receipt,
+        &verifier,
+        &expectation,
+        now_unix,
+        crate::state::atomic_json::OwnerGeneration::new(
+            format!("mcp-group-apply:{}", approved.session.session_id),
+            approved.session.generation,
+        )
+        .map_err(|_| "inventory group approval is unavailable".to_string())?,
+    )
+    .map_err(|_| "inventory group approval is unavailable".to_string())?;
+    if consume_artifact {
+        artifact_store
+            .consume(
+                artifact_id,
+                operation_id,
+                plan_fingerprint,
+                challenge,
+                &approved.session,
+                authorization.decision_digest(),
+                session_key,
+                now_unix,
+            )
+            .map_err(|_| "inventory group approval artifact is unavailable".to_string())?;
+    }
+    if status_only {
+        context.discovery_cache.invalidate();
+        return match controller.status_without_reauthorization(&claims.plan) {
+            Ok(result) => group_apply_response(&claims.plan, &expectation, &result),
+            Err(_) => Ok(group_recovery_required_response(operation_id)),
+        };
+    }
+    let result = match controller.apply(&claims.plan, authorization) {
+        Ok(result) => result,
+        Err(_) => {
+            context.discovery_cache.invalidate();
+            if controller
+                .operation(operation_id)
+                .ok()
+                .flatten()
+                .is_some_and(|operation| {
+                    operation.provider_writes_started || operation.terminal_result.is_some()
+                })
+            {
+                return Ok(group_recovery_required_response(operation_id));
+            }
+            return Ok(json!({
+                "status": "failed",
+                "operationId": operation_id,
+                "error": {
+                    "code": "group-apply-failed",
+                    "message": "inventory group apply failed",
+                },
+            }));
+        }
+    };
+    context.discovery_cache.invalidate();
+    group_apply_response(&claims.plan, &expectation, &result)
+}
+
+fn group_recovery_required_response(operation_id: &str) -> Value {
+    json!({
+        "status": "recovery-required",
+        "operationId": operation_id,
+        "error": {
+            "code": "group-recovery-required",
+            "message": "inventory group provider writes may have started; inspect the durable operation and backup evidence",
+        },
+        "guidance": "Run `unpin group operation-show <operationId> --json` before any further apply.",
+    })
+}
+
+fn group_apply_response(
+    plan: &GroupTogglePlan,
+    expectation: &ApprovalExpectation,
+    result: &GroupApplyResult,
+) -> Result<Value, String> {
+    let activation = plan
+        .resources
+        .iter()
+        .fold(EffectActivation::Live, |activation, resource| {
+            activation.max(resource.activation)
+        });
+    let providers = plan
+        .definition_view
+        .provider_coverage
+        .iter()
+        .copied()
+        .collect();
+    let operation = result
+        .control_operation_envelope(expectation, activation, providers)
+        .map_err(|_| "inventory group operation result is unavailable".to_string())?;
+    let status = match result.lifecycle {
+        crate::groups::GroupOperationLifecycle::Completed => "applied",
+        crate::groups::GroupOperationLifecycle::Partial
+        | crate::groups::GroupOperationLifecycle::Failed => "blocked",
+        crate::groups::GroupOperationLifecycle::RecoveryRequired => "recovery-required",
+        crate::groups::GroupOperationLifecycle::InProgress => {
+            return Err("inventory group operation result is unavailable".to_string());
+        }
+    };
+    Ok(json!({
+        "status": status,
+        "operation": operation,
+    }))
+}
+
+fn group_resolver(context: &McpContext) -> Result<GroupResolver, String> {
+    let access = GroupAccessContext::from_runtime(
+        &context.app_state_root,
+        &context.project_root,
+        &context.discovery_roots,
+        context.provider_scope.provider(),
+        None,
+    )
+    .map_err(|_| "inventory group context is unavailable".to_string())?;
+    Ok(GroupResolver::new(
+        access.clone(),
+        PersonalGroupStore::new(access.clone()),
+        RepositoryGroupStore::new(access),
+    ))
+}
+
+fn discover_inventory_groups(context: &McpContext) -> Result<DiscoveryOutput, String> {
+    discover_scoped(context).map_err(|_| "inventory group discovery is unavailable".to_string())
+}
+
+fn public_group_resolve_error(error: &GroupResolveError) -> String {
+    match error {
+        GroupResolveError::Store(_) | GroupResolveError::ScopeUnavailable { .. } => {
+            "inventory group storage is unavailable".to_string()
+        }
+        GroupResolveError::NotFound(_) | GroupResolveError::Ambiguous { .. } => error.to_string(),
+    }
+}
+
+fn ambiguous_group_value(candidates: &[String]) -> Value {
+    json!({
+        "status": "ambiguous",
+        "error": {
+            "code": "group-reference-ambiguous",
+            "message": "inventory group reference is ambiguous",
+            "candidates": candidates,
+        },
+    })
+}
+
+fn public_group_plan_error(error: &GroupPlanError) -> String {
+    match error {
+        GroupPlanError::Resolve(error) => public_group_resolve_error(error),
+        GroupPlanError::InvalidMaximum { .. }
+        | GroupPlanError::MaximumExceeded { .. }
+        | GroupPlanError::ContextMismatch
+        | GroupPlanError::NotActionable
+        | GroupPlanError::InvalidPlan
+        | GroupPlanError::FingerprintMismatch => error.to_string(),
+        GroupPlanError::Discovery(_)
+        | GroupPlanError::Transition(_)
+        | GroupPlanError::Validation(_)
+        | GroupPlanError::Approval(_)
+        | GroupPlanError::Serialization(_)
+        | GroupPlanError::IdentifierGeneration(_) => {
+            "inventory group planning is unavailable".to_string()
+        }
+    }
 }
 
 fn validate_profile(context: &McpContext, arguments: &Value) -> Result<Value, String> {
@@ -2703,25 +3222,6 @@ fn blocked_toggle_value(item: DiscoveryItem, target_enabled: bool, reason_code: 
     })
 }
 
-fn is_control_plane_protected_disable(item: &DiscoveryItem, target_enabled: bool) -> bool {
-    !target_enabled
-        && item.category == DiscoveryCategory::ConfiguredMcp
-        && item.kind == DiscoveryKind::Mcp
-        && is_control_plane_name(item)
-}
-
-fn is_control_plane_name(item: &DiscoveryItem) -> bool {
-    let id_name = item
-        .id
-        .rsplit(':')
-        .next()
-        .unwrap_or(item.id.as_str())
-        .to_ascii_lowercase();
-    let display_name = item.display_name.to_ascii_lowercase();
-
-    id_name == "unpin" || display_name == "unpin"
-}
-
 fn list_backups(context: &McpContext, arguments: &Value) -> Value {
     let limit = arguments
         .get("limit")
@@ -3159,15 +3659,22 @@ fn hex_bytes(bytes: &[u8]) -> String {
     rendered
 }
 
-fn tool_descriptors(provider_scope: McpProviderScope) -> Vec<Value> {
+fn tool_descriptors(context: &McpContext) -> Vec<Value> {
     UNPIN_MCP_TOOL_NAMES
         .iter()
+        .copied()
+        .chain(
+            context
+                .approved_group_apply
+                .as_ref()
+                .map(|_| UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME),
+        )
         .map(|name| {
             json!({
                 "name": name,
                 "title": tool_title(name),
                 "description": tool_description(name),
-                "inputSchema": tool_input_schema(name, provider_scope),
+                "inputSchema": tool_input_schema(name, context.provider_scope),
                 "annotations": tool_annotations(name)
             })
         })
@@ -3178,6 +3685,10 @@ fn tool_title(name: &str) -> &'static str {
     match name {
         "unpin_get_inventory_summary" => "Get Unpin inventory summary",
         "unpin_list_items" => "List Unpin items",
+        "unpin_list_inventory_groups" => "List Unpin inventory groups",
+        "unpin_get_inventory_group" => "Get one Unpin inventory group",
+        "unpin_plan_inventory_group" => "Plan one Unpin inventory group toggle",
+        "unpin_apply_inventory_group" => "Apply one approved Unpin inventory group toggle",
         "unpin_plan_toggle_item" => "Plan one Unpin item toggle",
         "unpin_apply_toggle_item" => "Request one Unpin item toggle",
         "unpin_plan_toggle_items" => "Plan Unpin item toggles",
@@ -3216,6 +3727,18 @@ fn tool_description(name: &str) -> &'static str {
         }
         "unpin_list_items" => {
             "List discovered Unpin provider items with optional selector filters."
+        }
+        "unpin_list_inventory_groups" => {
+            "List visible named inventory groups and their current derived state without writing."
+        }
+        "unpin_get_inventory_group" => {
+            "Inspect one qualified inventory group with fresh member state without writing."
+        }
+        "unpin_plan_inventory_group" => {
+            "Plan enabling or disabling one exact inventory group without writing."
+        }
+        "unpin_apply_inventory_group" => {
+            "Apply only the exact inventory group plan authorized by an external one-time human approval artifact."
         }
         "unpin_plan_toggle_item" => {
             "Plan a reversible toggle for one selected provider item without writing."
@@ -3317,6 +3840,45 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "selector": selector_schema(&provider_ids),
                 "limit": { "type": "integer", "minimum": 1 }
             }
+        }),
+        "unpin_list_inventory_groups" => json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+        "unpin_get_inventory_group" => json!({
+            "type": "object",
+            "required": ["group"],
+            "properties": {
+                "group": non_empty_string_schema()
+            },
+            "additionalProperties": false
+        }),
+        "unpin_plan_inventory_group" => json!({
+            "type": "object",
+            "required": ["group", "targetEnabled", "maxMembers"],
+            "properties": {
+                "group": non_empty_string_schema(),
+                "targetEnabled": { "type": "boolean" },
+                "maxMembers": { "type": "integer", "minimum": 1, "maximum": 256 }
+            },
+            "additionalProperties": false
+        }),
+        "unpin_apply_inventory_group" => json!({
+            "type": "object",
+            "required": [
+                "operationId",
+                "planFingerprint",
+                "challenge",
+                "approvalArtifact"
+            ],
+            "properties": {
+                "operationId": non_empty_string_schema(),
+                "planFingerprint": non_empty_string_schema(),
+                "challenge": non_empty_string_schema(),
+                "approvalArtifact": non_empty_string_schema()
+            },
+            "additionalProperties": false
         }),
         "unpin_plan_toggle_item" => json!({
             "type": "object",
@@ -3640,8 +4202,16 @@ fn control_session_launch_schema(provider_ids: &[&str]) -> Value {
 
 fn tool_annotations(name: &str) -> Value {
     match name {
+        "unpin_apply_inventory_group" => json!({
+            "readOnlyHint": false,
+            "destructiveHint": true,
+            "idempotentHint": false
+        }),
         "unpin_get_inventory_summary"
         | "unpin_list_items"
+        | "unpin_list_inventory_groups"
+        | "unpin_get_inventory_group"
+        | "unpin_plan_inventory_group"
         | "unpin_plan_toggle_item"
         | "unpin_plan_toggle_items"
         | "unpin_apply_toggle_item"

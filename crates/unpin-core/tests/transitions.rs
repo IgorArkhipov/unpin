@@ -26,7 +26,7 @@ use unpin_core::{
         EffectCheckpointStatus, TransitionBackend, TransitionConflict, TransitionConflictChecker,
         TransitionConflictGuard, TransitionContext, TransitionCoordinator, TransitionEffect,
         TransitionEffectKind, TransitionJournalStore, TransitionKind, TransitionLifecycle,
-        TransitionOutcomeStatus, TransitionPlan,
+        TransitionOutcomeStatus, TransitionPlan, TransitionRecoveryPolicy,
     },
 };
 
@@ -278,6 +278,18 @@ fn plan(operation_id: &str) -> TransitionPlan {
     .expect("transition plan")
 }
 
+#[test]
+fn transition_plan_schema_remains_compatible_with_existing_v1_journals() {
+    let original = plan("operation-schema-v1-recovery");
+    assert_eq!(original.schema_version, 1);
+    let persisted = serde_json::to_vec(&original).expect("serialize transition plan");
+    let recovered: TransitionPlan =
+        serde_json::from_slice(&persisted).expect("deserialize persisted v1 plan");
+
+    recovered.verify().expect("persisted v1 plan verifies");
+    assert_eq!(recovered.effect_graph_digest, original.effect_graph_digest);
+}
+
 fn effect(
     effect_id: &str,
     resource_id: &str,
@@ -432,6 +444,56 @@ fn crash_after_provider_write_resumes_same_operation_without_duplicate_backup_or
         .expect("journal JSON");
     assert!(!raw.contains("nonce-resume-apply"));
     assert!(!raw.contains(&receipt.tag));
+}
+
+#[test]
+fn no_resume_writes_terminalizes_interrupted_apply_without_more_provider_writes() {
+    let temp = TempDir::new();
+    let plan = plan("operation-no-resume-writes");
+    let receipt = receipt(&plan, "nonce-no-resume-writes");
+    let backend = backend();
+    backend.panic_after_apply_once("effect-one");
+
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        coordinator(temp.path()).execute_with_recovery_policy(
+            &plan,
+            Some(&receipt),
+            &verifier(),
+            1_050,
+            owner(),
+            &backend,
+            TransitionRecoveryPolicy::NoResumeWrites,
+        )
+    }));
+    assert!(crashed.is_err());
+    assert_eq!(backend.bytes("provider-a"), b"provider-a-new");
+    assert_eq!(backend.bytes("provider-b"), b"provider-b-old");
+
+    let reconciled = coordinator(temp.path())
+        .execute_with_recovery_policy(
+            &plan,
+            None,
+            &verifier(),
+            1_500,
+            OwnerGeneration::new("replacement-process", 1).expect("replacement owner"),
+            &backend,
+            TransitionRecoveryPolicy::NoResumeWrites,
+        )
+        .expect("interrupted group transition becomes recovery-required");
+
+    assert_eq!(reconciled.status, TransitionOutcomeStatus::NeedsRepair);
+    assert_eq!(reconciled.reason_code.as_deref(), Some("no-resume-writes"));
+    assert_eq!(backend.apply_count("effect-one"), 1);
+    assert_eq!(backend.apply_count("effect-two"), 0);
+    assert!(
+        backend
+            .rollback_calls
+            .lock()
+            .expect("rollback calls lock")
+            .is_empty()
+    );
+    assert_eq!(backend.bytes("provider-a"), b"provider-a-new");
+    assert_eq!(backend.bytes("provider-b"), b"provider-b-old");
 }
 
 #[test]

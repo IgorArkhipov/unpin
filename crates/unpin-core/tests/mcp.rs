@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeSet,
     fs,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
@@ -9,15 +10,24 @@ use rusqlite::Connection;
 use serde_json::json;
 use tempfile::TempDir;
 use unpin_core::{
-    approval::{ApprovalIssuer, ApprovalKey, ApprovalReceiptClaims, ApprovalVerifier},
+    approval::{
+        ApprovalIssuer, ApprovalKey, ApprovalReceiptClaims, ApprovalVerifier,
+        ControlApprovalContext,
+    },
     catalog::Catalog,
     config::get_hook_trust_path,
-    discovery::{DiscoveryKind, DiscoveryRoots, ProviderId, discover_all},
+    discovery::{DiscoveryKind, DiscoveryLayer, DiscoveryRoots, ProviderId, discover_all},
+    groups::{
+        GroupAccessContext, GroupApprovalArtifactStore, GroupDefinitionV1, GroupMemberIdentity,
+        GroupPlanDisposition, McpGroupSessionBinding, McpGroupSessionLeaseStore,
+        PersonalGroupStore, RepositoryGroupStore, current_unix_seconds,
+    },
     hooks::{HookTrustRecord, HookTrustStore},
     mcp::{
-        McpAuthenticationReadiness, McpContext, McpCredentialReadiness, McpDiscoveryCache,
-        McpProviderScope, UNPIN_MCP_TOOL_NAMES, handle_mcp_request, handle_stdio_request_once,
-        handle_stdio_requests,
+        McpApprovedGroupApplyContext, McpAuthenticationReadiness, McpContext,
+        McpCredentialReadiness, McpDiscoveryCache, McpProviderScope,
+        UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME, UNPIN_MCP_TOOL_NAMES, handle_mcp_request,
+        handle_stdio_request_once, handle_stdio_requests,
     },
     mutation::{BackupAuthenticationKey, authenticate_legacy_backup},
     profiles::{
@@ -79,6 +89,7 @@ fn context_with_roots(fixture_root: &Path, app_state_root: &Path) -> McpContext 
         session_authority_key: Some(SessionAuthorityKey::new([0x53; 32])),
         provider_scope: McpProviderScope::All,
         discovery_cache: McpDiscoveryCache::default(),
+        approved_group_apply: None,
     }
 }
 
@@ -291,7 +302,7 @@ fn call_tool_error(context: &McpContext, name: &str, arguments: serde_json::Valu
 
     response["error"]["message"]
         .as_str()
-        .expect("tool error message")
+        .unwrap_or_else(|| panic!("tool {name} did not return an error: {response:#}"))
         .to_string()
 }
 
@@ -751,6 +762,767 @@ fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_writing() {
     );
     assert_eq!(applied["status"], "human-action-required");
     assert!(!app_state.path().join("backups").exists());
+}
+
+#[test]
+fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_time_approval() {
+    let temp = TempDir::new().expect("temporary group MCP root");
+    let root = fs::canonicalize(temp.path()).expect("canonical group MCP root");
+    let fixture_root = root.join("fixtures");
+    let app_state_root = root.join("state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(&app_state_root).expect("app state");
+
+    let config_path = fixture_root.join("codex/global/config.toml");
+    let skill_path = fixture_root.join("codex/admin/skills/example-codex-admin-skill/SKILL.md");
+    let config_source = fs::read_to_string(&config_path).expect("Codex fixture");
+    fs::write(
+        &config_path,
+        format!(
+            "{config_source}\n[[skills.config]]\npath = {:?}\nenabled = true\n",
+            skill_path.to_string_lossy()
+        ),
+    )
+    .expect("Codex skill override");
+
+    let mut context = context_with_roots(&fixture_root, &app_state_root);
+    context.project_root = fixture_root.join("codex/project");
+    let access = GroupAccessContext::from_runtime(
+        &context.app_state_root,
+        &context.project_root,
+        &context.discovery_roots,
+        None,
+        None,
+    )
+    .expect("group access");
+    let discovered = discover_all(&context.discovery_roots).expect("discovery");
+    let item = discovered
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
+        .expect("group fixture skill");
+    let member = GroupMemberIdentity::try_from(item).expect("member identity");
+    let missing_member = GroupMemberIdentity::new(
+        item.provider,
+        item.kind,
+        item.category,
+        item.layer,
+        "codex:global:skill:admin/missing-group-mcp-skill",
+    )
+    .expect("missing member identity");
+    let personal = PersonalGroupStore::new(access.clone());
+    personal
+        .create(
+            &GroupDefinitionV1::new("brainstorming", vec![member]).expect("group definition"),
+            OwnerGeneration::new("group-mcp-test", 1).expect("owner"),
+        )
+        .expect("create group");
+    personal
+        .create(
+            &GroupDefinitionV1::new("missing-members", vec![missing_member])
+                .expect("missing-member group definition"),
+            OwnerGeneration::new("group-mcp-test", 2).expect("next owner generation"),
+        )
+        .expect("create missing-member group");
+
+    let default_tools = handle_mcp_request(
+        &context,
+        &json!({"jsonrpc": "2.0", "id": "tools", "method": "tools/list"}),
+    );
+    let default_names = default_tools["result"]["tools"]
+        .as_array()
+        .expect("default tools")
+        .iter()
+        .map(|tool| tool["name"].as_str().expect("tool name"))
+        .collect::<BTreeSet<_>>();
+    assert!(default_names.contains("unpin_list_inventory_groups"));
+    assert!(default_names.contains("unpin_get_inventory_group"));
+    assert!(default_names.contains("unpin_plan_inventory_group"));
+    assert!(!default_names.contains(UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME));
+
+    let default_initialize = handle_mcp_request(
+        &context,
+        &json!({"jsonrpc": "2.0", "id": "init", "method": "initialize"}),
+    );
+    let default_control =
+        &default_initialize["result"]["capabilities"]["experimental"]["unpinControl"];
+    assert_eq!(default_control["mutation"], "human-handoff-only");
+    assert!(
+        default_control
+            .get("conditionalProviderWritesEnabled")
+            .is_none()
+    );
+    assert!(default_control.get("sessionLeaseWrites").is_none());
+
+    let preview = call_tool(
+        &context,
+        "unpin_plan_inventory_group",
+        json!({
+            "group": "personal:brainstorming",
+            "targetEnabled": false,
+            "maxMembers": 10,
+        }),
+    );
+    assert_eq!(preview["status"], "preview");
+    assert_eq!(preview["plan"]["disposition"], "preview");
+    assert_eq!(
+        preview["plan"]["mode"],
+        serde_json::to_value(unpin_core::groups::GroupPlanMode::PreviewOnly)
+            .expect("preview mode JSON")
+    );
+    assert!(preview.get("challenge").is_none());
+    assert!(preview.get("operationId").is_none());
+    assert!(preview["plan"].get("operationId").is_none());
+    assert!(
+        call_tool_error(
+            &context,
+            UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+            json!({
+                "operationId": "preview",
+                "planFingerprint": "preview",
+                "challenge": "preview",
+                "approvalArtifact": "preview",
+            }),
+        )
+        .contains("unknown tool")
+    );
+
+    let now_unix = current_unix_seconds().expect("current time");
+    let session_key = context
+        .session_authority_key
+        .clone()
+        .expect("session authority key");
+    let session = McpGroupSessionLeaseStore::new(&context.app_state_root)
+        .create(
+            McpGroupSessionBinding {
+                provider: None,
+                repository_key: access.repository_key().to_string(),
+                workspace_key: access.workspace_key().to_string(),
+            },
+            &session_key,
+            now_unix,
+        )
+        .expect("approved group MCP lease");
+    let approval_key = ApprovalKey::new([0x71; 32]);
+    context.approved_group_apply = Some(McpApprovedGroupApplyContext {
+        session: session.clone(),
+        approval_key: approval_key.clone(),
+    });
+
+    let enabled_initialize = handle_mcp_request(
+        &context,
+        &json!({"jsonrpc": "2.0", "id": "init", "method": "initialize"}),
+    );
+    let enabled_control =
+        &enabled_initialize["result"]["capabilities"]["experimental"]["unpinControl"];
+    assert_eq!(enabled_control["mutation"], "human-handoff-only");
+    assert_eq!(
+        enabled_control["conditionalGroupApply"],
+        "approved-group-apply-v1"
+    );
+    assert_eq!(enabled_control["unattendedWritesEnabled"], false);
+    assert_eq!(enabled_control["conditionalProviderWritesEnabled"], true);
+    assert_eq!(enabled_control["challengeStoreWrites"], false);
+    assert_eq!(enabled_control["sessionLeaseWrites"], true);
+    assert_eq!(enabled_control["approvalArtifactRequired"], true);
+    assert_eq!(enabled_control["canMintApproval"], false);
+    assert_eq!(enabled_control["requiresPersistentSession"], true);
+    let apply_descriptor = tool_descriptor(&context, UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME);
+    assert_eq!(apply_descriptor["annotations"]["readOnlyHint"], false);
+    assert_eq!(
+        required_input_fields(&apply_descriptor),
+        vec![
+            "operationId",
+            "planFingerprint",
+            "challenge",
+            "approvalArtifact",
+        ]
+    );
+
+    for (tool, arguments, expected_error) in [
+        (
+            "unpin_list_inventory_groups",
+            json!({"unexpected": true}),
+            "field: unexpected",
+        ),
+        (
+            "unpin_get_inventory_group",
+            json!({}),
+            "missing required field: group",
+        ),
+        (
+            "unpin_get_inventory_group",
+            json!({"group": 1}),
+            "missing required field: group",
+        ),
+        (
+            "unpin_get_inventory_group",
+            json!({"group": "personal:brainstorming", "unexpected": true}),
+            "field: unexpected",
+        ),
+        (
+            "unpin_plan_inventory_group",
+            json!({"targetEnabled": false, "maxMembers": 10}),
+            "missing required field: group",
+        ),
+        (
+            "unpin_plan_inventory_group",
+            json!({
+                "group": "personal:brainstorming",
+                "targetEnabled": "false",
+                "maxMembers": 10,
+            }),
+            "missing required field: targetEnabled",
+        ),
+        (
+            "unpin_plan_inventory_group",
+            json!({
+                "group": "personal:brainstorming",
+                "targetEnabled": false,
+                "maxMembers": "10",
+            }),
+            "maxMembers must be a positive integer",
+        ),
+        (
+            "unpin_plan_inventory_group",
+            json!({
+                "group": "personal:brainstorming",
+                "targetEnabled": false,
+                "maxMembers": 10,
+                "unexpected": true,
+            }),
+            "field: unexpected",
+        ),
+        (
+            UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+            json!({}),
+            "missing required field: operationId",
+        ),
+        (
+            UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+            json!({
+                "operationId": "operation",
+                "planFingerprint": "fingerprint",
+                "challenge": "challenge",
+                "approvalArtifact": "artifact",
+                "unexpected": true,
+            }),
+            "field: unexpected",
+        ),
+    ] {
+        let error = call_tool_error(&context, tool, arguments);
+        assert!(
+            error.contains(expected_error),
+            "{tool} returned {error:?}, expected {expected_error:?}"
+        );
+    }
+
+    for (qualified_name, target_enabled, expected_status) in [
+        ("personal:brainstorming", true, "no-op"),
+        ("personal:missing-members", false, "blocked"),
+    ] {
+        let result = call_tool(
+            &context,
+            "unpin_plan_inventory_group",
+            json!({
+                "group": qualified_name,
+                "targetEnabled": target_enabled,
+                "maxMembers": 10,
+            }),
+        );
+        assert_eq!(result["status"], expected_status);
+        assert_eq!(result["approval"], "not-required");
+        assert_eq!(result["plan"]["disposition"], expected_status);
+        assert!(result.get("challenge").is_none());
+        assert!(result.get("operationId").is_none());
+        assert!(result["plan"].get("operationId").is_none());
+        assert!(result["humanAction"].is_null());
+    }
+
+    let actionable = call_tool(
+        &context,
+        "unpin_plan_inventory_group",
+        json!({
+            "group": "personal:brainstorming",
+            "targetEnabled": false,
+            "maxMembers": 10,
+        }),
+    );
+    assert_eq!(actionable["status"], "actionable");
+    assert_eq!(actionable["approval"], "required");
+    assert_eq!(actionable["humanAction"]["code"], "approve-for-mcp-apply");
+    let plan: unpin_core::groups::GroupTogglePlan =
+        serde_json::from_value(actionable["plan"].clone()).expect("actionable group plan");
+    assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
+    let operation_id = actionable["operationId"].as_str().expect("operation ID");
+    let fingerprint = actionable["planFingerprint"]
+        .as_str()
+        .expect("plan fingerprint");
+    let challenge = actionable["challenge"]
+        .as_str()
+        .expect("approval challenge");
+    let approval_context =
+        ControlApprovalContext::new(access.repository_key(), access.workspace_key())
+            .expect("approval context");
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .expect("group expectation");
+    let approval_receipt = |suffix: &str| {
+        ApprovalIssuer::new(
+            approval_key.clone(),
+            expectation.issuer.clone(),
+            expectation.audience.clone(),
+        )
+        .expect("group approval issuer")
+        .issue(ApprovalReceiptClaims {
+            version: 1,
+            receipt_id: format!("receipt-group-mcp-{suffix}"),
+            nonce: format!("nonce-group-mcp-{suffix}"),
+            issuer: String::new(),
+            audience: String::new(),
+            operation_id: expectation.operation_id.clone(),
+            operation_kind: expectation.operation_kind.clone(),
+            effect_graph_digest: expectation.effect_graph_digest.clone(),
+            repository_key: expectation.repository_key.clone(),
+            workspace_key: expectation.workspace_key.clone(),
+            session_id: expectation.session_id.clone(),
+            profile_digest: expectation.profile_digest.clone(),
+            resources: expectation.resources.clone(),
+            issued_at_unix: now_unix,
+            expires_at_unix: now_unix + 60,
+        })
+        .expect("group approval receipt")
+    };
+    let drift_artifact = GroupApprovalArtifactStore::new(&context.app_state_root)
+        .issue(
+            session.clone(),
+            &plan,
+            challenge,
+            approval_receipt("drift"),
+            &session_key,
+            now_unix,
+        )
+        .expect("drift approval artifact");
+
+    let approved_config = fs::read_to_string(&config_path).expect("approved Codex config");
+    let enabled_binding = format!("path = {:?}\nenabled = true", skill_path.to_string_lossy());
+    let disabled_binding = format!("path = {:?}\nenabled = false", skill_path.to_string_lossy());
+    let drifted_config = approved_config.replacen(&enabled_binding, &disabled_binding, 1);
+    assert_ne!(drifted_config, approved_config);
+    fs::write(&config_path, &drifted_config).expect("introduce approved-plan drift");
+    let drifted = call_tool(
+        &context,
+        UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+        json!({
+            "operationId": operation_id,
+            "planFingerprint": fingerprint,
+            "challenge": challenge,
+            "approvalArtifact": drift_artifact.artifact_id,
+        }),
+    );
+    assert_eq!(drifted["status"], "blocked");
+    assert!(
+        drifted["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("no longer matches current state")),
+        "{drifted}"
+    );
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("drifted Codex config"),
+        drifted_config
+    );
+    assert!(
+        !context
+            .app_state_root
+            .join("groups/operations")
+            .join(format!("{operation_id}.json"))
+            .exists()
+    );
+    assert!(!context.app_state_root.join("backups").exists());
+    fs::write(&config_path, approved_config).expect("restore approved Codex config");
+
+    let actionable = call_tool(
+        &context,
+        "unpin_plan_inventory_group",
+        json!({
+            "group": "personal:brainstorming",
+            "targetEnabled": false,
+            "maxMembers": 10,
+        }),
+    );
+    let plan: unpin_core::groups::GroupTogglePlan =
+        serde_json::from_value(actionable["plan"].clone()).expect("fresh actionable group plan");
+    let operation_id = actionable["operationId"]
+        .as_str()
+        .expect("fresh operation ID");
+    let fingerprint = actionable["planFingerprint"]
+        .as_str()
+        .expect("fresh plan fingerprint");
+    let challenge = actionable["challenge"]
+        .as_str()
+        .expect("fresh approval challenge");
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .expect("fresh group expectation");
+    let artifact = GroupApprovalArtifactStore::new(&context.app_state_root)
+        .issue(
+            session.clone(),
+            &plan,
+            challenge,
+            ApprovalIssuer::new(
+                approval_key.clone(),
+                expectation.issuer.clone(),
+                expectation.audience.clone(),
+            )
+            .expect("fresh group approval issuer")
+            .issue(ApprovalReceiptClaims {
+                version: 1,
+                receipt_id: "receipt-group-mcp-apply".to_string(),
+                nonce: "nonce-group-mcp-apply".to_string(),
+                issuer: String::new(),
+                audience: String::new(),
+                operation_id: expectation.operation_id.clone(),
+                operation_kind: expectation.operation_kind.clone(),
+                effect_graph_digest: expectation.effect_graph_digest.clone(),
+                repository_key: expectation.repository_key.clone(),
+                workspace_key: expectation.workspace_key.clone(),
+                session_id: expectation.session_id.clone(),
+                profile_digest: expectation.profile_digest.clone(),
+                resources: expectation.resources.clone(),
+                issued_at_unix: now_unix,
+                expires_at_unix: now_unix + 60,
+            })
+            .expect("fresh group approval receipt"),
+            &session_key,
+            now_unix,
+        )
+        .expect("approval artifact");
+
+    let applied = call_tool(
+        &context,
+        UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+        json!({
+            "operationId": operation_id,
+            "planFingerprint": fingerprint,
+            "challenge": challenge,
+            "approvalArtifact": artifact.artifact_id,
+        }),
+    );
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["operation"]["lifecycle"], "applied");
+    assert_eq!(applied["operation"]["details"]["groupStatus"], "completed");
+    assert_eq!(applied["operation"]["operationId"], operation_id);
+    assert!(
+        fs::read_to_string(&config_path)
+            .expect("updated Codex config")
+            .contains("enabled = false")
+    );
+    for internal_field in [
+        "authorizationDecisionDigest",
+        "sealedPlan",
+        "authenticationKeyId",
+        "authenticationTag",
+    ] {
+        assert!(
+            applied["operation"].get(internal_field).is_none(),
+            "public operation evidence exposed {internal_field}"
+        );
+    }
+    let replayed = call_tool(
+        &context,
+        UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+        json!({
+            "operationId": operation_id,
+            "planFingerprint": fingerprint,
+            "challenge": challenge,
+            "approvalArtifact": artifact.artifact_id,
+        }),
+    );
+    assert_eq!(
+        replayed, applied,
+        "an exactly bound consumed artifact must return cached status"
+    );
+
+    let retry_artifact = GroupApprovalArtifactStore::new(&context.app_state_root)
+        .issue(
+            session,
+            &plan,
+            challenge,
+            ApprovalIssuer::new(
+                approval_key,
+                expectation.issuer.clone(),
+                expectation.audience.clone(),
+            )
+            .expect("retry group approval issuer")
+            .issue(ApprovalReceiptClaims {
+                version: 1,
+                receipt_id: "receipt-group-mcp-retry".to_string(),
+                nonce: "nonce-group-mcp-retry".to_string(),
+                issuer: String::new(),
+                audience: String::new(),
+                operation_id: expectation.operation_id.clone(),
+                operation_kind: expectation.operation_kind.clone(),
+                effect_graph_digest: expectation.effect_graph_digest.clone(),
+                repository_key: expectation.repository_key.clone(),
+                workspace_key: expectation.workspace_key.clone(),
+                session_id: expectation.session_id.clone(),
+                profile_digest: expectation.profile_digest.clone(),
+                resources: expectation.resources.clone(),
+                issued_at_unix: now_unix,
+                expires_at_unix: now_unix + 60,
+            })
+            .expect("retry group approval receipt"),
+            &session_key,
+            now_unix,
+        )
+        .expect("retry approval artifact");
+    for cohort in &plan.cohorts {
+        fs::remove_file(
+            context
+                .app_state_root
+                .join("groups")
+                .join("operations")
+                .join(operation_id)
+                .join("cohorts")
+                .join(format!("{}.json", cohort.cohort_id)),
+        )
+        .expect("remove cohort evidence to exercise recovery");
+    }
+    let backup_id = applied["operation"]["details"]["result"]["backupIds"][0]
+        .as_str()
+        .expect("applied backup ID");
+    fs::remove_file(
+        context
+            .app_state_root
+            .join("backups")
+            .join(backup_id)
+            .join("manifest.json"),
+    )
+    .expect("remove backup manifest to exercise structured apply failure");
+    let failed_retry = call_tool(
+        &context,
+        UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+        json!({
+            "operationId": operation_id,
+            "planFingerprint": fingerprint,
+            "challenge": challenge,
+            "approvalArtifact": retry_artifact.artifact_id,
+        }),
+    );
+    assert_eq!(failed_retry["status"], "recovery-required");
+    assert_eq!(failed_retry["operation"]["lifecycle"], "recovery-required");
+    assert_eq!(
+        failed_retry["operation"]["details"]["groupStatus"],
+        "recovery-required"
+    );
+    assert!(
+        failed_retry["operation"]["details"]["result"]["members"]
+            .as_array()
+            .expect("recovery members")
+            .iter()
+            .any(|member| {
+                member["status"] == "failed" && member["failureMode"] == "recovery-required"
+            })
+    );
+    assert!(
+        !failed_retry
+            .to_string()
+            .contains(root.to_string_lossy().as_ref()),
+        "structured group apply error exposed a private path"
+    );
+
+    let replay = call_tool(
+        &context,
+        UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,
+        json!({
+            "operationId": operation_id,
+            "planFingerprint": fingerprint,
+            "challenge": challenge,
+            "approvalArtifact": artifact.artifact_id,
+        }),
+    );
+    assert_eq!(replay["status"], "recovery-required");
+    assert_eq!(replay["operation"]["lifecycle"], "recovery-required");
+}
+
+#[test]
+fn inventory_group_mcp_storage_errors_do_not_expose_private_paths() {
+    let temp = TempDir::new().expect("temporary group MCP error root");
+    let root = fs::canonicalize(temp.path()).expect("canonical group MCP error root");
+    let fixture_root = root.join("fixtures");
+    let app_state_root = root.join("private-state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(app_state_root.join("groups")).expect("group state directory");
+    fs::write(app_state_root.join("groups/groups.json"), b"{not-json")
+        .expect("malformed personal group state");
+    let context = context_with_roots(&fixture_root, &app_state_root);
+
+    let error = call_tool_error(&context, "unpin_list_inventory_groups", json!({}));
+
+    assert_eq!(error, "inventory group storage is unavailable");
+    assert!(
+        !error.contains(root.to_string_lossy().as_ref()),
+        "JSON-RPC group error exposed a private path"
+    );
+}
+
+#[test]
+fn inventory_group_mcp_ambiguity_returns_structured_qualified_candidates() {
+    let temp = TempDir::new().expect("temporary group ambiguity root");
+    let root = fs::canonicalize(temp.path()).expect("canonical group ambiguity root");
+    let fixture_root = root.join("fixtures");
+    let app_state_root = root.join("state");
+    let project_root = root.join("project");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(&app_state_root).expect("app state");
+    fs::create_dir_all(project_root.join(".git")).expect("project repository");
+    let mut context = context_with_roots(&fixture_root, &app_state_root);
+    context.project_root = project_root;
+    let access = GroupAccessContext::from_runtime(
+        &context.app_state_root,
+        &context.project_root,
+        &context.discovery_roots,
+        None,
+        None,
+    )
+    .expect("group access");
+    let member = discover_all(&context.discovery_roots)
+        .expect("fixture discovery")
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:configured-mcp:github")
+        .map(GroupMemberIdentity::try_from)
+        .transpose()
+        .expect("member identity")
+        .expect("fixture member");
+    let definition = GroupDefinitionV1::new("collision", vec![member]).expect("group definition");
+    let backup_key = context
+        .backup_authentication_key
+        .clone()
+        .expect("backup authentication");
+    PersonalGroupStore::new(access.clone())
+        .with_history_authentication_key(backup_key.clone())
+        .create(
+            &definition,
+            OwnerGeneration::new("mcp-ambiguity-personal", 1).expect("personal owner"),
+        )
+        .expect("personal group");
+    RepositoryGroupStore::new(access)
+        .with_history_authentication_key(backup_key)
+        .create(
+            &definition,
+            OwnerGeneration::new("mcp-ambiguity-repository", 1).expect("repository owner"),
+        )
+        .expect("repository group");
+
+    for response in [
+        call_tool(
+            &context,
+            "unpin_get_inventory_group",
+            json!({"group": "collision"}),
+        ),
+        call_tool(
+            &context,
+            "unpin_plan_inventory_group",
+            json!({
+                "group": "collision",
+                "targetEnabled": false,
+                "maxMembers": 10,
+            }),
+        ),
+    ] {
+        assert_eq!(response["status"], "ambiguous");
+        assert_eq!(response["error"]["code"], "group-reference-ambiguous");
+        assert_eq!(
+            response["error"]["candidates"],
+            json!(["personal:collision", "repository:collision"])
+        );
+    }
+}
+
+#[test]
+fn provider_scoped_mcp_redacts_mixed_provider_groups_and_blocks_planning() {
+    let temp = TempDir::new().expect("temporary provider-scoped group root");
+    let root = fs::canonicalize(temp.path()).expect("canonical provider-scoped group root");
+    let fixture_root = root.join("fixtures");
+    let app_state_root = root.join("state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(&app_state_root).expect("app state");
+
+    let mut context = context_with_roots(&fixture_root, &app_state_root);
+    context.project_root = fixture_root.join("codex/project");
+    let access = GroupAccessContext::from_runtime(
+        &context.app_state_root,
+        &context.project_root,
+        &context.discovery_roots,
+        None,
+        None,
+    )
+    .expect("unscoped group access");
+    let discovered = discover_all(&context.discovery_roots).expect("discovery");
+    let member_for = |provider| {
+        discovered
+            .items
+            .iter()
+            .filter(|item| item.provider == provider && item.layer == DiscoveryLayer::Global)
+            .find_map(|item| GroupMemberIdentity::try_from(item).ok())
+            .unwrap_or_else(|| panic!("{provider:?} group member"))
+    };
+    PersonalGroupStore::new(access)
+        .create(
+            &GroupDefinitionV1::new(
+                "mixed-providers",
+                vec![
+                    member_for(ProviderId::Codex),
+                    member_for(ProviderId::Claude),
+                ],
+            )
+            .expect("mixed-provider group"),
+            OwnerGeneration::new("group-mcp-provider-test", 1).expect("owner"),
+        )
+        .expect("create mixed-provider group");
+
+    context.provider_scope = McpProviderScope::Provider(ProviderId::Codex);
+    context.discovery_cache.invalidate();
+    let listed = call_tool(&context, "unpin_list_inventory_groups", json!({}));
+    assert_eq!(listed["status"], "ok");
+    let group = listed["groups"]
+        .as_array()
+        .expect("group list")
+        .iter()
+        .find(|group| group["qualifiedName"] == "personal:mixed-providers")
+        .expect("mixed-provider group");
+    assert_eq!(group["contextCompatible"], false);
+    for redacted_field in ["members", "providerCoverage", "counts", "state", "fresh"] {
+        assert!(
+            group.get(redacted_field).is_none(),
+            "context-mismatch group exposed {redacted_field}"
+        );
+    }
+
+    let shown = call_tool(
+        &context,
+        "unpin_get_inventory_group",
+        json!({"group": "personal:mixed-providers"}),
+    );
+    assert_eq!(shown["status"], "context-mismatch");
+    for redacted_field in ["members", "providerCoverage", "counts", "state", "fresh"] {
+        assert!(
+            shown["group"].get(redacted_field).is_none(),
+            "context-mismatch group exposed {redacted_field}"
+        );
+    }
+    let error = call_tool_error(
+        &context,
+        "unpin_plan_inventory_group",
+        json!({
+            "group": "personal:mixed-providers",
+            "targetEnabled": false,
+            "maxMembers": 10,
+        }),
+    );
+    assert!(error.contains("context"), "{error}");
+    assert!(!app_state_root.join("backups").exists());
 }
 
 #[test]

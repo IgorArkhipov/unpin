@@ -1,0 +1,41 @@
+{
+  "schemaVersion": 1,
+  "name": "brainstorming",
+  "members": [
+    {
+      "provider": "claude",
+      "kind": "skill",
+      "category": "skill",
+      "layer": "global",
+      "id": "claude:global:skill:example-claude-global-skill"
+    },
+    {
+      "provider": "codex",
+      "kind": "mcp",
+      "category": "configured-mcp",
+      "layer": "global",
+      "id": "codex:global:configured-mcp:github"
+    },
+    {
+      "provider": "pi",
+      "kind": "plugin",
+      "category": "plugin-config",
+      "layer": "global",
+      "id": "pi:global:plugin-config:package-extensions:npm:example-pi-connector"
+    },
+    {
+      "provider": "opencode",
+      "kind": "mcp",
+      "category": "configured-mcp",
+      "layer": "global",
+      "id": "opencode:global:configured-mcp:example-global"
+    },
+    {
+      "provider": "zed",
+      "kind": "mcp",
+      "category": "configured-mcp",
+      "layer": "global",
+      "id": "zed:global:configured-mcp:github"
+    }
+  ]
+}

@@ -7,6 +7,26 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Personal and repository inventory groups that save explicit mixed-type item
+  collections and operate on them through CLI, TUI, or externally approved MCP
+  apply flows.
+- File/stdin transport for large inventory-group approval challenges.
+
+### Security
+
+- Inventory-group recovery preserves authenticated operation evidence, fixture
+  apply paths remain sandboxed, and malformed repository group documents cannot
+  hide authenticated personal groups from combined list surfaces.
+
+### Compatibility
+
+- This pre-1.0 beta adds inventory-group apply state to the public
+  `unpin-core` MCP context and transition-kind contracts. Beta consumers must
+  recompile against this release; persisted group plans and definition history
+  use their new schema versions rather than accepting earlier prototypes.
+
 ## [0.1.0-beta.3] - 2026-07-24
 
 ### Added

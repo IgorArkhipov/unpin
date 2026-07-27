@@ -146,6 +146,12 @@ pub struct TransitionOutcome {
     pub reason_code: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransitionRecoveryPolicy {
+    ResumeSafe,
+    NoResumeWrites,
+}
+
 #[derive(Clone)]
 pub struct TransitionCoordinator {
     app_state_root: PathBuf,
@@ -191,6 +197,28 @@ impl TransitionCoordinator {
         owner: OwnerGeneration,
         backend: &B,
     ) -> Result<TransitionOutcome, CoordinatorError> {
+        self.execute_with_recovery_policy(
+            plan,
+            receipt,
+            verifier,
+            now_unix,
+            owner,
+            backend,
+            TransitionRecoveryPolicy::ResumeSafe,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn execute_with_recovery_policy<B: TransitionBackend>(
+        &self,
+        plan: &TransitionPlan,
+        receipt: Option<&ApprovalReceipt>,
+        verifier: &ApprovalVerifier,
+        now_unix: i64,
+        owner: OwnerGeneration,
+        backend: &B,
+        recovery_policy: TransitionRecoveryPolicy,
+    ) -> Result<TransitionOutcome, CoordinatorError> {
         plan.verify()?;
         let nonce_owner = owner;
         let owner = transition_journal_owner(plan)?;
@@ -211,6 +239,11 @@ impl TransitionCoordinator {
             legacy_mutation_compatibility_lock(&self.app_state_root, plan.kind)?;
         if handle.journal.lifecycle.is_terminal() {
             return self.cached_terminal_outcome(plan, &handle.journal, backend);
+        }
+        if recovery_policy == TransitionRecoveryPolicy::NoResumeWrites
+            && handle.journal.lifecycle != TransitionLifecycle::Planned
+        {
+            return self.needs_repair(&journal_store, &mut handle, "no-resume-writes", None);
         }
 
         self.ensure_authorized(

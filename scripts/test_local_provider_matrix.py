@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import local_provider_matrix_support as matrix_support
+import local_provider_matrix_cases as matrix_cases
 import run_local_provider_matrix as matrix_runner
 from local_provider_matrix_support import (
     FIXTURE_ROOT,
@@ -26,6 +27,84 @@ from run_local_provider_matrix import (
 
 
 class LiveInventoryFilterTests(unittest.TestCase):
+    def test_matrix_inventory_group_identity_is_explicit_and_bounded(self) -> None:
+        item = {
+            "provider": "codex",
+            "layer": "project",
+            "kind": "mcp",
+            "category": "configured-mcp",
+            "id": "codex:project:configured-mcp:docs",
+        }
+        self.assertEqual(
+            matrix_cases.inventory_group_member_selector(item),
+            "codex:project:mcp:configured-mcp:codex:project:configured-mcp:docs",
+        )
+        name = matrix_cases.matrix_inventory_group_name(
+            {"slug": "Provider Scenario With Spaces!" * 4}
+        )
+        self.assertTrue(name.startswith("matrix-provider-scenario-with-spaces-"))
+        self.assertLessEqual(len(name), 57)
+
+    def test_matrix_inventory_group_includes_every_shared_skill_view(self) -> None:
+        target = {
+            "provider": "codex",
+            "layer": "global",
+            "kind": "skill",
+            "category": "agent-skill",
+            "id": "codex:global:skill:shared",
+            "sourcePath": "/fixtures/shared/SKILL.md",
+        }
+        sibling = {
+            **target,
+            "provider": "zed",
+            "id": "zed:global:skill:shared",
+        }
+        unrelated = {
+            **target,
+            "provider": "claude",
+            "id": "claude:global:skill:other",
+            "sourcePath": "/fixtures/other/SKILL.md",
+        }
+        inventory = {"items": [target, sibling, unrelated]}
+
+        self.assertEqual(
+            matrix_cases.matrix_inventory_group_members(
+                inventory, {"id": target["id"]}
+            ),
+            [target, sibling],
+        )
+
+    def test_default_mcp_session_requires_read_only_inventory_group_tools(self) -> None:
+        session = matrix_cases.McpSession(
+            Path("/test/unpin"),
+            Path("/test/fixtures"),
+            Path("/test/state"),
+        )
+        session.request = mock.Mock(
+            side_effect=[
+                {
+                    "serverInfo": {"name": "unpin"},
+                    "protocolVersion": "2025-11-25",
+                },
+                {
+                    "tools": [
+                        {"name": "unpin_get_inventory_summary"},
+                        {"name": "unpin_list_inventory_groups"},
+                        {"name": "unpin_get_inventory_group"},
+                        {"name": "unpin_plan_toggle_item"},
+                        {"name": "unpin_apply_toggle_item"},
+                        {"name": "unpin_restore_backup"},
+                    ]
+                },
+            ]
+        )
+        session.notify = mock.Mock()
+
+        with self.assertRaisesRegex(
+            MatrixFailure, "omitted required matrix tools"
+        ):
+            session._initialize()
+
     def test_run_command_uses_devnull_without_explicit_input(self) -> None:
         observed: dict[str, object] = {}
         real_popen = subprocess.Popen

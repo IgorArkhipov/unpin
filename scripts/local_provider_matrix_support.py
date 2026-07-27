@@ -790,7 +790,16 @@ def list_command(
 ) -> list[str | Path]:
     command: list[str | Path] = [binary, "list"]
     if fixture_root is not None:
-        command.extend(["--fixture-root", fixture_root])
+        command.extend(
+            [
+                "--fixture-root",
+                fixture_root,
+                "--home-root",
+                fixture_root,
+                "--project-root",
+                fixture_root,
+            ]
+        )
     else:
         command.extend(["--home-root", home_root or Path.home()])
         command.extend(["--project-root", project_root or REPO_ROOT])
@@ -857,6 +866,10 @@ def fixture_toggle_command(
         "toggle",
         "--fixture-root",
         fixture_root,
+        "--home-root",
+        fixture_root,
+        "--project-root",
+        fixture_root,
         "--app-state-root",
         app_state_root,
         "--provider",
@@ -889,6 +902,10 @@ def fixture_restore_command(
         "restore",
         backup_id,
         "--fixture-root",
+        fixture_root,
+        "--home-root",
+        fixture_root,
+        "--project-root",
         fixture_root,
         "--app-state-root",
         app_state_root,

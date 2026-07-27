@@ -171,7 +171,10 @@ live host attachment, and runtime observation are separate facts; status does
 not claim strict enforcement when the provider adapter cannot prove it.
 
 MCP is a control plane, not an approval oracle. It can inventory and prepare
-reviewed handoffs, but persistent writes are completed through the CLI or TUI.
+reviewed handoffs. Persistent writes are normally completed through the CLI or
+TUI; the only MCP-side exception is an explicitly enabled persistent inventory
+group apply using an exact short-lived artifact independently approved through
+the CLI or TUI.
 
 ### Session diagnostics
 

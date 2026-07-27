@@ -1,6 +1,8 @@
 # Unpin
 
-Unpin is a Rust CLI/TUI for local AI-agent configuration discovery, safe mutation, snapshots, restore, and MCP-backed agent workflows.
+Unpin is a Rust CLI/TUI for local AI-agent configuration discovery, safe
+mutation, reusable inventory groups, snapshots, restore, and MCP-backed agent
+workflows.
 
 Internal agent workflow context may exist locally under `memory-bank/`, `.prompts/`, `.protocols/`, and `old/`, but those folders are excluded from git and are not part of the public repository surface.
 
@@ -144,9 +146,11 @@ Claude Code, Cursor, OpenCode, and Zed; explains Pi's native-MCP limitation;
 and includes a prompt you can give an agent to configure and verify the
 connection automatically. The
 [MCP capability-control prompt library](docs/MCP-PROMPTS.md) covers project
-allowlists, profiles, capability locks, hooks, sessions, and restore. MCP can
-inspect and prepare plans, but persistent writes always return a CLI/TUI
-human-action handoff.
+allowlists, inventory groups, profiles, capability locks, hooks, sessions, and
+restore. MCP normally inspects and prepares plans without writing. A persistent
+server started with `--enable-approved-group-apply` can additionally apply one
+exact inventory-group plan only after a human approves its challenge through
+the CLI or TUI; every other persistent MCP operation remains handoff-only.
 
 ## Command Surface
 
@@ -157,9 +161,10 @@ human-action handoff.
 - `unpin list` lists discovered provider items.
 - `unpin toggle` plans a supported item toggle, then applies only the exact confirmed fingerprint.
 - `unpin restore` plans a backup restore, then applies only the exact confirmed fingerprint.
+- `unpin group` maintains explicit mixed-type inventory groups, their revisions, history, previews, MCP approvals, and operation evidence.
 - `unpin catalog`, `profile`, `gateway`, `session`, and `hook` manage normalized capabilities, reusable policy, optional routing, isolated leases, and reviewed hook trust.
-- `unpin mcp` runs a newline-delimited stdio MCP control plane. Persistent apply requests return human-action handoffs instead of minting approval.
-- `unpin tui` opens the terminal inventory UI. `unpin dashboard` is an alias for the same command.
+- `unpin mcp` runs a newline-delimited stdio MCP control plane. Default item, bulk, restore, profile, policy, gateway, session, and hook writes return human-action handoffs; approved group apply is an explicit persistent-mode exception.
+- `unpin tui` opens the terminal inventory UI, including item and Groups views. `unpin dashboard` is an alias for the same command.
 
 ## Provider Coverage
 
@@ -186,6 +191,67 @@ Zed `context_servers` and OpenCode `mcp.<id>.enabled` mutation are JSONC-aware: 
 
 OpenCode is the supported harness in this provider family. OpenRouter is a model/API router with per-request plugins, not a standard local global/project agent-configuration host, so it has no Unpin provider adapter.
 
+## Inventory groups
+
+Inventory groups are named, explicit collections of any individually
+toggleable inventory items Unpin already supports. Skills, configured MCP
+servers, plugins, and agents can coexist when their provider-native item is
+writable. Each member stores its full `provider:layer:kind:category:id`
+identity. A group does not create an implicit selector or broaden to future
+matching items.
+
+Create definitions through the CLI or the TUI. Definition writes use the same
+preview, exact-fingerprint, and confirmation pattern as other Unpin writes:
+
+```bash
+unpin group create \
+  --project-root "$PROJECT_ROOT" \
+  --scope personal \
+  --name brainstorming \
+  --member 'claude:project:skill:skill:EXACT_SKILL_ITEM_ID' \
+  --member 'codex:global:mcp:configured-mcp:EXACT_MCP_ITEM_ID' \
+  --json
+
+unpin group create \
+  --project-root "$PROJECT_ROOT" \
+  --scope personal \
+  --name brainstorming \
+  --member 'claude:project:skill:skill:EXACT_SKILL_ITEM_ID' \
+  --member 'codex:global:mcp:configured-mcp:EXACT_MCP_ITEM_ID' \
+  --apply \
+  --confirm \
+  --plan-fingerprint PLAN_FINGERPRINT_FROM_PREVIEW \
+  --json
+```
+
+Use the exact `category` and item ID returned by `unpin list --json`. Personal
+definitions live in Unpin app state; repository definitions are
+workspace-bound project content. Both scopes retain revisioned history and
+support reviewed definition restore. If the same name exists in both scopes,
+use `personal:name` or `repository:name`; an unqualified ambiguous name is
+rejected.
+
+Repository-definition CAS rejects revisions changed before publication and
+all Unpin writers share the same lock. Concurrent uncooperative edits to the
+repository group document during the final platform rename are outside the
+supported race boundary; do not edit that document with Git or an editor
+while an Unpin definition write is being confirmed.
+
+The Groups view in `unpin tui` can create or edit a definition from staged full
+inventory identities, then plan, confirm, and apply the group as one deliberate
+operation. Group state is `On`, `Off`, or `Mixed`. Planning shows each member,
+connected resource cohort, provider fan-out, unresolved identity, and blocked
+outcome before approval. Unresolved or read-only members are never silently
+skipped. If a multi-resource operation partially fails, preserve its operation
+and backup evidence, repair or restore as directed, and build a fresh plan
+instead of resuming provider writes from the old process.
+
+Groups and profiles serve different purposes. A group is an explicit set of
+provider inventory identities used to change native enabled state now. A
+profile is a normalized capability allowlist used for policy, exposure, and
+future session selection; profile members are capability IDs rather than
+provider item identities.
+
 ## Profiles and optional gateway
 
 Native provider behavior remains default. Profiles are immutable allowlists resolved by replacement: session, workspace/worktree, repository, global, then native default. Provider-specific policy wins before generic policy at each scope. Global provider capability locks are applied after that selection: `hard-enabled` restores a capability omitted by a narrower profile, while `hard-disabled` removes it. Active sessions pin profile, lock, and exposure revisions, so another process, worktree, branch change, or later policy edit cannot mutate their capability set.
@@ -201,7 +267,12 @@ Gateway lifecycle separates installation, routing, and detachment:
 
 Managed native MCP configuration references are not yet part of gateway lifecycle effects. Status, dry-run, apply, MCP, and TUI output report this as `nativeMcpReferences=not-managed`; live provider attachment remains blocked, so Unpin never claims duplicate-free MCP routing before that effect exists.
 
-Every persistent profile, capability-lock, gateway, session-end, adoption, trust, toggle, and restore action is plan-first. Apply requires `--confirm` plus exact `--plan-fingerprint` from current dry-run. MCP callers receive structured handoff and cannot issue human approval or expose keychain material.
+Every persistent profile, capability-lock, gateway, session-end, adoption,
+trust, toggle, restore, and inventory-group definition action is plan-first.
+Apply requires `--confirm` plus the exact `--plan-fingerprint` from the current
+dry-run. MCP callers cannot mint human approval or expose keychain material.
+Outside the explicitly enabled approved-group flow, they receive a structured
+handoff for persistent work.
 
 Exact terminal retries revalidate live policy, provider, adopted-view, and restored-target state before returning cached success. Divergence reports `recovery-required`. Catalog adoption reports rolled-back and needs-repair outcomes explicitly and exits nonzero for both.
 

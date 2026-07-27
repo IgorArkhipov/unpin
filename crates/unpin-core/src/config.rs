@@ -273,6 +273,10 @@ pub fn get_workspace_profiles_dir(workspace_root: impl AsRef<Path>) -> PathBuf {
     workspace_root.as_ref().join(".unpin").join("profiles")
 }
 
+pub fn get_workspace_groups_dir(workspace_root: impl AsRef<Path>) -> PathBuf {
+    workspace_root.as_ref().join(".unpin").join("groups")
+}
+
 pub fn get_workspace_policy_path(workspace_root: impl AsRef<Path>) -> PathBuf {
     workspace_root.as_ref().join(".unpin").join("policy.json")
 }

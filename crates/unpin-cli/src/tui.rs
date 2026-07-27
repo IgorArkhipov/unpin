@@ -7,7 +7,7 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -29,6 +29,7 @@ use unpin_core::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, DiscoveryOutput,
     DiscoveryRoots, DiscoveryWarning, ProviderId, discover_all,
 };
+use unpin_core::groups::{GroupAccessContext, GroupMemberIdentity, GroupOperationLifecycle};
 use unpin_core::mutation::{
     BackupAuthenticationKey, BackupAuthenticationStatus, BackupSummary, NativeToggleController,
     NativeTogglePlan, RestoreControlError, RestoreControlPlan, RestoreController, RestoreStatus,
@@ -39,11 +40,13 @@ use unpin_core::sessions::SessionAuthorityKey;
 #[cfg(test)]
 use unpin_core::snapshots::write_discovery_snapshot;
 use unpin_core::snapshots::{SnapshotWriteOptions, write_control_snapshot};
+use unpin_core::state::atomic_json::{AtomicJsonStore, OwnerGeneration};
 use unpin_core::state::workspace::resolve_workspace_identity;
 
 use crate::{credentials, unix_now};
 
 mod gateway;
+mod groups;
 mod hooks;
 mod profiles;
 mod sessions;
@@ -76,6 +79,7 @@ impl WorkflowPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiView {
     Inventory,
+    Groups,
     Profiles,
     Gateways,
     Sessions,
@@ -84,8 +88,9 @@ enum TuiView {
 }
 
 impl TuiView {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 7] = [
         Self::Inventory,
+        Self::Groups,
         Self::Profiles,
         Self::Gateways,
         Self::Sessions,
@@ -96,6 +101,7 @@ impl TuiView {
     const fn label(self) -> &'static str {
         match self {
             Self::Inventory => "inventory",
+            Self::Groups => "groups",
             Self::Profiles => "profiles",
             Self::Gateways => "gateways",
             Self::Sessions => "sessions",
@@ -139,12 +145,13 @@ struct TuiState {
     fixture_mode: bool,
     view: TuiView,
     profile_workflow: profiles::ProfileWorkflow,
+    group_workflow: groups::GroupWorkflow,
     gateway_workflow: gateway::GatewayWorkflow,
     session_workflow: sessions::SessionWorkflow,
     hook_workflow: hooks::HookWorkflow,
     restore_workflow: RestoreWorkflow,
     last_control_envelope: Option<ControlOperationEnvelope>,
-    staged: BTreeMap<String, StagedToggle>,
+    staged: BTreeMap<GroupMemberIdentity, StagedToggle>,
     pending_confirmation: bool,
     search_query: String,
     search_editing: bool,
@@ -153,6 +160,7 @@ struct TuiState {
     layer_filter: LayerFilter,
     category_filter: CategoryFilter,
     last_action: Option<TuiActionStatus>,
+    mcp_approval_handoff: Option<groups::McpApprovalHandoff>,
     #[cfg(test)]
     _owned_app_state: Option<tempfile::TempDir>,
 }
@@ -163,6 +171,10 @@ struct StagedToggle {
     plan: Option<NativeTogglePlan>,
     blocked_reason: Option<String>,
     target_enabled: bool,
+}
+
+fn inventory_item_key(item: &DiscoveryItem) -> GroupMemberIdentity {
+    GroupMemberIdentity::try_from(item).expect("discovered inventory item identity is valid")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -564,6 +576,7 @@ impl TuiState {
             fixture_mode: cfg!(test),
             view: TuiView::Inventory,
             profile_workflow,
+            group_workflow: groups::GroupWorkflow::empty(),
             gateway_workflow,
             session_workflow,
             hook_workflow,
@@ -578,6 +591,7 @@ impl TuiState {
             layer_filter: LayerFilter::All,
             category_filter: CategoryFilter::All,
             last_action: None,
+            mcp_approval_handoff: None,
             #[cfg(test)]
             _owned_app_state: None,
         }
@@ -608,6 +622,7 @@ impl TuiState {
         backup_authentication_key: Option<BackupAuthenticationKey>,
         session_authority_key: Option<SessionAuthorityKey>,
     ) -> Self {
+        let group_discovery = discovery.clone();
         let mut state = Self::new_with_paths_and_key(
             discovery,
             app_state_root,
@@ -616,6 +631,9 @@ impl TuiState {
             session_authority_key,
         );
         state.discovery_roots = Some(discovery_roots);
+        if let Err(error) = state.refresh_group_workflow(&group_discovery) {
+            state.group_workflow.record_error(error);
+        }
         state
     }
 
@@ -652,6 +670,10 @@ impl TuiState {
                 })
                 .collect(),
             TuiView::Profiles => self.profile_workflow.rows(),
+            TuiView::Groups if self.group_workflow.uses_inventory_rows() => {
+                self.group_workflow.rows(&self.visible_items())
+            }
+            TuiView::Groups => self.group_workflow.rows(&[]),
             TuiView::Gateways => self.gateway_workflow.rows(),
             TuiView::Sessions => self.session_workflow.rows(),
             TuiView::Hooks => self.hook_workflow.rows(),
@@ -670,6 +692,23 @@ impl TuiState {
                 },
             ),
             TuiView::Profiles => self.profile_workflow.details(),
+            TuiView::Groups => {
+                let mut details = self.group_workflow.details();
+                if let Some(handoff) = &self.mcp_approval_handoff {
+                    details.extend([
+                        format!(
+                            "MCP handoff ready: operation={} fingerprint={} artifact={} expires={}",
+                            handoff.operation_id,
+                            handoff.plan_fingerprint,
+                            handoff.approval_artifact,
+                            handoff.expires_at_unix,
+                        ),
+                        "No provider apply occurred. Press X to export the exact bound handoff as private JSON."
+                            .to_string(),
+                    ]);
+                }
+                details
+            }
             TuiView::Gateways => self.gateway_workflow.details(),
             TuiView::Sessions => self.session_workflow.details(),
             TuiView::Hooks => self.hook_workflow.details(),
@@ -689,16 +728,18 @@ impl TuiState {
             ));
             return false;
         };
-        let discovery = DiscoveryOutput {
-            items: self.items.clone(),
-            warnings: self.warnings.clone(),
-        };
         let operation = match self.view {
             TuiView::Inventory => unreachable!("inventory handled above"),
-            TuiView::Profiles => self
-                .profile_workflow
-                .plan(&discovery, &self.app_state_root, &context)
-                .cloned(),
+            TuiView::Groups => self.group_workflow.plan(&context).cloned(),
+            TuiView::Profiles => {
+                let discovery = DiscoveryOutput {
+                    items: self.items.clone(),
+                    warnings: self.warnings.clone(),
+                };
+                self.profile_workflow
+                    .plan(&discovery, &self.app_state_root, &context)
+                    .cloned()
+            }
             TuiView::Gateways => match (
                 self.session_authority_key.as_ref(),
                 self.backup_authentication_key.as_ref(),
@@ -723,10 +764,15 @@ impl TuiState {
                     Err("session authority key missing; run `unpin auth session init`".to_string())
                 }
             },
-            TuiView::Hooks => self
-                .hook_workflow
-                .plan(&discovery, &self.app_state_root)
-                .cloned(),
+            TuiView::Hooks => {
+                let discovery = DiscoveryOutput {
+                    items: self.items.clone(),
+                    warnings: self.warnings.clone(),
+                };
+                self.hook_workflow
+                    .plan(&discovery, &self.app_state_root)
+                    .cloned()
+            }
             TuiView::RestoreOperations => self
                 .restore_workflow
                 .plan(
@@ -748,6 +794,7 @@ impl TuiState {
             Err(error) => {
                 match self.view {
                     TuiView::Profiles => self.profile_workflow.record_error(error.clone()),
+                    TuiView::Groups => self.group_workflow.record_error(error.clone()),
                     TuiView::Gateways => self.gateway_workflow.record_error(error.clone()),
                     TuiView::Sessions => self.session_workflow.record_error(error.clone()),
                     TuiView::Hooks => self.hook_workflow.record_error(error.clone()),
@@ -768,6 +815,7 @@ impl TuiState {
         }
         let confirmed = match self.view {
             TuiView::Profiles => self.profile_workflow.confirm(),
+            TuiView::Groups => self.group_workflow.confirm(),
             TuiView::Gateways => self.gateway_workflow.confirm(),
             TuiView::Sessions => self.session_workflow.confirm(),
             TuiView::Hooks => self.hook_workflow.confirm(),
@@ -787,6 +835,10 @@ impl TuiState {
             self.apply_confirmed_staged();
             return;
         }
+        if self.view == TuiView::Groups {
+            self.apply_group_action();
+            return;
+        }
         let Some(context) = self.approval_context.clone() else {
             self.last_action = Some(TuiActionStatus::Error(
                 self.approval_context_error
@@ -796,6 +848,7 @@ impl TuiState {
             return;
         };
         let result = match self.view {
+            TuiView::Groups => unreachable!("groups handled above"),
             TuiView::Profiles => match self.session_authority_key.as_ref() {
                 Some(authority) => self.profile_workflow.apply(
                     &self.app_state_root,
@@ -871,7 +924,8 @@ impl TuiState {
                 let operation_id = envelope.operation_id.clone();
                 let lifecycle = envelope.lifecycle;
                 self.last_control_envelope = Some(envelope);
-                match self.refresh_control_plane() {
+                let refresh = self.refresh_control_plane();
+                match refresh {
                     Ok(()) => {
                         self.last_action = Some(TuiActionStatus::Success(format!(
                             "{operation_id} {lifecycle:?}"
@@ -887,6 +941,7 @@ impl TuiState {
             Err(error) => {
                 match self.view {
                     TuiView::Profiles => self.profile_workflow.record_error(error.clone()),
+                    TuiView::Groups => unreachable!("groups handled above"),
                     TuiView::Gateways => self.gateway_workflow.record_error(error.clone()),
                     TuiView::Sessions => self.session_workflow.record_error(error.clone()),
                     TuiView::Hooks => self.hook_workflow.record_error(error.clone()),
@@ -900,8 +955,90 @@ impl TuiState {
         }
     }
 
+    fn apply_group_action(&mut self) {
+        let Some(context) = self.approval_context.clone() else {
+            self.last_action = Some(TuiActionStatus::Error(
+                self.approval_context_error
+                    .clone()
+                    .unwrap_or_else(|| "workspace approval context unavailable".to_string()),
+            ));
+            return;
+        };
+        let Some(authority) = self.session_authority_key.as_ref() else {
+            self.last_action = Some(TuiActionStatus::Error(
+                "session authority key missing; run `unpin auth session init`".to_string(),
+            ));
+            return;
+        };
+        let outcome = self.group_workflow.apply_active(
+            &self.app_state_root,
+            &self.project_root,
+            &context,
+            authority,
+            self.backup_authentication_key.as_ref(),
+            self.fixture_mode,
+        );
+        match outcome {
+            Ok(groups::GroupApplyOutcome::Direct {
+                envelope,
+                lifecycle: group_lifecycle,
+            }) => {
+                let envelope = *envelope;
+                let operation_id = envelope.operation_id.clone();
+                let lifecycle = envelope.lifecycle;
+                self.last_control_envelope = Some(envelope);
+                let refresh = self
+                    .rediscover_after_apply()
+                    .and_then(|discovery| self.refresh_control_plane_from(&discovery));
+                self.last_action = Some(match (group_lifecycle, refresh) {
+                    (GroupOperationLifecycle::Completed, Ok(())) => {
+                        TuiActionStatus::Success(format!("{operation_id} {lifecycle:?}"))
+                    }
+                    (_, Ok(())) => TuiActionStatus::Error(format!(
+                        "{operation_id} group outcome {group_lifecycle:?}; review member results and backup evidence"
+                    )),
+                    (_, Err(error)) => TuiActionStatus::Error(format!(
+                        "{operation_id} group outcome {group_lifecycle:?}; control refresh failed: {error}"
+                    )),
+                });
+            }
+            Ok(groups::GroupApplyOutcome::DefinitionChanged { message, created }) => {
+                if created {
+                    self.clear_staged();
+                }
+                let discovery = DiscoveryOutput {
+                    items: self.items.clone(),
+                    warnings: self.warnings.clone(),
+                };
+                self.last_action = Some(match self.refresh_group_workflow(&discovery) {
+                    Ok(()) => TuiActionStatus::Success(format!(
+                        "inventory group definition {message}; authenticated history recorded"
+                    )),
+                    Err(error) => TuiActionStatus::Error(format!(
+                        "inventory group definition {message}; refresh failed: {error}"
+                    )),
+                });
+            }
+            Ok(groups::GroupApplyOutcome::McpApprovalIssued(handoff)) => {
+                let operation_id = handoff.operation_id.clone();
+                let plan_fingerprint = handoff.plan_fingerprint.clone();
+                let artifact_id = handoff.approval_artifact.clone();
+                let expires_at_unix = handoff.expires_at_unix;
+                self.mcp_approval_handoff = Some(handoff);
+                self.last_action = Some(TuiActionStatus::Success(format!(
+                    "MCP approval artifact {artifact_id} issued for {operation_id} fingerprint={plan_fingerprint} expires={expires_at_unix}; no group apply performed; press X to export"
+                )));
+            }
+            Err(error) => {
+                self.group_workflow.record_error(error.clone());
+                self.last_action = Some(TuiActionStatus::Error(error));
+            }
+        }
+    }
+
     fn cycle_active_action(&mut self) {
         match self.view {
+            TuiView::Groups => self.group_workflow.cycle_target(),
             TuiView::Profiles => self.profile_workflow.cycle_backend(),
             TuiView::Gateways => self.gateway_workflow.cycle_action(),
             _ => {}
@@ -909,8 +1046,10 @@ impl TuiState {
     }
 
     fn cycle_profile_scope(&mut self) {
-        if self.view == TuiView::Profiles {
-            self.profile_workflow.cycle_scope();
+        match self.view {
+            TuiView::Profiles => self.profile_workflow.cycle_scope(),
+            TuiView::Groups => self.group_workflow.cycle_draft_scope(),
+            _ => {}
         }
     }
 
@@ -926,7 +1065,248 @@ impl TuiState {
         }
     }
 
+    fn group_text_editing(&self) -> bool {
+        self.view == TuiView::Groups && self.group_workflow.is_text_input()
+    }
+
+    fn push_group_text_char(&mut self, character: char) {
+        self.group_workflow.push_text_char(character);
+    }
+
+    fn push_group_text(&mut self, text: &str) {
+        self.group_workflow.push_text(text);
+    }
+
+    fn pop_group_text_char(&mut self) {
+        self.group_workflow.pop_text_char();
+    }
+
+    fn finish_group_text_input(&mut self) {
+        let submission = self.group_workflow.finish_text_input();
+        match submission {
+            Ok(groups::GroupTextSubmission::DefinitionName) => {
+                self.last_action = Some(TuiActionStatus::Success(
+                    "group name accepted; review member selection and press w to preview"
+                        .to_string(),
+                ));
+            }
+            Ok(groups::GroupTextSubmission::McpChallenge(challenge)) => {
+                let result = self
+                    .approval_context
+                    .as_ref()
+                    .ok_or_else(|| "workspace approval context unavailable".to_string())
+                    .and_then(|context| {
+                        self.session_authority_key
+                            .as_ref()
+                            .ok_or_else(|| {
+                                "session authority key missing; run `unpin auth session init`"
+                                    .to_string()
+                            })
+                            .and_then(|authority| {
+                                self.group_workflow.review_mcp_challenge(
+                                    challenge,
+                                    &self.app_state_root,
+                                    context,
+                                    authority,
+                                    unix_now(),
+                                )
+                            })
+                    });
+                match result {
+                    Ok(()) => {
+                        self.last_action = Some(TuiActionStatus::Success(
+                            "MCP challenge authenticated; review every effect, then Enter confirms artifact issuance"
+                                .to_string(),
+                        ));
+                    }
+                    Err(error) => {
+                        self.group_workflow.record_error(error.clone());
+                        self.last_action = Some(TuiActionStatus::Error(error));
+                    }
+                }
+            }
+            Err(error) => {
+                self.group_workflow.record_error(error.clone());
+                self.last_action = Some(TuiActionStatus::Error(error));
+            }
+        }
+    }
+
+    fn start_group_create(&mut self) {
+        if self.view != TuiView::Groups {
+            return;
+        }
+        let members = self
+            .staged
+            .values()
+            .map(|staged| GroupMemberIdentity::try_from(&staged.item))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| error.to_string());
+        let result = members.and_then(|members| self.group_workflow.start_create(members));
+        self.record_group_definition_result(
+            result,
+            "enter a group name, then use inventory filters/search to edit members",
+        );
+    }
+
+    fn start_group_edit(&mut self) {
+        if self.view == TuiView::Groups {
+            let result = self.group_workflow.start_edit();
+            self.record_group_definition_result(
+                result,
+                "editing selected group; Space toggles the highlighted full identity",
+            );
+        }
+    }
+
+    fn start_group_rename(&mut self) {
+        if self.view == TuiView::Groups {
+            let result = self.group_workflow.start_rename();
+            self.record_group_definition_result(result, "enter the new group name");
+        }
+    }
+
+    fn start_group_delete(&mut self) {
+        if self.view == TuiView::Groups {
+            let result = self.group_workflow.start_delete();
+            self.record_group_definition_result(
+                result,
+                "delete preview ready; Enter confirms and a applies",
+            );
+        }
+    }
+
+    fn show_group_history(&mut self) {
+        if self.view == TuiView::Groups {
+            let result = self.group_workflow.show_history();
+            self.record_group_definition_result(
+                result,
+                "authenticated group history loaded; r previews the selected restore",
+            );
+        }
+    }
+
+    fn stage_group_restore(&mut self) {
+        if self.view == TuiView::Groups {
+            let result = self.group_workflow.stage_history_restore();
+            self.record_group_definition_result(
+                result,
+                "restore preview ready; Enter confirms and a applies",
+            );
+        }
+    }
+
+    fn start_group_mcp_approval(&mut self) {
+        if self.view == TuiView::Groups {
+            self.group_workflow.start_mcp_approval();
+            self.last_action = Some(TuiActionStatus::Success(
+                "paste the opaque MCP group challenge and press Enter; no apply will occur"
+                    .to_string(),
+            ));
+        }
+    }
+
+    fn export_group_mcp_handoff(&mut self) {
+        if self.view != TuiView::Groups {
+            return;
+        }
+        let result = self
+            .mcp_approval_handoff
+            .as_ref()
+            .ok_or_else(|| "no issued MCP approval handoff is available".to_string())
+            .and_then(|handoff| {
+                let export = handoff.export_value();
+                let path = self
+                    .app_state_root
+                    .join("groups")
+                    .join("handoff-exports")
+                    .join(format!("{}.json", handoff.approval_artifact));
+                let store = AtomicJsonStore::new(&path, 1);
+                match store
+                    .load::<serde_json::Value>()
+                    .map_err(|error| error.to_string())?
+                {
+                    Some(snapshot) if snapshot.value == export => Ok(path),
+                    Some(_) => Err(
+                        "MCP approval handoff export already exists with different contents"
+                            .to_string(),
+                    ),
+                    None => {
+                        let owner = OwnerGeneration::new("unpin-tui-mcp-handoff-export", 1)
+                            .map_err(|error| error.to_string())?;
+                        store
+                            .compare_and_swap(None, owner, &export)
+                            .map_err(|error| error.to_string())?;
+                        Ok(path)
+                    }
+                }
+            });
+        self.last_action = Some(match result {
+            Ok(path) => TuiActionStatus::Success(format!(
+                "MCP approval handoff exported to {}; no provider apply performed",
+                path.display()
+            )),
+            Err(error) => TuiActionStatus::Error(error),
+        });
+    }
+
+    fn stage_group_definition_save(&mut self) {
+        if self.view == TuiView::Groups {
+            let result = self.group_workflow.stage_definition_save();
+            self.record_group_definition_result(
+                result,
+                "definition preview ready; Enter confirms and a applies",
+            );
+        }
+    }
+
+    fn toggle_group_member(&mut self) -> bool {
+        if self.view != TuiView::Groups || !self.group_workflow.is_member_editor() {
+            return false;
+        }
+        let visible = self.visible_items();
+        let selected = visible
+            .get(self.group_workflow.member_selected_index())
+            .copied()
+            .cloned();
+        let result = selected
+            .ok_or_else(|| "no inventory item matches the current filters".to_string())
+            .and_then(|item| self.group_workflow.toggle_member(&item));
+        self.record_group_definition_result(result, "group draft member selection updated");
+        true
+    }
+
+    fn cancel_group_interaction(&mut self) -> bool {
+        if self.view == TuiView::Groups && self.group_workflow.cancel_interaction() {
+            self.last_action = Some(TuiActionStatus::Success(
+                "group definition/MCP approval workflow cancelled without writing".to_string(),
+            ));
+            return true;
+        }
+        false
+    }
+
+    fn record_group_definition_result(&mut self, result: Result<(), String>, success: &str) {
+        match result {
+            Ok(()) => {
+                self.last_action = Some(TuiActionStatus::Success(success.to_string()));
+            }
+            Err(error) => {
+                self.group_workflow.record_error(error.clone());
+                self.last_action = Some(TuiActionStatus::Error(error));
+            }
+        }
+    }
+
     fn refresh_control_plane(&mut self) -> Result<(), String> {
+        let discovery = DiscoveryOutput {
+            items: self.items.clone(),
+            warnings: self.warnings.clone(),
+        };
+        self.refresh_control_plane_from(&discovery)
+    }
+
+    fn refresh_control_plane_from(&mut self, discovery: &DiscoveryOutput) -> Result<(), String> {
         let key = self
             .session_authority_key
             .as_ref()
@@ -935,14 +1315,29 @@ impl TuiState {
             &self.app_state_root,
             self.backup_authentication_key.as_ref(),
         );
-        let discovery = DiscoveryOutput {
-            items: self.items.clone(),
-            warnings: self.warnings.clone(),
-        };
         let control =
-            build_control_status(&discovery, &self.app_state_root, &self.project_root, key)
+            build_control_status(discovery, &self.app_state_root, &self.project_root, key)
                 .map_err(|error| error.to_string())?;
-        self.install_control_status(control, &discovery);
+        self.install_control_status(control, discovery);
+        self.refresh_group_workflow(discovery)?;
+        Ok(())
+    }
+
+    fn refresh_group_workflow(&mut self, discovery: &DiscoveryOutput) -> Result<(), String> {
+        let roots = self
+            .discovery_roots
+            .as_ref()
+            .ok_or_else(|| "inventory group discovery roots are unavailable".to_string())?;
+        let access = GroupAccessContext::from_runtime(
+            &self.app_state_root,
+            &self.project_root,
+            roots,
+            None,
+            None,
+        )
+        .map_err(|error| error.to_string())?;
+        self.group_workflow =
+            groups::GroupWorkflow::new(access, self.backup_authentication_key.as_ref(), discovery)?;
         Ok(())
     }
 
@@ -1003,7 +1398,7 @@ impl TuiState {
             blocked_reason,
             target_enabled,
         };
-        self.staged.insert(item.id.clone(), staged);
+        self.staged.insert(inventory_item_key(&item), staged);
         self.pending_confirmation = false;
         true
     }
@@ -1027,7 +1422,10 @@ impl TuiState {
         for staged in &staged {
             let result = self.apply_staged_toggle(staged);
             if result.status == ToggleStatus::Applied
-                && let Some(item) = self.items.iter_mut().find(|item| item.id == staged.item.id)
+                && let Some(item) = self
+                    .items
+                    .iter_mut()
+                    .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
             {
                 item.enabled = staged.target_enabled;
             }
@@ -1081,7 +1479,11 @@ impl TuiState {
 
         self.clear_staged();
         for mut staged in failed_staged {
-            if let Some(current_item) = self.items.iter().find(|item| item.id == staged.item.id) {
+            if let Some(current_item) = self
+                .items
+                .iter()
+                .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
+            {
                 if current_item.enabled == staged.target_enabled {
                     continue;
                 }
@@ -1103,7 +1505,7 @@ impl TuiState {
                     }
                 }
             }
-            self.staged.insert(staged.item.id.clone(), staged);
+            self.staged.insert(inventory_item_key(&staged.item), staged);
         }
         if !backups_reloaded {
             self.backups = load_backup_summaries_authenticated(
@@ -1256,7 +1658,7 @@ impl TuiState {
             .ok_or_else(|| "discovery roots are unavailable after apply".to_string())?;
         let roots = roots.with_app_state_root(&self.app_state_root);
         let discovery = discover_all(&roots).map_err(|error| error.to_string())?;
-        self.refresh_discovery(discovery.clone());
+        self.refresh_discovery(&discovery);
         Ok(discovery)
     }
 
@@ -1307,9 +1709,9 @@ impl TuiState {
         self.clamp_selected();
     }
 
-    fn refresh_discovery(&mut self, discovery: DiscoveryOutput) {
-        self.items = discovery.items;
-        self.warnings = discovery.warnings;
+    fn refresh_discovery(&mut self, discovery: &DiscoveryOutput) {
+        self.items.clone_from(&discovery.items);
+        self.warnings.clone_from(&discovery.warnings);
         self.backups = load_backup_summaries_authenticated(
             &self.app_state_root,
             self.backup_authentication_key.as_ref(),
@@ -1333,6 +1735,10 @@ impl TuiState {
 
     fn move_next(&mut self) {
         match self.view {
+            TuiView::Groups => {
+                let visible_count = self.visible_count();
+                return self.group_workflow.select_next(visible_count);
+            }
             TuiView::Profiles => return self.profile_workflow.select_next(),
             TuiView::Gateways => return self.gateway_workflow.select_next(),
             TuiView::Sessions => return self.session_workflow.select_next(),
@@ -1350,6 +1756,10 @@ impl TuiState {
 
     fn move_previous(&mut self) {
         match self.view {
+            TuiView::Groups => {
+                let visible_count = self.visible_count();
+                return self.group_workflow.select_previous(visible_count);
+            }
             TuiView::Profiles => return self.profile_workflow.select_previous(),
             TuiView::Gateways => return self.gateway_workflow.select_previous(),
             TuiView::Sessions => return self.session_workflow.select_previous(),
@@ -1462,6 +1872,7 @@ impl TuiState {
         } else if self.selected >= visible_count {
             self.selected = visible_count - 1;
         }
+        self.group_workflow.clamp_member_selection(visible_count);
     }
 
     fn provider_choices(&self) -> Vec<ProviderFilter> {
@@ -1682,7 +2093,7 @@ fn render_headless_state(state: &TuiState) -> String {
 
     lines.push(String::new());
     lines.push(
-        "Commands: v view | j/k move | m action/backend | s profile-scope | r profile-provider | f force | p provider | l layer | c category | / search | space plan | enter confirm | a apply | u unstage | q quit"
+        "Commands: v view | j/k move | m action/backend | s profile-scope | r profile-provider | f force | p provider | l layer | c category | / search | space plan | enter confirm | a apply | groups: X export-MCP | u unstage | q quit"
             .to_string(),
     );
     lines.join("\n")
@@ -1699,7 +2110,7 @@ pub fn run_interactive(
 ) -> TuiResult<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
     let mut state = TuiState::new_with_paths_and_roots_and_key(
@@ -1730,102 +2141,192 @@ fn run_loop(
             continue;
         }
 
-        let should_draw = match event::read()? {
-            Event::Resize(_, _) => true,
-            Event::Key(key) if state.search_editing() => match key.code {
-                KeyCode::Esc | KeyCode::Enter => {
-                    state.finish_search_editing();
-                    true
-                }
-                KeyCode::Backspace => {
-                    state.pop_search_char();
-                    true
-                }
-                KeyCode::Char(ch) => {
-                    state.push_search_char(ch);
-                    true
-                }
-                _ => false,
-            },
-            Event::Key(key) => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => return Ok(()),
-                KeyCode::Char('v') => {
-                    state.cycle_view();
-                    true
-                }
-                KeyCode::Down | KeyCode::Char('j') => {
-                    state.move_next();
-                    true
-                }
-                KeyCode::Up | KeyCode::Char('k') => {
-                    state.move_previous();
-                    true
-                }
-                KeyCode::Char('m') => {
-                    state.cycle_active_action();
-                    true
-                }
-                KeyCode::Char('f') => {
-                    state.toggle_gateway_force();
-                    true
-                }
-                KeyCode::Char('s') => {
-                    state.cycle_profile_scope();
-                    true
-                }
-                KeyCode::Char('r') => {
-                    state.cycle_profile_provider();
-                    true
-                }
-                KeyCode::Char('p') => {
-                    state.cycle_provider_filter();
-                    true
-                }
-                KeyCode::Char('l') => {
-                    state.cycle_layer_filter();
-                    true
-                }
-                KeyCode::Char('c') => {
-                    state.cycle_category_filter();
-                    true
-                }
-                KeyCode::Char('/') => {
-                    state.start_search_editing();
-                    true
-                }
-                KeyCode::Char('x') => {
-                    state.clear_search_query();
-                    true
-                }
-                KeyCode::Char(' ') => {
-                    state.plan_active_action();
-                    true
-                }
-                KeyCode::Enter => {
-                    state.confirm_active_action();
-                    true
-                }
-                KeyCode::Char('a') => {
-                    state.apply_active_action();
-                    true
-                }
-                KeyCode::Char('u') => {
-                    state.clear_staged();
-                    true
-                }
-                _ => false,
-            },
-            _ => false,
-        };
-        if should_draw {
-            terminal.draw(|frame| draw(frame, state))?;
+        match handle_tui_event(state, event::read()?) {
+            TuiEventOutcome::Quit => return Ok(()),
+            TuiEventOutcome::Redraw => {
+                terminal.draw(|frame| draw(frame, state))?;
+            }
+            TuiEventOutcome::Ignore => {}
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiEventOutcome {
+    Redraw,
+    Ignore,
+    Quit,
+}
+
+fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
+    let should_draw = match event {
+        Event::Resize(_, _) => true,
+        Event::Paste(text) if state.group_text_editing() => {
+            state.push_group_text(&text);
+            true
+        }
+        Event::Key(key) if state.group_text_editing() => match key.code {
+            KeyCode::Esc => {
+                state.cancel_group_interaction();
+                true
+            }
+            KeyCode::Enter => {
+                state.finish_group_text_input();
+                true
+            }
+            KeyCode::Backspace => {
+                state.pop_group_text_char();
+                true
+            }
+            KeyCode::Char(ch) => {
+                state.push_group_text_char(ch);
+                true
+            }
+            _ => false,
+        },
+        Event::Key(key) if state.search_editing() => match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                state.finish_search_editing();
+                true
+            }
+            KeyCode::Backspace => {
+                state.pop_search_char();
+                true
+            }
+            KeyCode::Char(ch) => {
+                state.push_search_char(ch);
+                true
+            }
+            _ => false,
+        },
+        Event::Key(key) => match key.code {
+            KeyCode::Char('q') => return TuiEventOutcome::Quit,
+            KeyCode::Esc => {
+                if !state.cancel_group_interaction() {
+                    return TuiEventOutcome::Quit;
+                }
+                true
+            }
+            KeyCode::Char('v') => {
+                state.cycle_view();
+                true
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                state.move_next();
+                true
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                state.move_previous();
+                true
+            }
+            KeyCode::Char('m') => {
+                state.cycle_active_action();
+                true
+            }
+            KeyCode::Char('f') => {
+                state.toggle_gateway_force();
+                true
+            }
+            KeyCode::Char('s') => {
+                state.cycle_profile_scope();
+                true
+            }
+            KeyCode::Char('r') => {
+                if state.view == TuiView::Groups {
+                    state.stage_group_restore();
+                } else {
+                    state.cycle_profile_provider();
+                }
+                true
+            }
+            KeyCode::Char('n') => {
+                state.start_group_create();
+                true
+            }
+            KeyCode::Char('e') => {
+                state.start_group_edit();
+                true
+            }
+            KeyCode::Char('R') => {
+                state.start_group_rename();
+                true
+            }
+            KeyCode::Char('d') => {
+                state.start_group_delete();
+                true
+            }
+            KeyCode::Char('h') => {
+                state.show_group_history();
+                true
+            }
+            KeyCode::Char('o') => {
+                state.start_group_mcp_approval();
+                true
+            }
+            KeyCode::Char('w') => {
+                state.stage_group_definition_save();
+                true
+            }
+            KeyCode::Char('p') => {
+                state.cycle_provider_filter();
+                true
+            }
+            KeyCode::Char('l') => {
+                state.cycle_layer_filter();
+                true
+            }
+            KeyCode::Char('c') => {
+                state.cycle_category_filter();
+                true
+            }
+            KeyCode::Char('/') => {
+                state.start_search_editing();
+                true
+            }
+            KeyCode::Char('x') => {
+                state.clear_search_query();
+                true
+            }
+            KeyCode::Char('X') => {
+                state.export_group_mcp_handoff();
+                true
+            }
+            KeyCode::Char(' ') => {
+                if !state.toggle_group_member() {
+                    state.plan_active_action();
+                }
+                true
+            }
+            KeyCode::Enter => {
+                state.confirm_active_action();
+                true
+            }
+            KeyCode::Char('a') => {
+                state.apply_active_action();
+                true
+            }
+            KeyCode::Char('u') => {
+                state.clear_staged();
+                true
+            }
+            _ => false,
+        },
+        _ => false,
+    };
+    if should_draw {
+        TuiEventOutcome::Redraw
+    } else {
+        TuiEventOutcome::Ignore
     }
 }
 
 fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> TuiResult<()> {
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    )?;
     terminal.show_cursor()?;
     Ok(())
 }
@@ -1910,7 +2411,7 @@ fn draw(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(backup_detail(state), detail_chunks[2]);
 
     let footer = Paragraph::new(
-        "v view | j/k move | m action/backend | s profile-scope | r profile-provider | f force | p provider | l layer | c category | / search | space plan | enter confirm | a apply | u unstage | q quit",
+        "v view | j/k move | m action/target | p/l/c filters | / search | space select/plan | enter confirm | a apply | groups: n/e/R/d/h/r/o/w/X-export | u unstage | q quit",
     )
     .block(Block::default().borders(Borders::ALL).title("Commands"));
     frame.render_widget(footer, chunks[2]);
@@ -2177,7 +2678,14 @@ mod tests {
         DiscoveryCategory, DiscoveryKind, DiscoveryLayer, DiscoveryMutability, DiscoveryRoots,
         discover_all,
     };
-    use unpin_core::mutation::authenticate_legacy_backup;
+    use unpin_core::groups::{
+        GROUP_DEFINITION_SCHEMA_VERSION, GroupDefinitionV1, GroupPlanMode, GroupPlanner, GroupRef,
+        GroupResolver, GroupTargetState, McpGroupSessionBinding, McpGroupSessionLeaseStore,
+        PersonalGroupStore, RepositoryGroupStore, issue_group_approval_challenge,
+    };
+    use unpin_core::mutation::{
+        TogglePlanRequest, ToggleStatus, authenticate_legacy_backup, plan_toggle,
+    };
     use unpin_core::profiles::{PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileStore};
     use unpin_core::snapshots::load_latest_discovery_snapshot;
     use unpin_core::state::atomic_json::OwnerGeneration;
@@ -2203,6 +2711,165 @@ mod tests {
                 fs::copy(&source_path, &destination_path).expect("copy file");
             }
         }
+    }
+
+    fn key_event(code: KeyCode) -> Event {
+        Event::Key(crossterm::event::KeyEvent::new(
+            code,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    #[test]
+    fn group_mcp_approval_event_path_issues_and_exports_without_provider_writes() {
+        let temp = TempDir::new().expect("temporary TUI approval root");
+        let root = fs::canonicalize(temp.path()).expect("canonical TUI approval root");
+        let app_state_root = root.join("state");
+        let project_root = root.join("project");
+        fs::create_dir_all(&app_state_root).expect("app state");
+        fs::create_dir_all(&project_root).expect("project root");
+        let git = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project_root)
+            .output()
+            .expect("git init");
+        assert!(git.status.success());
+
+        let roots =
+            DiscoveryRoots::fixture_root(fixtures_root()).with_app_state_root(&app_state_root);
+        let discovery = discover_all(&roots).expect("fixture discovery");
+        let member_item = discovery
+            .items
+            .iter()
+            .find(|item| item.id == "codex:global:configured-mcp:github")
+            .expect("toggleable fixture MCP");
+        let member = GroupMemberIdentity::try_from(member_item).expect("group member identity");
+        let provider_path = PathBuf::from(&member_item.source_path);
+        let provider_before = fs::read(&provider_path).expect("provider config before approval");
+        let backup_key = BackupAuthenticationKey::new([0x42; 32]);
+        let session_key = SessionAuthorityKey::new([0x53; 32]);
+        let access =
+            GroupAccessContext::from_runtime(&app_state_root, &project_root, &roots, None, None)
+                .expect("group access");
+        let personal = PersonalGroupStore::new(access.clone())
+            .with_history_authentication_key(backup_key.clone());
+        personal
+            .create(
+                &GroupDefinitionV1 {
+                    schema_version: GROUP_DEFINITION_SCHEMA_VERSION,
+                    name: "event-approval".to_string(),
+                    members: vec![member],
+                },
+                OwnerGeneration::new("tui-event-test", 1).expect("owner"),
+            )
+            .expect("create approval group");
+        let repository = RepositoryGroupStore::new(access.clone())
+            .with_history_authentication_key(backup_key.clone());
+        let plan = GroupPlanner::new(GroupResolver::new(access.clone(), personal, repository))
+            .plan(
+                &GroupRef::parse("personal:event-approval").expect("group reference"),
+                GroupTargetState::Disable,
+                10,
+                GroupPlanMode::McpHandoff,
+            )
+            .expect("MCP handoff plan");
+        let now_unix = unix_now();
+        let lease_store = McpGroupSessionLeaseStore::new(&app_state_root);
+        let session = lease_store
+            .create(
+                McpGroupSessionBinding {
+                    provider: None,
+                    repository_key: access.repository_key().to_string(),
+                    workspace_key: access.workspace_key().to_string(),
+                },
+                &session_key,
+                now_unix,
+            )
+            .expect("MCP session lease");
+        let lease_expires_at = lease_store
+            .verify(&session, &session_key, now_unix)
+            .expect("session expiry");
+        let challenge =
+            issue_group_approval_challenge(plan, session, lease_expires_at, &session_key, now_unix)
+                .expect("approval challenge");
+
+        let mut state = TuiState::new_with_paths_and_roots_and_key(
+            discovery,
+            app_state_root.clone(),
+            project_root,
+            roots,
+            Some(backup_key),
+            Some(session_key),
+        );
+        state.fixture_mode = true;
+        state.view = TuiView::Groups;
+
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('o'))),
+            TuiEventOutcome::Redraw
+        );
+        assert!(state.group_text_editing());
+        assert_eq!(
+            handle_tui_event(&mut state, Event::Paste(challenge)),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Enter)),
+            TuiEventOutcome::Redraw
+        );
+        assert!(
+            state
+                .group_workflow
+                .details()
+                .iter()
+                .any(|line| line.contains("MCP approval review"))
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Enter)),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('a'))),
+            TuiEventOutcome::Redraw
+        );
+        let handoff = state
+            .mcp_approval_handoff
+            .clone()
+            .expect("issued handoff remains structured");
+        assert_eq!(
+            fs::read(&provider_path).expect("provider config after approval"),
+            provider_before
+        );
+        assert!(!app_state_root.join("backups").exists());
+
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('X'))),
+            TuiEventOutcome::Redraw
+        );
+        let export_path = app_state_root
+            .join("groups")
+            .join("handoff-exports")
+            .join(format!("{}.json", handoff.approval_artifact));
+        let exported = AtomicJsonStore::new(export_path, 1)
+            .load::<serde_json::Value>()
+            .expect("load exported handoff")
+            .expect("exported handoff document");
+        assert_eq!(exported.value, handoff.export_value());
+
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('o'))),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Esc)),
+            TuiEventOutcome::Redraw,
+            "Esc cancels the active interaction before quitting"
+        );
+        assert!(!state.group_text_editing());
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Esc)),
+            TuiEventOutcome::Quit
+        );
     }
 
     fn item(
@@ -2451,6 +3118,7 @@ mod tests {
         let mut state = TuiState::new_with_paths(discovered, state_root, project);
 
         state.cycle_view();
+        state.cycle_view();
         assert_eq!(state.view, TuiView::Profiles);
         assert!(state.plan_active_action());
         assert_eq!(state.profile_workflow.phase(), WorkflowPhase::Planned);
@@ -2515,7 +3183,7 @@ mod tests {
         let mut state =
             TuiState::new_with_paths(discovery(Vec::new()), state_root.clone(), project);
 
-        for _ in 0..5 {
+        for _ in 0..6 {
             state.cycle_view();
         }
         assert_eq!(state.view, TuiView::RestoreOperations);
@@ -3038,6 +3706,138 @@ mod tests {
     }
 
     #[test]
+    fn staged_inventory_uses_full_identity_for_same_id_items() {
+        let mut state = TuiState::new(discovery(vec![
+            item(
+                "shared-name",
+                ProviderId::Claude,
+                DiscoveryLayer::Global,
+                DiscoveryCategory::Tool,
+                DiscoveryKind::Setting,
+            ),
+            item(
+                "shared-name",
+                ProviderId::Codex,
+                DiscoveryLayer::Project,
+                DiscoveryCategory::Skill,
+                DiscoveryKind::Skill,
+            ),
+        ]));
+
+        assert!(state.stage_selected_toggle());
+        state.move_next();
+        assert!(state.stage_selected_toggle());
+
+        assert_eq!(state.staged_count(), 2);
+        assert_eq!(state.staged_summary_strings().len(), 2);
+    }
+
+    #[test]
+    fn group_member_selection_is_clamped_when_inventory_filters_shrink() {
+        let first = item(
+            "first-group-member",
+            ProviderId::Codex,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        );
+        let second = item(
+            "second-group-member",
+            ProviderId::Codex,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        );
+        let mut state = TuiState::new(discovery(vec![first, second]));
+        assert!(state.stage_selected_toggle());
+        state.move_next();
+        assert!(state.stage_selected_toggle());
+        state.cycle_view();
+        state.start_group_create();
+        for character in "clamped".chars() {
+            state.push_group_text_char(character);
+        }
+        state.finish_group_text_input();
+        state.group_workflow.select_next(2);
+        assert_eq!(state.group_workflow.member_selected_index(), 1);
+
+        state.set_search_query("first-group-member");
+
+        assert_eq!(state.visible_count(), 1);
+        assert_eq!(state.group_workflow.member_selected_index(), 0);
+    }
+
+    #[test]
+    fn tui_group_create_uses_staged_members_and_authenticated_definition_flow() {
+        let temp = TempDir::new().expect("temporary group TUI root");
+        let root = fs::canonicalize(temp.path()).expect("canonical group TUI root");
+        let project = root.join("project");
+        let state_root = root.join("state");
+        fs::create_dir(&project).expect("project directory");
+        let git = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(&project)
+            .output()
+            .expect("git init");
+        assert!(git.status.success());
+        let fixture_root = fs::canonicalize(fixtures_root()).expect("canonical fixture root");
+        let mut discovered =
+            discover_all(&DiscoveryRoots::fixture_root(&fixture_root)).expect("fixture discovery");
+        discovered.items.retain(|item| {
+            item.mutability == DiscoveryMutability::ReadWrite
+                && plan_toggle(TogglePlanRequest {
+                    app_state_root: state_root.clone(),
+                    item: item.clone(),
+                })
+                .status
+                    == ToggleStatus::DryRun
+        });
+        discovered.items.truncate(2);
+        assert_eq!(
+            discovered.items.len(),
+            2,
+            "fixture must expose two individually toggleable items"
+        );
+        let mut state = TuiState::new_with_paths_and_roots(
+            discovered,
+            state_root,
+            project,
+            DiscoveryRoots::fixture_root(fixture_root),
+        );
+
+        assert!(state.stage_selected_toggle());
+        state.move_next();
+        assert!(state.stage_selected_toggle());
+        state.cycle_view();
+        assert_eq!(state.view, TuiView::Groups);
+
+        state.start_group_create();
+        assert!(state.group_text_editing());
+        for character in "brainstorming".chars() {
+            state.push_group_text_char(character);
+        }
+        state.finish_group_text_input();
+        state.stage_group_definition_save();
+        assert!(state.confirm_active_action());
+        state.apply_active_action();
+
+        assert_eq!(state.group_workflow.len(), 1);
+        let details = state.group_workflow.details();
+        assert!(
+            details
+                .iter()
+                .any(|line| line.contains("personal:brainstorming"))
+        );
+        assert!(matches!(
+            state.last_action,
+            Some(TuiActionStatus::Success(ref message))
+                if message.contains("authenticated history recorded")
+        ));
+        assert_eq!(state.staged_count(), 0);
+        assert!(!state.pending_confirmation);
+    }
+
+    #[test]
     fn refresh_discovery_clears_staged_state() {
         let mut state = TuiState::new(discovery(vec![item(
             "claude-global-tool",
@@ -3049,7 +3849,7 @@ mod tests {
         assert!(state.stage_selected_toggle());
         assert!(state.confirm_staged());
 
-        state.refresh_discovery(discovery(vec![item(
+        state.refresh_discovery(&discovery(vec![item(
             "codex-project-skill",
             ProviderId::Codex,
             DiscoveryLayer::Project,
