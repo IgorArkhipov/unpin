@@ -64,7 +64,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli
 
       - name: Install SBOM generator
-        uses: taiki-e/install-action@7572810d7dd469b651bb7793945692cf78da5dd7 # v2
+        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
         with:
           tool: cargo-cyclonedx@0.5.9
 
