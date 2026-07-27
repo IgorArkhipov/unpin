@@ -12,6 +12,7 @@ outcome:
 | Desired outcome | Unpin control | Scope and activation |
 | --- | --- | --- |
 | Change provider-native enabled state | Single or bounded bulk item toggle | Global or project item; live, reload, or restart as reported by the plan |
+| Change an explicit mixed set of provider items together | Inventory group | Personal or repository definition; provider-native state changes as one reviewed operation |
 | Select a reusable capability allowlist | Profile policy | Global, repository, or workspace; future sessions |
 | Override every profile for one provider capability | Capability lock | Global `hard-enabled`, `hard-disabled`, or `clear`; future sessions |
 | Use a task-specific setup temporarily | Profile proposal and session launch handoff | One immutable session lease |
@@ -48,9 +49,13 @@ Begin with Unpin inventory and control status. Resolve exact provider, kind,
 layer or policy scope, item or capability IDs, enabled state, mutability, and
 current revisions before proposing a change.
 
-Never treat `confirm`, host tool approval, or an MCP apply-tool call as
-authorization to write provider state. Unpin MCP apply tools only validate the
-reviewed fingerprint and return a CLI/TUI human-action handoff.
+Never treat `confirm`, host tool approval, or an MCP apply-tool call as human
+authorization. Default Unpin MCP apply tools only validate the reviewed
+fingerprint and return a CLI/TUI human-action handoff. The sole exception is
+`unpin_apply_inventory_group` on a persistent connection explicitly started in
+approved-group mode; even there, call it only with the exact short-lived,
+one-time artifact issued independently by the CLI or TUI. MCP cannot create
+that approval.
 
 Show me the complete plan, actionable and blocked items, affected paths or
 resources, cross-provider fan-out, activation timing, warnings, and exact plan
@@ -70,14 +75,17 @@ repository.
 1. Call inventory summary and control status.
 2. List project skills, configured MCP servers, plugins, agents, and hooks for
    every discovered provider.
-3. Report each exact item ID, normalized capability ID when available, provider,
+3. List personal and repository inventory groups. Report each qualified name,
+   revision, On/Off/Mixed state, provider coverage, unresolved or blocked
+   member, and context mismatch.
+4. Report each exact item ID, normalized capability ID when available, provider,
    layer, enabled state, mutability, and whether its physical source is shared
    across providers.
-4. Report the effective profile and gateway source at global, repository, and
+5. Report the effective profile and gateway source at global, repository, and
    workspace scope, plus all provider capability locks.
-5. Report hook coverage and trust state separately. Do not describe hooks as
+6. Report hook coverage and trust state separately. Do not describe hooks as
    generic writable toggles.
-6. Identify drift, read-only items, unsupported provider combinations, and
+7. Identify drift, read-only items, unsupported provider combinations, and
    changes that would require reload, restart, or a new session.
 
 Do not plan, request, or apply any change.
@@ -109,6 +117,51 @@ human-action handoff. Rediscover the item after I complete that handoff.
 Do not ask an agent to "toggle" without an explicit desired state. The current
 state may change between discovery and planning; `targetEnabled` makes intent
 unambiguous.
+
+## Inspect, plan, and externally approve an inventory group
+
+Inventory groups contain explicit full provider inventory identities and
+change provider-native enabled state. They are not profiles: profiles contain
+normalized capability IDs and select policy or exposure for future sessions.
+Create or edit the definition through the Unpin CLI or TUI before using this
+prompt; MCP cannot manage definitions.
+
+```text
+Using only Unpin MCP, inspect and prepare an operation for an existing
+inventory group:
+
+- group: personal:brainstorming
+- desired state: enabled | disabled
+
+1. List inventory groups and resolve the exact qualified name. If the name is
+   ambiguous between personal and repository scope, stop and ask me to choose.
+2. Get the group and report its revision, On/Off/Mixed state, every explicit
+   full member identity, provider coverage, unresolved members, blocked
+   members, context compatibility, and shared-source fan-out.
+3. Call the group plan tool with the qualified name, explicit targetEnabled,
+   and maxMembers equal to or greater than the reviewed member count.
+4. Show every member outcome, connected resource cohort, affected resource,
+   activation requirement, warning, operation ID if present, and exact plan
+   fingerprint.
+5. If the result is a non-authorizable preview, stop. Explain that default MCP
+   cannot create a challenge and ask me whether I want to restart a persistent
+   connection with approved group apply enabled.
+6. If the result is actionable, stop for my review. Do not run `unpin group
+   approve`, type its controlling-terminal approval phrase, create or edit the
+   group, or claim approval.
+7. Ask me to run the exact CLI approval command with the returned opaque
+   challenge. After I provide its approvalArtifact, verify that the operation
+   ID and plan fingerprint match the still-current plan.
+8. Call unpin_apply_inventory_group once with only the exact operation ID,
+   plan fingerprint, original challenge, and approval artifact.
+9. Inspect operation evidence and rediscover the group. Report every backup ID,
+   member result, rollback result, partial outcome, reload/restart requirement,
+   and whether manual repair or restore is required.
+
+Never retry with a stale challenge or artifact. Never resume provider writes
+from a previous process. Any drift, expiry, blocked member, or partial failure
+requires preserving evidence and returning to fresh discovery and planning.
+```
 
 ## Converge writable project items to an explicit allowlist
 

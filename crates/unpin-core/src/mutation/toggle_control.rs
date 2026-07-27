@@ -16,8 +16,8 @@ use crate::{
     sessions::SessionAuthorityKey,
     transitions::{
         EffectActivation, EffectAuthority, TransitionContext, TransitionEffect,
-        TransitionEffectKind, TransitionJournalStore, TransitionKind, TransitionPlan,
-        TransitionPlanError, journal::JournalError,
+        TransitionEffectKind, TransitionJournal, TransitionJournalStore, TransitionKind,
+        TransitionPlan, TransitionPlanError, journal::JournalError,
     },
 };
 
@@ -99,6 +99,24 @@ impl NativeToggleController {
         item: DiscoveryItem,
         context: &ControlApprovalContext,
     ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let journals = self.planning_journals()?;
+        self.plan_with_journals(item, context, &journals)
+    }
+
+    pub(crate) fn planning_journals(
+        &self,
+    ) -> Result<Vec<TransitionJournal>, NativeToggleControlError> {
+        TransitionJournalStore::new(&self.app_state_root)
+            .list()
+            .map_err(Into::into)
+    }
+
+    pub(crate) fn plan_with_journals(
+        &self,
+        item: DiscoveryItem,
+        context: &ControlApprovalContext,
+        journals: &[TransitionJournal],
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
         let preview = plan_toggle_inner(TogglePlanInput {
             app_state_root: self.app_state_root.clone(),
             item,
@@ -114,7 +132,7 @@ impl NativeToggleController {
                     .unwrap_or_else(|| "native toggle cannot be planned".to_string()),
             ));
         }
-        let transition = toggle_transition(&self.app_state_root, &preview, context)?;
+        let transition = toggle_transition(&preview, context, journals)?;
         let plan = NativeTogglePlan {
             schema_version: NATIVE_TOGGLE_PLAN_SCHEMA_VERSION,
             plan_fingerprint: toggle_plan_fingerprint(&preview, &transition)?,
@@ -192,9 +210,9 @@ fn toggle_plan_fingerprint(
 }
 
 fn toggle_transition(
-    app_state_root: &PathBuf,
     preview: &ToggleResult,
     context: &ControlApprovalContext,
+    journals: &[TransitionJournal],
 ) -> Result<TransitionPlan, NativeToggleControlError> {
     let encoded = serde_json::to_vec(preview)
         .map_err(|error| NativeToggleControlError::Serialization(error.to_string()))?;
@@ -212,9 +230,8 @@ fn toggle_transition(
     let context_bytes = serde_json::to_vec(&transition_context)
         .map_err(|error| NativeToggleControlError::Serialization(error.to_string()))?;
     let context_digest = crate::encode_lower_hex(&Sha256::digest(context_bytes));
-    let completed_generations = TransitionJournalStore::new(app_state_root)
-        .list()?
-        .into_iter()
+    let completed_generations = journals
+        .iter()
         .filter(|journal| {
             journal.operation_kind == TransitionKind::NativeToggle.as_str()
                 && journal.repository_key == transition_context.repository_key
@@ -270,6 +287,24 @@ pub enum NativeToggleControlError {
     RecoveryRequired(String),
     GenerationOverflow,
     Serialization(String),
+}
+
+impl NativeToggleControlError {
+    #[must_use]
+    pub(crate) const fn public_reason_code(&self) -> &'static str {
+        match self {
+            Self::Approval(_) => "approval-unavailable",
+            Self::Journal(_) => "transition-state-unavailable",
+            Self::TransitionPlan(_)
+            | Self::InvalidPlan
+            | Self::PlanFingerprintMismatch
+            | Self::Serialization(_) => "native-plan-invalid",
+            Self::ContextMismatch => "context-scope-conflict",
+            Self::Blocked(_) => "native-plan-blocked",
+            Self::RecoveryRequired(_) => "recovery-required",
+            Self::GenerationOverflow => "native-plan-capacity-exceeded",
+        }
+    }
 }
 
 impl From<ApprovalError> for NativeToggleControlError {

@@ -23,6 +23,7 @@ pub enum TransitionKind {
     TrustHook,
     Recover,
     NativeToggle,
+    InventoryGroupApply,
 }
 
 impl TransitionKind {
@@ -39,6 +40,7 @@ impl TransitionKind {
             Self::TrustHook => "trust-hook",
             Self::Recover => "recover",
             Self::NativeToggle => "native-toggle",
+            Self::InventoryGroupApply => "inventory-group-apply",
         }
     }
 }
@@ -83,6 +85,26 @@ pub enum EffectActivation {
     ReloadRequired,
     RestartRequired,
     NextSessionOnly,
+}
+
+impl EffectActivation {
+    #[must_use]
+    pub const fn max(self, other: Self) -> Self {
+        if self.rank() >= other.rank() {
+            self
+        } else {
+            other
+        }
+    }
+
+    const fn rank(self) -> u8 {
+        match self {
+            Self::Live => 0,
+            Self::ReloadRequired => 1,
+            Self::RestartRequired => 2,
+            Self::NextSessionOnly => 3,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

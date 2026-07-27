@@ -73,6 +73,7 @@ pub(crate) struct WindowsFileIdentity {
     pub(crate) full_file_id: bool,
     pub(crate) legacy_volume: u32,
     pub(crate) legacy_file_index: u64,
+    pub(crate) number_of_links: u32,
     pub(crate) workspace_reliable: bool,
 }
 
@@ -171,13 +172,14 @@ pub(crate) fn windows_file_identity(file: &fs::File) -> io::Result<WindowsFileId
     if succeeded == 0 {
         let error = io::Error::last_os_error();
         if matches!(error.raw_os_error(), Some(1 | 50 | 87)) {
-            let (legacy_volume, legacy_file_index) = windows_legacy_file_identity(file)?;
+            let legacy = windows_legacy_file_identity(file)?;
             return Ok(WindowsFileIdentity {
-                volume: u64::from(legacy_volume),
-                file_id: encode_legacy_windows_file_id(legacy_file_index),
+                volume: u64::from(legacy.volume),
+                file_id: encode_legacy_windows_file_id(legacy.file_index),
                 full_file_id: false,
-                legacy_volume,
-                legacy_file_index,
+                legacy_volume: legacy.volume,
+                legacy_file_index: legacy.file_index,
+                number_of_links: legacy.number_of_links,
                 workspace_reliable: false,
             });
         }
@@ -186,23 +188,31 @@ pub(crate) fn windows_file_identity(file: &fs::File) -> io::Result<WindowsFileId
     // SAFETY: a successful `GetFileInformationByHandleEx` call initializes the
     // complete `FileIdInfo` value.
     let information = unsafe { information.assume_init() };
-    let (legacy_volume, legacy_file_index) = windows_legacy_file_identity(file)?;
+    let legacy = windows_legacy_file_identity(file)?;
     // The legacy API exposes only a 32-bit volume serial representation, so
     // compare the file-ID relation without treating the volume widths as equal.
     let workspace_reliable =
-        information.file_id.identifier == encode_legacy_windows_file_id(legacy_file_index);
+        information.file_id.identifier == encode_legacy_windows_file_id(legacy.file_index);
     Ok(WindowsFileIdentity {
         volume: information.volume_serial_number,
         file_id: information.file_id.identifier,
         full_file_id: true,
-        legacy_volume,
-        legacy_file_index,
+        legacy_volume: legacy.volume,
+        legacy_file_index: legacy.file_index,
+        number_of_links: legacy.number_of_links,
         workspace_reliable,
     })
 }
 
 #[cfg(windows)]
-fn windows_legacy_file_identity(file: &fs::File) -> io::Result<(u32, u64)> {
+struct WindowsLegacyFileIdentity {
+    volume: u32,
+    file_index: u64,
+    number_of_links: u32,
+}
+
+#[cfg(windows)]
+fn windows_legacy_file_identity(file: &fs::File) -> io::Result<WindowsLegacyFileIdentity> {
     use std::{ffi::c_void, mem::MaybeUninit, os::windows::io::AsRawHandle};
 
     #[repr(C)]
@@ -249,7 +259,11 @@ fn windows_legacy_file_identity(file: &fs::File) -> io::Result<(u32, u64)> {
     let information = unsafe { information.assume_init() };
     let index =
         (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low);
-    Ok((information.volume_serial_number, index))
+    Ok(WindowsLegacyFileIdentity {
+        volume: information.volume_serial_number,
+        file_index: index,
+        number_of_links: information.number_of_links,
+    })
 }
 
 #[cfg(any(windows, test))]

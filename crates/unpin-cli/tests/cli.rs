@@ -23,6 +23,11 @@ use unpin_core::{
         DiscoveryRoots, ProviderId, discover_all,
     },
     fixture::{FixtureCredentialPurpose, fixture_credential_key},
+    groups::{
+        GroupAccessContext, GroupController, GroupDefinitionV1, GroupMemberIdentity, GroupPlanMode,
+        GroupPlanner, GroupRef, GroupResolver, GroupScope, GroupTargetState, PersonalGroupStore,
+        RepositoryGroupStore,
+    },
     mutation::{
         BackupAuthenticationKey, NativeToggleController, ToggleStatus, authenticate_legacy_backup,
     },
@@ -86,6 +91,40 @@ fn copy_dir_all(source: &Path, destination: &Path) {
 fn write_text(path: &Path, content: &str) {
     fs::create_dir_all(path.parent().expect("fixture file has parent")).expect("create parent");
     fs::write(path, content).expect("write fixture file");
+}
+
+fn run_group_command(
+    fixture_root: &Path,
+    project_root: &Path,
+    app_state_root: &Path,
+    args: &[&str],
+) -> Output {
+    Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .arg("group")
+        .args(args)
+        .arg("--fixture-root")
+        .arg(fixture_root)
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--home-root")
+        .arg(fixture_root)
+        .arg("--app-state-root")
+        .arg(app_state_root)
+        .arg("--json")
+        .output()
+        .expect("group command output")
+}
+
+fn assert_success_json(output: Output, label: &str) -> serde_json::Value {
+    assert!(
+        output.status.success(),
+        "{label} should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|error| panic!("{label} should return JSON: {error}"))
 }
 
 fn run_git(cwd: &Path, args: &[&str]) {
@@ -2869,6 +2908,687 @@ fn toggle_plans_skill_disable_human_dry_run() {
 }
 
 #[test]
+fn group_cli_crud_history_restore_and_action_bound_previews() {
+    fn member_keys(value: &serde_json::Value) -> BTreeSet<String> {
+        value
+            .as_array()
+            .expect("group members")
+            .iter()
+            .map(|member| {
+                let member = member.get("identity").unwrap_or(member);
+                format!(
+                    "{}:{}:{}:{}:{}",
+                    member["provider"].as_str().expect("member provider"),
+                    member["layer"].as_str().expect("member layer"),
+                    member["kind"].as_str().expect("member kind"),
+                    member["category"].as_str().expect("member category"),
+                    member["id"].as_str().expect("member id"),
+                )
+            })
+            .collect()
+    }
+
+    let temp = TempDir::new().expect("temporary group CLI root");
+    let root = fs::canonicalize(temp.path()).expect("canonical group CLI root");
+    let fixture_root = root.join("fixtures");
+    let project_root = root.join("workspace");
+    let app_state_root = root.join("state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(&app_state_root).expect("app state");
+
+    let first_skill = fixture_root.join("codex/admin/skills/example-codex-admin-skill/SKILL.md");
+    let second_skill = fixture_root.join("codex/admin/skills/example-group-second/SKILL.md");
+    write_text(
+        &second_skill,
+        "---\nname: example-group-second\ndescription: Group CLI fixture skill.\n---\n",
+    );
+    let config_path = fixture_root.join("codex/global/config.toml");
+    let config = fs::read_to_string(&config_path).expect("Codex fixture config");
+    fs::write(
+        &config_path,
+        format!(
+            "{config}\n[[skills.config]]\npath = {:?}\nenabled = true\n\n[[skills.config]]\npath = {:?}\nenabled = true\n",
+            first_skill.to_string_lossy(),
+            second_skill.to_string_lossy(),
+        ),
+    )
+    .expect("configure group fixture skills");
+
+    let first_member =
+        "codex:global:skill:skill:codex:global:skill:admin/example-codex-admin-skill";
+    let second_member = "codex:global:skill:skill:codex:global:skill:admin/example-group-second";
+    let expected_members = BTreeSet::from([first_member.to_string(), second_member.to_string()]);
+
+    let create_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "create",
+                "--scope",
+                "personal",
+                "--name",
+                "brainstorming",
+                "--member",
+                first_member,
+            ],
+        ),
+        "group create preview",
+    );
+    assert_eq!(create_preview["status"], "planned");
+    let create_fingerprint = create_preview["planFingerprint"]
+        .as_str()
+        .expect("create plan fingerprint")
+        .to_string();
+    let created = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "create",
+                "--scope",
+                "personal",
+                "--name",
+                "brainstorming",
+                "--member",
+                first_member,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                &create_fingerprint,
+            ],
+        ),
+        "group create apply",
+    );
+    assert_eq!(created["status"], "created");
+    let created_revision = created["result"]["revision"]
+        .as_str()
+        .expect("created revision")
+        .to_string();
+
+    let edit_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "edit",
+                "personal:brainstorming",
+                "--member",
+                first_member,
+                "--member",
+                second_member,
+                "--expected-revision",
+                &created_revision,
+            ],
+        ),
+        "group edit preview",
+    );
+    let edit_fingerprint = edit_preview["planFingerprint"]
+        .as_str()
+        .expect("edit plan fingerprint")
+        .to_string();
+    assert_ne!(create_fingerprint, edit_fingerprint);
+    let edited = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "edit",
+                "personal:brainstorming",
+                "--member",
+                first_member,
+                "--member",
+                second_member,
+                "--expected-revision",
+                &created_revision,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                &edit_fingerprint,
+            ],
+        ),
+        "group edit apply",
+    );
+    assert_eq!(
+        member_keys(&edited["result"]["definition"]["members"]),
+        expected_members
+    );
+    let edited_revision = edited["result"]["revision"]
+        .as_str()
+        .expect("edited revision")
+        .to_string();
+
+    let rename_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "rename",
+                "personal:brainstorming",
+                "--new-name",
+                "planning",
+                "--expected-revision",
+                &edited_revision,
+            ],
+        ),
+        "group rename preview",
+    );
+    let rename_fingerprint = rename_preview["planFingerprint"]
+        .as_str()
+        .expect("rename plan fingerprint")
+        .to_string();
+    let renamed = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "rename",
+                "personal:brainstorming",
+                "--new-name",
+                "planning",
+                "--expected-revision",
+                &edited_revision,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                &rename_fingerprint,
+            ],
+        ),
+        "group rename apply",
+    );
+    let renamed_revision = renamed["result"]["revision"]
+        .as_str()
+        .expect("renamed revision")
+        .to_string();
+    assert_eq!(renamed["result"]["qualifiedName"], "personal:planning");
+
+    let delete_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "delete",
+                "personal:planning",
+                "--expected-revision",
+                &renamed_revision,
+            ],
+        ),
+        "group delete preview",
+    );
+    let delete_fingerprint = delete_preview["planFingerprint"]
+        .as_str()
+        .expect("delete plan fingerprint")
+        .to_string();
+    let deleted = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "delete",
+                "personal:planning",
+                "--expected-revision",
+                &renamed_revision,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                &delete_fingerprint,
+            ],
+        ),
+        "group delete apply",
+    );
+    let delete_history_id = deleted["result"]["historyId"]
+        .as_str()
+        .expect("delete history ID")
+        .to_string();
+
+    let history = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &["history", "--scope", "personal"],
+        ),
+        "group history",
+    );
+    let delete_history = history["result"]
+        .as_array()
+        .expect("history records")
+        .iter()
+        .find(|record| record["historyId"] == delete_history_id)
+        .expect("delete history");
+    assert_eq!(delete_history["change"], "delete");
+    assert_eq!(
+        member_keys(&delete_history["definitionBefore"]["members"]),
+        expected_members
+    );
+
+    let restore_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "restore-definition",
+                "--scope",
+                "personal",
+                &delete_history_id,
+            ],
+        ),
+        "group restore preview",
+    );
+    let restore_fingerprint = restore_preview["planFingerprint"]
+        .as_str()
+        .expect("restore plan fingerprint")
+        .to_string();
+    let restored = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "restore-definition",
+                "--scope",
+                "personal",
+                &delete_history_id,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                &restore_fingerprint,
+            ],
+        ),
+        "group restore apply",
+    );
+    assert_eq!(restored["status"], "restored");
+    assert_eq!(restored["result"]["qualifiedName"], "personal:planning");
+    assert_eq!(
+        member_keys(&restored["result"]["definition"]["members"]),
+        expected_members
+    );
+
+    let shown = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &["show", "personal:planning"],
+        ),
+        "group show restored",
+    );
+    assert_eq!(member_keys(&shown["result"]["members"]), expected_members);
+
+    let repository_create_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "create",
+                "--scope",
+                "repository",
+                "--name",
+                "implementation",
+                "--member",
+                first_member,
+            ],
+        ),
+        "repository group create preview",
+    );
+    let repository_create = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "create",
+                "--scope",
+                "repository",
+                "--name",
+                "implementation",
+                "--member",
+                first_member,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                repository_create_preview["planFingerprint"]
+                    .as_str()
+                    .expect("repository create fingerprint"),
+            ],
+        ),
+        "repository group create apply",
+    );
+    let repository_created_revision = repository_create["result"]["revision"]
+        .as_str()
+        .expect("repository created revision");
+    let repository_edit_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "edit",
+                "repository:implementation",
+                "--member",
+                first_member,
+                "--member",
+                second_member,
+                "--expected-revision",
+                repository_created_revision,
+            ],
+        ),
+        "repository group edit preview",
+    );
+    let repository_edit = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "edit",
+                "repository:implementation",
+                "--member",
+                first_member,
+                "--member",
+                second_member,
+                "--expected-revision",
+                repository_created_revision,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                repository_edit_preview["planFingerprint"]
+                    .as_str()
+                    .expect("repository edit fingerprint"),
+            ],
+        ),
+        "repository group edit apply",
+    );
+    assert_eq!(
+        member_keys(&repository_edit["result"]["definition"]["members"]),
+        expected_members
+    );
+    let repository_edited_revision = repository_edit["result"]["revision"]
+        .as_str()
+        .expect("repository edited revision");
+    let repository_delete_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "delete",
+                "repository:implementation",
+                "--expected-revision",
+                repository_edited_revision,
+            ],
+        ),
+        "repository group delete preview",
+    );
+    let repository_delete = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "delete",
+                "repository:implementation",
+                "--expected-revision",
+                repository_edited_revision,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                repository_delete_preview["planFingerprint"]
+                    .as_str()
+                    .expect("repository delete fingerprint"),
+            ],
+        ),
+        "repository group delete apply",
+    );
+    let repository_history_id = repository_delete["result"]["historyId"]
+        .as_str()
+        .expect("repository delete history ID");
+    let repository_history = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &["history", "--scope", "repository"],
+        ),
+        "repository group history",
+    );
+    let repository_delete_history = repository_history["result"]
+        .as_array()
+        .expect("repository history records")
+        .iter()
+        .find(|record| record["historyId"] == repository_history_id)
+        .expect("repository delete history");
+    assert_eq!(
+        member_keys(&repository_delete_history["definitionBefore"]["members"]),
+        expected_members
+    );
+    let repository_restore_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "restore-definition",
+                "--scope",
+                "repository",
+                repository_history_id,
+            ],
+        ),
+        "repository group restore preview",
+    );
+    let repository_restored = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "restore-definition",
+                "--scope",
+                "repository",
+                repository_history_id,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                repository_restore_preview["planFingerprint"]
+                    .as_str()
+                    .expect("repository restore fingerprint"),
+            ],
+        ),
+        "repository group restore apply",
+    );
+    assert_eq!(
+        member_keys(&repository_restored["result"]["definition"]["members"]),
+        expected_members
+    );
+}
+
+#[test]
+fn group_operation_show_handles_missing_context_and_redacts_internal_evidence() {
+    let temp = TempDir::new().expect("temporary group operation CLI root");
+    let root = fs::canonicalize(temp.path()).expect("canonical group operation CLI root");
+    let fixture_root = root.join("fixtures");
+    let project_root = root.join("workspace");
+    let other_project_root = root.join("other-workspace");
+    let app_state_root = root.join("state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(other_project_root.join(".git")).expect("other workspace");
+    fs::create_dir_all(&app_state_root).expect("app state");
+
+    let skill_path = fixture_root.join("codex/admin/skills/example-codex-admin-skill/SKILL.md");
+    let config_path = fixture_root.join("codex/global/config.toml");
+    let config = fs::read_to_string(&config_path).expect("Codex fixture config");
+    fs::write(
+        &config_path,
+        format!(
+            "{config}\n[[skills.config]]\npath = {:?}\nenabled = true\n",
+            skill_path.to_string_lossy(),
+        ),
+    )
+    .expect("configure group fixture skill");
+
+    let roots = DiscoveryRoots::fixture_root(&fixture_root).with_app_state_root(&app_state_root);
+    let access =
+        GroupAccessContext::from_runtime(&app_state_root, &project_root, &roots, None, None)
+            .expect("group access");
+    let member = discover_all(&roots)
+        .expect("group discovery")
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
+        .map(GroupMemberIdentity::try_from)
+        .transpose()
+        .expect("group member identity")
+        .expect("group fixture skill");
+    let personal = PersonalGroupStore::new(access.clone());
+    personal
+        .create(
+            &GroupDefinitionV1::new("operation-inspection", vec![member])
+                .expect("group definition"),
+            OwnerGeneration::new("group-operation-cli-test", 1).expect("group owner"),
+        )
+        .expect("create group");
+    let planner = GroupPlanner::new(GroupResolver::new(
+        access.clone(),
+        personal,
+        RepositoryGroupStore::new(access.clone()),
+    ));
+    let controller = GroupController::new(
+        planner,
+        backup_authentication_key(&app_state_root),
+        session_authority_key(&app_state_root),
+    );
+    let plan = controller
+        .plan(
+            &GroupRef::qualified(GroupScope::Personal, "operation-inspection")
+                .expect("group reference"),
+            GroupTargetState::Disable,
+            10,
+            GroupPlanMode::TuiDirect,
+        )
+        .expect("group plan");
+    let approval_context =
+        ControlApprovalContext::new(access.repository_key(), access.workspace_key())
+            .expect("approval context");
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .expect("approval expectation");
+    let approval_key = ApprovalKey::new([0x71; 32]);
+    let now_unix = 2_000_000_000;
+    let receipt = ApprovalIssuer::new(
+        approval_key.clone(),
+        expectation.issuer.clone(),
+        expectation.audience.clone(),
+    )
+    .expect("approval issuer")
+    .issue(ApprovalReceiptClaims {
+        version: 1,
+        receipt_id: "receipt-group-operation-cli".to_string(),
+        nonce: "nonce-group-operation-cli".to_string(),
+        issuer: String::new(),
+        audience: String::new(),
+        operation_id: expectation.operation_id.clone(),
+        operation_kind: expectation.operation_kind.clone(),
+        effect_graph_digest: expectation.effect_graph_digest.clone(),
+        repository_key: expectation.repository_key.clone(),
+        workspace_key: expectation.workspace_key.clone(),
+        session_id: expectation.session_id.clone(),
+        profile_digest: expectation.profile_digest.clone(),
+        resources: expectation.resources.clone(),
+        issued_at_unix: now_unix,
+        expires_at_unix: now_unix + 60,
+    })
+    .expect("approval receipt");
+    let authorization = authorize_control(
+        &app_state_root,
+        &receipt,
+        &ApprovalVerifier::new(approval_key),
+        &expectation,
+        now_unix,
+        OwnerGeneration::new("group-operation-cli-approval", 1).expect("approval owner"),
+    )
+    .expect("group authorization");
+    let applied = controller.apply(&plan, authorization).expect("group apply");
+
+    let shown = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &["operation-show", &applied.operation_id],
+        ),
+        "group operation show",
+    );
+    assert_eq!(shown["status"], "operation");
+    assert_eq!(
+        shown["result"]["operation"]["operationId"],
+        applied.operation_id
+    );
+    let rendered = shown.to_string();
+    for private_field in [
+        "authorizationDecisionDigest",
+        "sealedPlan",
+        "authenticationKeyId",
+        "authenticationTag",
+        "repositoryKey",
+        "workspaceKey",
+    ] {
+        assert!(
+            !rendered.contains(private_field),
+            "operation inspection exposed {private_field}"
+        );
+    }
+    assert!(
+        !rendered.contains(root.to_string_lossy().as_ref()),
+        "operation inspection exposed a private path"
+    );
+
+    let missing = run_group_command(
+        &fixture_root,
+        &project_root,
+        &app_state_root,
+        &["operation-show", "missing-operation"],
+    );
+    assert!(!missing.status.success());
+    let missing: serde_json::Value =
+        serde_json::from_slice(&missing.stdout).expect("missing operation JSON");
+    assert_eq!(missing["status"], "failed");
+    assert_eq!(missing["reason"], "group operation was not found");
+
+    let mismatched = run_group_command(
+        &fixture_root,
+        &other_project_root,
+        &app_state_root,
+        &["operation-show", &applied.operation_id],
+    );
+    assert!(!mismatched.status.success());
+    let mismatched: serde_json::Value =
+        serde_json::from_slice(&mismatched.stdout).expect("context mismatch JSON");
+    assert_eq!(mismatched["status"], "blocked");
+    assert_eq!(
+        mismatched["reason"],
+        "group operation belongs to a different workspace context"
+    );
+    assert!(
+        !mismatched
+            .to_string()
+            .contains(root.to_string_lossy().as_ref()),
+        "context mismatch exposed a private path"
+    );
+}
+
+#[test]
 fn toggle_applies_and_reenables_claude_global_configured_mcp() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
@@ -4478,6 +5198,73 @@ fn restore_reports_missing_backup_id() {
 }
 
 #[test]
+fn mcp_once_rejects_approved_group_apply_mode() {
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["mcp", "--once", "--enable-approved-group-apply"])
+        .output()
+        .expect("mcp startup output");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("MCP stderr is utf8");
+    assert!(stderr.contains(
+        "--once cannot be combined with --enable-approved-group-apply; approved apply requires a persistent MCP session"
+    ));
+}
+
+#[test]
+fn mcp_approved_group_apply_rejects_an_unsafe_fixture_state_root_before_leasing() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let project_root = fixture_copy.path().join("codex").join("project");
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["mcp", "--fixture-root"])
+        .arg(fixture_copy.path())
+        .args(["--project-root"])
+        .arg(project_root)
+        .args(["--app-state-root", "/", "--enable-approved-group-apply"])
+        .output()
+        .expect("mcp startup output");
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let stderr = String::from_utf8(output.stderr).expect("MCP stderr is utf8");
+    assert!(
+        stderr.contains("approved group apply session blocked")
+            && stderr.contains("fixture apply is confined"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn group_approve_accepts_challenge_file_transport_and_bounds_input() {
+    let temp = TempDir::new().expect("temp challenge");
+    let challenge_path = temp.path().join("challenge.txt");
+    fs::write(
+        &challenge_path,
+        vec![b'a'; unpin_core::groups::MAX_GROUP_APPROVAL_CHALLENGE_TEXT_BYTES + 1],
+    )
+    .expect("oversized challenge");
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["group", "approve", "--challenge-file"])
+        .arg(&challenge_path)
+        .output()
+        .expect("group approve output");
+
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout)
+            .expect("group approve stdout")
+            .trim(),
+        "inventory group challenge input is too large"
+    );
+}
+
+#[test]
 fn mcp_once_lists_stable_tool_surface() {
     let app_state = TempDir::new().expect("temp app state");
     let request = "{\"jsonrpc\":\"2.0\",\"id\":7,\"method\":\"tools/list\"}\n";
@@ -4510,6 +5297,9 @@ fn mcp_once_lists_stable_tool_surface() {
         [
             "unpin_get_inventory_summary",
             "unpin_list_items",
+            "unpin_list_inventory_groups",
+            "unpin_get_inventory_group",
+            "unpin_plan_inventory_group",
             "unpin_plan_toggle_item",
             "unpin_apply_toggle_item",
             "unpin_plan_toggle_items",

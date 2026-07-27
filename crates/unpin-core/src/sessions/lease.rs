@@ -23,6 +23,8 @@ const SESSION_AUTHENTICATION_ALGORITHM: &str = "hmac-sha256";
 const BOOTSTRAP_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-bootstrap-v2\0";
 const LEASE_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-lease-v2\0";
 const LAUNCH_CONTROL_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-launch-control-v1\0";
+const INVENTORY_GROUP_AUTHENTICATION_PURPOSE: &[u8] =
+    b"unpin-inventory-group-session-authority-v1\0";
 
 #[derive(Clone)]
 pub struct SessionAuthorityKey([u8; SECRET_BYTES]);
@@ -55,6 +57,16 @@ impl SessionAuthorityKey {
 
     pub fn verify_launch_control(&self, payload: &[u8], tag: &str) -> Result<(), String> {
         self.verify(LAUNCH_CONTROL_AUTHENTICATION_PURPOSE, payload, tag)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn authenticate_inventory_group(&self, payload: &[u8]) -> Result<String, String> {
+        self.authenticate(INVENTORY_GROUP_AUTHENTICATION_PURPOSE, payload)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn verify_inventory_group(&self, payload: &[u8], tag: &str) -> Result<(), String> {
+        self.verify(INVENTORY_GROUP_AUTHENTICATION_PURPOSE, payload, tag)
             .map_err(|error| error.to_string())
     }
 

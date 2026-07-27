@@ -187,6 +187,36 @@ Useful keys:
 Selected-item pane shows dry-run plan before staging. Header shows backup-auth
 readiness, warnings, backup count, and latest action.
 
+The TUI also has a Groups view for personal and repository inventory groups.
+It stages full item identities for definition create/edit, shows `On`, `Off`,
+or `Mixed` aggregate state, and preserves the plan-confirm-apply boundary for a
+whole group. The review includes unresolved or blocked members, provider
+fan-out, connected resource cohorts, and operation evidence; a group never
+silently drops a member to make the plan actionable.
+
+## Inventory groups
+
+Inventory groups combine any individually toggleable item kinds already
+supported by the provider matrix. A member is stored as the explicit
+`provider:layer:kind:category:id` identity, so definitions do not expand when
+new matching inventory appears. Personal and repository scopes can use the
+same name; qualify collisions as `personal:name` or `repository:name`.
+
+Use `unpin group list|show|create|edit|rename|delete|history|restore-definition`
+to manage revisioned definitions and history. Definition changes are plan-first
+and require the exact preview fingerprint. `unpin group plan` produces a
+read-only CLI preview; direct group apply is available through the TUI or the
+externally approved persistent MCP flow.
+
+Repository-owned group JSON is untrusted. If it is malformed, combined CLI,
+TUI, and MCP list surfaces continue to show authenticated personal groups and
+emit a `repository-groups-unavailable` warning; repository-qualified reads and
+writes still fail closed until that document is repaired.
+
+Groups change provider-native enabled state. Profiles remain normalized
+capability allowlists for policy, exposure, and future sessions. Do not use one
+as a substitute for the other in validation.
+
 ## Profiles, sessions, hooks, and optional gateway
 
 Native mode remains default. Profile policy resolves session, workspace/worktree,
@@ -296,9 +326,15 @@ least one supported host and verify:
    `writesEnabled=false`, and `humanApproval=cli-or-tui-required`.
 4. `unpin_list_items` can filter project skills and configured MCP
    servers without changing provider files.
-5. A one-item plan identifies the intended provider, kind, layer, target state,
+5. `unpin_list_inventory_groups`, `unpin_get_inventory_group`, and
+   `unpin_plan_inventory_group` are present, while default MCP omits
+   `unpin_apply_inventory_group`.
+6. A default group plan returns a non-authorizable read-only preview with no
+   challenge or authorizing operation and leaves provider files and Unpin app
+   state unchanged.
+7. A one-item plan identifies the intended provider, kind, layer, target state,
    and exact plan fingerprint.
-6. An apply request returns a structured CLI/TUI human-action handoff rather
+8. An item apply request returns a structured CLI/TUI human-action handoff rather
    than mutating provider state.
 
 Current host registration is documented for Codex, Claude Code, Cursor,
@@ -347,6 +383,9 @@ Each full run covers:
 - same 31 plan/review/handoff cycles through persistent MCP sessions, including
   initialize, initialized notification, tool discovery, rejected unreviewed
   writes, and exact-fingerprint CLI completion of each human-action handoff;
+- one personal inventory group per MCP scenario, including definition
+  create/apply evidence plus read-only list, get, and non-authorizable preview
+  assertions with unchanged provider and app state during group planning;
 - cross-provider fan-out assertions for every skill source visible to multiple
   hosts, proving disable hides all views and enable restores all original views;
 - authenticated manifest v3 backup and audit-event checks;

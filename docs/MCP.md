@@ -11,17 +11,70 @@ UI directly.
 An MCP-connected agent can:
 
 - inspect providers, skills, configured MCP servers, plugins, and backups;
+- list and inspect personal or repository inventory groups;
 - check whether write prerequisites are ready;
-- prepare one-item or bounded bulk plans;
+- prepare one-item, bounded bulk, or inventory-group plans;
 - return the exact plan fingerprint and affected resources for review.
 
-An MCP-connected agent cannot approve its own persistent write. Apply and
-restore tools return a structured human-action handoff. Complete that handoff
-through the Unpin CLI or TUI after reviewing the exact plan. Keep the host
-agent's normal MCP tool approvals enabled as an additional boundary.
+An MCP-connected agent cannot approve its own persistent write, create or edit
+an inventory-group definition, or mint approval. Item, bulk, restore, profile,
+policy, gateway, session, and hook apply tools return a structured human-action
+handoff. Complete that handoff through the Unpin CLI or TUI after reviewing the
+exact plan.
+
+Inventory groups have one narrow opt-in exception. A persistent server started
+with `--enable-approved-group-apply` may apply an exact group operation only
+after the CLI or TUI independently verifies its challenge and issues a
+short-lived, one-time approval artifact. Default MCP and `mcp --once` never
+expose that apply tool. Keep the host agent's normal MCP tool approvals enabled
+as an additional boundary.
 
 MCP tool IDs use the `unpin_` prefix. Their titles, descriptions, and server
 identity use Unpin branding.
+
+### Inventory-group MCP modes
+
+Default persistent MCP and one-request `mcp --once` expose these read-only
+group tools:
+
+- `unpin_list_inventory_groups`
+- `unpin_get_inventory_group`
+- `unpin_plan_inventory_group`
+
+The plan is a non-authorizable `preview`: it contains no challenge and creates
+no authorizing operation. The one-request mode rejects
+`--enable-approved-group-apply`.
+
+For a deliberately privileged persistent connection, start:
+
+```bash
+unpin mcp \
+  --provider all \
+  --project-root "$PROJECT_ROOT" \
+  --enable-approved-group-apply
+```
+
+Use the narrowest provider scope that contains every member of the intended
+group; `all` is needed only for a cross-provider group. This mode adds only
+`unpin_apply_inventory_group`. Its initialization capability reports:
+
+```text
+mutation=human-handoff-only
+conditionalGroupApply=approved-group-apply-v1
+conditionalProviderWritesEnabled=true
+challengeStoreWrites=false
+sessionLeaseWrites=true
+approvalArtifactRequired=true
+canMintApproval=false
+requiresPersistentSession=true
+```
+
+The MCP process creates a private authenticated session lease, but it cannot
+write the challenge store or approval store on the human's behalf. The CLI or
+TUI must approve the exact operation, plan fingerprint, challenge, session,
+workspace, definition revision, and resources. Approval is single-use and
+expires; any definition, inventory, provider-state, or resource drift requires
+a fresh MCP plan and fresh approval.
 
 ## Prerequisites
 
@@ -42,7 +95,8 @@ agent does not depend on a different shell `PATH`.
 
 For read-only MCP use, no Unpin keychain initialization is required. Before
 completing persistent handoffs through the CLI or TUI, initialize the
-purpose-separated keys once:
+purpose-separated keys once. Approved inventory-group apply also requires all
+three keys before the persistent MCP process starts:
 
 ```bash
 unpin auth backup init
@@ -243,9 +297,86 @@ Bulk plans require an explicit maximum item count. Prefer one-item plans while
 learning the workflow.
 
 For copy-ready requests covering one-item changes, bounded project allowlists,
-reusable profiles, session-specific profiles, capability locks, hook trust, and
-restore, use the
+inventory groups, reusable profiles, session-specific profiles, capability
+locks, hook trust, and restore, use the
 [MCP capability-control prompt library](MCP-PROMPTS.md).
+
+## Inventory-group workflow
+
+Groups are explicit collections of full provider inventory identities. They
+operate on provider-native enabled state. Profiles instead contain normalized
+capability IDs and select policy or exposure for future sessions. Creating a
+group does not create a profile, and selecting a profile does not toggle a
+group.
+
+Create, edit, rename, delete, inspect history, or restore a definition through
+`unpin group` or the TUI. MCP exposes no definition-write tool. Personal and
+repository scopes may contain the same name, so use a qualified reference such
+as `personal:brainstorming` or `repository:brainstorming` when a collision is
+possible.
+
+Group inspection reports:
+
+- `On`, `Off`, or `Mixed` aggregate state;
+- every explicit member and provider covered by the definition;
+- unresolved identities, individually blocked members, and context mismatch;
+- connected resource cohorts and shared-source fan-out;
+- current definition revision.
+
+In default MCP mode, list or get the group, then call
+`unpin_plan_inventory_group` with its qualified name, an explicit
+`targetEnabled`, and a bounded `maxMembers`. The result is read-only preview
+evidence and cannot be approved. An unqualified name collision returns
+`status: ambiguous` with a stable error code and safe personal/repository
+qualified candidates.
+
+In approved persistent mode:
+
+1. Call the same plan tool. An actionable result contains the exact operation
+   ID, fingerprint, and opaque challenge.
+2. Review every member outcome, connected cohort, affected resource, provider,
+   activation requirement, and blocked item.
+3. From a separate controlling terminal, run:
+
+   ```bash
+   unpin group approve \
+     --project-root "$PROJECT_ROOT" \
+     OPAQUE_CHALLENGE \
+     --json
+   ```
+
+   For large challenges, avoid process argument limits by writing the opaque
+   value to a file and passing `--challenge-file PATH`. Use
+   `--challenge-file -` to read it from stdin.
+
+4. Type the displayed approval phrase only after matching the complete plan.
+   The CLI returns an opaque `approvalArtifact`; it does not expose signing
+   material. In the TUI, the issued handoff remains visible without applying
+   provider state; press `X` to export the exact operation, fingerprint,
+   challenge, artifact, and expiry as private atomic JSON under the Unpin state
+   root.
+5. Supply the exact operation ID, plan fingerprint, original challenge, and
+   approval artifact to `unpin_apply_inventory_group`. The first accepted call
+   consumes write authority. Repeating that exact fully bound call returns only
+   the current authenticated operation result and never replays provider
+   writes, which makes a lost MCP response recoverable.
+6. Inspect `unpin group operation-show OPERATION_ID --json`, rediscover the
+   group, and retain every backup ID.
+
+Operation inspection includes authenticated `cohortBackupIndexes`. Each
+`coverage` entry maps one original-state rollback backup to the exact
+`resourceIds` and group `memberIdentities` it covers; intermediate child
+backups are not presented as cohort rollback points. `evidenceAvailable` is
+false whenever a referenced authenticated backup manifest can no longer be
+verified; in that case the public operation lifecycle is overlaid as
+`recovery-required` even though the immutable terminal record is retained.
+
+Never use a stale challenge or artifact for a new operation, changed plan, or
+different session. A blocked plan writes nothing.
+Failure before provider writes is terminal and requires a fresh plan. If an
+operation records partial provider or rollback evidence, stop automatic
+retries, preserve its operation and backup records, repair or restore as
+reported, and then start from fresh discovery.
 
 ## Prompt an agent to configure Unpin
 
@@ -283,6 +414,7 @@ Requirements:
 9. Report what changed, how the connection was verified, and how to remove the
    registration.
 
-Remember that Unpin MCP may inspect and plan, but persistent writes require a
-human-action handoff completed through the Unpin CLI or TUI.
+Remember that default Unpin MCP may inspect and plan, but persistent writes
+require a human-action handoff completed through the Unpin CLI or TUI. Do not
+enable approved group apply during initial setup.
 ```

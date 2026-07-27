@@ -273,6 +273,45 @@ impl ControlAuthorization {
     pub const fn nonce_consumption(&self) -> NonceConsumption {
         self.nonce
     }
+
+    pub(crate) fn attenuate_for_inventory_group_child(
+        &self,
+        parent_expectation: &ApprovalExpectation,
+        child_expectation: &ApprovalExpectation,
+        cohort_id: &str,
+        member_plan_fingerprint: &str,
+    ) -> Result<Self, ApprovalError> {
+        self.assert_matches(parent_expectation)?;
+        let mut child_expectation = child_expectation.clone();
+        child_expectation.resources.sort();
+        if child_expectation.repository_key != parent_expectation.repository_key
+            || child_expectation.workspace_key != parent_expectation.workspace_key
+            || child_expectation.session_id != parent_expectation.session_id
+            || cohort_id.is_empty()
+            || cohort_id.len() > 256
+            || member_plan_fingerprint.len() != 64
+            || !crate::is_lower_hex_digest(member_plan_fingerprint)
+        {
+            return Err(ApprovalError::BindingMismatch);
+        }
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "purpose": "inventory-group-child-capability-v1",
+            "parentDecisionDigest": self.decision_digest,
+            "parentExpectation": parent_expectation,
+            "childExpectation": child_expectation,
+            "cohortId": cohort_id,
+            "memberPlanFingerprint": member_plan_fingerprint,
+        }))
+        .map_err(|error| ApprovalError::Serialization(error.to_string()))?;
+        let decision_digest = crate::encode_lower_hex(&Sha256::digest(payload));
+        Ok(Self {
+            operation_id: child_expectation.operation_id.clone(),
+            expectation: child_expectation,
+            decision_digest,
+            nonce: self.nonce,
+        })
+    }
 }
 
 pub fn authorize_control(

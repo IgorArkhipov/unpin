@@ -11,6 +11,7 @@ use unpin_core::{
         ApprovalVerifier, ControlAuthorization, MAX_APPROVAL_LIFETIME_SECONDS, authorize_control,
     },
     fixture::{FixtureCredentialPurpose, fixture_credential_key},
+    groups::GroupTogglePlan,
     state::atomic_json::OwnerGeneration,
 };
 use zeroize::Zeroizing;
@@ -185,8 +186,62 @@ pub(crate) fn issue_human_approval(
     )
 }
 
+pub(crate) fn issue_inventory_group_approval(
+    fixture_mode: bool,
+    app_state_root: &Path,
+    expectation: &ApprovalExpectation,
+    plan: &GroupTogglePlan,
+    now_unix: i64,
+) -> Result<HumanApproval, String> {
+    plan.verify().map_err(|error| error.to_string())?;
+    if plan.plan_fingerprint != expectation.effect_graph_digest {
+        return Err("group plan does not match approval expectation".to_string());
+    }
+    if !fixture_mode {
+        render_inventory_group_review(plan)?;
+    }
+    issue_human_approval(
+        fixture_mode,
+        app_state_root,
+        expectation,
+        &plan.plan_fingerprint,
+        Some(&plan.plan_fingerprint),
+        now_unix,
+    )
+}
+
+#[cfg(unix)]
+fn render_inventory_group_review(plan: &GroupTogglePlan) -> Result<(), String> {
+    let mut tty = OpenOptions::new()
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| {
+            format!("inventory group approval requires a controlling terminal: {error}")
+        })?;
+    writeln!(tty, "Complete inventory group effect under review:")
+        .map_err(|error| error.to_string())?;
+    serde_json::to_writer_pretty(&mut tty, plan).map_err(|error| error.to_string())?;
+    writeln!(tty).map_err(|error| error.to_string())?;
+    tty.flush().map_err(|error| error.to_string())
+}
+
+#[cfg(not(unix))]
+fn render_inventory_group_review(_plan: &GroupTogglePlan) -> Result<(), String> {
+    Err("inventory group approval is unsupported on this platform".to_string())
+}
+
 fn fixture_approval_key(app_state_root: &Path) -> Result<ApprovalKey, String> {
     fixture_credential_key(app_state_root, FixtureCredentialPurpose::Approval).map(ApprovalKey::new)
+}
+
+pub(crate) fn resolve_approval_key(
+    fixture_mode: bool,
+    app_state_root: &Path,
+) -> Result<Option<ApprovalKey>, String> {
+    if fixture_mode {
+        return fixture_approval_key(app_state_root).map(Some);
+    }
+    load_approval_key(&KeychainSecretStore)
 }
 
 trait HumanPresence {

@@ -5,6 +5,8 @@ use std::{
     path::{Component, Path, PathBuf},
     process,
     sync::atomic::{AtomicU64, Ordering},
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -487,6 +489,23 @@ impl StateResourceLock {
         }
         Ok(Self { _inner: inner })
     }
+
+    pub fn acquire_with_timeout(
+        resource_path: impl AsRef<Path>,
+        timeout: Duration,
+    ) -> StateResult<Self> {
+        ensure_private_writes_supported(resource_path.as_ref())?;
+        let physical_path = resolve_physical_path(resource_path.as_ref(), true)?;
+        let inner = ResourceLock::acquire_with_timeout(&physical_path, timeout)?;
+        let locked_path = resolve_physical_path(resource_path.as_ref(), true)?;
+        if physical_resource_id(&locked_path) != physical_resource_id(&physical_path) {
+            return Err(StateError::PhysicalResourceChanged {
+                before: physical_path,
+                after: locked_path,
+            });
+        }
+        Ok(Self { _inner: inner })
+    }
 }
 
 impl ResourceLock {
@@ -507,6 +526,41 @@ impl ResourceLock {
         }
         let file = open_private_lock_file(&lock_path)?;
         file.lock().map_err(|error| io_error(&lock_path, error))?;
+        validate_opened_file(&lock_path, &file)?;
+        Ok(Self { _file: file })
+    }
+
+    fn acquire_with_timeout(resource_path: &Path, timeout: Duration) -> StateResult<Self> {
+        let resource_id = physical_resource_id(resource_path);
+        let lock_path =
+            resource_path.with_file_name(format!(".unpin-resource-{}.lock", resource_id.as_str()));
+        match fs::symlink_metadata(&lock_path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(StateError::SymlinkRejected { path: lock_path });
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(StateError::NotRegularFile { path: lock_path });
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(io_error(&lock_path, error)),
+        }
+        let file = open_private_lock_file(&lock_path)?;
+        let started = Instant::now();
+        loop {
+            match file.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) if started.elapsed() < timeout => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(fs::TryLockError::WouldBlock) => {
+                    return Err(StateError::LockUnavailable { path: lock_path });
+                }
+                Err(fs::TryLockError::Error(error)) => {
+                    return Err(io_error(&lock_path, error));
+                }
+            }
+        }
         validate_opened_file(&lock_path, &file)?;
         Ok(Self { _file: file })
     }
@@ -783,6 +837,9 @@ pub enum StateError {
         current: OwnerGeneration,
         requested: OwnerGeneration,
     },
+    LockUnavailable {
+        path: PathBuf,
+    },
 }
 
 impl fmt::Display for StateError {
@@ -875,6 +932,9 @@ impl fmt::Display for StateError {
             Self::StaleRevision { .. } => formatter.write_str("state revision is stale"),
             Self::StaleOwnerGeneration { .. } => {
                 formatter.write_str("state owner generation is stale")
+            }
+            Self::LockUnavailable { path } => {
+                write!(formatter, "state resource lock is busy: {}", path.display())
             }
         }
     }
