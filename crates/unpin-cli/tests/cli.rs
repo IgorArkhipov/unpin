@@ -876,7 +876,7 @@ fn gateway_install_on_and_status_share_reviewed_scope_plan() {
 
 #[test]
 #[cfg(unix)]
-fn live_profile_apply_without_usable_session_authority_fails_before_mutation() {
+fn detached_live_profile_apply_fails_before_mutation() {
     let temp = TempDir::new().expect("temporary noninteractive approval root");
     let root = fs::canonicalize(temp.path()).expect("canonical approval root");
     let home = root.join("home");
@@ -958,11 +958,12 @@ fn live_profile_apply_without_usable_session_authority_fails_before_mutation() {
         String::from_utf8_lossy(&applied.stdout),
         String::from_utf8_lossy(&applied.stderr)
     );
-    let blocked_for_session_authority = output
+    let blocked_before_mutation = output
         .contains("session authority key missing; run `unpin auth session init`")
         || output.contains("keychain entry could not be opened:")
-        || output.contains("keychain credential could not be read:");
-    assert!(blocked_for_session_authority, "unexpected output: {output}");
+        || output.contains("keychain credential could not be read:")
+        || output.contains("interactive human approval requires a controlling terminal");
+    assert!(blocked_before_mutation, "unexpected output: {output}");
     assert!(
         PolicyStore::new(&state)
             .load(&target)
