@@ -13,6 +13,11 @@ use crate::{
         BackupAuthenticationKey, TogglePlanInput, ToggleResult, ToggleStatus,
         apply_authorized_toggle_transaction, plan_toggle_inner,
     },
+    provider_reach::{
+        ConnectionBoundary, DerivedTargetKind, ProviderCoverageEntry, ProviderReach,
+        ProviderReachCoverage, ProviderReachError, ProviderReachInput, ProviderReachRequest,
+        SelectedProviderAuthority,
+    },
     sessions::SessionAuthorityKey,
     transitions::{
         EffectActivation, EffectAuthority, TransitionContext, TransitionEffect,
@@ -29,6 +34,8 @@ pub struct NativeTogglePlan {
     pub schema_version: u32,
     pub preview: ToggleResult,
     pub transition: TransitionPlan,
+    pub provider_reach: ProviderReach,
+    pub coverage: ProviderReachCoverage,
     pub plan_fingerprint: String,
 }
 
@@ -37,6 +44,8 @@ impl NativeTogglePlan {
         if self.schema_version != NATIVE_TOGGLE_PLAN_SCHEMA_VERSION
             || self.preview.status != ToggleStatus::DryRun
             || self.transition.kind != TransitionKind::NativeToggle
+            || self.preview.provider_reach != Some(self.provider_reach)
+            || self.preview.coverage.as_ref() != Some(&self.coverage)
         {
             return Err(NativeToggleControlError::InvalidPlan);
         }
@@ -99,8 +108,47 @@ impl NativeToggleController {
         item: DiscoveryItem,
         context: &ControlApprovalContext,
     ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let request = ProviderReachRequest::new(
+            ConnectionBoundary::All,
+            ProviderReachInput::Omitted,
+            DerivedTargetKind::Individual,
+        );
+        self.plan_with_reach_request(item, context, request)
+    }
+
+    /// Resolve connection and explicit selected-provider authority before the
+    /// native mutation planner is invoked, then reconcile the exact item
+    /// provider after derivation.
+    pub fn plan_with_reach(
+        &self,
+        item: DiscoveryItem,
+        context: &ControlApprovalContext,
+        boundary: ConnectionBoundary,
+        reach: ProviderReachInput,
+        authority_candidates: Vec<SelectedProviderAuthority>,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let request = ProviderReachRequest {
+            boundary,
+            reach,
+            target_kind: DerivedTargetKind::Individual,
+            authority_candidates,
+        };
+        self.plan_with_reach_request(item, context, request)
+    }
+
+    /// Request-shaped alias for operation adapters that already construct the
+    /// shared two-phase reach request.
+    pub fn plan_with_reach_request(
+        &self,
+        item: DiscoveryItem,
+        context: &ControlApprovalContext,
+        request: ProviderReachRequest,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let resolution = request
+            .validate_before_discovery()?
+            .reconcile_exact_target(Some(item.provider))?;
         let journals = self.planning_journals()?;
-        self.plan_with_journals(item, context, &journals)
+        self.plan_with_resolution_and_journals(item, context, &journals, resolution.reach)
     }
 
     pub(crate) fn planning_journals(
@@ -117,13 +165,37 @@ impl NativeToggleController {
         context: &ControlApprovalContext,
         journals: &[TransitionJournal],
     ) -> Result<NativeTogglePlan, NativeToggleControlError> {
-        let preview = plan_toggle_inner(TogglePlanInput {
+        let request = ProviderReachRequest::new(
+            ConnectionBoundary::All,
+            ProviderReachInput::Omitted,
+            DerivedTargetKind::Individual,
+        );
+        let resolution = request
+            .validate_before_discovery()?
+            .reconcile_exact_target(Some(item.provider))?;
+        self.plan_with_resolution_and_journals(item, context, journals, resolution.reach)
+    }
+
+    fn plan_with_resolution_and_journals(
+        &self,
+        item: DiscoveryItem,
+        context: &ControlApprovalContext,
+        journals: &[TransitionJournal],
+        provider_reach: ProviderReach,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let coverage = ProviderReachCoverage::new(vec![ProviderCoverageEntry::included(
+            item.provider,
+            item.id.clone(),
+        )]);
+        let mut preview = plan_toggle_inner(TogglePlanInput {
             app_state_root: self.app_state_root.clone(),
             item,
             apply: false,
             backup_authentication_key: None,
             session_authority_key: None,
         });
+        preview.provider_reach = Some(provider_reach);
+        preview.coverage = Some(coverage.clone());
         if preview.status != ToggleStatus::DryRun {
             return Err(NativeToggleControlError::Blocked(
                 preview
@@ -138,6 +210,8 @@ impl NativeToggleController {
             plan_fingerprint: toggle_plan_fingerprint(&preview, &transition)?,
             preview,
             transition,
+            provider_reach,
+            coverage,
         };
         plan.verify()?;
         Ok(plan)
@@ -152,7 +226,7 @@ impl NativeToggleController {
     ) -> Result<ToggleResult, NativeToggleControlError> {
         let expectation = reviewed.approval_expectation(context)?;
         authorization.assert_matches(&expectation)?;
-        let result = apply_authorized_toggle_transaction(
+        let mut result = apply_authorized_toggle_transaction(
             TogglePlanInput {
                 app_state_root: self.app_state_root.clone(),
                 item: reviewed.preview.selection.clone(),
@@ -164,6 +238,8 @@ impl NativeToggleController {
             &authorization,
             &reviewed.preview,
         );
+        result.provider_reach = Some(reviewed.provider_reach);
+        result.coverage = Some(reviewed.coverage.clone());
         if matches!(
             result.status,
             ToggleStatus::Applied | ToggleStatus::RecoveryRequired
@@ -280,6 +356,7 @@ pub enum NativeToggleControlError {
     Approval(ApprovalError),
     Journal(JournalError),
     TransitionPlan(TransitionPlanError),
+    ProviderReach(ProviderReachError),
     InvalidPlan,
     ContextMismatch,
     PlanFingerprintMismatch,
@@ -296,6 +373,7 @@ impl NativeToggleControlError {
             Self::Approval(_) => "approval-unavailable",
             Self::Journal(_) => "transition-state-unavailable",
             Self::TransitionPlan(_)
+            | Self::ProviderReach(_)
             | Self::InvalidPlan
             | Self::PlanFingerprintMismatch
             | Self::Serialization(_) => "native-plan-invalid",
@@ -325,12 +403,19 @@ impl From<TransitionPlanError> for NativeToggleControlError {
     }
 }
 
+impl From<ProviderReachError> for NativeToggleControlError {
+    fn from(error: ProviderReachError) -> Self {
+        Self::ProviderReach(error)
+    }
+}
+
 impl fmt::Display for NativeToggleControlError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Approval(error) => error.fmt(formatter),
             Self::Journal(error) => error.fmt(formatter),
             Self::TransitionPlan(error) => error.fmt(formatter),
+            Self::ProviderReach(error) => error.fmt(formatter),
             Self::InvalidPlan => formatter.write_str("native toggle plan is invalid"),
             Self::ContextMismatch => {
                 formatter.write_str("native toggle plan context does not match workspace")

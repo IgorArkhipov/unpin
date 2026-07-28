@@ -28,15 +28,20 @@ use crate::groups::{
 };
 use crate::hooks::HookTrustStore;
 use crate::mutation::{
-    BackupAuthenticationKey, BackupSummary, CONTROL_PLANE_PROTECTED_REASON, NativeToggleController,
-    RestoreController, TogglePlanRequest, ToggleStatus, is_control_plane_protected_disable,
-    load_backup_summaries_authenticated, plan_toggle,
+    BackupAuthenticationKey, BackupSummary, BulkToggleController, BulkTogglePlan,
+    BulkTogglePlanError, BulkTogglePlanStatus, BulkToggleRequest, BulkToggleSelector,
+    CONTROL_PLANE_PROTECTED_REASON, NativeToggleController, RestoreController,
+    is_control_plane_protected_disable, load_backup_summaries_authenticated,
 };
 use crate::profiles::{
     CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, CompiledProfileRevision,
     GatewaySelection, PolicyChange, PolicyStore, PolicyTarget, ProfileDefinition,
     ProfilePolicyController, ProfileReference, ProfileSelection, ProfileSourceScope, ProfileStore,
     capability_lock_enforcement, compile_profile, propose_profile, resolve_effective_gateway,
+};
+use crate::provider_reach::{
+    ConnectionBoundary, DerivedTargetKind, ProviderReachInput, ProviderReachLifecycle,
+    ProviderReachRequest,
 };
 use crate::sessions::{
     GatewayModeAction, GatewayModeController, GatewayModeTarget, GatewayWorkflowController,
@@ -2503,10 +2508,54 @@ fn run_doctor_structured(context: &McpContext) -> Value {
     }
 }
 
+fn individual_reach_inputs(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<
+    (
+        ConnectionBoundary,
+        ProviderReachInput,
+        Vec<crate::provider_reach::SelectedProviderAuthority>,
+    ),
+    String,
+> {
+    let boundary = context
+        .provider_scope
+        .provider()
+        .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
+    let reach = parse_bulk_provider_reach(arguments.get("providerReach"))?;
+    let mut authority_candidates = Vec::new();
+    if let Some(provider) = arguments.get("provider") {
+        let provider = provider
+            .as_str()
+            .ok_or_else(|| "provider must be a string".to_string())
+            .and_then(parse_provider_id)?;
+        authority_candidates.push(crate::provider_reach::SelectedProviderAuthority::new(
+            provider,
+            crate::provider_reach::SelectedProviderProvenance::ExplicitInput,
+        ));
+    }
+    Ok((boundary, reach, authority_candidates))
+}
+
 fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
     let Some(target_enabled) = arguments.get("targetEnabled").and_then(Value::as_bool) else {
         return blocked_value("missing required field: targetEnabled");
     };
+    let (boundary, reach, authority_candidates) = match individual_reach_inputs(context, arguments)
+    {
+        Ok(inputs) => inputs,
+        Err(reason) => return blocked_value(reason),
+    };
+    let reach_request = ProviderReachRequest {
+        boundary,
+        reach,
+        target_kind: DerivedTargetKind::Individual,
+        authority_candidates: authority_candidates.clone(),
+    };
+    if let Err(error) = reach_request.clone().validate_before_discovery() {
+        return blocked_value(error.to_string());
+    }
     let item = match selected_item(context, arguments) {
         Ok(item) => item,
         Err(reason) => return blocked_value(reason),
@@ -2516,10 +2565,25 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
     }
 
     if item.enabled == target_enabled {
+        let resolved = match reach_request
+            .validate_before_discovery()
+            .and_then(|preflight| preflight.reconcile_exact_target(Some(item.provider)))
+        {
+            Ok(resolved) => resolved,
+            Err(error) => return blocked_value(error.to_string()),
+        };
         let mut plan = json!({
             "status": "planned",
-            "selection": item,
+            "selection": item.clone(),
             "targetEnabled": target_enabled,
+            "providerReach": resolved.reach,
+            "coverage": {
+                "entries": [{
+                    "provider": resolved.reach.provider().unwrap_or(item.provider),
+                    "targetId": item.id.clone(),
+                    "included": true
+                }]
+            },
             "applyMode": "re-resolve-on-apply",
             "operations": [],
             "affectedTargets": [],
@@ -2562,11 +2626,16 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         Ok(approval_context) => approval_context,
         Err(error) => return blocked_value(error),
     };
-    let controlled =
-        match NativeToggleController::new(&context.app_state_root).plan(item, &approval_context) {
-            Ok(controlled) => controlled,
-            Err(error) => return blocked_value(error.to_string()),
-        };
+    let controlled = match NativeToggleController::new(&context.app_state_root).plan_with_reach(
+        item,
+        &approval_context,
+        boundary,
+        reach,
+        authority_candidates,
+    ) {
+        Ok(controlled) => controlled,
+        Err(error) => return blocked_value(error.to_string()),
+    };
     let expectation = match controlled.approval_expectation(&approval_context) {
         Ok(expectation) => expectation,
         Err(error) => return blocked_value(error.to_string()),
@@ -2590,6 +2659,10 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
     let mut plan = plan_summary_value(
         serde_json::to_value(&controlled.preview).expect("toggle result serializes"),
     );
+    plan["providerReach"] =
+        serde_json::to_value(controlled.provider_reach).expect("provider reach serializes");
+    plan["coverage"] =
+        serde_json::to_value(&controlled.coverage).expect("provider coverage serializes");
     plan["planFingerprint"] = json!(controlled.plan_fingerprint);
     plan["controlContractVersion"] = json!(UNPIN_CONTROL_CONTRACT_VERSION);
     plan["operation"] =
@@ -2619,15 +2692,25 @@ fn apply_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         Ok(item) => item,
         Err(reason) => return blocked_value(reason),
     };
+    let (boundary, reach, authority_candidates) = match individual_reach_inputs(context, arguments)
+    {
+        Ok(inputs) => inputs,
+        Err(reason) => return blocked_value(reason),
+    };
     let approval_context = match control_approval_context(context) {
         Ok(context) => context,
         Err(error) => return blocked_value(error),
     };
-    let controlled =
-        match NativeToggleController::new(&context.app_state_root).plan(item, &approval_context) {
-            Ok(controlled) => controlled,
-            Err(error) => return blocked_value(error.to_string()),
-        };
+    let controlled = match NativeToggleController::new(&context.app_state_root).plan_with_reach(
+        item,
+        &approval_context,
+        boundary,
+        reach,
+        authority_candidates,
+    ) {
+        Ok(controlled) => controlled,
+        Err(error) => return blocked_value(error.to_string()),
+    };
     if controlled.plan_fingerprint != fingerprint {
         return blocked_value("plan fingerprint does not match current reviewed plan");
     }
@@ -2658,8 +2741,8 @@ fn apply_single_toggle(context: &McpContext, arguments: &Value) -> Value {
 
 fn plan_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
     match build_bulk_plan(context, arguments) {
-        Ok(plan) => plan,
-        Err(reason) => blocked_value(reason),
+        Ok((plan, warnings)) => bulk_plan_value(&plan, warnings),
+        Err(error) => bulk_plan_error_value(error),
     }
 }
 
@@ -2673,13 +2756,11 @@ fn apply_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
         return blocked_value("missing required field: maxItems");
     };
 
-    let current_plan = match build_bulk_plan(context, arguments) {
+    let (current_plan, warnings) = match build_bulk_plan(context, arguments) {
         Ok(plan) => plan,
-        Err(reason) => return blocked_value(reason),
+        Err(error) => return bulk_plan_error_value(error),
     };
-    let current_fingerprint = current_plan["planFingerprint"]
-        .as_str()
-        .expect("bulk plan includes fingerprint");
+    let current_fingerprint = current_plan.plan_fingerprint.as_str();
     if current_fingerprint != provided_fingerprint {
         return json!({
             "status": "blocked",
@@ -2690,177 +2771,306 @@ fn apply_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
         });
     }
 
-    let actionable = current_plan["actionable"]
-        .as_array()
-        .expect("bulk plan includes actionable array");
-    if actionable.len() as u64 > max_items {
+    let actionable_count = current_plan.write_count();
+    if actionable_count as u64 > max_items {
         return json!({
             "status": "blocked",
             "reason": "max-items-exceeded",
             "reasonCode": "max-items-exceeded",
             "message": "The reviewed bulk plan exceeds the requested maxItems guard.",
             "maxItems": max_items,
-            "actionableCount": actionable.len(),
+            "actionableCount": actionable_count,
             "planFingerprint": current_fingerprint
         });
     }
 
-    if actionable.is_empty() {
-        return json!({
-            "status": "no-op",
-            "selector": current_plan["selector"],
-            "targetEnabled": current_plan["targetEnabled"],
-            "applyMode": "fingerprint-required",
-            "planFingerprint": current_fingerprint,
-            "matchedCount": current_plan["matchedCount"],
-            "actionableCount": 0,
-            "blockedCount": current_plan["blockedCount"],
-            "blockedItems": current_plan["blockedItems"],
-            "warnings": current_plan["warnings"]
-        });
+    if current_plan.status == BulkTogglePlanStatus::Blocked || actionable_count == 0 {
+        let mut response = bulk_plan_value(&current_plan, warnings);
+        if current_plan.lifecycle == ProviderReachLifecycle::Partial {
+            response["status"] = json!(ProviderReachLifecycle::Partial.as_str());
+        }
+        return response;
     }
 
     legacy_bulk_human_action_required("toggle-items", current_fingerprint)
 }
 
-fn build_bulk_plan(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+#[derive(Debug)]
+enum BulkBuildError {
+    Message(String),
+    Core(BulkTogglePlanError),
+}
+
+fn build_bulk_plan(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<(BulkTogglePlan, Vec<Value>), BulkBuildError> {
     let target_enabled = arguments
         .get("targetEnabled")
         .and_then(Value::as_bool)
-        .ok_or_else(|| "missing required field: targetEnabled".to_string())?;
-    let selector = arguments.get("selector").unwrap_or(&Value::Null);
-    validate_selector(selector)?;
-    let allow_empty = arguments
-        .get("allowEmptySelection")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let discovery = discover_scoped(context)?;
-    let warnings = discovery.warnings;
-    let matched_items = discovery
-        .items
-        .into_iter()
-        .filter(|item| selector_matches(item, selector))
+        .ok_or_else(|| {
+            BulkBuildError::Message("missing required field: targetEnabled".to_string())
+        })?;
+    let selector_value = arguments
+        .get("selector")
+        .ok_or_else(|| BulkBuildError::Message("selector is required".to_string()))?;
+    validate_selector(selector_value).map_err(BulkBuildError::Message)?;
+    let selector = serde_json::from_value::<BulkToggleSelector>(selector_value.clone())
+        .map_err(|error| BulkBuildError::Message(format!("invalid selector: {error}")))?;
+    let reach = parse_bulk_provider_reach(arguments.get("providerReach"))
+        .map_err(BulkBuildError::Message)?;
+    let allow_empty_selection = match arguments.get("allowEmptySelection") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            BulkBuildError::Message("allowEmptySelection must be a boolean".to_string())
+        })?,
+    };
+    let acknowledge_whole_inventory = match arguments.get("acknowledgeWholeInventory") {
+        None => false,
+        Some(value) => value.as_bool().ok_or_else(|| {
+            BulkBuildError::Message("acknowledgeWholeInventory must be a boolean".to_string())
+        })?,
+    };
+
+    let boundary = match context.provider_scope.provider() {
+        Some(provider) => ConnectionBoundary::Pinned(provider),
+        None => ConnectionBoundary::All,
+    };
+    let request = BulkToggleRequest::new(selector, target_enabled)
+        .with_reach(boundary, reach)
+        .allow_empty_selection(allow_empty_selection)
+        .acknowledge_whole_inventory(acknowledge_whole_inventory);
+    BulkToggleController::validate_before_discovery(&request).map_err(BulkBuildError::Core)?;
+
+    let discovery = discover_scoped(context).map_err(BulkBuildError::Message)?;
+    let warnings = discovery
+        .warnings
+        .iter()
+        .map(|warning| serde_json::to_value(warning).expect("discovery warning serializes"))
         .collect::<Vec<_>>();
+    let plan = BulkToggleController::new(&context.app_state_root)
+        .plan_from_discovery(discovery, request)
+        .map_err(BulkBuildError::Core)?;
+    Ok((plan, warnings))
+}
 
-    let mut actionable = Vec::new();
-    let mut blocked = Vec::new();
-    let mut blocked_items = Vec::new();
-    for item in &matched_items {
-        if is_control_plane_protected_disable(item, target_enabled) {
-            blocked.push(json!({
-                "item": item,
-                "reason": CONTROL_PLANE_PROTECTED_REASON
-            }));
-            blocked_items.push(blocked_item_value(item, CONTROL_PLANE_PROTECTED_REASON));
-            continue;
-        }
-
-        if item.enabled == target_enabled {
-            let reason_code = "already-in-desired-state";
-            blocked.push(json!({
-                "item": item,
-                "reason": reason_code
-            }));
-            blocked_items.push(blocked_item_value(item, reason_code));
-            continue;
-        }
-
-        let plan = plan_toggle(TogglePlanRequest {
-            app_state_root: context.app_state_root.clone(),
-            item: item.clone(),
-        });
-        if plan.status == ToggleStatus::DryRun {
-            actionable.push(plan_summary_value(
-                serde_json::to_value(plan).expect("toggle result serializes"),
-            ));
-        } else {
-            let reason_code = plan.reason.unwrap_or_else(|| "not-actionable".to_string());
-            blocked.push(json!({
-                "item": item,
-                "reason": reason_code
-            }));
-            blocked_items.push(blocked_item_value(item, &reason_code));
-        }
+fn parse_bulk_provider_reach(value: Option<&Value>) -> Result<ProviderReachInput, String> {
+    let Some(value) = value else {
+        return Ok(ProviderReachInput::Omitted);
+    };
+    if let Some(mode) = value.as_str() {
+        return match mode {
+            "all" | "all-providers" => Ok(ProviderReachInput::All),
+            "omitted" => Ok(ProviderReachInput::Omitted),
+            _ => {
+                Err("providerReach must be all, omitted, or a selected provider object".to_string())
+            }
+        };
     }
+    let object = value
+        .as_object()
+        .ok_or_else(|| "providerReach must be a string or object".to_string())?;
+    let mode = object
+        .get("mode")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "providerReach.mode is required".to_string())?;
+    match mode {
+        "all" | "all-providers" => {
+            if object.keys().any(|key| key != "mode") {
+                return Err("providerReach has unsupported fields".to_string());
+            }
+            Ok(ProviderReachInput::All)
+        }
+        "selected" | "selected-provider" => {
+            let provider = object
+                .get("provider")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "providerReach.provider is required".to_string())
+                .and_then(parse_provider_id)?;
+            let provenance = object
+                .get("provenance")
+                .cloned()
+                .map(|value| {
+                    serde_json::from_value(value)
+                        .map_err(|error| format!("invalid providerReach provenance: {error}"))
+                })
+                .transpose()?
+                .unwrap_or(crate::provider_reach::SelectedProviderProvenance::ExplicitInput);
+            if object
+                .keys()
+                .any(|key| !matches!(key.as_str(), "mode" | "provider" | "provenance"))
+            {
+                return Err("providerReach has unsupported fields".to_string());
+            }
+            Ok(ProviderReachInput::selected(provider, provenance))
+        }
+        _ => Err("providerReach.mode must be all or selected".to_string()),
+    }
+}
 
-    let selector = canonical_selector(selector);
-    let matched_items_json = matched_items
+fn bulk_plan_value(plan: &BulkTogglePlan, warnings: Vec<Value>) -> Value {
+    let matched = plan
+        .matched
         .iter()
-        .map(|item| serde_json::to_value(item).expect("discovery item serializes"))
+        .map(|item| serde_json::to_value(item).expect("bulk item serializes"))
         .collect::<Vec<_>>();
-    let mut matched_item_identities = matched_items
+    let mut matched_items = plan
+        .matched_identities()
+        .into_iter()
+        .map(|identity| serde_json::to_value(identity).expect("bulk identity serializes"))
+        .collect::<Vec<_>>();
+    sort_item_identity_values(&mut matched_items);
+
+    let mut per_item_plans = plan
+        .included
         .iter()
-        .map(item_identity_value)
+        .map(|entry| {
+            let mut value = plan_summary_value(
+                serde_json::to_value(&entry.result).expect("toggle result serializes"),
+            );
+            if entry.outcome == crate::provider_reach::IncludedTargetOutcome::NoOp {
+                value["status"] = json!("no-op");
+                value["reason"] = json!("already-in-desired-state");
+                value["reasonCode"] = json!("already-in-desired-state");
+            }
+            value
+        })
         .collect::<Vec<_>>();
-    sort_item_identity_values(&mut matched_item_identities);
+    sort_per_item_plan_values(&mut per_item_plans);
+    let mut actionable = plan
+        .included
+        .iter()
+        .filter(|entry| entry.outcome == crate::provider_reach::IncludedTargetOutcome::Applied)
+        .map(|entry| {
+            plan_summary_value(
+                serde_json::to_value(&entry.result).expect("toggle result serializes"),
+            )
+        })
+        .collect::<Vec<_>>();
+    sort_per_item_plan_values(&mut actionable);
     let mut actionable_items = actionable
         .iter()
         .map(|entry| item_identity_from_value(&entry["selection"]))
         .collect::<Vec<_>>();
     sort_item_identity_values(&mut actionable_items);
+    let mut no_op_plans = per_item_plans
+        .iter()
+        .filter(|entry| entry["status"] == "no-op")
+        .cloned()
+        .collect::<Vec<_>>();
+    sort_per_item_plan_values(&mut no_op_plans);
+    let mut no_op_items = no_op_plans
+        .iter()
+        .map(|entry| item_identity_from_value(&entry["selection"]))
+        .collect::<Vec<_>>();
+    sort_item_identity_values(&mut no_op_items);
+    let per_item_operation_digests = plan
+        .included
+        .iter()
+        .map(|entry| json!({"selection": serde_json::to_value(&entry.item).expect("identity"), "digest": entry.operation_digest}))
+        .collect::<Vec<_>>();
+    let mut blocked = plan
+        .blocked
+        .iter()
+        .map(|entry| {
+            json!({
+                "item": entry.item,
+                "reason": entry.reason_code,
+            })
+        })
+        .collect::<Vec<_>>();
+    sort_blocked_item_values(&mut blocked);
+    let mut blocked_items = plan
+        .blocked
+        .iter()
+        .map(|entry| {
+            json!({
+                "item": entry.item,
+                "reasonCode": entry.reason_code,
+                "message": blocked_reason_message(&entry.reason_code),
+            })
+        })
+        .collect::<Vec<_>>();
     sort_blocked_item_values(&mut blocked_items);
-    let mut per_item_plans = actionable
-        .iter()
-        .map(per_item_plan_value)
-        .collect::<Vec<_>>();
-    sort_per_item_plan_values(&mut per_item_plans);
-    let per_item_operation_digests = per_item_plans
-        .iter()
-        .map(per_item_operation_digest_value)
-        .collect::<Vec<_>>();
-    let fingerprint = bulk_plan_fingerprint(json!({
-        "schemaVersion": 1,
-        "tool": "unpin_plan_toggle_items",
-        "projectRoot": context.project_root.to_string_lossy().into_owned(),
-        "selector": selector.clone(),
-        "targetEnabled": target_enabled,
-        "matchedItems": matched_item_identities.clone(),
-        "actionableItems": actionable_items.clone(),
-        "blockedItems": blocked_fingerprint_values(&blocked_items),
-        "perItemOperationDigests": per_item_operation_digests
-    }));
-    let status = if matched_items.is_empty() {
-        if allow_empty { "no-op" } else { "blocked" }
-    } else if actionable.is_empty() {
-        "blocked"
-    } else {
-        "planned"
+    let status = match plan.status {
+        BulkTogglePlanStatus::Planned => "planned",
+        BulkTogglePlanStatus::NoOp => "no-op",
+        BulkTogglePlanStatus::Blocked => "blocked",
+        BulkTogglePlanStatus::NoTargetsInProviderReach => "no-targets-in-provider-reach",
     };
-
     let mut response = json!({
+        "schemaVersion": plan.schema_version,
         "status": status,
-        "selector": selector,
-        "targetEnabled": target_enabled,
+        "selector": plan.selector,
+        "targetEnabled": plan.target_enabled,
+        "allowEmptySelection": plan.allow_empty_selection,
+        "providerReach": plan.provider_reach,
+        "coverage": plan.provider_coverage,
+        "acknowledgement": plan.acknowledgement,
+        "lifecycle": plan.lifecycle,
         "applyMode": "fingerprint-required",
-        "planFingerprint": fingerprint,
-        "matchedCount": matched_item_identities.len(),
+        "planFingerprint": plan.plan_fingerprint,
+        "matchedCount": matched_items.len(),
+        "includedCount": per_item_plans.len(),
         "actionableCount": actionable_items.len(),
+        "noOpCount": no_op_items.len(),
         "blockedCount": blocked_items.len(),
-        "matchedItems": matched_item_identities,
+        "matchedItems": matched_items,
         "actionableItems": actionable_items,
+        "noOpItems": no_op_items,
         "blockedItems": blocked_items,
         "perItemPlans": per_item_plans,
+        "noOpPlans": no_op_plans,
+        "perItemOperationDigests": per_item_operation_digests,
         "warnings": warnings,
-        "matched": matched_items_json,
+        "matched": matched,
         "actionable": actionable,
-        "blocked": blocked
+        "blocked": blocked,
     });
-    if matched_items.is_empty() && !allow_empty {
+    if matches!(plan.status, BulkTogglePlanStatus::NoOp) && plan.matched.is_empty() {
         response["reason"] = json!("empty-selection");
         response["reasonCode"] = json!("empty-selection");
         response["message"] = json!(blocked_reason_message("empty-selection"));
     }
-
-    Ok(response)
+    response
 }
 
-fn item_identity_value(item: &DiscoveryItem) -> Value {
-    json!({
-        "provider": item.provider.as_str(),
-        "kind": item.kind.as_str(),
-        "id": item.id,
-        "layer": item.layer.as_str()
-    })
+fn bulk_plan_error_value(error: BulkBuildError) -> Value {
+    match error {
+        BulkBuildError::Message(message) => blocked_value(message),
+        BulkBuildError::Core(BulkTogglePlanError::WholeInventoryAcknowledgementRequired(
+            counts,
+        )) => {
+            json!({
+                "status": "blocked",
+                "reason": "whole-inventory-acknowledgement-required",
+                "reasonCode": "whole-inventory-acknowledgement-required",
+                "message": "The selector covers an entire multi-item inventory; acknowledge the complete inventory before planning.",
+                "resolvedCounts": counts,
+                "acknowledgementRequired": true,
+            })
+        }
+        BulkBuildError::Core(error) => {
+            let (reason_code, message) = match &error {
+                BulkTogglePlanError::SelectorRequiresNonProviderCriterion => (
+                    "selector-requires-non-provider-criterion",
+                    error.to_string(),
+                ),
+                BulkTogglePlanError::EmptySelection => ("empty-selection", error.to_string()),
+                BulkTogglePlanError::NoTargetsInProviderReach => {
+                    ("no-targets-in-provider-reach", error.to_string())
+                }
+                _ => ("bulk-plan-invalid", error.to_string()),
+            };
+            json!({
+                "status": "blocked",
+                "reason": reason_code,
+                "reasonCode": reason_code,
+                "message": message,
+                "controlContractVersion": UNPIN_CONTROL_CONTRACT_VERSION,
+            })
+        }
+    }
 }
 
 fn item_identity_from_value(item: &Value) -> Value {
@@ -2869,14 +3079,6 @@ fn item_identity_from_value(item: &Value) -> Value {
         "kind": item["kind"],
         "id": item["id"],
         "layer": item["layer"]
-    })
-}
-
-fn blocked_item_value(item: &DiscoveryItem, reason_code: &str) -> Value {
-    json!({
-        "item": item_identity_value(item),
-        "reasonCode": reason_code,
-        "message": blocked_reason_message(reason_code)
     })
 }
 
@@ -2895,38 +3097,6 @@ fn blocked_reason_message(reason_code: &str) -> String {
         }
         other => format!("Item is blocked: {other}"),
     }
-}
-
-fn per_item_plan_value(plan: &Value) -> Value {
-    let mut value = plan.clone();
-    if let Some(object) = value.as_object_mut()
-        && let Some(selection) = object.get("selection").cloned()
-    {
-        object.insert(
-            "selection".to_string(),
-            item_identity_from_value(&selection),
-        );
-    }
-    value
-}
-
-fn per_item_operation_digest_value(plan: &Value) -> Value {
-    json!({
-        "selection": plan["selection"],
-        "operations": plan["operations"]
-    })
-}
-
-fn blocked_fingerprint_values(blocked_items: &[Value]) -> Vec<Value> {
-    blocked_items
-        .iter()
-        .map(|item| {
-            json!({
-                "item": item["item"],
-                "reasonCode": item["reasonCode"]
-            })
-        })
-        .collect()
 }
 
 fn sort_item_identity_values(items: &mut [Value]) {
@@ -3336,7 +3506,7 @@ fn restore_backup_tool(context: &McpContext, arguments: &Value) -> Value {
 }
 
 fn selected_item(context: &McpContext, arguments: &Value) -> Result<DiscoveryItem, String> {
-    let provider = required_provider(context, arguments)?;
+    let provider = optional_provider(context, arguments)?;
     let kind = required_string(arguments, "kind")?;
     let layer = required_string(arguments, "layer")?;
     let id = required_string(arguments, "id")?;
@@ -3345,7 +3515,7 @@ fn selected_item(context: &McpContext, arguments: &Value) -> Result<DiscoveryIte
         .items
         .into_iter()
         .filter(|item| {
-            item.provider == provider
+            provider.is_none_or(|provider| item.provider == provider)
                 && item.kind.as_str() == kind
                 && item.layer.as_str() == layer
                 && item.id == id
@@ -3618,6 +3788,7 @@ fn selector_array_matches(selector: &Value, field: &str, value: &str) -> bool {
         .is_none_or(|entries| entries.iter().any(|entry| entry.as_str() == Some(value)))
 }
 
+#[allow(dead_code)]
 fn canonical_selector(selector: &Value) -> Value {
     let Some(selector_object) = selector.as_object() else {
         return json!({});
@@ -3882,26 +4053,28 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
         }),
         "unpin_plan_toggle_item" => json!({
             "type": "object",
-            "required": ["provider", "kind", "layer", "id", "targetEnabled"],
+            "required": ["kind", "layer", "id", "targetEnabled"],
             "properties": {
                 "provider": string_enum(&provider_ids),
                 "kind": string_enum(&["skill", "mcp", "plugin", "agent", "hook", "setting"]),
                 "layer": string_enum(&["global", "project"]),
                 "id": non_empty_string_schema(),
                 "targetEnabled": { "type": "boolean" },
+                "providerReach": { "type": ["string", "object"] },
                 "requireConfirmation": { "type": "boolean" },
                 "confirm": { "type": "boolean" }
             }
         }),
         "unpin_apply_toggle_item" => json!({
             "type": "object",
-            "required": ["provider", "kind", "layer", "id", "targetEnabled", "planFingerprint"],
+            "required": ["kind", "layer", "id", "targetEnabled", "planFingerprint"],
             "properties": {
                 "provider": string_enum(&provider_ids),
                 "kind": string_enum(&["skill", "mcp", "plugin", "agent", "hook", "setting"]),
                 "layer": string_enum(&["global", "project"]),
                 "id": non_empty_string_schema(),
                 "targetEnabled": { "type": "boolean" },
+                "providerReach": { "type": ["string", "object"] },
                 "requireConfirmation": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
                 "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
                 "planFingerprint": non_empty_string_schema()
@@ -3917,7 +4090,9 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "confirm": { "type": "boolean" },
                 "planFingerprint": { "type": "string" },
                 "maxItems": { "type": "integer", "minimum": 0 },
-                "allowEmptySelection": { "type": "boolean" }
+                "allowEmptySelection": { "type": "boolean" },
+                "providerReach": { "type": ["string", "object"] },
+                "acknowledgeWholeInventory": { "type": "boolean" }
             }
         }),
         "unpin_apply_toggle_items" => json!({
@@ -3930,7 +4105,9 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "confirm": { "type": "boolean" },
                 "planFingerprint": { "type": "string" },
                 "maxItems": { "type": "integer", "minimum": 0 },
-                "allowEmptySelection": { "type": "boolean" }
+                "allowEmptySelection": { "type": "boolean" },
+                "providerReach": { "type": ["string", "object"] },
+                "acknowledgeWholeInventory": { "type": "boolean" }
             }
         }),
         "unpin_restore_backup" => json!({

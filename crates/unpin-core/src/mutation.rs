@@ -55,6 +55,9 @@ pub(crate) mod group_control;
 mod toggle_control;
 pub use toggle_control::*;
 
+mod bulk_control;
+pub use bulk_control::*;
+
 mod backup_authentication;
 
 pub use backup_authentication::BackupAuthenticationKey;
@@ -140,6 +143,13 @@ pub struct ToggleResult {
     pub backup_id: Option<String>,
     pub reason: Option<String>,
     pub writes: Option<String>,
+    /// Reach-aware projections are additive so legacy mutation callers remain
+    /// source-compatible. Native and bulk controllers always populate these
+    /// fields; older direct mutation helpers leave them absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_reach: Option<crate::provider_reach::ProviderReach>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<crate::provider_reach::ProviderReachCoverage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -702,13 +712,18 @@ fn apply_authorized_toggle_transaction_with_policy(
         }
     }
 
-    let dry_run = plan_toggle_inner(TogglePlanInput {
+    let mut dry_run = plan_toggle_inner(TogglePlanInput {
         app_state_root: input.app_state_root.clone(),
         item: input.item.clone(),
         apply: false,
         backup_authentication_key: None,
         session_authority_key: None,
     });
+    // Reach and coverage are reviewed-plan metadata. Reattach them to the
+    // freshly derived native preview before drift comparison; native mutation
+    // dispatch itself remains provider-specific and unchanged.
+    dry_run.provider_reach = reviewed_preview.provider_reach;
+    dry_run.coverage = reviewed_preview.coverage.clone();
     if dry_run.status != ToggleStatus::DryRun {
         if existing_handle.as_ref().is_some_and(|handle| {
             matches!(
@@ -1176,6 +1191,8 @@ mod checkpoint_recovery_tests {
             backup_id: Some(backup_id),
             reason: None,
             writes: Some("writes were performed".to_string()),
+            provider_reach: None,
+            coverage: None,
         }
     }
 
@@ -1535,6 +1552,8 @@ fn plan_codex_skill_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -2355,6 +2374,8 @@ fn plan_directory_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> Toggle
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -2775,6 +2796,8 @@ fn plan_path_file_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> Toggle
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3133,6 +3156,8 @@ fn plan_claude_plugin_config_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3305,6 +3330,8 @@ fn plan_claude_all_project_mcp_servers_toggle(item: DiscoveryItem) -> ToggleResu
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3504,6 +3531,8 @@ fn plan_claude_configured_mcp_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3775,6 +3804,8 @@ fn plan_codex_toml_table_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3865,6 +3896,8 @@ fn plan_disabled_codex_configured_mcp_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -4371,6 +4404,8 @@ fn plan_json_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem)
             backup_id: None,
             reason: None,
             writes: Some("no writes were performed".to_string()),
+            provider_reach: None,
+            coverage: None,
         };
     }
 
@@ -4411,6 +4446,8 @@ fn plan_json_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem)
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -4492,6 +4529,8 @@ fn plan_disabled_json_configured_mcp_vault_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -4588,6 +4627,8 @@ fn plan_cursor_workspace_configured_mcp_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -5464,6 +5505,8 @@ fn plan_opencode_configured_mcp_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -5685,6 +5728,8 @@ fn plan_pi_package_extension_toggle(app_state_root: PathBuf, item: DiscoveryItem
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -6126,6 +6171,8 @@ fn plan_opencode_plugin_config_toggle(
             backup_id: None,
             reason: None,
             writes: Some("no writes were performed".to_string()),
+            provider_reach: None,
+            coverage: None,
         };
     }
 
@@ -6183,6 +6230,8 @@ fn plan_opencode_plugin_config_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -6605,6 +6654,8 @@ fn plan_zed_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem) 
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -6674,6 +6725,8 @@ fn plan_disabled_zed_configured_mcp_vault_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -7063,6 +7116,8 @@ fn blocked(item: DiscoveryItem, reason: impl Into<String>) -> ToggleResult {
         backup_id: None,
         reason: Some(reason.into()),
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 

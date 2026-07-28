@@ -553,7 +553,7 @@ fn stdio_loop_skips_all_idless_message_responses() {
 }
 
 #[test]
-fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
+fn plans_bulk_toggle_items_with_fingerprint_and_separate_no_op_items() {
     let planned = call_tool(
         &context(),
         "unpin_plan_toggle_items",
@@ -562,7 +562,12 @@ fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
                 "providers": ["claude"],
                 "kinds": ["plugin"]
             },
-            "targetEnabled": false
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            },
+            "acknowledgeWholeInventory": true
         }),
     );
 
@@ -611,7 +616,7 @@ fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
             .as_array()
             .expect("perItemPlans")
             .len(),
-        actionable.len()
+        planned["includedCount"].as_u64().expect("included count") as usize
     );
     assert_eq!(planned["warnings"], json!([]));
     assert!(
@@ -651,18 +656,16 @@ fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
             )
     );
     assert!(
+        planned["noOpItems"]
+            .as_array()
+            .expect("noOpItems")
+            .iter()
+            .any(|entry| entry["id"] == "claude:project:tool:settings-local:local-shell")
+    );
+    assert!(
         planned["blockedItems"]
             .as_array()
-            .expect("blockedItems")
-            .iter()
-            .any(
-                |entry| entry["item"]["id"] == "claude:project:tool:settings-local:local-shell"
-                    && entry["reasonCode"] == "already-in-desired-state"
-                    && entry["message"]
-                        .as_str()
-                        .expect("blocked message")
-                        .contains("already")
-            )
+            .is_some_and(Vec::is_empty)
     );
 }
 
@@ -683,6 +686,100 @@ fn rejects_malformed_bulk_selector_fields() {
     assert_eq!(
         response["reason"],
         "selector.providers must be an array of strings"
+    );
+}
+
+#[test]
+fn bulk_preflight_rejects_missing_reach_and_provider_only_selectors() {
+    let missing_reach = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "ids": ["claude:global:tool:settings:safe-shell"]
+            },
+            "targetEnabled": false
+        }),
+    );
+    assert_eq!(missing_reach["status"], "blocked");
+    assert_eq!(missing_reach["reasonCode"], "bulk-plan-invalid");
+    assert!(
+        missing_reach["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("selected provider"))
+    );
+
+    let provider_only = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "providers": ["claude"]
+            },
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            },
+            "allowEmptySelection": true
+        }),
+    );
+    assert_eq!(provider_only["status"], "blocked");
+    assert_eq!(
+        provider_only["reasonCode"],
+        "selector-requires-non-provider-criterion"
+    );
+
+    let malformed_reach = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "ids": ["claude:global:tool:settings:safe-shell"]
+            },
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude",
+                "unexpected": true
+            }
+        }),
+    );
+    assert_eq!(malformed_reach["status"], "blocked");
+    assert_eq!(
+        malformed_reach["reason"],
+        "providerReach has unsupported fields"
+    );
+}
+
+#[test]
+fn bulk_whole_inventory_acknowledgement_precedes_reach_filtering() {
+    let response = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "kinds": ["skill"]
+            },
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            }
+        }),
+    );
+
+    assert_eq!(response["status"], "blocked");
+    assert_eq!(
+        response["reasonCode"],
+        "whole-inventory-acknowledgement-required"
+    );
+    assert_eq!(response["acknowledgementRequired"], true);
+    assert!(
+        response["resolvedCounts"]
+            .as_array()
+            .is_some_and(|counts| counts.iter().any(|count| count["provider"] != "claude")),
+        "counts come from the complete matched set before selected-provider filtering"
     );
 }
 
@@ -1562,7 +1659,11 @@ fn bulk_apply_requires_fingerprint_and_max_items_but_not_boolean_confirmation() 
             "kinds": ["plugin"],
             "ids": ["claude:global:tool:settings:safe-shell"]
         },
-        "targetEnabled": false
+        "targetEnabled": false,
+        "providerReach": {
+            "mode": "selected",
+            "provider": "claude"
+        }
     });
 
     let unconfirmed = call_tool(&context(), "unpin_apply_toggle_items", selector.clone());
@@ -1626,7 +1727,8 @@ fn bulk_plan_blocks_empty_selection_unless_explicitly_allowed() {
             "selector": {
                 "ids": ["missing-item"]
             },
-            "targetEnabled": false
+            "targetEnabled": false,
+            "providerReach": "all"
         }),
     );
 
@@ -1641,6 +1743,7 @@ fn bulk_plan_blocks_empty_selection_unless_explicitly_allowed() {
                 "ids": ["missing-item"]
             },
             "targetEnabled": false,
+            "providerReach": "all",
             "allowEmptySelection": true
         }),
     );
@@ -1666,6 +1769,7 @@ fn bulk_plan_blocks_empty_selection_unless_explicitly_allowed() {
                 "ids": ["missing-item"]
             },
             "targetEnabled": false,
+            "providerReach": "all",
             "allowEmptySelection": true,
             "requireConfirmation": true,
             "planFingerprint": allowed["planFingerprint"],
@@ -1702,6 +1806,10 @@ fn bulk_apply_blocks_fingerprint_mismatch_without_writes() {
                 "ids": ["claude:global:tool:settings:safe-shell"]
             },
             "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            },
             "requireConfirmation": true,
             "planFingerprint": "sha256:mismatch",
             "maxItems": 1
@@ -1751,7 +1859,11 @@ fn bulk_apply_with_matching_fingerprint_returns_handoff_without_writes() {
             "kinds": ["plugin"],
             "ids": ["claude:global:tool:settings:safe-shell"]
         },
-        "targetEnabled": false
+        "targetEnabled": false,
+        "providerReach": {
+            "mode": "selected",
+            "provider": "claude"
+        }
     });
     let planned = call_tool(&context, "unpin_plan_toggle_items", request.clone());
     let fingerprint = planned["planFingerprint"]
@@ -3085,7 +3197,6 @@ fn plans_project_codex_configured_mcp_native_toggle_over_mcp() {
         &context(),
         "unpin_plan_toggle_item",
         json!({
-            "provider": "codex",
             "kind": "mcp",
             "layer": "project",
             "id": "codex:project:configured-mcp:project-docs",
@@ -3098,12 +3209,53 @@ fn plans_project_codex_configured_mcp_native_toggle_over_mcp() {
     assert_eq!(planned["selection"]["layer"], "project");
     assert_eq!(planned["selection"]["enabled"], false);
     assert_eq!(planned["targetEnabled"], true);
+    assert_eq!(planned["providerReach"]["selected"]["provider"], "codex");
+    assert_eq!(
+        planned["providerReach"]["selected"]["provenance"],
+        "exact-individual-target"
+    );
+    assert_eq!(planned["coverage"]["entries"][0]["provider"], "codex");
+    assert_eq!(planned["coverage"]["entries"][0]["included"], true);
     assert_eq!(planned["operations"][0]["type"], "replaceFile");
     assert!(
         planned["operations"][0]["path"]
             .as_str()
             .expect("config path")
             .ends_with("codex/project/.codex/config.toml")
+    );
+}
+
+#[test]
+fn individual_toggle_rejects_selected_provider_conflict_before_native_planning() {
+    let app_state = TempDir::new().expect("temp app state");
+    let mut context = context();
+    context.app_state_root = app_state.path().to_path_buf();
+    let response = call_tool(
+        &context,
+        "unpin_plan_toggle_item",
+        json!({
+            "kind": "mcp",
+            "layer": "global",
+            "id": "zed:global:configured-mcp:github",
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "codex"
+            }
+        }),
+    );
+
+    assert_eq!(response["status"], "blocked");
+    assert!(
+        response["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("codex")
+                && reason.contains("zed")
+                && reason.contains("exact target"))
+    );
+    assert!(
+        !app_state.path().join("journals").exists(),
+        "provider conflict rejects before native transition planning"
     );
 }
 
@@ -3214,24 +3366,27 @@ fn control_plane_configured_mcp_is_blocked_in_bulk_plan() {
     );
     let context = context_with_roots(fixture_copy.path(), app_state.path());
 
-    let planned = call_tool(
-        &context,
-        "unpin_plan_toggle_items",
-        json!({
-            "selector": {
-                "providers": ["claude"],
-                "categories": ["configured-mcp"],
-                "layers": ["project"],
-                "ids": [
-                    "claude:project:configured-mcp:unpin",
-                    "claude:project:configured-mcp:github"
-                ]
-            },
-            "targetEnabled": false
-        }),
-    );
+    let request = json!({
+        "selector": {
+            "providers": ["claude"],
+            "categories": ["configured-mcp"],
+            "layers": ["project"],
+            "ids": [
+                "claude:project:configured-mcp:unpin",
+                "claude:project:configured-mcp:github"
+            ]
+        },
+        "targetEnabled": false,
+        "providerReach": {
+            "mode": "selected",
+            "provider": "claude"
+        },
+        "acknowledgeWholeInventory": true
+    });
+    let planned = call_tool(&context, "unpin_plan_toggle_items", request.clone());
 
-    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["status"], "blocked");
+    assert_eq!(planned["lifecycle"], "blocked");
     assert_eq!(planned["matchedCount"], 2);
     assert_eq!(planned["actionableCount"], 1);
     assert_eq!(planned["blockedCount"], 1);
@@ -3253,6 +3408,24 @@ fn control_plane_configured_mcp_is_blocked_in_bulk_plan() {
             .as_str()
             .expect("fingerprint")
             .starts_with("sha256:")
+    );
+
+    let mut apply = request.as_object().expect("bulk request object").clone();
+    apply.insert(
+        "planFingerprint".to_string(),
+        planned["planFingerprint"].clone(),
+    );
+    apply.insert("maxItems".to_string(), json!(2));
+    let applied = call_tool(
+        &context,
+        "unpin_apply_toggle_items",
+        serde_json::Value::Object(apply),
+    );
+    assert_eq!(applied["status"], "blocked");
+    assert_eq!(applied["lifecycle"], "blocked");
+    assert_eq!(
+        applied["blockedItems"][0]["reasonCode"],
+        "control-plane-protected"
     );
 }
 

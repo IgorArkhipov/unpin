@@ -21,6 +21,10 @@ use unpin_core::{
         BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
         PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
     },
+    provider_reach::{
+        ConnectionBoundary, DerivedTargetKind, ProviderReach, ProviderReachError,
+        ProviderReachInput, ProviderReachRequest, SelectedProviderProvenance,
+    },
     state::atomic_json::OwnerGeneration,
     transitions::{
         EffectAuthority, EffectCheckpointStatus, TransitionContext, TransitionEffect,
@@ -1177,6 +1181,8 @@ fn exact_native_toggle_retry_verifies_authenticated_live_post_state() {
     let applied = controller
         .apply(&plan, authorization, &context, key.clone())
         .expect("native toggle apply");
+    assert_eq!(applied.provider_reach, Some(plan.provider_reach));
+    assert_eq!(applied.coverage.as_ref(), Some(&plan.coverage));
     let backup_id = applied.backup_id.clone().expect("native toggle backup");
     let committed = TransitionJournalStore::new(&app_state_root)
         .list()
@@ -1199,6 +1205,8 @@ fn exact_native_toggle_retry_verifies_authenticated_live_post_state() {
         .apply(&plan, exact_retry_authorization, &context, key.clone())
         .expect("verified exact native toggle retry");
     assert_eq!(exact_retry.status, ToggleStatus::Applied);
+    assert_eq!(exact_retry.provider_reach, Some(plan.provider_reach));
+    assert_eq!(exact_retry.coverage.as_ref(), Some(&plan.coverage));
     assert_eq!(exact_retry.backup_id.as_deref(), Some(backup_id.as_str()));
 
     let restored = restore_backup(RestoreBackupInput {
@@ -1410,6 +1418,73 @@ fn interrupted_native_toggle_with_provider_drift_requires_recovery() {
     assert_eq!(
         repaired.journal.terminal_code.as_deref(),
         Some("legacy-resume-state-diverged")
+    );
+}
+
+#[test]
+fn native_toggle_omitted_reach_uses_exact_target_provenance() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.provider == ProviderId::Codex && item.mutability == DiscoveryMutability::ReadWrite)
+        .expect("Codex writable item");
+    let controller = NativeToggleController::new(app_state.path());
+    let plan = controller
+        .plan(item, &control_context("test-repository", "test-workspace"))
+        .expect("exact target plan");
+
+    assert_eq!(
+        plan.provider_reach,
+        ProviderReach::selected(
+            ProviderId::Codex,
+            SelectedProviderProvenance::ExactIndividualTarget,
+        )
+    );
+    assert_eq!(plan.preview.provider_reach, Some(plan.provider_reach));
+    assert_eq!(plan.coverage.entries.len(), 1);
+    assert!(plan.coverage.entries[0].included);
+}
+
+#[test]
+fn native_toggle_rejects_selected_provider_conflict_before_native_planning() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "zed:global:configured-mcp:github")
+        .expect("Zed configured MCP item");
+    let request = ProviderReachRequest::new(
+        ConnectionBoundary::All,
+        ProviderReachInput::selected(
+            ProviderId::Codex,
+            SelectedProviderProvenance::ExplicitInput,
+        ),
+        DerivedTargetKind::Individual,
+    );
+    let error = NativeToggleController::new(app_state.path())
+        .plan_with_reach_request(
+            item,
+            &control_context("test-repository", "test-workspace"),
+            request,
+        )
+        .expect_err("selected Codex must reject exact Zed target");
+    assert!(matches!(
+        error,
+        NativeToggleControlError::ProviderReach(ProviderReachError::ExactTargetConflict {
+            selected: ProviderId::Codex,
+            target: ProviderId::Zed,
+        })
+    ));
+    assert!(
+        !app_state.path().join("journals").exists(),
+        "authority conflict must happen before native transition state"
     );
 }
 
