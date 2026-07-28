@@ -486,6 +486,7 @@ fn hook_trust_is_profile_bound_and_visible_as_stored_decision() {
         description: None,
         members: vec![hook_capability_id],
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let compiled = compile_profile(&definition, &catalog, ProfileSourceScope::Global)
         .expect("compile profile");
@@ -894,6 +895,7 @@ fn detached_live_profile_apply_fails_before_mutation() {
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     ProfileStore::new(&state)
         .save_global_definition(
@@ -986,6 +988,7 @@ fn fixture_credentials_cannot_authorize_non_temporary_profile_scope() {
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     ProfileStore::new(&state)
         .save_global_definition(
@@ -1061,6 +1064,7 @@ fn profile_list_and_apply_use_reviewed_next_session_policy_plan() {
         description: Some("Profile surface test".to_string()),
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     ProfileStore::new(&state)
         .save_global_definition(
@@ -1678,7 +1682,8 @@ while [ ! -f "$release" ]; do sleep 0.02; done
                     display_name: format!("Worktree Profile {index}"),
                     description: None,
                     members: Vec::new(),
-                    provider_members: Default::default(),
+        provider_members: Default::default(),
+        supported_providers: Default::default(),
                 },
                 &Catalog::default(),
                 ProfileSourceScope::Workspace,

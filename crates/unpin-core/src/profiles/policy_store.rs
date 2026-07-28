@@ -98,6 +98,19 @@ impl PolicyStore {
         expected: Option<&StateRevision>,
         owner: OwnerGeneration,
     ) -> Result<StateRevision, PolicyStoreError> {
+        self.compare_and_swap_scope_policy(target, policy, expected, owner)
+    }
+
+    /// Atomically replaces one complete scope policy. Provider-target profile
+    /// operations use this boundary once for the entire declared provider set;
+    /// they never commit provider overrides one at a time.
+    pub fn compare_and_swap_scope_policy(
+        &self,
+        target: &PolicyTarget,
+        policy: &ScopePolicy,
+        expected: Option<&StateRevision>,
+        owner: OwnerGeneration,
+    ) -> Result<StateRevision, PolicyStoreError> {
         target.validate()?;
         self.store(target)?
             .compare_and_swap(expected, owner, policy)

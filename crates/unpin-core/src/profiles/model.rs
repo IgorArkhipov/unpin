@@ -30,6 +30,11 @@ pub struct ProfileDefinition {
     pub members: Vec<CapabilityId>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub provider_members: BTreeMap<ProviderId, Vec<CapabilityId>>,
+    /// Providers for which a named compiled profile may materialize an
+    /// explicit provider override. Omitted declarations retain legacy
+    /// behavior and are derived from compiled member views.
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub supported_providers: BTreeSet<ProviderId>,
 }
 
 impl ProfileDefinition {
@@ -113,6 +118,8 @@ pub struct CompiledProfileRevision {
     pub origin: CompiledProfileOrigin,
     pub digest: String,
     pub members: Vec<CompiledProfileMember>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub supported_providers: BTreeSet<ProviderId>,
     pub requires_local_review: bool,
 }
 
@@ -125,6 +132,7 @@ impl CompiledProfileRevision {
             self.description.as_deref(),
             &self.origin,
             &self.members,
+            &self.supported_providers,
             self.requires_local_review,
         )?;
         if actual == self.digest {
@@ -139,9 +147,18 @@ impl CompiledProfileRevision {
 
     #[must_use]
     pub fn supports_provider(&self, provider: ProviderId) -> bool {
-        self.members
-            .iter()
-            .any(|member| member.providers.contains(&provider))
+        if self.supported_providers.is_empty() {
+            self.members
+                .iter()
+                .any(|member| member.providers.contains(&provider))
+        } else {
+            self.supported_providers.contains(&provider)
+        }
+    }
+
+    #[must_use]
+    pub fn supported_providers(&self) -> &BTreeSet<ProviderId> {
+        &self.supported_providers
     }
 
     pub fn members_for_provider(
@@ -286,6 +303,14 @@ pub fn compile_profile(
     let requires_local_review = members
         .iter()
         .any(|member| member.trust_requirements.requires_local_review());
+    let supported_providers = if normalized.supported_providers.is_empty() {
+        resolved_providers
+            .values()
+            .flat_map(|providers| providers.iter().copied())
+            .collect()
+    } else {
+        normalized.supported_providers.clone()
+    };
     let digest = compiled_digest(
         COMPILED_PROFILE_SCHEMA_VERSION,
         &normalized.id,
@@ -293,6 +318,7 @@ pub fn compile_profile(
         normalized.description.as_deref(),
         &origin,
         &members,
+        &supported_providers,
         requires_local_review,
     )?;
 
@@ -304,6 +330,7 @@ pub fn compile_profile(
         origin,
         digest,
         members,
+        supported_providers,
         requires_local_review,
     })
 }
@@ -533,6 +560,8 @@ struct CompiledDigestBody<'a> {
     description: Option<&'a str>,
     origin: &'a CompiledProfileOrigin,
     members: &'a [CompiledProfileMember],
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    supported_providers: &'a BTreeSet<ProviderId>,
     requires_local_review: bool,
 }
 
@@ -543,6 +572,7 @@ fn compiled_digest(
     description: Option<&str>,
     origin: &CompiledProfileOrigin,
     members: &[CompiledProfileMember],
+    supported_providers: &BTreeSet<ProviderId>,
     requires_local_review: bool,
 ) -> Result<String, ProfileValidationError> {
     let body = CompiledDigestBody {
@@ -552,6 +582,7 @@ fn compiled_digest(
         description,
         origin,
         members,
+        supported_providers,
         requires_local_review,
     };
     let bytes =

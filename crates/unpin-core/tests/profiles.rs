@@ -16,13 +16,16 @@ use unpin_core::{
     profiles::{
         ActivationRequirement, CapabilityLockSnapshot, CapabilityLockState, EnforcementKind,
         GatewaySelection, MAX_PROFILE_DEFINITION_BYTES, MemberSelectionKind, PolicyResolutionError,
-        PolicyScope, ProfileDefinition, ProfileDefinitionEntry, ProfileReference,
-        ProfileRevisionSet, ProfileSelection, ProfileSourceScope, ProfileValidationError,
-        ProviderPolicy, ResolutionPolicies, ResolvedGatewayMode, ResolvedProfileSelection,
-        ScopePolicy, capability_lock_enforcement, compile_profile, propose_profile,
+        PolicyScope, ProfileDefinition, ProfileDefinitionEntry, ProfileProviderOperationController,
+        ProfileProviderOperationError, ProfileProviderOperationStatus,
+        ProfileProviderTargetClassification, ProfileReference, ProfileRevisionSet,
+        ProfileSelection, ProfileSourceScope, ProfileValidationError, ProviderPolicy,
+        ResolutionPolicies, ResolvedGatewayMode, ResolvedProfileSelection, ScopePolicy,
+        capability_lock_enforcement, compile_profile, propose_profile,
         resolve_effective_capabilities, resolve_effective_gateway, resolve_effective_policy,
         store::{ProfileStore, ProfileStoreError},
     },
+    provider_reach::{ProviderReach, SelectedProviderProvenance},
     providers::ProviderId,
     state::atomic_json::OwnerGeneration,
 };
@@ -47,6 +50,7 @@ fn profile_entry(
             description: Some(description.to_string()),
             members: Vec::new(),
             provider_members: BTreeMap::new(),
+            supported_providers: BTreeSet::new(),
         },
         revision: None,
     }
@@ -274,6 +278,7 @@ fn definition(profile_id: &str, members: &[&str]) -> ProfileDefinition {
         description: None,
         members: members.iter().map(|value| id(value)).collect(),
         provider_members: BTreeMap::new(),
+        supported_providers: BTreeSet::new(),
     }
 }
 
@@ -286,6 +291,304 @@ fn profile_policy(reference: ProfileReference) -> ScopePolicy {
         profile: ProfileSelection::Profile { reference },
         ..ScopePolicy::default()
     }
+}
+
+fn named_profile_revision() -> unpin_core::profiles::CompiledProfileRevision {
+    let mut definition = definition("named", &["skill.review"]);
+    definition.supported_providers =
+        BTreeSet::from([ProviderId::Claude, ProviderId::Codex, ProviderId::Zed]);
+    compile_profile(&definition, &profile_catalog(), ProfileSourceScope::Global)
+        .expect("named profile revision")
+}
+
+#[test]
+fn selected_provider_profile_materializes_absent_override_without_touching_generic_policy() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    store
+        .save(
+            &target,
+            &ScopePolicy {
+                profile: ProfileSelection::Native,
+                ..ScopePolicy::default()
+            },
+            None,
+            owner(),
+        )
+        .expect("seed generic policy");
+    let revision = named_profile_revision();
+    let controller = ProfileProviderOperationController::new(&state);
+    let plan = controller
+        .plan(
+            &target,
+            &revision,
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
+        )
+        .expect("selected provider plan");
+
+    assert_eq!(plan.targets.len(), 1);
+    assert_eq!(
+        plan.targets[0].classification,
+        ProfileProviderTargetClassification::Create
+    );
+    assert!(plan.targets[0].prior_provider_policy.is_none());
+    let applied = controller
+        .apply(&plan, "profile-provider-test")
+        .expect("apply");
+    assert_eq!(applied.status, ProfileProviderOperationStatus::Applied);
+    let snapshot = store
+        .load(&target)
+        .expect("load policy")
+        .expect("policy snapshot");
+    assert_eq!(snapshot.policy.profile, ProfileSelection::Native);
+    assert!(matches!(
+        snapshot
+            .policy
+            .providers
+            .get(&ProviderId::Codex)
+            .expect("Codex override")
+            .profile,
+        ProfileSelection::Profile { .. }
+    ));
+}
+
+#[test]
+fn existing_inherit_provider_override_is_classified_as_replace() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    store
+        .save(
+            &target,
+            &ScopePolicy {
+                providers: BTreeMap::from([(ProviderId::Codex, ProviderPolicy::default())]),
+                ..ScopePolicy::default()
+            },
+            None,
+            owner(),
+        )
+        .expect("seed inherited provider override");
+    let controller = ProfileProviderOperationController::new(&state);
+    let plan = controller
+        .plan(
+            &target,
+            &named_profile_revision(),
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
+        )
+        .expect("selected provider plan");
+    assert_eq!(
+        plan.targets[0].classification,
+        ProfileProviderTargetClassification::Replace
+    );
+}
+
+#[test]
+fn all_provider_profile_operation_is_one_scope_cas_with_inverse_evidence() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let revision = named_profile_revision();
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    let prior = ScopePolicy {
+        providers: BTreeMap::from([(
+            ProviderId::Claude,
+            ProviderPolicy {
+                profile: ProfileSelection::Native,
+                ..ProviderPolicy::default()
+            },
+        )]),
+        ..ScopePolicy::default()
+    };
+    let seeded = store
+        .save(
+            &target,
+            &prior,
+            None,
+            OwnerGeneration::new("seed", 1).expect("seed owner"),
+        )
+        .expect("seed policy");
+    let controller = ProfileProviderOperationController::new(&state);
+    let plan = controller
+        .plan(&target, &revision, ProviderReach::all())
+        .expect("all-provider plan");
+    assert_eq!(
+        plan.targets
+            .iter()
+            .map(|target| target.provider)
+            .collect::<BTreeSet<_>>(),
+        revision.supported_providers().clone()
+    );
+    assert!(
+        plan.targets
+            .iter()
+            .any(|target| target.classification == ProfileProviderTargetClassification::Replace)
+    );
+    assert!(
+        plan.targets
+            .iter()
+            .any(|target| target.classification == ProfileProviderTargetClassification::Create)
+    );
+    let applied = controller
+        .apply(&plan, "profile-provider-test")
+        .expect("apply");
+    assert_eq!(applied.status, ProfileProviderOperationStatus::Applied);
+    let applied_revision = applied.revision.clone().expect("applied revision");
+    assert_eq!(applied_revision.sequence, seeded.sequence + 1);
+    assert_eq!(applied.inverse_evidence.len(), 3);
+    let current = store
+        .load(&target)
+        .expect("load final policy")
+        .expect("final policy");
+    assert_eq!(current.revision, applied_revision);
+    for provider in revision.supported_providers() {
+        assert!(matches!(
+            current
+                .policy
+                .providers
+                .get(provider)
+                .map(|policy| &policy.profile),
+            Some(ProfileSelection::Profile { .. })
+        ));
+    }
+}
+
+#[test]
+fn provider_profile_operation_blocks_stale_pre_state_before_write() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let revision = named_profile_revision();
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    store
+        .save(
+            &target,
+            &ScopePolicy::default(),
+            None,
+            OwnerGeneration::new("seed", 1).expect("seed owner"),
+        )
+        .expect("seed policy");
+    let controller = ProfileProviderOperationController::new(&state);
+    let plan = controller
+        .plan(&target, &revision, ProviderReach::all())
+        .expect("plan");
+    store
+        .save(
+            &target,
+            &ScopePolicy {
+                gateway: GatewaySelection::Native,
+                ..ScopePolicy::default()
+            },
+            plan.expected_revision.as_ref(),
+            OwnerGeneration::new("other", 2).expect("concurrent owner"),
+        )
+        .expect("mutate stale state");
+    assert!(matches!(
+        controller.apply(&plan, "profile-provider-test"),
+        Err(ProfileProviderOperationError::StalePreState { .. })
+    ));
+}
+
+#[test]
+fn provider_profile_fingerprint_is_stable_for_target_order_and_recovery_is_not_partial() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let revision = named_profile_revision();
+    let controller = ProfileProviderOperationController::new(&state);
+    let first = controller
+        .plan(&target, &revision, ProviderReach::all())
+        .expect("first plan");
+    let second = controller
+        .plan(&target, &revision, ProviderReach::all())
+        .expect("second plan");
+    assert_eq!(first.plan_fingerprint, second.plan_fingerprint);
+    let mut reordered = first.clone();
+    reordered.targets.reverse();
+    reordered.inverse_evidence.reverse();
+    assert!(reordered.verify().is_ok());
+    assert_eq!(reordered.plan_fingerprint, first.plan_fingerprint);
+
+    let mut removed = first.clone();
+    removed.targets.pop();
+    assert!(removed.verify().is_err());
+    let mut added = first.clone();
+    added.targets.push(added.targets[0].clone());
+    assert!(added.verify().is_err());
+    let mut changed = first.clone();
+    changed.targets[0].post_state_fingerprint.push('0');
+    assert!(changed.verify().is_err());
+
+    let result = controller
+        .apply_with_verifier(&first, "profile-provider-test", |_| {
+            Err("injected post-commit verification failure".to_string())
+        })
+        .expect_err("post-commit failure");
+    assert!(matches!(
+        result,
+        ProfileProviderOperationError::RecoveryRequired { .. }
+    ));
+}
+
+#[test]
+fn all_provider_restore_removes_created_and_restores_replaced_overrides_atomically() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let revision = named_profile_revision();
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    let prior = ScopePolicy {
+        profile: ProfileSelection::Native,
+        providers: BTreeMap::from([(
+            ProviderId::Claude,
+            ProviderPolicy {
+                profile: ProfileSelection::Native,
+                ..ProviderPolicy::default()
+            },
+        )]),
+        ..ScopePolicy::default()
+    };
+    let seeded = store
+        .save(
+            &target,
+            &prior,
+            None,
+            OwnerGeneration::new("seed", 1).expect("seed owner"),
+        )
+        .expect("seed policy");
+    let controller = ProfileProviderOperationController::new(&state);
+    let plan = controller
+        .plan(&target, &revision, ProviderReach::all())
+        .expect("all-provider plan");
+    let applied = controller
+        .apply(&plan, "profile-provider-test")
+        .expect("apply all providers");
+    let applied_revision = applied.revision.clone().expect("applied revision");
+    assert_eq!(applied_revision.sequence, seeded.sequence + 1);
+    let restored_revision = controller
+        .restore(&plan, &applied, "profile-provider-restore")
+        .expect("restore all providers");
+    assert_eq!(restored_revision.sequence, applied_revision.sequence + 1);
+
+    let restored = store
+        .load(&target)
+        .expect("load restored policy")
+        .expect("restored policy");
+    assert_eq!(restored.revision, restored_revision);
+    assert_eq!(restored.policy.profile, ProfileSelection::Native);
+    assert_eq!(
+        restored
+            .policy
+            .providers
+            .get(&ProviderId::Claude)
+            .expect("replaced provider")
+            .profile,
+        ProfileSelection::Native
+    );
+    assert!(!restored.policy.providers.contains_key(&ProviderId::Codex));
+    assert!(!restored.policy.providers.contains_key(&ProviderId::Zed));
 }
 
 #[test]

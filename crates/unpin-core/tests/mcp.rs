@@ -418,6 +418,7 @@ fn validates_inline_profile_without_materializing_state() {
         description: None,
         members: vec![capability_id.clone()],
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
 
     let validated = call_tool(
@@ -2025,6 +2026,7 @@ fn profile_proposal_tool_is_read_only_metadata_routing_with_human_handoff() {
         description: Some("review changes for correctness and security".to_string()),
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     fs::write(
         profile_directory.join("review.json"),
@@ -2071,6 +2073,7 @@ fn session_launch_plan_returns_exact_argv_handoff_without_writes_or_authority() 
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let profile_directory = unpin_core::config::get_workspace_profiles_dir(&context.project_root);
     fs::create_dir_all(&profile_directory).expect("workspace profile directory");
@@ -2266,6 +2269,7 @@ fn control_mcp_reuses_profile_gateway_and_hook_models_with_human_handoff() {
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let store = ProfileStore::new(&app_state_root);
     store
@@ -2503,6 +2507,7 @@ fn hook_trust_mcp_hands_off_and_list_hooks_reports_profile_bound_decision() {
         description: None,
         members: vec![capability_id.clone()],
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let revision = compile_profile(&definition, &catalog, ProfileSourceScope::Global)
         .expect("compile hook profile");
