@@ -312,6 +312,7 @@ pub struct ReachAwareRecoveryEvidence {
 pub struct ReachAwarePrincipal {
     pub session_id: String,
     pub connection_scope_id: String,
+    pub connection_boundary: ConnectionBoundary,
     pub authority_key_id: String,
     pub authentication_tag: String,
 }
@@ -320,11 +321,13 @@ impl ReachAwarePrincipal {
     pub fn sign(
         session_id: impl Into<String>,
         connection_scope_id: impl Into<String>,
+        connection_boundary: ConnectionBoundary,
         authority_key: &SessionAuthorityKey,
     ) -> Result<Self, ReachAwareEnvelopeError> {
         let mut principal = Self {
             session_id: session_id.into(),
             connection_scope_id: connection_scope_id.into(),
+            connection_boundary,
             authority_key_id: authority_key.key_id(),
             authentication_tag: String::new(),
         };
@@ -352,6 +355,7 @@ impl ReachAwarePrincipal {
         serde_json::to_vec(&serde_json::json!({
             "sessionId": self.session_id,
             "connectionScopeId": self.connection_scope_id,
+            "connectionBoundary": self.connection_boundary,
             "authorityKeyId": self.authority_key_id,
         }))
         .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))
@@ -364,11 +368,236 @@ pub struct ReachAwareTransferCapability {
     pub capability_id: String,
     pub audience: String,
     pub scope_digest: String,
+    pub operation_id: String,
+    pub connection_boundary: ConnectionBoundary,
+    pub principal_session_id: String,
+    pub principal_scope_id: String,
     pub issued_at_unix: i64,
     pub expires_at_unix: i64,
+    /// Legacy wire state is retained for dual-read compatibility, but durable
+    /// consumption is recorded in the transition journal under CAS.  This
+    /// flag is never used as the source of truth and must remain false.
     pub consumed: bool,
     pub authority_key_id: String,
     pub authentication_tag: String,
+}
+
+impl ReachAwareTransferCapability {
+    #[allow(clippy::too_many_arguments)]
+    pub fn issue(
+        capability_id: impl Into<String>,
+        audience: impl Into<String>,
+        scope_digest: impl Into<String>,
+        operation_id: impl Into<String>,
+        principal: &ReachAwarePrincipal,
+        issued_at_unix: i64,
+        expires_at_unix: i64,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<Self, ReachAwareEnvelopeError> {
+        principal.verify(authority_key)?;
+        let mut capability = Self {
+            capability_id: capability_id.into(),
+            audience: audience.into(),
+            scope_digest: scope_digest.into(),
+            operation_id: operation_id.into(),
+            connection_boundary: principal.connection_boundary,
+            principal_session_id: principal.session_id.clone(),
+            principal_scope_id: principal.connection_scope_id.clone(),
+            issued_at_unix,
+            expires_at_unix,
+            consumed: false,
+            authority_key_id: authority_key.key_id(),
+            authentication_tag: String::new(),
+        };
+        capability.validate_structure()?;
+        capability.authentication_tag = authority_key
+            .authenticate_reach_aware(&capability.signing_payload()?)
+            .map_err(ReachAwareEnvelopeError::Authentication)?;
+        Ok(capability)
+    }
+
+    pub fn validate_for(
+        &self,
+        operation_id: &str,
+        audience: &str,
+        scope_digest: &str,
+        principal: &ReachAwarePrincipal,
+        now_unix: i64,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), ReachAwareEnvelopeError> {
+        principal.verify(authority_key)?;
+        self.validate_structure()?;
+        if self.consumed || now_unix < self.issued_at_unix || now_unix >= self.expires_at_unix {
+            return Err(ReachAwareEnvelopeError::CapabilityUnavailable);
+        }
+        if self.operation_id != operation_id
+            || self.connection_boundary != principal.connection_boundary
+            || self.audience != audience
+            || self.scope_digest != scope_digest
+            || self.principal_session_id != principal.session_id
+            || self.principal_scope_id != principal.connection_scope_id
+        {
+            return Err(ReachAwareEnvelopeError::InvalidCapability);
+        }
+        self.verify_authenticated(authority_key)
+    }
+
+    pub fn verify_authenticated(
+        &self,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), ReachAwareEnvelopeError> {
+        self.validate_structure()?;
+        if self.authority_key_id != authority_key.key_id() {
+            return Err(ReachAwareEnvelopeError::AuthenticationFailed);
+        }
+        if self.authentication_tag.is_empty() {
+            return Err(ReachAwareEnvelopeError::AuthenticationFailed);
+        }
+        authority_key
+            .verify_reach_aware(&self.signing_payload()?, &self.authentication_tag)
+            .map_err(|_| ReachAwareEnvelopeError::AuthenticationFailed)
+    }
+
+    fn validate_structure(&self) -> Result<(), ReachAwareEnvelopeError> {
+        validate_safe_text(&self.capability_id, "capability id")?;
+        validate_safe_text(&self.audience, "capability audience")?;
+        validate_safe_text(&self.scope_digest, "capability scope")?;
+        validate_safe_text(&self.operation_id, "capability operation")?;
+        validate_safe_text(&self.principal_session_id, "capability principal")?;
+        validate_safe_text(&self.principal_scope_id, "capability principal scope")?;
+        if self.expires_at_unix <= self.issued_at_unix || self.authority_key_id.is_empty() {
+            return Err(ReachAwareEnvelopeError::InvalidCapability);
+        }
+        Ok(())
+    }
+
+    fn signing_payload(&self) -> Result<Vec<u8>, ReachAwareEnvelopeError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            ReachAwareEnvelopeError::Serialization("capability is not an object".to_string())
+        })?;
+        object.remove("authenticationTag");
+        serde_json::to_vec(&value)
+            .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareCapabilityConsumption {
+    pub capability_id: String,
+    pub operation_id: String,
+    pub connection_boundary: ConnectionBoundary,
+    pub audience: String,
+    pub scope_digest: String,
+    pub principal_session_id: String,
+    pub principal_scope_id: String,
+    pub consumed_at_unix: i64,
+    pub authority_key_id: String,
+    pub authentication_tag: String,
+}
+
+impl ReachAwareCapabilityConsumption {
+    #[allow(clippy::too_many_arguments)]
+    pub fn record(
+        capability: &ReachAwareTransferCapability,
+        operation_id: &str,
+        audience: &str,
+        scope_digest: &str,
+        principal: &ReachAwarePrincipal,
+        consumed_at_unix: i64,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<Self, ReachAwareEnvelopeError> {
+        capability.validate_for(
+            operation_id,
+            audience,
+            scope_digest,
+            principal,
+            consumed_at_unix,
+            authority_key,
+        )?;
+        let mut receipt = Self {
+            capability_id: capability.capability_id.clone(),
+            operation_id: operation_id.to_string(),
+            connection_boundary: capability.connection_boundary,
+            audience: audience.to_string(),
+            scope_digest: scope_digest.to_string(),
+            principal_session_id: principal.session_id.clone(),
+            principal_scope_id: principal.connection_scope_id.clone(),
+            consumed_at_unix,
+            authority_key_id: authority_key.key_id(),
+            authentication_tag: String::new(),
+        };
+        receipt.validate_structure(capability)?;
+        receipt.authentication_tag = authority_key
+            .authenticate_reach_aware(&receipt.signing_payload()?)
+            .map_err(ReachAwareEnvelopeError::Authentication)?;
+        Ok(receipt)
+    }
+
+    pub fn verify_for(
+        &self,
+        capability: &ReachAwareTransferCapability,
+        principal: &ReachAwarePrincipal,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), ReachAwareEnvelopeError> {
+        principal.verify(authority_key)?;
+        capability.verify_authenticated(authority_key)?;
+        self.validate_structure(capability)?;
+        if self.authority_key_id != authority_key.key_id()
+            || self.authentication_tag.is_empty()
+            || self.principal_session_id != principal.session_id
+            || self.principal_scope_id != principal.connection_scope_id
+        {
+            return Err(ReachAwareEnvelopeError::AuthenticationFailed);
+        }
+        authority_key
+            .verify_reach_aware(&self.signing_payload()?, &self.authentication_tag)
+            .map_err(|_| ReachAwareEnvelopeError::AuthenticationFailed)
+    }
+
+    fn validate_structure(
+        &self,
+        capability: &ReachAwareTransferCapability,
+    ) -> Result<(), ReachAwareEnvelopeError> {
+        validate_safe_text(&self.capability_id, "consumed capability id")?;
+        validate_safe_text(&self.operation_id, "consumed capability operation")?;
+        validate_safe_text(&self.audience, "consumed capability audience")?;
+        validate_safe_text(&self.scope_digest, "consumed capability scope")?;
+        validate_safe_text(&self.principal_session_id, "consumed capability principal")?;
+        validate_safe_text(
+            &self.principal_scope_id,
+            "consumed capability principal scope",
+        )?;
+        if self.capability_id != capability.capability_id
+            || self.operation_id != capability.operation_id
+            || self.connection_boundary != capability.connection_boundary
+            || self.audience != capability.audience
+            || self.scope_digest != capability.scope_digest
+            || self.principal_session_id != capability.principal_session_id
+            || self.principal_scope_id != capability.principal_scope_id
+            || self.consumed_at_unix < capability.issued_at_unix
+            || self.consumed_at_unix >= capability.expires_at_unix
+            || self.authority_key_id.is_empty()
+        {
+            return Err(ReachAwareEnvelopeError::InvalidCapability);
+        }
+        Ok(())
+    }
+
+    fn signing_payload(&self) -> Result<Vec<u8>, ReachAwareEnvelopeError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            ReachAwareEnvelopeError::Serialization(
+                "capability consumption is not an object".to_string(),
+            )
+        })?;
+        object.remove("authenticationTag");
+        serde_json::to_vec(&value)
+            .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -730,7 +959,15 @@ impl ReachAwareControlOperationEnvelope {
         }
         authority_key
             .verify_reach_aware(&self.signing_payload()?, &self.authentication_tag)
-            .map_err(|_| ReachAwareEnvelopeError::AuthenticationFailed)
+            .map_err(|_| ReachAwareEnvelopeError::AuthenticationFailed)?;
+        if let Some(capability) = &self.transfer_capability {
+            capability.verify_authenticated(authority_key)?;
+            if capability.operation_id != self.operation_id || capability.audience != self.audience
+            {
+                return Err(ReachAwareEnvelopeError::InvalidCapability);
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -740,6 +977,9 @@ impl ReachAwareControlOperationEnvelope {
         redacted.prior_state.iter_mut().for_each(|entry| {
             entry.target_id = redact_path(&entry.target_id);
         });
+        if let Some(capability) = redacted.transfer_capability.as_mut() {
+            capability.authentication_tag.clear();
+        }
         redacted.authentication_tag.clear();
         redacted.envelope_fingerprint = redacted.compute_fingerprint().unwrap_or_default();
         redacted
@@ -790,6 +1030,7 @@ impl ReachAwareControlOperationEnvelope {
         self.roots.verify()?;
         if self.principal.session_id.is_empty()
             || self.principal.connection_scope_id.is_empty()
+            || self.principal.connection_boundary != self.connection_boundary
             || self.principal.authority_key_id.is_empty()
             || self.principal.authentication_tag.is_empty()
         {
@@ -830,18 +1071,20 @@ impl ReachAwareControlOperationEnvelope {
         {
             return Err(ReachAwareEnvelopeError::InvalidOperation);
         }
-        if let Some(capability) = &self.transfer_capability {
-            if capability.consumed
+        if let Some(capability) = &self.transfer_capability
+            && (capability.consumed
                 || capability.audience != self.audience
+                || capability.operation_id != self.operation_id
                 || capability.issued_at_unix < self.issued_at_unix
                 || capability.expires_at_unix > self.expires_at_unix
                 || capability.expires_at_unix <= capability.issued_at_unix
                 || capability.scope_digest.is_empty()
+                || capability.principal_session_id.is_empty()
+                || capability.principal_scope_id.is_empty()
                 || capability.authority_key_id.is_empty()
-                || capability.authentication_tag.is_empty()
-            {
-                return Err(ReachAwareEnvelopeError::InvalidCapability);
-            }
+                || capability.authentication_tag.is_empty())
+        {
+            return Err(ReachAwareEnvelopeError::InvalidCapability);
         }
         Ok(())
     }

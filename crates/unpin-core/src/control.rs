@@ -8,17 +8,27 @@ use crate::{
         hook_bridge_descriptor,
     },
     catalog::{CapabilityKind, Catalog},
+    control_operation::{
+        ReachAwareControlOperationEnvelope, ReachAwareEnvelopeError, ReachAwareOperationFamily,
+        ReachAwarePrincipal, ReachAwareRecoveryEvidence, ReachAwareTransferCapability,
+    },
     discovery::DiscoveryOutput,
     profiles::{PolicyStore, ProfileDefinitionEntry, ProfileStore, ResolutionPolicies},
+    provider_reach::{
+        ConnectionBoundary, ProviderReach, ProviderReachCoverage, ProviderReachLifecycle,
+        SelectedProviderAuthority,
+    },
     providers::ProviderId,
     sessions::{
         CoverageLevel, GatewayModeManager, GatewayModeState, GatewayModeTarget, IsolationLevel,
         LeaseLifecycle, LiveExposureStatus, SessionAuthorityKey, SessionManager,
     },
     state::workspace::{WorkspaceIdentity, resolve_workspace_identity},
+    transitions::{JournalEvent, TransitionJournal},
 };
 
 pub const CONTROL_STATUS_SCHEMA_VERSION: u32 = 1;
+pub const REACH_AWARE_STATUS_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -94,6 +104,65 @@ pub struct ControlOperationStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_code: Option<String>,
     pub recovery_required: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_aware: Option<ReachAwareOperationStatus>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareOperationStatus {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub operation_kind: String,
+    pub family: ReachAwareOperationFamily,
+    pub lifecycle: ProviderReachLifecycle,
+    pub expected_lifecycle: ProviderReachLifecycle,
+    pub provider_reach: ProviderReach,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<SelectedProviderAuthority>,
+    pub provider_coverage: ProviderReachCoverage,
+    pub excluded_provider_counts: BTreeMap<ProviderId, usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ReachAwareRecoveryEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_code: Option<String>,
+    pub audit: Vec<JournalEvent>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReachAwareStatusAuthorization {
+    pub principal: ReachAwarePrincipal,
+    pub audience: String,
+    pub capability_scope_digest: String,
+    pub now_unix: i64,
+    pub transfer_capability: Option<ReachAwareTransferCapability>,
+}
+
+impl ReachAwareStatusAuthorization {
+    #[must_use]
+    pub fn new(
+        principal: ReachAwarePrincipal,
+        audience: impl Into<String>,
+        capability_scope_digest: impl Into<String>,
+        now_unix: i64,
+        transfer_capability: Option<ReachAwareTransferCapability>,
+    ) -> Self {
+        Self {
+            principal,
+            audience: audience.into(),
+            capability_scope_digest: capability_scope_digest.into(),
+            now_unix,
+            transfer_capability,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReachAwareStatusFilter {
+    pub operation_id: Option<String>,
+    pub family: Option<ReachAwareOperationFamily>,
+    pub lifecycle: Option<ProviderReachLifecycle>,
+    pub provider: Option<ProviderId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +276,7 @@ pub fn build_control_status(
                     .collect(),
                 terminal_code: journal.terminal_code,
                 recovery_required,
+                reach_aware: None,
             }
         })
         .collect();
@@ -222,6 +292,183 @@ pub fn build_control_status(
         operations,
         hooks: persistent.hooks,
     })
+}
+
+/// Project one reach-aware journal record for an authenticated connection.
+/// The principal is always verified from the signed session record; caller
+/// metadata is not accepted as an authorization input.
+pub fn project_reach_aware_operation_status(
+    journal: &TransitionJournal,
+    authorization: &ReachAwareStatusAuthorization,
+    authority_key: &SessionAuthorityKey,
+) -> Result<ReachAwareOperationStatus, ControlStatusError> {
+    let envelope = journal.reach_aware.as_ref().ok_or_else(|| {
+        ControlStatusError::ReachAwareAuthorization("operation is schema-v1".into())
+    })?;
+    let connection_boundary =
+        authorize_reach_aware_status(journal, envelope, authorization, authority_key)?;
+    let mut entries = Vec::new();
+    let mut excluded_provider_counts = BTreeMap::new();
+    for entry in envelope.provider_coverage.entries() {
+        if connection_boundary.allows(entry.provider) {
+            entries.push(entry.clone());
+        } else {
+            *excluded_provider_counts.entry(entry.provider).or_default() += 1;
+        }
+    }
+    let selected_provider = envelope
+        .selected_provider
+        .filter(|selected| connection_boundary.allows(selected.provider));
+    Ok(ReachAwareOperationStatus {
+        schema_version: REACH_AWARE_STATUS_SCHEMA_VERSION,
+        operation_id: envelope.operation_id.clone(),
+        operation_kind: envelope.operation_kind.clone(),
+        family: envelope.family,
+        lifecycle: envelope.lifecycle,
+        expected_lifecycle: envelope.expected_lifecycle,
+        provider_reach: envelope.provider_reach,
+        selected_provider,
+        provider_coverage: ProviderReachCoverage::new(entries),
+        excluded_provider_counts,
+        recovery: envelope.recovery.clone(),
+        terminal_code: journal.terminal_code.clone(),
+        audit: journal.audit.clone(),
+    })
+}
+
+/// Project authorized reach-aware records with stable operation/family/
+/// lifecycle/provider filters. Authorization and redaction occur before
+/// filtering so raw provider-qualified coverage cannot become a side channel.
+pub fn project_reach_aware_operations(
+    journals: &[TransitionJournal],
+    filter: &ReachAwareStatusFilter,
+    authorization: &ReachAwareStatusAuthorization,
+    authority_key: &SessionAuthorityKey,
+) -> Result<Vec<ReachAwareOperationStatus>, ControlStatusError> {
+    let mut projections = Vec::new();
+    for journal in journals {
+        if journal.reach_aware.is_none() {
+            continue;
+        }
+        let projection =
+            match project_reach_aware_operation_status(journal, authorization, authority_key) {
+                Ok(projection) => projection,
+                Err(ControlStatusError::ReachAwareAuthorization(_)) => continue,
+                Err(error) => return Err(error),
+            };
+        let matches = filter
+            .operation_id
+            .as_deref()
+            .is_none_or(|operation_id| projection.operation_id == operation_id)
+            && filter
+                .family
+                .is_none_or(|family| projection.family == family)
+            && filter
+                .lifecycle
+                .is_none_or(|lifecycle| projection.lifecycle == lifecycle)
+            && filter.provider.is_none_or(|provider| {
+                projection
+                    .provider_coverage
+                    .entries()
+                    .iter()
+                    .any(|entry| entry.provider == provider)
+                    || projection.excluded_provider_counts.contains_key(&provider)
+            });
+        if matches {
+            projections.push(projection);
+        }
+    }
+    projections.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+    Ok(projections)
+}
+
+fn authorize_reach_aware_status(
+    journal: &TransitionJournal,
+    envelope: &ReachAwareControlOperationEnvelope,
+    authorization: &ReachAwareStatusAuthorization,
+    authority_key: &SessionAuthorityKey,
+) -> Result<ConnectionBoundary, ControlStatusError> {
+    envelope
+        .verify_authenticated(authority_key)
+        .map_err(|error| ControlStatusError::ReachAwareRecord(error.to_string()))?;
+    authorization
+        .principal
+        .verify(authority_key)
+        .map_err(ControlStatusError::from)?;
+    if authorization.audience != envelope.audience {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "status audience is not authorized".into(),
+        ));
+    }
+    let connection_boundary = authorization.principal.connection_boundary;
+    if let ConnectionBoundary::Pinned(provider) = connection_boundary
+        && (!envelope.connection_boundary.allows(provider)
+            || envelope
+                .provider_reach
+                .provider()
+                .is_some_and(|selected| selected != provider)
+            || !envelope
+                .provider_coverage
+                .entries()
+                .iter()
+                .any(|entry| entry.provider == provider))
+    {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "status connection boundary is not authorized".into(),
+        ));
+    }
+    if authorization.principal == envelope.principal {
+        return Ok(connection_boundary);
+    }
+    let bound_capability = envelope.transfer_capability.as_ref().ok_or_else(|| {
+        ControlStatusError::ReachAwareAuthorization("transfer capability is unavailable".into())
+    })?;
+    if bound_capability.scope_digest != authorization.capability_scope_digest {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "transfer capability scope is not authorized".into(),
+        ));
+    }
+    if bound_capability.connection_boundary != connection_boundary {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "transfer capability connection boundary is not authorized".into(),
+        ));
+    }
+    if let Some(consumption) = journal
+        .consumed_transfer_capabilities
+        .get(&bound_capability.capability_id)
+    {
+        if consumption.principal_session_id != authorization.principal.session_id
+            || consumption.principal_scope_id != authorization.principal.connection_scope_id
+            || consumption.connection_boundary != connection_boundary
+        {
+            return Err(ControlStatusError::ReachAwareAuthorization(
+                "transferred principal is not authorized".into(),
+            ));
+        }
+        consumption
+            .verify_for(bound_capability, &authorization.principal, authority_key)
+            .map_err(|error| ControlStatusError::ReachAwareRecord(error.to_string()))?;
+        return Ok(connection_boundary);
+    }
+    let capability = authorization.transfer_capability.as_ref().ok_or_else(|| {
+        ControlStatusError::ReachAwareAuthorization("transfer capability is required".into())
+    })?;
+    if bound_capability != capability {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "transfer capability is unavailable".into(),
+        ));
+    }
+    capability
+        .validate_for(
+            &envelope.operation_id,
+            &envelope.audience,
+            &authorization.capability_scope_digest,
+            &authorization.principal,
+            authorization.now_unix,
+            authority_key,
+        )
+        .map_err(ControlStatusError::from)?;
+    Ok(connection_boundary)
 }
 
 pub fn build_persistent_control_metadata(
@@ -339,6 +586,8 @@ pub enum ControlStatusError {
     Session(crate::sessions::LeaseError),
     Journal(crate::transitions::JournalError),
     Bridge(BridgeError),
+    ReachAwareAuthorization(String),
+    ReachAwareRecord(String),
 }
 
 impl From<crate::state::workspace::WorkspaceIdentityError> for ControlStatusError {
@@ -383,6 +632,12 @@ impl From<BridgeError> for ControlStatusError {
     }
 }
 
+impl From<ReachAwareEnvelopeError> for ControlStatusError {
+    fn from(error: ReachAwareEnvelopeError) -> Self {
+        Self::ReachAwareAuthorization(error.to_string())
+    }
+}
+
 impl fmt::Display for ControlStatusError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -393,6 +648,8 @@ impl fmt::Display for ControlStatusError {
             Self::Session(error) => error.fmt(formatter),
             Self::Journal(error) => error.fmt(formatter),
             Self::Bridge(error) => error.fmt(formatter),
+            Self::ReachAwareAuthorization(message) => formatter.write_str(message),
+            Self::ReachAwareRecord(message) => formatter.write_str(message),
         }
     }
 }

@@ -268,6 +268,7 @@ impl NativeToggleController {
     /// The caller must provide trusted provider roots and a principal that was
     /// signed by the verified session authority; the journal fills owner and
     /// revision immediately after its create/attach CAS.
+    #[allow(clippy::too_many_arguments)]
     pub fn apply_with_reach_aware(
         &self,
         reviewed: &NativeTogglePlan,
@@ -301,8 +302,14 @@ impl NativeToggleController {
             )
             .as_bytes(),
         ));
-        let principal = ReachAwarePrincipal::sign(session_id, scope_digest, session_authority_key)
-            .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
+        let connection_boundary = derived_connection_boundary(reviewed.provider_reach);
+        let principal = ReachAwarePrincipal::sign(
+            session_id,
+            scope_digest,
+            connection_boundary,
+            session_authority_key,
+        )
+        .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
         let family = ReachAwareOperationFamily::NativeToggle;
         let provider = reviewed.provider_reach.provider();
         let selected_provider = provider.map(|provider| {
@@ -328,7 +335,7 @@ impl NativeToggleController {
                 profile_digest: reviewed.transition.context.profile_digest.clone(),
             })
             .reach(
-                derived_connection_boundary(reviewed.provider_reach),
+                connection_boundary,
                 reviewed.provider_reach,
                 selected_provider,
                 reviewed.coverage.clone(),
