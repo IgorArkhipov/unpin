@@ -1,4 +1,5 @@
 use std::{
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -790,6 +791,10 @@ fn list_inventory_groups(context: &McpContext, arguments: &Value) -> Result<Valu
     for warning in &mut warnings {
         warning.message = "inventory group scope is unavailable".to_string();
     }
+    let groups = groups
+        .iter()
+        .map(|view| public_group_view_value(view, context.provider_scope.provider()))
+        .collect::<Vec<_>>();
     Ok(json!({
         "status": "ok",
         "groups": groups,
@@ -811,16 +816,17 @@ fn get_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value,
         }
         Err(error) => return Err(public_group_resolve_error(&error)),
     };
+    let public_view = public_group_view_value(&view, context.provider_scope.provider());
     Ok(json!({
         "status": if view.context_compatible { "ok" } else { "context-mismatch" },
-        "group": view,
+        "group": public_view,
     }))
 }
 
 fn plan_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     require_only_fields(
         arguments,
-        &["group", "targetEnabled", "maxMembers"],
+        &["group", "targetEnabled", "maxMembers", "providerReach"],
         "inventory group plan arguments",
     )?;
     let reference =
@@ -847,8 +853,26 @@ fn plan_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value
     } else {
         GroupPlanMode::PreviewOnly
     };
+    let boundary = context
+        .provider_scope
+        .provider()
+        .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
+    let reach = parse_bulk_provider_reach(arguments.get("providerReach"))?;
+    let reach_request = ProviderReachRequest::new(boundary, reach, DerivedTargetKind::Group);
+    // This validation is deliberately before group discovery and provider
+    // planning. An all-provider MCP connection must state its reach explicitly.
+    reach_request
+        .clone()
+        .validate_before_discovery()
+        .map_err(|error| error.to_string())?;
     let planner = GroupPlanner::new(group_resolver(context)?);
-    let plan = match planner.plan(&reference, target, max_members, mode) {
+    let plan = match planner.plan_with_provider_reach_request(
+        &reference,
+        target,
+        max_members,
+        mode,
+        reach_request,
+    ) {
         Ok(plan) => plan,
         Err(GroupPlanError::Resolve(GroupResolveError::Ambiguous { candidates, .. })) => {
             return Ok(ambiguous_group_value(&candidates));
@@ -873,10 +897,11 @@ fn plan_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value
             ),
         ),
     };
+    let public_plan = public_group_plan_value(&plan, context.provider_scope.provider());
     let mut response = json!({
         "status": status,
         "approval": approval,
-        "plan": plan,
+        "plan": public_plan,
         "humanAction": guidance.map(|guidance| json!({
             "code": if actionable { "approve-for-mcp-apply" } else { "approved-group-mode-required" },
             "guidance": guidance,
@@ -1175,27 +1200,212 @@ fn group_apply_response(
             activation.max(resource.activation)
         });
     let providers = plan
-        .definition_view
         .provider_coverage
+        .entries()
         .iter()
-        .copied()
+        .map(|entry| entry.provider)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
     let operation = result
         .control_operation_envelope(expectation, activation, providers)
         .map_err(|_| "inventory group operation result is unavailable".to_string())?;
-    let status = match result.lifecycle {
-        crate::groups::GroupOperationLifecycle::Completed => "applied",
-        crate::groups::GroupOperationLifecycle::Partial
-        | crate::groups::GroupOperationLifecycle::Failed => "blocked",
-        crate::groups::GroupOperationLifecycle::RecoveryRequired => "recovery-required",
-        crate::groups::GroupOperationLifecycle::InProgress => {
-            return Err("inventory group operation result is unavailable".to_string());
+    let status = match result.provider_reach_lifecycle {
+        crate::provider_reach::ProviderReachLifecycle::Applied => match result.lifecycle {
+            crate::groups::GroupOperationLifecycle::Completed => "applied",
+            crate::groups::GroupOperationLifecycle::Partial
+            | crate::groups::GroupOperationLifecycle::Failed => "blocked",
+            crate::groups::GroupOperationLifecycle::RecoveryRequired => "recovery-required",
+            crate::groups::GroupOperationLifecycle::InProgress => {
+                return Err("inventory group operation result is unavailable".to_string());
+            }
+        },
+        crate::provider_reach::ProviderReachLifecycle::Partial => "partial",
+        crate::provider_reach::ProviderReachLifecycle::NoOp => "no-op",
+        crate::provider_reach::ProviderReachLifecycle::NoTargetsInProviderReach => {
+            "no-targets-in-provider-reach"
         }
+        crate::provider_reach::ProviderReachLifecycle::Blocked => "blocked",
+        crate::provider_reach::ProviderReachLifecycle::RecoveryRequired => "recovery-required",
     };
+    let mut operation = serde_json::to_value(operation)
+        .map_err(|_| "inventory group operation result is unavailable".to_string())?;
+    if let Some(allowed) = plan.provider_reach.provider() {
+        if let Some(result_value) = operation
+            .get_mut("details")
+            .and_then(|details| details.get_mut("result"))
+        {
+            *result_value = public_group_result_value(result, Some(allowed));
+        }
+    }
     Ok(json!({
         "status": status,
         "operation": operation,
     }))
+}
+
+fn public_group_plan_value(plan: &GroupTogglePlan, allowed: Option<ProviderId>) -> Value {
+    let mut value = serde_json::to_value(plan).expect("group plan serializes");
+    redact_group_projection(&mut value, allowed);
+    value
+}
+
+fn public_group_result_value(result: &GroupApplyResult, allowed: Option<ProviderId>) -> Value {
+    let mut value = serde_json::to_value(result).expect("group result serializes");
+    redact_group_projection(&mut value, allowed);
+    value
+}
+
+fn public_group_view_value(
+    view: &crate::groups::GroupDefinitionView,
+    allowed: Option<ProviderId>,
+) -> Value {
+    let mut value = serde_json::to_value(view).expect("group view serializes");
+    if let Some(allowed) = allowed {
+        redact_group_view_projection(&mut value, allowed);
+    }
+    value
+}
+
+fn redact_group_projection(value: &mut Value, allowed: Option<ProviderId>) {
+    let Some(allowed) = allowed else {
+        return;
+    };
+    let allowed_value = serde_json::to_value(allowed).expect("provider serializes");
+    for key in ["members", "groupMembers"] {
+        if let Some(members) = value.get_mut(key).and_then(Value::as_array_mut) {
+            members.retain(|member| {
+                member
+                    .get("identity")
+                    .and_then(|identity| identity.get("provider"))
+                    .is_some_and(|provider| provider == &allowed_value)
+            });
+        }
+    }
+    if let Some(definition_view) = value.get_mut("definitionView") {
+        redact_group_view_projection(definition_view, allowed);
+    }
+    let mut excluded_counts = BTreeMap::<String, usize>::new();
+    if let Some(entries) = value
+        .get_mut("providerCoverage")
+        .and_then(|coverage| coverage.get_mut("entries"))
+        .and_then(Value::as_array_mut)
+    {
+        entries.retain(|entry| {
+            let included = entry
+                .get("included")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            if included {
+                return true;
+            }
+            if let Some(provider) = entry.get("provider").and_then(Value::as_str) {
+                *excluded_counts.entry(provider.to_string()).or_default() += 1;
+            }
+            false
+        });
+    }
+    if !excluded_counts.is_empty() {
+        value["reachExclusions"] = json!({
+            "providers": excluded_counts
+                .iter()
+                .map(|(provider, count)| json!({"provider": provider, "count": count}))
+                .collect::<Vec<_>>(),
+            "count": excluded_counts.values().sum::<usize>(),
+            "reason": "out-of-provider-reach",
+        });
+    }
+}
+
+fn redact_group_view_projection(value: &mut Value, allowed: ProviderId) {
+    if value.get("contextCompatible").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let allowed_value = serde_json::to_value(allowed).expect("provider serializes");
+    let mut excluded_counts = BTreeMap::<String, usize>::new();
+    if let Some(members) = value.get_mut("members").and_then(Value::as_array_mut) {
+        members.retain(|member| {
+            let provider = member
+                .get("identity")
+                .and_then(|identity| identity.get("provider"));
+            let retained = provider == Some(&allowed_value);
+            if !retained && let Some(provider) = provider.and_then(Value::as_str) {
+                *excluded_counts.entry(provider.to_string()).or_default() += 1;
+            }
+            retained
+        });
+    }
+    if let Some(providers) = value
+        .get_mut("providerCoverage")
+        .and_then(Value::as_array_mut)
+    {
+        providers.retain(|provider| provider == &allowed_value);
+    }
+
+    let Some(members) = value.get("members").and_then(Value::as_array) else {
+        return;
+    };
+    if members.is_empty() {
+        for field in ["counts", "state", "fresh"] {
+            value
+                .as_object_mut()
+                .expect("group view is an object")
+                .remove(field);
+        }
+    } else {
+        let mut enabled = 0_u64;
+        let mut disabled = 0_u64;
+        let mut blocked = 0_u64;
+        let mut missing = 0_u64;
+        let mut ambiguous = 0_u64;
+        let mut stale = 0_u64;
+        let mut observed = Vec::with_capacity(members.len());
+        for member in members {
+            let state = member.get("enabled").and_then(Value::as_bool);
+            observed.push(state);
+            match state {
+                Some(true) => enabled += 1,
+                Some(false) => disabled += 1,
+                None => match member.get("reason").and_then(Value::as_str) {
+                    Some("missing") => missing += 1,
+                    Some("ambiguous") => ambiguous += 1,
+                    _ => {}
+                },
+            }
+            if state.is_some() && member.get("eligible").and_then(Value::as_bool) == Some(false) {
+                blocked += 1;
+            }
+            if member.get("reason").and_then(Value::as_str) == Some("observation-stale") {
+                stale += 1;
+            }
+        }
+        value["counts"] = json!({
+            "enabled": enabled,
+            "disabled": disabled,
+            "blocked": blocked,
+            "missing": missing,
+            "ambiguous": ambiguous,
+            "stale": stale,
+        });
+        value["state"] = if observed.iter().all(|state| *state == Some(true)) {
+            json!("on")
+        } else if observed.iter().all(|state| *state == Some(false)) {
+            json!("off")
+        } else {
+            json!("mixed")
+        };
+        value["fresh"] = json!(stale == 0);
+    }
+    if !excluded_counts.is_empty() {
+        value["reachExclusions"] = json!({
+            "providers": excluded_counts
+                .iter()
+                .map(|(provider, count)| json!({"provider": provider, "count": count}))
+                .collect::<Vec<_>>(),
+            "count": excluded_counts.values().sum::<usize>(),
+            "reason": "out-of-provider-reach",
+        });
+    }
 }
 
 fn group_resolver(context: &McpContext) -> Result<GroupResolver, String> {
@@ -1241,6 +1451,7 @@ fn ambiguous_group_value(candidates: &[String]) -> Value {
 fn public_group_plan_error(error: &GroupPlanError) -> String {
     match error {
         GroupPlanError::Resolve(error) => public_group_resolve_error(error),
+        GroupPlanError::ProviderReach(error) => error.to_string(),
         GroupPlanError::InvalidMaximum { .. }
         | GroupPlanError::MaximumExceeded { .. }
         | GroupPlanError::ContextMismatch
@@ -4027,11 +4238,26 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
         }),
         "unpin_plan_inventory_group" => json!({
             "type": "object",
-            "required": ["group", "targetEnabled", "maxMembers"],
+            "required": ["group", "targetEnabled", "maxMembers", "providerReach"],
             "properties": {
                 "group": non_empty_string_schema(),
                 "targetEnabled": { "type": "boolean" },
-                "maxMembers": { "type": "integer", "minimum": 1, "maximum": 256 }
+                "maxMembers": { "type": "integer", "minimum": 1, "maximum": 256 },
+                "providerReach": {
+                    "oneOf": [
+                        { "type": "string", "enum": ["all", "all-providers", "omitted"] },
+                        {
+                            "type": "object",
+                            "required": ["mode", "provider"],
+                            "properties": {
+                                "mode": { "type": "string", "enum": ["selected", "selected-provider"] },
+                                "provider": non_empty_string_schema(),
+                                "provenance": { "type": "string" }
+                            },
+                            "additionalProperties": false
+                        }
+                    ]
+                }
             },
             "additionalProperties": false
         }),

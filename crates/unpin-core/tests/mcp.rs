@@ -958,6 +958,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
             "group": "personal:brainstorming",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": "all",
         }),
     );
     assert_eq!(preview["status"], "preview");
@@ -1125,6 +1126,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
                 "group": qualified_name,
                 "targetEnabled": target_enabled,
                 "maxMembers": 10,
+                "providerReach": "all",
             }),
         );
         assert_eq!(result["status"], expected_status);
@@ -1143,6 +1145,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
             "group": "personal:brainstorming",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": "all",
         }),
     );
     assert_eq!(actionable["status"], "actionable");
@@ -1245,6 +1248,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
             "group": "personal:brainstorming",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": "all",
         }),
     );
     let plan: unpin_core::groups::GroupTogglePlan =
@@ -1525,6 +1529,7 @@ fn inventory_group_mcp_ambiguity_returns_structured_qualified_candidates() {
                 "group": "collision",
                 "targetEnabled": false,
                 "maxMembers": 10,
+                "providerReach": "all",
             }),
         ),
     ] {
@@ -1538,7 +1543,7 @@ fn inventory_group_mcp_ambiguity_returns_structured_qualified_candidates() {
 }
 
 #[test]
-fn provider_scoped_mcp_redacts_mixed_provider_groups_and_blocks_planning() {
+fn provider_scoped_mcp_redacts_mixed_provider_groups_and_plans_subset() {
     let temp = TempDir::new().expect("temporary provider-scoped group root");
     let root = fs::canonicalize(temp.path()).expect("canonical provider-scoped group root");
     let fixture_root = root.join("fixtures");
@@ -1589,36 +1594,78 @@ fn provider_scoped_mcp_redacts_mixed_provider_groups_and_blocks_planning() {
         .iter()
         .find(|group| group["qualifiedName"] == "personal:mixed-providers")
         .expect("mixed-provider group");
-    assert_eq!(group["contextCompatible"], false);
-    for redacted_field in ["members", "providerCoverage", "counts", "state", "fresh"] {
-        assert!(
-            group.get(redacted_field).is_none(),
-            "context-mismatch group exposed {redacted_field}"
-        );
-    }
+    assert_eq!(group["contextCompatible"], true);
+    assert_eq!(
+        group["members"].as_array().expect("scoped members").len(),
+        1
+    );
+    assert_eq!(group["members"][0]["identity"]["provider"], json!("codex"));
+    assert_eq!(
+        group["counts"]
+            .as_object()
+            .expect("scoped counts")
+            .values()
+            .map(|count| count.as_u64().expect("count"))
+            .sum::<u64>(),
+        1,
+        "aggregate state must not include excluded-provider members"
+    );
+    assert_eq!(group["providerCoverage"], json!(["codex"]));
 
     let shown = call_tool(
         &context,
         "unpin_get_inventory_group",
         json!({"group": "personal:mixed-providers"}),
     );
-    assert_eq!(shown["status"], "context-mismatch");
-    for redacted_field in ["members", "providerCoverage", "counts", "state", "fresh"] {
-        assert!(
-            shown["group"].get(redacted_field).is_none(),
-            "context-mismatch group exposed {redacted_field}"
-        );
-    }
-    let error = call_tool_error(
+    assert_eq!(shown["status"], "ok");
+    assert_eq!(
+        shown["group"]["members"]
+            .as_array()
+            .expect("scoped members")
+            .len(),
+        1
+    );
+    assert_eq!(
+        shown["group"]["counts"]
+            .as_object()
+            .expect("scoped counts")
+            .values()
+            .map(|count| count.as_u64().expect("count"))
+            .sum::<u64>(),
+        1,
+        "detail state must not include excluded-provider members"
+    );
+    assert_eq!(shown["group"]["providerCoverage"], json!(["codex"]));
+    let plan = call_tool(
         &context,
         "unpin_plan_inventory_group",
         json!({
             "group": "personal:mixed-providers",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "codex"
+            }
         }),
     );
-    assert!(error.contains("context"), "{error}");
+    assert_ne!(plan["status"], "blocked");
+    assert_eq!(
+        plan["plan"]["providerReach"]["selected"]["provider"],
+        "codex"
+    );
+    assert_eq!(
+        plan["plan"]["members"]
+            .as_array()
+            .expect("scoped plan members")
+            .len(),
+        1
+    );
+    let encoded = serde_json::to_string(&plan).expect("scoped plan JSON");
+    assert!(
+        !encoded.contains("claude:"),
+        "excluded identity leaked: {encoded}"
+    );
     assert!(!app_state_root.join("backups").exists());
 }
 

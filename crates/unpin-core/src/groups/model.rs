@@ -382,9 +382,24 @@ impl GroupAccessContext {
 
     #[must_use]
     pub fn admits_member(&self, member: &GroupMemberIdentity) -> bool {
+        self.admits_provider(member) && self.admits_layer(member)
+    }
+
+    /// Whether a member's provider is within the ambient connection scope.
+    ///
+    /// Group planning keeps this separate from layer admission so a pinned
+    /// provider can retain complete persisted membership and classify the
+    /// other providers as reach exclusions instead of redacting the group.
+    #[must_use]
+    pub fn admits_provider(&self, member: &GroupMemberIdentity) -> bool {
         self.provider_scope
             .is_none_or(|provider| provider == member.provider)
-            && self.allowed_layers.contains(&member.layer)
+    }
+
+    /// Whether a member is allowed by the context's layer boundary.
+    #[must_use]
+    pub fn admits_layer(&self, member: &GroupMemberIdentity) -> bool {
+        self.allowed_layers.contains(&member.layer)
     }
 }
 

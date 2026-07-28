@@ -17,13 +17,13 @@ use unpin_core::{
         RestoreStatus, TogglePlanRequest, ToggleResult, ToggleStatus, authenticate_legacy_backup,
         load_backup_summaries_authenticated, plan_toggle as core_plan_toggle, restore_backup,
     },
-    sessions::{
-        BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
-        PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
-    },
     provider_reach::{
         ConnectionBoundary, DerivedTargetKind, ProviderReach, ProviderReachError,
         ProviderReachInput, ProviderReachRequest, SelectedProviderProvenance,
+    },
+    sessions::{
+        BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
+        PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
     },
     state::atomic_json::OwnerGeneration,
     transitions::{
@@ -1430,7 +1430,9 @@ fn native_toggle_omitted_reach_uses_exact_target_provenance() {
         .expect("fixture discovery")
         .items
         .into_iter()
-        .find(|item| item.provider == ProviderId::Codex && item.mutability == DiscoveryMutability::ReadWrite)
+        .find(|item| {
+            item.provider == ProviderId::Codex && item.mutability == DiscoveryMutability::ReadWrite
+        })
         .expect("Codex writable item");
     let controller = NativeToggleController::new(app_state.path());
     let plan = controller
@@ -1462,10 +1464,7 @@ fn native_toggle_rejects_selected_provider_conflict_before_native_planning() {
         .expect("Zed configured MCP item");
     let request = ProviderReachRequest::new(
         ConnectionBoundary::All,
-        ProviderReachInput::selected(
-            ProviderId::Codex,
-            SelectedProviderProvenance::ExplicitInput,
-        ),
+        ProviderReachInput::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
         DerivedTargetKind::Individual,
     );
     let error = NativeToggleController::new(app_state.path())

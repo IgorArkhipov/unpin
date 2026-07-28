@@ -8,6 +8,7 @@ use crate::{
     },
     groups::{GroupMemberIdentity, GroupState, GroupTargetState, GroupTogglePlan},
     mutation::{BackupAuthenticationKey, authenticated_backup_manifest_digest},
+    provider_reach::{ProviderReach, ProviderReachCoverage, ProviderReachLifecycle},
     providers::ProviderId,
     state::atomic_json::{
         AtomicJsonStore, OwnerGeneration, StateError, StateRevision, StateSnapshot,
@@ -23,6 +24,18 @@ const GROUP_CONTROL_DETAILS_SCHEMA_VERSION: u8 = 1;
 const GROUP_OPERATION_AUTHENTICATION_PURPOSE: &[u8] =
     b"unpin-inventory-group-operation-record-v1\0";
 const GROUP_COHORT_INDEX_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-inventory-group-cohort-index-v1\0";
+
+fn default_provider_reach() -> ProviderReach {
+    ProviderReach::All
+}
+
+fn default_provider_coverage() -> ProviderReachCoverage {
+    ProviderReachCoverage::new(Vec::new())
+}
+
+fn default_provider_reach_lifecycle() -> ProviderReachLifecycle {
+    ProviderReachLifecycle::Applied
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -54,6 +67,7 @@ pub enum GroupApplyMemberStatus {
     AlreadyCorrect,
     Blocked,
     Missing,
+    OutOfProviderReach,
     Failed,
 }
 
@@ -86,6 +100,12 @@ pub struct GroupApplyResult {
     pub plan_fingerprint: String,
     pub requested_state: GroupTargetState,
     pub lifecycle: GroupOperationLifecycle,
+    #[serde(default = "default_provider_reach")]
+    pub provider_reach: ProviderReach,
+    #[serde(default = "default_provider_coverage")]
+    pub provider_coverage: ProviderReachCoverage,
+    #[serde(default = "default_provider_reach_lifecycle")]
+    pub provider_reach_lifecycle: ProviderReachLifecycle,
     pub members: Vec<GroupApplyMemberResult>,
     pub backup_ids: Vec<String>,
     pub final_state: GroupState,
@@ -157,6 +177,12 @@ pub struct GroupOperationRecord {
     pub repository_key: String,
     pub workspace_key: String,
     pub sealed_plan: GroupTogglePlan,
+    #[serde(default = "default_provider_reach")]
+    pub provider_reach: ProviderReach,
+    #[serde(default = "default_provider_coverage")]
+    pub provider_coverage: ProviderReachCoverage,
+    #[serde(default = "default_provider_reach_lifecycle")]
+    pub provider_reach_lifecycle: ProviderReachLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_result: Option<GroupApplyResult>,
     pub authentication_key_id: String,
@@ -185,6 +211,9 @@ pub struct GroupOperationPublicRecord {
     pub created_at: String,
     pub updated_at: String,
     pub provider_writes_started: bool,
+    pub provider_reach: ProviderReach,
+    pub provider_coverage: ProviderReachCoverage,
+    pub provider_reach_lifecycle: ProviderReachLifecycle,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_result: Option<GroupApplyResult>,
 }
@@ -202,6 +231,9 @@ impl From<&GroupOperationRecord> for GroupOperationPublicRecord {
             created_at: record.created_at.clone(),
             updated_at: record.updated_at.clone(),
             provider_writes_started: record.provider_writes_started,
+            provider_reach: record.provider_reach,
+            provider_coverage: record.provider_coverage.clone(),
+            provider_reach_lifecycle: record.provider_reach_lifecycle,
             terminal_result: record.terminal_result.clone(),
         }
     }
@@ -235,7 +267,10 @@ impl GroupOperationRecord {
             provider_writes_started: false,
             repository_key,
             workspace_key,
-            sealed_plan,
+            sealed_plan: sealed_plan.clone(),
+            provider_reach: sealed_plan.provider_reach,
+            provider_coverage: sealed_plan.provider_coverage.clone(),
+            provider_reach_lifecycle: sealed_plan.lifecycle,
             terminal_result: None,
             authentication_key_id: String::new(),
             authentication_tag: String::new(),
@@ -261,6 +296,9 @@ impl GroupOperationRecord {
         if !result.lifecycle.is_terminal()
             || result.operation_id != self.operation_id
             || result.plan_fingerprint != self.plan_fingerprint
+            || result.provider_reach != self.provider_reach
+            || result.provider_coverage != self.provider_coverage
+            || result.provider_reach_lifecycle != self.provider_reach_lifecycle
         {
             return Err(GroupOperationError::InvalidRecord);
         }
@@ -662,6 +700,8 @@ fn validate_record(
         || record.authentication_key_id != authentication_key.key_id()
         || record.sealed_plan.operation_id.as_deref() != Some(operation_id)
         || record.sealed_plan.plan_fingerprint != record.plan_fingerprint
+        || record.provider_reach != record.sealed_plan.provider_reach
+        || record.provider_coverage != record.sealed_plan.provider_coverage
         || record.recovery_policy != GroupRecoveryPolicy::NoResumeWrites
         || record.lifecycle.is_terminal() != record.terminal_result.is_some()
         || record.authorization_link.as_ref().is_some_and(|link| {

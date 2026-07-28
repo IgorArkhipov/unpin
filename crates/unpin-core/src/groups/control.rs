@@ -15,12 +15,13 @@ use crate::{
         GroupOperationRecord, GroupOperationStore, GroupPlanDisposition, GroupPlanError,
         GroupPlanMode, GroupPlanner, GroupRef, GroupState, GroupTargetState, GroupTogglePlan,
         acquire_group_definition_lock, index_discovery, index_source_views,
-        shared_source_has_unlisted_view,
+        shared_source_crosses_provider_reach, shared_source_has_unlisted_view,
     },
     mutation::{
         BackupAuthenticationKey, NativeToggleController, ToggleStatus,
         authenticated_backup_manifest_digest, group_control::apply_group_member_toggle,
     },
+    provider_reach::{ProviderReach, ProviderReachLifecycle},
     sessions::SessionAuthorityKey,
     state::atomic_json::{OwnerGeneration, StateError, StateResourceLock, StateSnapshot},
     transitions::{
@@ -47,6 +48,17 @@ struct CohortApplyContext<'a, 'discovery> {
     journals: &'a [TransitionJournal],
 }
 
+struct PreparedCohort {
+    cohort_id: String,
+    members: Vec<PreparedMember>,
+}
+
+struct PreparedMember {
+    member_index: usize,
+    native_plan: crate::mutation::NativeTogglePlan,
+    authorization: ControlAuthorization,
+}
+
 impl GroupController {
     #[must_use]
     pub fn new(
@@ -70,6 +82,32 @@ impl GroupController {
     ) -> Result<GroupTogglePlan, GroupControlError> {
         self.planner
             .plan(reference, target, max_members, mode)
+            .map_err(Into::into)
+    }
+
+    pub fn plan_with_reach(
+        &self,
+        reference: &GroupRef,
+        target: GroupTargetState,
+        max_members: usize,
+        mode: GroupPlanMode,
+        provider_reach: ProviderReach,
+    ) -> Result<GroupTogglePlan, GroupControlError> {
+        self.planner
+            .plan_with_reach(reference, target, max_members, mode, provider_reach)
+            .map_err(Into::into)
+    }
+
+    pub fn plan_with_provider_reach_request(
+        &self,
+        reference: &GroupRef,
+        target: GroupTargetState,
+        max_members: usize,
+        mode: GroupPlanMode,
+        request: crate::provider_reach::ProviderReachRequest,
+    ) -> Result<GroupTogglePlan, GroupControlError> {
+        self.planner
+            .plan_with_provider_reach_request(reference, target, max_members, mode, request)
             .map_err(Into::into)
     }
 
@@ -234,10 +272,6 @@ impl GroupController {
             store.save(&operation, &operation_revision, owner)?;
             return Err(GroupControlError::PlanDrift);
         }
-        drop(definition_lock);
-        operation.mark_provider_writes_started()?;
-        operation_revision = store.save(&operation, &operation_revision, owner.clone())?;
-
         let mut member_results = initial_member_results(reviewed);
         let mut aggregate_backup_ids = BTreeSet::new();
         let execution_inputs =
@@ -263,24 +297,74 @@ impl GroupController {
             .iter()
             .map(|member| member.identity.clone())
             .collect::<BTreeSet<_>>();
-        for cohort in &reviewed.cohorts {
+        let mut prepared_cohorts = Vec::with_capacity(reviewed.cohorts.len());
+        let mut preflight_failed = false;
+        match (&execution_inputs, &discovery_index, &source_views) {
+            (Ok((_, journals)), Some(discovery), Some(source_views)) => {
+                for cohort in &reviewed.cohorts {
+                    match self.prepare_cohort(
+                        cohort,
+                        &CohortApplyContext {
+                            reviewed,
+                            authorization: &authorization,
+                            parent_expectation: &expectation,
+                            approval_context: &approval_context,
+                            discovery,
+                            selected: &selected,
+                            source_views,
+                            journals,
+                        },
+                        &mut member_results,
+                    ) {
+                        Ok(prepared) => prepared_cohorts.push(prepared),
+                        Err(reason) => {
+                            preflight_failed = true;
+                            mark_cohort_preflight_failed(cohort, &mut member_results, &reason);
+                        }
+                    }
+                }
+            }
+            (Err(error), _, _) => {
+                preflight_failed = true;
+                for cohort in &reviewed.cohorts {
+                    mark_cohort_preflight_failed(cohort, &mut member_results, error);
+                }
+            }
+            _ => unreachable!("discovery index exists for successful execution inputs"),
+        }
+
+        if preflight_failed {
+            let result = preflight_blocked_result(reviewed, member_results);
+            operation.provider_reach_lifecycle = result.provider_reach_lifecycle;
+            operation.terminalize(result.clone())?;
+            store.save(&operation, &operation_revision, owner)?;
+            drop(definition_lock);
+            return Ok(result);
+        }
+
+        drop(definition_lock);
+        operation.mark_provider_writes_started()?;
+        operation_revision = store.save(&operation, &operation_revision, owner.clone())?;
+
+        for (cohort, prepared) in reviewed.cohorts.iter().zip(prepared_cohorts) {
             match (&execution_inputs, &discovery_index, &source_views) {
-                (Ok((_, journals)), Some(discovery), Some(source_views)) => self.apply_cohort(
-                    cohort,
-                    &CohortApplyContext {
-                        reviewed,
-                        authorization: &authorization,
-                        parent_expectation: &expectation,
-                        approval_context: &approval_context,
-                        discovery,
-                        selected: &selected,
-                        source_views,
-                        journals,
-                    },
-                    &mut member_results,
-                ),
-                (Err(error), _, _) => mark_cohort_failed(cohort, &mut member_results, error),
-                _ => unreachable!("discovery index exists for successful execution inputs"),
+                (Ok((_, journals)), Some(discovery), Some(source_views)) => self
+                    .apply_prepared_cohort(
+                        cohort,
+                        prepared,
+                        &CohortApplyContext {
+                            reviewed,
+                            authorization: &authorization,
+                            parent_expectation: &expectation,
+                            approval_context: &approval_context,
+                            discovery,
+                            selected: &selected,
+                            source_views,
+                            journals,
+                        },
+                        &mut member_results,
+                    ),
+                _ => unreachable!("prepared cohorts require successful execution inputs"),
             }
             let coverage = cohort_backup_coverage(reviewed, cohort, &member_results);
             normalize_cohort_member_backup_ids(reviewed, cohort, &coverage, &mut member_results);
@@ -337,6 +421,19 @@ impl GroupController {
         }
 
         let lifecycle = roll_up(&member_results);
+        let provider_reach_lifecycle = if member_results.iter().any(|member| {
+            matches!(
+                member.status,
+                GroupApplyMemberStatus::Failed
+                    | GroupApplyMemberStatus::Blocked
+                    | GroupApplyMemberStatus::Missing
+            ) || member.failure_mode
+                == Some(crate::groups::GroupMemberFailureMode::RecoveryRequired)
+        }) {
+            ProviderReachLifecycle::RecoveryRequired
+        } else {
+            reviewed.lifecycle
+        };
         let (final_state, observation_fresh, observation_reason) =
             self.observe_final_state(reviewed);
         let result = GroupApplyResult {
@@ -345,12 +442,16 @@ impl GroupController {
             plan_fingerprint: reviewed.plan_fingerprint.clone(),
             requested_state: reviewed.target,
             lifecycle,
+            provider_reach: reviewed.provider_reach,
+            provider_coverage: reviewed.provider_coverage.clone(),
+            provider_reach_lifecycle,
             members: member_results,
             backup_ids: aggregate_backup_ids.into_iter().collect(),
             final_state,
             observation_fresh,
             observation_reason,
         };
+        operation.provider_reach_lifecycle = result.provider_reach_lifecycle;
         operation.terminalize(result.clone())?;
         store.save(&operation, &operation_revision, owner)?;
         Ok(result)
@@ -472,18 +573,19 @@ impl GroupController {
         Ok(result)
     }
 
-    fn apply_cohort(
+    fn prepare_cohort(
         &self,
         cohort: &GroupExecutionCohort,
         context: &CohortApplyContext<'_, '_>,
         member_results: &mut [GroupApplyMemberResult],
-    ) {
+    ) -> Result<PreparedCohort, String> {
         let mut prepared = Vec::with_capacity(cohort.member_indices.len());
         for member_index in &cohort.member_indices {
             let planned = &context.reviewed.members[*member_index];
             let native_plan = match self.fresh_native_plan(
                 &planned.identity,
                 context.reviewed.target,
+                context.reviewed.provider_reach,
                 context.discovery,
                 context.selected,
                 context.source_views,
@@ -495,10 +597,7 @@ impl GroupController {
                     member_results[*member_index].reason = None;
                     continue;
                 }
-                Err(reason) => {
-                    mark_cohort_preflight_failed(cohort, member_results, &reason);
-                    return;
-                }
+                Err(reason) => return Err(reason),
             };
             let authorization = match self.child_authorization(
                 planned,
@@ -509,16 +608,33 @@ impl GroupController {
                 context.approval_context,
             ) {
                 Ok(authorization) => authorization,
-                Err(reason) => {
-                    mark_cohort_preflight_failed(cohort, member_results, &reason);
-                    return;
-                }
+                Err(reason) => return Err(reason),
             };
-            prepared.push((*member_index, native_plan, authorization));
+            prepared.push(PreparedMember {
+                member_index: *member_index,
+                native_plan,
+                authorization,
+            });
         }
+        Ok(PreparedCohort {
+            cohort_id: cohort.cohort_id.clone(),
+            members: prepared,
+        })
+    }
 
+    fn apply_prepared_cohort(
+        &self,
+        cohort: &GroupExecutionCohort,
+        prepared: PreparedCohort,
+        context: &CohortApplyContext<'_, '_>,
+        member_results: &mut [GroupApplyMemberResult],
+    ) {
         let mut provider_write_succeeded = false;
-        for (member_index, native_plan, authorization) in prepared {
+        debug_assert_eq!(prepared.cohort_id, cohort.cohort_id);
+        for prepared_member in prepared.members {
+            let member_index = prepared_member.member_index;
+            let native_plan = prepared_member.native_plan;
+            let authorization = prepared_member.authorization;
             let result = apply_group_member_toggle(
                 self.planner
                     .resolver()
@@ -637,6 +753,7 @@ impl GroupController {
         &self,
         identity: &GroupMemberIdentity,
         target: GroupTargetState,
+        provider_reach: ProviderReach,
         discovery: &GroupDiscoveryIndex<'_>,
         selected: &BTreeSet<GroupMemberIdentity>,
         source_views: &BTreeMap<String, BTreeSet<GroupMemberIdentity>>,
@@ -656,6 +773,9 @@ impl GroupController {
         }
         if shared_source_has_unlisted_view(item, selected, source_views) {
             return Err("non-member-fan-out".to_string());
+        }
+        if shared_source_crosses_provider_reach(item, &provider_reach, source_views) {
+            return Err("shared-source-crosses-provider-reach".to_string());
         }
         let context = ControlApprovalContext::new(
             self.planner.resolver().context().repository_key(),
@@ -942,6 +1062,10 @@ fn initial_member_results(reviewed: &GroupTogglePlan) -> Vec<GroupApplyMemberRes
                 GroupMemberPlanOutcome::Missing => {
                     (GroupApplyMemberStatus::Missing, member.reason.clone())
                 }
+                GroupMemberPlanOutcome::OutOfProviderReach => (
+                    GroupApplyMemberStatus::OutOfProviderReach,
+                    member.reason.clone(),
+                ),
             };
             let cohort_id = reviewed
                 .cohorts
@@ -979,6 +1103,7 @@ fn roll_up(members: &[GroupApplyMemberResult]) -> GroupOperationLifecycle {
             member.status,
             GroupApplyMemberStatus::Blocked
                 | GroupApplyMemberStatus::Missing
+                | GroupApplyMemberStatus::OutOfProviderReach
                 | GroupApplyMemberStatus::Failed
         )
     });
@@ -1016,19 +1141,6 @@ fn mark_cohort_preflight_failed(
         member.status = GroupApplyMemberStatus::Failed;
         member.failure_mode = None;
         member.reason = Some(format!("cohort-blocked: {reason}"));
-    }
-}
-
-fn mark_cohort_failed(
-    cohort: &GroupExecutionCohort,
-    members: &mut [GroupApplyMemberResult],
-    reason: &str,
-) {
-    for member_index in &cohort.member_indices {
-        let member = &mut members[*member_index];
-        member.status = GroupApplyMemberStatus::Failed;
-        member.failure_mode = None;
-        member.reason = Some(reason.to_string());
     }
 }
 
@@ -1077,6 +1189,9 @@ fn interrupted_result(
         plan_fingerprint: reviewed.plan_fingerprint.clone(),
         requested_state: reviewed.target,
         lifecycle,
+        provider_reach: reviewed.provider_reach,
+        provider_coverage: reviewed.provider_coverage.clone(),
+        provider_reach_lifecycle: reviewed.lifecycle,
         members,
         backup_ids: aggregate_backup_ids.into_iter().collect(),
         final_state: GroupState::Mixed,
@@ -1270,6 +1385,9 @@ fn prewrite_drift_result(reviewed: &GroupTogglePlan) -> GroupApplyResult {
         plan_fingerprint: reviewed.plan_fingerprint.clone(),
         requested_state: reviewed.target,
         lifecycle: GroupOperationLifecycle::Failed,
+        provider_reach: reviewed.provider_reach,
+        provider_coverage: reviewed.provider_coverage.clone(),
+        provider_reach_lifecycle: reviewed.lifecycle,
         members,
         backup_ids: Vec::new(),
         final_state: reviewed.definition_view.observed_state(),
@@ -1277,6 +1395,32 @@ fn prewrite_drift_result(reviewed: &GroupTogglePlan) -> GroupApplyResult {
         observation_reason: Some(
             "observation-stale: plan drift before provider writes".to_string(),
         ),
+    }
+}
+
+fn preflight_blocked_result(
+    reviewed: &GroupTogglePlan,
+    mut members: Vec<GroupApplyMemberResult>,
+) -> GroupApplyResult {
+    for member in &mut members {
+        if member.status == GroupApplyMemberStatus::Failed && member.reason.is_none() {
+            member.reason = Some("operation-blocked: cohort preflight failed".to_string());
+        }
+    }
+    GroupApplyResult {
+        operation_id: reviewed.operation_id.clone().unwrap_or_default(),
+        qualified_name: reviewed.qualified_name.clone(),
+        plan_fingerprint: reviewed.plan_fingerprint.clone(),
+        requested_state: reviewed.target,
+        lifecycle: GroupOperationLifecycle::Failed,
+        provider_reach: reviewed.provider_reach,
+        provider_coverage: reviewed.provider_coverage.clone(),
+        provider_reach_lifecycle: ProviderReachLifecycle::Blocked,
+        members,
+        backup_ids: Vec::new(),
+        final_state: reviewed.definition_view.observed_state(),
+        observation_fresh: false,
+        observation_reason: Some("observation-stale: cohort preflight failed".to_string()),
     }
 }
 
