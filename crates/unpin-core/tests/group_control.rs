@@ -2,30 +2,36 @@ mod support;
 
 use std::{
     collections::BTreeSet,
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
     thread,
 };
 
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use unpin_core::{
     approval::{
         ApprovalExpectation, ApprovalIssuer, ApprovalKey, ApprovalReceipt, ApprovalReceiptClaims,
     },
     config::{UnpinConfig, UnpinConfigPaths},
+    control_operation::{ReachAwareOperationFamily, ReachAwarePrincipal, ReachAwareRootBinding},
     discovery::{DiscoveryRoots, discover_all},
     groups::{
         GroupAccessContext, GroupApprovalArtifactStore, GroupCohortBackupIndexV1, GroupController,
         GroupDefinitionV1, GroupMemberIdentity, GroupPlanDisposition, GroupPlanMode, GroupPlanner,
-        GroupRef, GroupResolver, GroupScope, GroupTargetState, McpGroupSessionBinding,
-        McpGroupSessionIdentity, McpGroupSessionLeaseStore, PersonalGroupStore,
-        RepositoryGroupStore, authenticate_group_approval_challenge,
+        GroupReachAwareApplyContext, GroupRef, GroupResolver, GroupScope, GroupTargetState,
+        McpGroupSessionBinding, McpGroupSessionIdentity, McpGroupSessionLeaseStore,
+        PersonalGroupStore, RepositoryGroupStore, authenticate_group_approval_challenge,
         issue_group_approval_challenge, verify_group_approval_challenge,
     },
     mutation::{BackupAuthenticationKey, RestoreController, RestoreStatus},
+    provider_reach::ConnectionBoundary,
+    providers::ProviderId,
     sessions::SessionAuthorityKey,
     state::atomic_json::OwnerGeneration,
+    transitions::{TransitionJournalStore, TransitionLifecycle},
 };
 
 use support::{control_authorization, control_context};
@@ -149,6 +155,48 @@ impl GroupHarness {
         ))
         .expect("approval expectation")
     }
+
+    fn reach_context(
+        &self,
+        authority_key: &SessionAuthorityKey,
+        roots: ReachAwareRootBinding,
+        boundary: ConnectionBoundary,
+        audience: &str,
+        issued_at_unix: i64,
+        expires_at_unix: i64,
+    ) -> GroupReachAwareApplyContext {
+        let session_id = "group-reach-session";
+        let scope_digest = sha256_hex(
+            format!(
+                "{}\0{}\0{}",
+                self.context.repository_key(),
+                self.context.workspace_key(),
+                session_id
+            )
+            .as_bytes(),
+        );
+        GroupReachAwareApplyContext {
+            roots,
+            principal: ReachAwarePrincipal::sign(session_id, scope_digest, boundary, authority_key)
+                .expect("signed reach-aware principal"),
+            audience: audience.to_string(),
+            issued_at_unix,
+            expires_at_unix,
+        }
+    }
+
+    fn codex_roots(&self, app_state_root: &Path) -> ReachAwareRootBinding {
+        ReachAwareRootBinding::from_provider_paths(
+            app_state_root,
+            vec![(
+                ProviderId::Codex,
+                self.context.discovery_roots().codex_global.clone(),
+                "fixture-codex".to_string(),
+            )],
+            "fixture".to_string(),
+        )
+        .expect("trusted Codex roots")
+    }
 }
 
 #[test]
@@ -181,6 +229,221 @@ fn sealed_plan_structure_binds_scope_name_and_cohort_identity() {
     let mut invalid_cohort = plan;
     invalid_cohort.cohorts[0].cohort_id = "group-cohort-../../escape".to_string();
     assert!(invalid_cohort.verify().is_err());
+}
+
+#[test]
+fn reach_aware_group_apply_attaches_v2_journal_and_replays_without_writes() {
+    let harness = GroupHarness::new();
+    let authority_key = SessionAuthorityKey::new([0x53; 32]);
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    let expectation = harness.expectation(&plan);
+    let durable = harness.reach_context(
+        &authority_key,
+        harness.codex_roots(harness.context.app_state_root()),
+        ConnectionBoundary::All,
+        "unpin-core-inventory-group-apply-v1",
+        NOW_UNIX,
+        NOW_UNIX + 60,
+    );
+    let authorization = control_authorization(
+        harness.context.app_state_root(),
+        &expectation,
+        "group-reach-aware-first",
+        NOW_UNIX,
+    );
+    let result = harness
+        .controller
+        .apply_with_reach_aware(&plan, authorization, durable.clone())
+        .expect("reach-aware group apply");
+    let config_after_apply = fs::read_to_string(&harness.config_path).expect("provider config");
+    let backup_count = fs::read_dir(harness.context.app_state_root().join("backups"))
+        .expect("backup directory")
+        .count();
+    let journal_store = TransitionJournalStore::new(harness.context.app_state_root());
+    let journal = journal_store
+        .list()
+        .expect("transition journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == result.operation_id)
+        .expect("group transition journal");
+    assert_eq!(journal.lifecycle, TransitionLifecycle::Committed);
+    assert_eq!(
+        journal.terminal_code.as_deref(),
+        Some("provider-reach-applied")
+    );
+    let envelope = journal.reach_aware.expect("reach-aware envelope");
+    assert_eq!(envelope.schema_version, 2);
+    assert_eq!(envelope.family, ReachAwareOperationFamily::GroupToggle);
+    assert_eq!(envelope.family_schema_version, 2);
+    assert_eq!(envelope.operation_id, result.operation_id);
+    assert_eq!(envelope.plan_fingerprint, plan.plan_fingerprint);
+    assert_eq!(envelope.provider_reach, plan.provider_reach);
+    assert_eq!(envelope.provider_coverage, plan.provider_coverage);
+    assert_eq!(envelope.roots, durable.roots);
+    assert_eq!(envelope.principal, durable.principal);
+    assert_eq!(envelope.audience, durable.audience);
+    assert_eq!(envelope.prior_state.len(), plan.members.len());
+    assert_eq!(
+        envelope
+            .recovery
+            .as_ref()
+            .expect("recovery evidence")
+            .writes_started,
+        true
+    );
+    assert_eq!(
+        envelope
+            .recovery
+            .as_ref()
+            .expect("recovery evidence")
+            .recovery_reference,
+        Some(format!("groups/operations/{}", result.operation_id))
+    );
+    envelope
+        .verify_authenticated(&authority_key)
+        .expect("authenticated group envelope");
+
+    let retry = harness
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-reach-aware-retry",
+                NOW_UNIX,
+            ),
+            durable,
+        )
+        .expect("idempotent reach-aware retry");
+    assert_eq!(retry, result);
+    assert_eq!(
+        fs::read_to_string(&harness.config_path).expect("provider config after retry"),
+        config_after_apply
+    );
+    assert_eq!(
+        fs::read_dir(harness.context.app_state_root().join("backups"))
+            .expect("backup directory after retry")
+            .count(),
+        backup_count
+    );
+}
+
+#[test]
+fn reach_aware_group_plan_drift_terminalizes_shared_journal_as_blocked() {
+    let harness = GroupHarness::new();
+    let authority_key = SessionAuthorityKey::new([0x53; 32]);
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    let expectation = harness.expectation(&plan);
+    fs::remove_file(&harness.first_skill_path).expect("introduce reviewed-plan drift");
+
+    let error = harness
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-reach-aware-plan-drift",
+                NOW_UNIX,
+            ),
+            harness.reach_context(
+                &authority_key,
+                harness.codex_roots(harness.context.app_state_root()),
+                ConnectionBoundary::All,
+                "unpin-core-inventory-group-apply-v1",
+                NOW_UNIX,
+                NOW_UNIX + 60,
+            ),
+        )
+        .expect_err("reviewed-plan drift must reject");
+    assert!(matches!(
+        error,
+        unpin_core::groups::GroupControlError::PlanDrift
+    ));
+
+    let journal = TransitionJournalStore::new(harness.context.app_state_root())
+        .list()
+        .expect("transition journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == plan.operation_id.clone().expect("operation id"))
+        .expect("group transition journal");
+    assert_eq!(journal.lifecycle, TransitionLifecycle::RolledBack);
+    assert_eq!(
+        journal.terminal_code.as_deref(),
+        Some("provider-reach-blocked")
+    );
+    assert_eq!(
+        journal
+            .reach_aware
+            .as_ref()
+            .expect("reach-aware envelope")
+            .lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Blocked
+    );
+}
+
+#[test]
+fn reach_aware_group_apply_rejects_controller_root_drift_before_provider_writes() {
+    let harness = GroupHarness::new();
+    let authority_key = SessionAuthorityKey::new([0x53; 32]);
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    let expectation = harness.expectation(&plan);
+    let drift_root = TempDir::new().expect("drift state root");
+    let durable = harness.reach_context(
+        &authority_key,
+        harness.codex_roots(drift_root.path()),
+        ConnectionBoundary::All,
+        "unpin-core-inventory-group-apply-v1",
+        NOW_UNIX,
+        NOW_UNIX + 60,
+    );
+    let before = fs::read_to_string(&harness.config_path).expect("provider config before drift");
+    let error = harness
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-reach-aware-root-drift",
+                NOW_UNIX,
+            ),
+            durable,
+        )
+        .expect_err("root drift must be rejected");
+    assert!(matches!(
+        error,
+        unpin_core::groups::GroupControlError::ReachAware(_)
+    ));
+    assert_eq!(
+        fs::read_to_string(&harness.config_path).expect("provider config after drift"),
+        before
+    );
+    assert!(
+        !harness
+            .context
+            .app_state_root()
+            .join("transactions")
+            .exists()
+    );
+    assert!(!harness.context.app_state_root().join("backups").exists());
+    assert!(
+        !harness
+            .context
+            .app_state_root()
+            .join("groups")
+            .join("operations")
+            .exists()
+    );
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut encoded, "{byte:02x}").expect("write to String");
+    }
+    encoded
 }
 
 #[test]

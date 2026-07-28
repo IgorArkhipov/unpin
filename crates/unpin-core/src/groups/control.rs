@@ -1,14 +1,22 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
+    path::Path,
     time::Duration,
 };
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     approval::{ApprovalExpectation, ControlApprovalContext, ControlAuthorization},
+    control_operation::{
+        ControlResolvedContext, ReachAwareControlOperationEnvelope, ReachAwareOperationFamily,
+        ReachAwarePayloadReference, ReachAwarePrincipal, ReachAwarePriorState,
+        ReachAwareRecoveryEvidence, ReachAwareRootBinding,
+    },
     discovery::discover_all,
     groups::{
-        GroupApplyMemberResult, GroupApplyMemberStatus, GroupApplyResult,
+        GROUP_APPROVAL_AUDIENCE, GroupApplyMemberResult, GroupApplyMemberStatus, GroupApplyResult,
         GroupCohortBackupCoverageV1, GroupCohortBackupIndexV1, GroupDiscoveryIndex,
         GroupExecutionCohort, GroupMemberIdentity, GroupMemberPlanOutcome,
         GroupOperationAuthorizationLink, GroupOperationError, GroupOperationLifecycle,
@@ -21,14 +29,30 @@ use crate::{
         BackupAuthenticationKey, NativeToggleController, ToggleStatus,
         authenticated_backup_manifest_digest, group_control::apply_group_member_toggle,
     },
-    provider_reach::{ProviderReach, ProviderReachLifecycle},
+    provider_reach::{
+        ConnectionBoundary, ProviderReach, ProviderReachLifecycle, SelectedProviderAuthority,
+        SelectedProviderProvenance,
+    },
+    providers::ProviderId,
     sessions::SessionAuthorityKey,
     state::atomic_json::{OwnerGeneration, StateError, StateResourceLock, StateSnapshot},
     transitions::{
-        EffectCheckpointStatus, JournalError, TransitionJournal, TransitionJournalStore,
-        TransitionKind,
+        EffectCheckpointStatus, JournalError, JournalHandle, TransitionJournal,
+        TransitionJournalStore, TransitionKind,
     },
 };
+
+/// Trusted inputs required to persist a schema-v2 reach-aware group apply.
+/// Roots and the signed principal are supplied by the verified caller; this
+/// controller never invents roots or derives identity from repository files.
+#[derive(Debug, Clone)]
+pub struct GroupReachAwareApplyContext {
+    pub roots: ReachAwareRootBinding,
+    pub principal: ReachAwarePrincipal,
+    pub audience: String,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+}
 
 #[derive(Debug, Clone)]
 pub struct GroupController {
@@ -57,6 +81,15 @@ struct PreparedMember {
     member_index: usize,
     native_plan: crate::mutation::NativeTogglePlan,
     authorization: ControlAuthorization,
+}
+
+struct FreshNativePlanContext<'a, 'discovery> {
+    target: GroupTargetState,
+    provider_reach: ProviderReach,
+    discovery: &'a GroupDiscoveryIndex<'discovery>,
+    selected: &'a BTreeSet<GroupMemberIdentity>,
+    source_views: &'a BTreeMap<String, BTreeSet<GroupMemberIdentity>>,
+    journals: &'a [TransitionJournal],
 }
 
 impl GroupController {
@@ -457,6 +490,327 @@ impl GroupController {
         Ok(result)
     }
 
+    /// Apply a reviewed group while attaching the authenticated schema-v2
+    /// reach-aware journal envelope. The legacy `apply` path remains the
+    /// schema-v1-compatible adapter for existing records.
+    pub fn apply_with_reach_aware(
+        &self,
+        reviewed: &GroupTogglePlan,
+        authorization: ControlAuthorization,
+        durable: GroupReachAwareApplyContext,
+    ) -> Result<GroupApplyResult, GroupControlError> {
+        reviewed.verify()?;
+        if reviewed.disposition != GroupPlanDisposition::Actionable {
+            return Err(GroupControlError::NotActionable);
+        }
+        let approval_context = ControlApprovalContext::new(
+            self.planner.resolver().context().repository_key(),
+            self.planner.resolver().context().workspace_key(),
+        )
+        .map_err(|error| GroupControlError::ApprovalContext(error.to_string()))?;
+        let expectation = reviewed.approval_expectation_verified(&approval_context)?;
+        authorization.assert_matches(&expectation)?;
+        let (journal_store, mut journal) =
+            self.attach_reach_aware_journal(reviewed, &expectation, &durable)?;
+        match self.apply(reviewed, authorization) {
+            Ok(result) => {
+                self.finalize_reach_aware_journal(&journal_store, &mut journal, reviewed, &result)?;
+                Ok(result)
+            }
+            Err(error) => {
+                self.finalize_reach_aware_error(&journal_store, &mut journal, reviewed)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn finalize_reach_aware_error(
+        &self,
+        store: &TransitionJournalStore,
+        handle: &mut JournalHandle,
+        reviewed: &GroupTogglePlan,
+    ) -> Result<(), GroupControlError> {
+        let writes_started = match reviewed.operation_id.as_deref() {
+            Some(operation_id) => self
+                .operation(operation_id)
+                .map(|operation| operation.is_some_and(|record| record.provider_writes_started))
+                .unwrap_or(true),
+            None => false,
+        };
+        let lifecycle = if writes_started {
+            ProviderReachLifecycle::RecoveryRequired
+        } else {
+            ProviderReachLifecycle::Blocked
+        };
+        self.finalize_reach_aware_lifecycle(store, handle, reviewed, lifecycle, writes_started)
+    }
+
+    fn finalize_reach_aware_journal(
+        &self,
+        store: &TransitionJournalStore,
+        handle: &mut JournalHandle,
+        reviewed: &GroupTogglePlan,
+        result: &GroupApplyResult,
+    ) -> Result<(), GroupControlError> {
+        let writes_started = result.members.iter().any(|member| {
+            matches!(
+                member.status,
+                GroupApplyMemberStatus::Changed | GroupApplyMemberStatus::Failed
+            ) && member.backup_id.is_some()
+        });
+        self.finalize_reach_aware_lifecycle(
+            store,
+            handle,
+            reviewed,
+            result.provider_reach_lifecycle,
+            writes_started,
+        )
+    }
+
+    fn finalize_reach_aware_lifecycle(
+        &self,
+        store: &TransitionJournalStore,
+        handle: &mut JournalHandle,
+        reviewed: &GroupTogglePlan,
+        lifecycle: ProviderReachLifecycle,
+        writes_started: bool,
+    ) -> Result<(), GroupControlError> {
+        if handle.journal.lifecycle.is_terminal() {
+            let envelope = handle.journal.reach_aware.as_ref().ok_or_else(|| {
+                GroupControlError::ReachAware("missing reach-aware journal".to_string())
+            })?;
+            if envelope.lifecycle == lifecycle {
+                return Ok(());
+            }
+            return Err(GroupControlError::ReachAware(
+                "terminal reach-aware journal lifecycle does not match group result".to_string(),
+            ));
+        }
+        {
+            let envelope = handle.journal.reach_aware.as_mut().ok_or_else(|| {
+                GroupControlError::ReachAware("missing reach-aware journal".to_string())
+            })?;
+            envelope.lifecycle = lifecycle;
+            envelope.recovery = Some(ReachAwareRecoveryEvidence {
+                writes_started,
+                recovery_reference: writes_started.then(|| {
+                    format!(
+                        "groups/operations/{}",
+                        reviewed.operation_id.as_deref().unwrap_or_default()
+                    )
+                }),
+                affected_resources: if writes_started {
+                    reviewed
+                        .resources
+                        .iter()
+                        .map(|resource| resource.resource_id.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                },
+            });
+            envelope.envelope_fingerprint = envelope
+                .fingerprint()
+                .map_err(|error| GroupControlError::ReachAware(error.to_string()))?;
+            envelope
+                .seal(&self.session_authority_key)
+                .map_err(|error| GroupControlError::ReachAware(error.to_string()))?;
+        }
+        let journal_lifecycle = match lifecycle {
+            ProviderReachLifecycle::RecoveryRequired => {
+                crate::transitions::TransitionLifecycle::NeedsRepair
+            }
+            ProviderReachLifecycle::Blocked | ProviderReachLifecycle::NoTargetsInProviderReach => {
+                crate::transitions::TransitionLifecycle::RolledBack
+            }
+            ProviderReachLifecycle::Applied
+            | ProviderReachLifecycle::Partial
+            | ProviderReachLifecycle::NoOp => crate::transitions::TransitionLifecycle::Committed,
+        };
+        let terminal_code = format!("provider-reach-{}", lifecycle.as_str());
+        handle.journal.terminal_code = Some(terminal_code.clone());
+        handle
+            .journal
+            .record(journal_lifecycle, terminal_code, None)
+            .map_err(GroupControlError::Journal)?;
+        store.save(handle).map_err(GroupControlError::Journal)
+    }
+
+    fn attach_reach_aware_journal(
+        &self,
+        reviewed: &GroupTogglePlan,
+        expectation: &ApprovalExpectation,
+        durable: &GroupReachAwareApplyContext,
+    ) -> Result<(TransitionJournalStore, JournalHandle), GroupControlError> {
+        let transition = reviewed
+            .transition
+            .as_ref()
+            .ok_or(GroupControlError::InvalidPlan)?;
+        let operation_id = reviewed
+            .operation_id
+            .as_deref()
+            .ok_or(GroupControlError::InvalidPlan)?;
+        durable
+            .principal
+            .verify(&self.session_authority_key)
+            .map_err(|error| GroupControlError::ReachAware(error.to_string()))?;
+        let expected_scope_digest = reach_scope_digest(expectation, &durable.principal.session_id);
+        if durable.principal.connection_scope_id != expected_scope_digest {
+            return Err(GroupControlError::ReachAware(
+                "reach-aware principal scope does not match reviewed group context".to_string(),
+            ));
+        }
+        if durable.audience != GROUP_APPROVAL_AUDIENCE
+            || durable.principal.connection_boundary
+                != derived_connection_boundary(reviewed.provider_reach)
+            || expectation
+                .session_id
+                .as_deref()
+                .is_some_and(|session| session != durable.principal.session_id)
+        {
+            return Err(GroupControlError::ReachAware(
+                "reach-aware principal does not match reviewed group boundary".to_string(),
+            ));
+        }
+        self.verify_reach_aware_roots(&durable.roots, reviewed)?;
+        let family = ReachAwareOperationFamily::GroupToggle;
+        let selected_provider = reviewed.provider_reach.provider().map(|provider| {
+            SelectedProviderAuthority::new(
+                provider,
+                reviewed
+                    .provider_reach
+                    .provenance()
+                    .unwrap_or(SelectedProviderProvenance::ExplicitInput),
+            )
+        });
+        let activation = reviewed.resources.iter().fold(
+            crate::transitions::EffectActivation::Live,
+            |current, resource| current.max(resource.activation),
+        );
+        let builder = ReachAwareControlOperationEnvelope::builder()
+            .family(family, 2)
+            .operation(
+                transition.operation_id.clone(),
+                transition.kind.as_str(),
+                reviewed.plan_fingerprint.clone(),
+            )
+            .context(ControlResolvedContext {
+                repository_key: transition.context.repository_key.clone(),
+                workspace_key: transition.context.workspace_key.clone(),
+                session_id: Some(durable.principal.session_id.clone()),
+                profile_digest: transition.context.profile_digest.clone(),
+            })
+            .reach(
+                derived_connection_boundary(reviewed.provider_reach),
+                reviewed.provider_reach,
+                selected_provider,
+                reviewed.provider_coverage.clone(),
+            )
+            .lifecycle(reviewed.lifecycle, reviewed.lifecycle, activation)
+            .trusted_roots(durable.roots.clone())
+            .authority(
+                durable.principal.clone(),
+                durable.audience.clone(),
+                durable.issued_at_unix,
+                durable.expires_at_unix,
+            )
+            .payload_reference(ReachAwarePayloadReference {
+                family,
+                schema_version: 2,
+                reference: operation_id.to_string(),
+                payload_digest: reviewed.plan_fingerprint.clone(),
+            })
+            .prior_state(group_prior_state(reviewed));
+        let store = TransitionJournalStore::new(
+            self.planner
+                .resolver()
+                .context()
+                .app_state_root()
+                .to_path_buf(),
+        );
+        let owner = operation_owner(operation_id)?;
+        let mut handle = store
+            .create_or_attach_reach_aware(transition, owner, builder, &self.session_authority_key)
+            .map_err(GroupControlError::Journal)?;
+        if let Some(envelope) = handle.journal.reach_aware.as_ref()
+            && (envelope.family != family
+                || envelope.family_schema_version != 2
+                || envelope.plan_fingerprint != reviewed.plan_fingerprint
+                || envelope.provider_reach != reviewed.provider_reach
+                || envelope.provider_coverage != reviewed.provider_coverage
+                || envelope.roots != durable.roots
+                || envelope.principal != durable.principal
+                || envelope.audience != durable.audience
+                || envelope.issued_at_unix != durable.issued_at_unix
+                || envelope.expires_at_unix != durable.expires_at_unix)
+        {
+            return Err(GroupControlError::ReachAware(
+                "reach-aware journal does not match reviewed group".to_string(),
+            ));
+        }
+        if !handle.journal.lifecycle.is_terminal()
+            && handle.journal.lifecycle != crate::transitions::TransitionLifecycle::Applying
+        {
+            handle
+                .journal
+                .record(
+                    crate::transitions::TransitionLifecycle::Applying,
+                    "reach-aware-applying",
+                    None,
+                )
+                .map_err(GroupControlError::Journal)?;
+            store
+                .save(&mut handle)
+                .map_err(GroupControlError::Journal)?;
+        }
+        Ok((store, handle))
+    }
+
+    fn verify_reach_aware_roots(
+        &self,
+        roots: &ReachAwareRootBinding,
+        reviewed: &GroupTogglePlan,
+    ) -> Result<(), GroupControlError> {
+        roots
+            .verify()
+            .map_err(|error| GroupControlError::ReachAware(error.to_string()))?;
+        let context = self.planner.resolver().context();
+        if roots.app_state_root != canonical_context_path(context.app_state_root()) {
+            return Err(GroupControlError::ReachAware(
+                "reach-aware app-state root does not match controller boundary".to_string(),
+            ));
+        }
+
+        let required_providers = reviewed
+            .provider_coverage
+            .included()
+            .map(|entry| entry.provider)
+            .collect::<BTreeSet<_>>();
+        let provided_providers = roots
+            .provider_roots
+            .iter()
+            .map(|entry| entry.provider)
+            .collect::<BTreeSet<_>>();
+        if provided_providers != required_providers {
+            return Err(GroupControlError::ReachAware(
+                "reach-aware provider roots do not match reviewed coverage".to_string(),
+            ));
+        }
+        for entry in &roots.provider_roots {
+            let matches_controller_root =
+                provider_root_candidates(context.discovery_roots(), entry.provider)
+                    .into_iter()
+                    .any(|candidate| canonical_context_path(candidate) == entry.root);
+            if !matches_controller_root {
+                return Err(GroupControlError::ReachAware(
+                    "reach-aware provider root does not match controller discovery roots"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     pub fn status(
         &self,
         reviewed: &GroupTogglePlan,
@@ -584,12 +938,14 @@ impl GroupController {
             let planned = &context.reviewed.members[*member_index];
             let native_plan = match self.fresh_native_plan(
                 &planned.identity,
-                context.reviewed.target,
-                context.reviewed.provider_reach,
-                context.discovery,
-                context.selected,
-                context.source_views,
-                context.journals,
+                &FreshNativePlanContext {
+                    target: context.reviewed.target,
+                    provider_reach: context.reviewed.provider_reach,
+                    discovery: context.discovery,
+                    selected: context.selected,
+                    source_views: context.source_views,
+                    journals: context.journals,
+                },
             ) {
                 Ok(Some(plan)) => plan,
                 Ok(None) => {
@@ -599,17 +955,14 @@ impl GroupController {
                 }
                 Err(reason) => return Err(reason),
             };
-            let authorization = match self.child_authorization(
+            let authorization = self.child_authorization(
                 planned,
                 cohort,
                 &native_plan,
                 context.authorization,
                 context.parent_expectation,
                 context.approval_context,
-            ) {
-                Ok(authorization) => authorization,
-                Err(reason) => return Err(reason),
-            };
+            )?;
             prepared.push(PreparedMember {
                 member_index: *member_index,
                 native_plan,
@@ -752,14 +1105,10 @@ impl GroupController {
     fn fresh_native_plan(
         &self,
         identity: &GroupMemberIdentity,
-        target: GroupTargetState,
-        provider_reach: ProviderReach,
-        discovery: &GroupDiscoveryIndex<'_>,
-        selected: &BTreeSet<GroupMemberIdentity>,
-        source_views: &BTreeMap<String, BTreeSet<GroupMemberIdentity>>,
-        journals: &[TransitionJournal],
+        context: &FreshNativePlanContext<'_, '_>,
     ) -> Result<Option<crate::mutation::NativeTogglePlan>, String> {
-        let matches = discovery
+        let matches = context
+            .discovery
             .get(identity)
             .map(Vec::as_slice)
             .unwrap_or_default();
@@ -768,22 +1117,23 @@ impl GroupController {
             [item] => *item,
             _ => return Err("group member became ambiguous before cohort apply".to_string()),
         };
-        if item.enabled == target.enabled() {
+        if item.enabled == context.target.enabled() {
             return Ok(None);
         }
-        if shared_source_has_unlisted_view(item, selected, source_views) {
+        if shared_source_has_unlisted_view(item, context.selected, context.source_views) {
             return Err("non-member-fan-out".to_string());
         }
-        if shared_source_crosses_provider_reach(item, &provider_reach, source_views) {
+        if shared_source_crosses_provider_reach(item, &context.provider_reach, context.source_views)
+        {
             return Err("shared-source-crosses-provider-reach".to_string());
         }
-        let context = ControlApprovalContext::new(
+        let approval_context = ControlApprovalContext::new(
             self.planner.resolver().context().repository_key(),
             self.planner.resolver().context().workspace_key(),
         )
         .map_err(|error| error.to_string())?;
         NativeToggleController::new(self.planner.resolver().context().app_state_root())
-            .plan_with_journals(item.clone(), &context, journals)
+            .plan_with_journals(item.clone(), &approval_context, context.journals)
             .map(Some)
             .map_err(|error| error.public_reason_code().to_string())
     }
@@ -1451,6 +1801,78 @@ fn operation_owner(operation_id: &str) -> Result<OwnerGeneration, GroupControlEr
         .map_err(|error| GroupControlError::OperationOwner(error.to_string()))
 }
 
+fn derived_connection_boundary(provider_reach: ProviderReach) -> ConnectionBoundary {
+    match provider_reach {
+        ProviderReach::Selected {
+            provider,
+            provenance: SelectedProviderProvenance::PinnedMcpBoundary,
+        } => ConnectionBoundary::Pinned(provider),
+        ProviderReach::All | ProviderReach::Selected { .. } => ConnectionBoundary::All,
+    }
+}
+
+fn reach_scope_digest(expectation: &ApprovalExpectation, session_id: &str) -> String {
+    crate::encode_lower_hex(&Sha256::digest(
+        format!(
+            "{}\0{}\0{}",
+            expectation.repository_key, expectation.workspace_key, session_id
+        )
+        .as_bytes(),
+    ))
+}
+
+fn canonical_context_path(path: &Path) -> String {
+    std::fs::canonicalize(path)
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn provider_root_candidates(
+    roots: &crate::discovery::DiscoveryRoots,
+    provider: ProviderId,
+) -> Vec<&Path> {
+    match provider {
+        ProviderId::Claude => vec![
+            roots.claude_global.as_path(),
+            roots.claude_user_state.as_path(),
+            roots.claude_project.as_path(),
+        ],
+        ProviderId::Codex => vec![
+            roots.codex_global.as_path(),
+            roots.codex_admin.as_path(),
+            roots.codex_project.as_path(),
+        ],
+        ProviderId::Cursor => vec![
+            roots.cursor_global.as_path(),
+            roots.cursor_config.as_path(),
+            roots.cursor_project.as_path(),
+        ],
+        ProviderId::Pi => vec![roots.pi_global.as_path(), roots.pi_project.as_path()],
+        ProviderId::OpenCode => vec![
+            roots.opencode_global.as_path(),
+            roots.opencode_project.as_path(),
+        ],
+        ProviderId::Zed => vec![roots.zed_global.as_path(), roots.zed_project.as_path()],
+    }
+}
+
+fn group_prior_state(reviewed: &GroupTogglePlan) -> Vec<ReachAwarePriorState> {
+    reviewed
+        .members
+        .iter()
+        .map(|member| ReachAwarePriorState {
+            target_id: member.identity.id.clone(),
+            fingerprint: member.item_plan_fingerprint.clone().unwrap_or_else(|| {
+                member
+                    .reason
+                    .as_deref()
+                    .map_or_else(|| "unobserved".to_string(), str::to_string)
+            }),
+        })
+        .collect()
+}
+
 fn acquire_operation_execution_lock(
     app_state_root: &std::path::Path,
     operation_id: &str,
@@ -1478,6 +1900,7 @@ pub enum GroupControlError {
     OperationOwner(String),
     ApprovalContext(String),
     BackupEvidence(String),
+    ReachAware(String),
 }
 
 impl From<GroupPlanError> for GroupControlError {
@@ -1534,6 +1957,9 @@ impl fmt::Display for GroupControlError {
             }
             Self::BackupEvidence(error) => {
                 write!(formatter, "group backup evidence is invalid: {error}")
+            }
+            Self::ReachAware(error) => {
+                write!(formatter, "group reach-aware envelope is invalid: {error}")
             }
         }
     }
