@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::approval::ControlAuthorization;
 use crate::clock::{current_timestamp, unix_nanos_id};
 use crate::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, ProviderId,
@@ -45,6 +44,9 @@ use crate::transitions::{
     EffectCheckpointStatus, JournalHandle, TransitionConflictChecker, TransitionJournal,
     TransitionJournalStore, TransitionLifecycle, TransitionPlan,
     journal::{JournalError, MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES},
+};
+use crate::{
+    approval::ControlAuthorization, control_operation::ReachAwareControlOperationEnvelopeBuilder,
 };
 
 mod restore_control;
@@ -101,7 +103,7 @@ pub struct TogglePlanRequest {
 }
 
 #[derive(Debug, Clone)]
-struct TogglePlanInput {
+pub(crate) struct TogglePlanInput {
     app_state_root: PathBuf,
     item: DiscoveryItem,
     apply: bool,
@@ -608,6 +610,24 @@ fn apply_authorized_toggle_transaction(
         authorization,
         reviewed_preview,
         crate::transitions::TransitionRecoveryPolicy::ResumeSafe,
+        None,
+    )
+}
+
+pub(crate) fn apply_authorized_toggle_transaction_reach_aware(
+    input: TogglePlanInput,
+    transition: &TransitionPlan,
+    authorization: &ControlAuthorization,
+    reviewed_preview: &ToggleResult,
+    envelope_builder: ReachAwareControlOperationEnvelopeBuilder,
+) -> ToggleResult {
+    apply_authorized_toggle_transaction_with_policy(
+        input,
+        transition,
+        authorization,
+        reviewed_preview,
+        crate::transitions::TransitionRecoveryPolicy::ResumeSafe,
+        Some(envelope_builder),
     )
 }
 
@@ -617,6 +637,7 @@ fn apply_authorized_toggle_transaction_with_policy(
     authorization: &ControlAuthorization,
     reviewed_preview: &ToggleResult,
     recovery_policy: crate::transitions::TransitionRecoveryPolicy,
+    mut reach_builder: Option<ReachAwareControlOperationEnvelopeBuilder>,
 ) -> ToggleResult {
     let app_state_root = input.app_state_root.clone();
     let journal_app_state_root = canonical_existing_root(&app_state_root);
@@ -644,6 +665,7 @@ fn apply_authorized_toggle_transaction_with_policy(
             );
         }
     };
+    let reach_authority_key = session_authority_key.clone();
     let session_manager =
         SessionManager::with_authority_key(&journal_app_state_root, session_authority_key);
     let _session_conflict_guard =
@@ -769,6 +791,15 @@ fn apply_authorized_toggle_transaction_with_policy(
             Err(error) => return blocked_result_from_plan(dry_run, error.to_string()),
         },
     };
+    if handle.journal.reach_aware.is_none()
+        && let Some(builder) = reach_builder.take()
+    {
+        if let Err(error) =
+            store.attach_reach_aware_builder(&mut handle, builder, &reach_authority_key)
+        {
+            return blocked_result_from_plan(dry_run, error.to_string());
+        }
+    }
     if handle.journal.lifecycle.is_terminal() {
         return cached_native_toggle_result(
             &app_state_root,

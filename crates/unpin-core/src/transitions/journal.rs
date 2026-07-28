@@ -5,6 +5,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     config::get_transition_journal_path,
+    control_operation::{
+        ReachAwareControlOperationEnvelope, ReachAwareControlOperationEnvelopeBuilder,
+    },
+    sessions::SessionAuthorityKey,
     state::atomic_json::{
         AtomicJsonStore, OwnerGeneration, StateError, StateRevision, StateSnapshot,
     },
@@ -114,6 +118,10 @@ pub struct TransitionJournal {
     pub audit: Vec<JournalEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_code: Option<String>,
+    /// Optional schema-v2 reach envelope. Missing means this is an existing
+    /// schema-v1 operation and remains dual-readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_aware: Option<ReachAwareControlOperationEnvelope>,
 }
 
 impl TransitionJournal {
@@ -148,6 +156,7 @@ impl TransitionJournal {
             effects,
             audit: Vec::new(),
             terminal_code: None,
+            reach_aware: None,
         };
         journal.record(TransitionLifecycle::Planned, "planned", None)?;
         Ok(journal)
@@ -306,6 +315,69 @@ impl TransitionJournalStore {
         }
     }
 
+    pub fn create_or_attach_reach_aware(
+        &self,
+        plan: &TransitionPlan,
+        owner: OwnerGeneration,
+        builder: ReachAwareControlOperationEnvelopeBuilder,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<JournalHandle, JournalError> {
+        let mut handle = self.create_or_attach(plan, owner)?;
+        self.attach_reach_aware_builder(&mut handle, builder, authority_key)?;
+        Ok(handle)
+    }
+
+    fn attach_reach_aware_authenticated(
+        &self,
+        handle: &mut JournalHandle,
+        envelope: ReachAwareControlOperationEnvelope,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), JournalError> {
+        envelope
+            .verify_authenticated(authority_key)
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        if envelope.operation_id != handle.journal.operation_id
+            || envelope.operation_kind != handle.journal.operation_kind
+            || envelope.context.repository_key != handle.journal.repository_key
+            || envelope.context.workspace_key != handle.journal.workspace_key
+        {
+            return Err(JournalError::OperationConflict);
+        }
+        match &handle.journal.reach_aware {
+            Some(existing) if existing != &envelope => Err(JournalError::OperationConflict),
+            Some(_) => Ok(()),
+            None if envelope.owner != handle.owner || envelope.revision != handle.revision => {
+                Err(JournalError::OperationConflict)
+            }
+            None => {
+                handle.journal.reach_aware = Some(envelope);
+                self.save(handle)
+            }
+        }
+    }
+
+    pub fn attach_reach_aware_builder(
+        &self,
+        handle: &mut JournalHandle,
+        builder: ReachAwareControlOperationEnvelopeBuilder,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), JournalError> {
+        if let Some(existing) = &handle.journal.reach_aware {
+            existing
+                .verify_authenticated(authority_key)
+                .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+            return Ok(());
+        }
+        let mut envelope = builder
+            .journal_binding(handle.owner.clone(), handle.revision.clone())
+            .build()
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        envelope
+            .seal(authority_key)
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        self.attach_reach_aware_authenticated(handle, envelope, authority_key)
+    }
+
     pub fn load(
         &self,
         plan: &TransitionPlan,
@@ -321,6 +393,19 @@ impl TransitionJournalStore {
 
     pub fn save(&self, handle: &mut JournalHandle) -> Result<(), JournalError> {
         handle.journal.verify_audit_chain()?;
+        if let Some(envelope) = &handle.journal.reach_aware {
+            envelope
+                .verify()
+                .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+            if envelope.authentication_tag.is_empty()
+                || envelope.authority_key_id.is_empty()
+                || envelope.principal.authentication_tag.is_empty()
+            {
+                return Err(JournalError::ReachAwareEnvelope(
+                    "reach-aware envelope is not sealed".to_string(),
+                ));
+            }
+        }
         let revision = self.store(&handle.journal.operation_id).compare_and_swap(
             Some(&handle.revision),
             handle.owner.clone(),
@@ -517,6 +602,7 @@ pub enum JournalError {
     JournalPathMismatch,
     Io(PathBuf, String),
     State(StateError),
+    ReachAwareEnvelope(String),
 }
 
 impl From<StateError> for JournalError {
@@ -551,6 +637,9 @@ impl fmt::Display for JournalError {
             }
             Self::Io(path, message) => write!(formatter, "{}: {message}", path.display()),
             Self::State(error) => error.fmt(formatter),
+            Self::ReachAwareEnvelope(message) => {
+                write!(formatter, "invalid reach-aware envelope: {message}")
+            }
         }
     }
 }

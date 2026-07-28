@@ -30,5 +30,6 @@ pub(crate) fn apply_group_member_toggle(
         authorization,
         &reviewed.preview,
         TransitionRecoveryPolicy::NoResumeWrites,
+        None,
     ))
 }

@@ -8,15 +8,20 @@ use crate::{
         ApprovalError, ApprovalExpectation, CONTROL_APPROVAL_AUDIENCE, CONTROL_APPROVAL_ISSUER,
         ControlApprovalContext, ControlAuthorization,
     },
+    control_operation::{
+        ControlResolvedContext, ReachAwareControlOperationEnvelope, ReachAwareOperationFamily,
+        ReachAwarePayloadReference, ReachAwarePrincipal, ReachAwareRootBinding,
+    },
     discovery::DiscoveryItem,
     mutation::{
         BackupAuthenticationKey, TogglePlanInput, ToggleResult, ToggleStatus,
-        apply_authorized_toggle_transaction, plan_toggle_inner,
+        apply_authorized_toggle_transaction, apply_authorized_toggle_transaction_reach_aware,
+        plan_toggle_inner,
     },
     provider_reach::{
         ConnectionBoundary, DerivedTargetKind, ProviderCoverageEntry, ProviderReach,
-        ProviderReachCoverage, ProviderReachError, ProviderReachInput, ProviderReachRequest,
-        SelectedProviderAuthority,
+        ProviderReachCoverage, ProviderReachError, ProviderReachInput, ProviderReachLifecycle,
+        ProviderReachRequest, SelectedProviderAuthority, SelectedProviderProvenance,
     },
     sessions::SessionAuthorityKey,
     transitions::{
@@ -258,6 +263,139 @@ impl NativeToggleController {
             }
         }
     }
+
+    /// Apply a native toggle while attaching the durable schema-v2 envelope.
+    /// The caller must provide trusted provider roots and a principal that was
+    /// signed by the verified session authority; the journal fills owner and
+    /// revision immediately after its create/attach CAS.
+    pub fn apply_with_reach_aware(
+        &self,
+        reviewed: &NativeTogglePlan,
+        authorization: ControlAuthorization,
+        context: &ControlApprovalContext,
+        backup_authentication_key: BackupAuthenticationKey,
+        roots: ReachAwareRootBinding,
+        audience: impl Into<String>,
+        issued_at_unix: i64,
+        expires_at_unix: i64,
+    ) -> Result<ToggleResult, NativeToggleControlError> {
+        let expectation = reviewed.approval_expectation(context)?;
+        authorization.assert_matches(&expectation)?;
+        roots
+            .verify()
+            .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
+        let session_id = expectation.session_id.clone().ok_or_else(|| {
+            NativeToggleControlError::ReachAware(
+                "reach-aware toggle requires a verified session identity".to_string(),
+            )
+        })?;
+        let session_authority_key = self.session_authority_key.as_ref().ok_or_else(|| {
+            NativeToggleControlError::ReachAware(
+                "reach-aware toggle requires a session authority key".to_string(),
+            )
+        })?;
+        let scope_digest = crate::encode_lower_hex(&Sha256::digest(
+            format!(
+                "{}\0{}\0{}",
+                expectation.repository_key, expectation.workspace_key, session_id
+            )
+            .as_bytes(),
+        ));
+        let principal = ReachAwarePrincipal::sign(session_id, scope_digest, session_authority_key)
+            .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
+        let family = ReachAwareOperationFamily::NativeToggle;
+        let provider = reviewed.provider_reach.provider();
+        let selected_provider = provider.map(|provider| {
+            SelectedProviderAuthority::new(
+                provider,
+                reviewed
+                    .provider_reach
+                    .provenance()
+                    .unwrap_or(SelectedProviderProvenance::ExactIndividualTarget),
+            )
+        });
+        let envelope_builder = ReachAwareControlOperationEnvelope::builder()
+            .family(family, NATIVE_TOGGLE_PLAN_SCHEMA_VERSION)
+            .operation(
+                reviewed.transition.operation_id.clone(),
+                reviewed.transition.kind.as_str(),
+                reviewed.plan_fingerprint.clone(),
+            )
+            .context(ControlResolvedContext {
+                repository_key: reviewed.transition.context.repository_key.clone(),
+                workspace_key: reviewed.transition.context.workspace_key.clone(),
+                session_id: reviewed.transition.context.session_id.clone(),
+                profile_digest: reviewed.transition.context.profile_digest.clone(),
+            })
+            .reach(
+                derived_connection_boundary(reviewed.provider_reach),
+                reviewed.provider_reach,
+                selected_provider,
+                reviewed.coverage.clone(),
+            )
+            .lifecycle(
+                ProviderReachLifecycle::Applied,
+                ProviderReachLifecycle::Applied,
+                reviewed
+                    .transition
+                    .effects
+                    .first()
+                    .map_or(EffectActivation::RestartRequired, |effect| {
+                        effect.activation
+                    }),
+            )
+            .trusted_roots(roots)
+            .authority(principal, audience, issued_at_unix, expires_at_unix)
+            .payload_reference(ReachAwarePayloadReference {
+                family,
+                schema_version: NATIVE_TOGGLE_PLAN_SCHEMA_VERSION,
+                reference: reviewed.transition.operation_id.clone(),
+                payload_digest: reviewed.plan_fingerprint.clone(),
+            })
+            .transfer_capability(None);
+        let mut result = apply_authorized_toggle_transaction_reach_aware(
+            TogglePlanInput {
+                app_state_root: self.app_state_root.clone(),
+                item: reviewed.preview.selection.clone(),
+                apply: true,
+                backup_authentication_key: Some(backup_authentication_key),
+                session_authority_key: self.session_authority_key.clone(),
+            },
+            &reviewed.transition,
+            &authorization,
+            &reviewed.preview,
+            envelope_builder,
+        );
+        result.provider_reach = Some(reviewed.provider_reach);
+        result.coverage = Some(reviewed.coverage.clone());
+        if matches!(
+            result.status,
+            ToggleStatus::Applied | ToggleStatus::RecoveryRequired
+        ) {
+            Ok(result)
+        } else {
+            let reason = result
+                .reason
+                .unwrap_or_else(|| "native toggle apply was blocked".to_string());
+            if let Some(reason) = reason.strip_prefix("recovery-required: ") {
+                Err(NativeToggleControlError::RecoveryRequired(
+                    reason.to_string(),
+                ))
+            } else {
+                Err(NativeToggleControlError::Blocked(reason))
+            }
+        }
+    }
+}
+
+fn derived_connection_boundary(provider_reach: ProviderReach) -> ConnectionBoundary {
+    match provider_reach {
+        ProviderReach::Selected {
+            provider,
+            provenance: SelectedProviderProvenance::PinnedMcpBoundary,
+        } => ConnectionBoundary::Pinned(provider),
+        ProviderReach::All | ProviderReach::Selected { .. } => ConnectionBoundary::All,
+    }
 }
 
 fn toggle_plan_fingerprint(
@@ -362,6 +500,7 @@ pub enum NativeToggleControlError {
     PlanFingerprintMismatch,
     Blocked(String),
     RecoveryRequired(String),
+    ReachAware(String),
     GenerationOverflow,
     Serialization(String),
 }
@@ -380,6 +519,7 @@ impl NativeToggleControlError {
             Self::ContextMismatch => "context-scope-conflict",
             Self::Blocked(_) => "native-plan-blocked",
             Self::RecoveryRequired(_) => "recovery-required",
+            Self::ReachAware(_) => "reach-aware-envelope-invalid",
             Self::GenerationOverflow => "native-plan-capacity-exceeded",
         }
     }
@@ -427,6 +567,7 @@ impl fmt::Display for NativeToggleControlError {
             Self::RecoveryRequired(reason) => {
                 write!(formatter, "native toggle recovery required: {reason}")
             }
+            Self::ReachAware(reason) => write!(formatter, "reach-aware toggle blocked: {reason}"),
             Self::GenerationOverflow => {
                 formatter.write_str("native toggle generation counter overflowed")
             }

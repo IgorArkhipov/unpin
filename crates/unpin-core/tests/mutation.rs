@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use unpin_core::{
-    control_operation::DurableControlError,
+    control_operation::{DurableControlError, ReachAwareRootBinding},
     discovery::{DiscoveryItem, DiscoveryMutability, DiscoveryRoots, ProviderId, discover_all},
     mutation::{
         BackupAuthenticationKey, BackupAuthenticationStatus, NativeToggleControlError,
@@ -95,6 +95,61 @@ fn apply_audit_failure_preserves_recovery_evidence_after_directory_move() {
         !source_path.exists(),
         "the test must reach the post-mutation audit failure"
     );
+}
+
+#[test]
+fn reach_aware_native_wrapper_rejects_context_drift_before_writes() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
+        .expect("Codex skill");
+    let context = control_context("reach-aware-repository", "reach-aware-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let authorization = control_authorization(
+        &app_state_root,
+        &plan
+            .approval_expectation(&context)
+            .expect("approval expectation"),
+        "reach-aware-context-drift",
+        2_000_000_000,
+    );
+    let provider_root = fixture_copy.path().join("codex").join("global");
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &app_state_root,
+        vec![(
+            ProviderId::Codex,
+            provider_root,
+            "fixture-codex".to_string(),
+        )],
+        "fixture",
+    )
+    .expect("trusted roots");
+    let result = controller.apply_with_reach_aware(
+        &plan,
+        authorization,
+        &control_context("drifted-repository", "reach-aware-workspace"),
+        backup_authentication_key(),
+        roots,
+        "unpin-test-audience",
+        100,
+        200,
+    );
+    assert!(matches!(
+        result,
+        Err(NativeToggleControlError::ContextMismatch)
+    ));
+    assert!(!app_state_root.join("transactions").exists());
+    assert!(!app_state_root.join("backups").exists());
 }
 
 fn sha256_hex(value: &[u8]) -> String {

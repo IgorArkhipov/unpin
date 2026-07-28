@@ -1,4 +1,7 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -6,8 +9,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     approval::{ApprovalExpectation, ControlAuthorization},
+    provider_reach::{
+        ConnectionBoundary, ProviderReach, ProviderReachCoverage, ProviderReachLifecycle,
+        SelectedProviderAuthority,
+    },
     providers::ProviderId,
-    state::atomic_json::OwnerGeneration,
+    sessions::SessionAuthorityKey,
+    state::atomic_json::{OwnerGeneration, StateRevision},
     transitions::{
         EffectActivation, JournalError, JournalHandle, TransitionJournalStore, TransitionLifecycle,
         TransitionPlan, journal::MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES,
@@ -15,6 +23,57 @@ use crate::{
 };
 
 pub const CONTROL_OPERATION_ENVELOPE_SCHEMA_VERSION: u32 = 1;
+/// Reach-aware mutation records intentionally use a separate schema so the
+/// long-lived v1 control envelope and read-only projections remain unchanged.
+pub const REACH_AWARE_CONTROL_OPERATION_SCHEMA_VERSION: u32 = 2;
+pub const CONTROL_OPERATION_REACH_AWARE_SCHEMA_VERSION: u32 =
+    REACH_AWARE_CONTROL_OPERATION_SCHEMA_VERSION;
+
+/// Operation families own their payload schemas.  The shared reach-aware
+/// envelope only carries this typed reference and its digest; family payloads
+/// never get copied into the shared control plane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReachAwareOperationFamily {
+    NativeToggle,
+    BulkToggle,
+    GroupToggle,
+    Profile,
+    Gateway,
+    Session,
+    Restore,
+}
+
+impl ReachAwareOperationFamily {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NativeToggle => "native-toggle",
+            Self::BulkToggle => "bulk-toggle",
+            Self::GroupToggle => "group-toggle",
+            Self::Profile => "profile",
+            Self::Gateway => "gateway",
+            Self::Session => "session",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwarePayloadReference {
+    pub family: ReachAwareOperationFamily,
+    pub schema_version: u32,
+    pub reference: String,
+    pub payload_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareJournalBinding {
+    pub owner: OwnerGeneration,
+    pub revision: StateRevision,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -45,7 +104,7 @@ pub struct ControlHumanAction {
     pub guidance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ControlOperationEnvelope {
     pub schema_version: u32,
@@ -126,6 +185,697 @@ impl ControlOperationEnvelope {
             details,
         )
     }
+}
+
+/// Sanitized roots sealed into a reach-aware operation. Roots are canonical
+/// strings only; provider payloads and repository-owned redirect settings are
+/// never persisted in this projection.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareRootBinding {
+    pub app_state_root: String,
+    pub provider_roots: Vec<ReachAwareProviderRoot>,
+    pub provenance: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareProviderRoot {
+    pub provider: ProviderId,
+    pub root: String,
+    pub provenance: String,
+}
+
+impl ReachAwareRootBinding {
+    pub fn from_provider_paths(
+        app_state_root: impl AsRef<Path>,
+        provider_roots: Vec<(ProviderId, PathBuf, String)>,
+        provenance: impl Into<String>,
+    ) -> Result<Self, ReachAwareEnvelopeError> {
+        let app_state_root = canonical_root(app_state_root.as_ref())?;
+        let provenance = provenance.into();
+        validate_safe_text(&provenance, "root provenance")?;
+        if provider_roots.is_empty() {
+            return Err(ReachAwareEnvelopeError::UnsafeRoot(PathBuf::from(
+                "provider roots",
+            )));
+        }
+        let mut normalized = provider_roots
+            .into_iter()
+            .map(|(provider, root, provider_provenance)| {
+                let provider_provenance = {
+                    validate_safe_text(&provider_provenance, "provider root provenance")?;
+                    provider_provenance
+                };
+                Ok(ReachAwareProviderRoot {
+                    provider,
+                    root: canonical_root(&root)?,
+                    provenance: provider_provenance,
+                })
+            })
+            .collect::<Result<Vec<_>, ReachAwareEnvelopeError>>()?;
+        normalized.sort_by_key(|entry| entry.provider);
+        if normalized
+            .windows(2)
+            .any(|pair| pair[0].provider == pair[1].provider)
+        {
+            return Err(ReachAwareEnvelopeError::InvalidOperation);
+        }
+        Ok(Self {
+            app_state_root,
+            provider_roots: normalized,
+            provenance,
+        })
+    }
+
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        Self {
+            app_state_root: redact_path(&self.app_state_root),
+            provider_roots: self
+                .provider_roots
+                .iter()
+                .map(|entry| ReachAwareProviderRoot {
+                    provider: entry.provider,
+                    root: redact_path(&entry.root),
+                    provenance: entry.provenance.clone(),
+                })
+                .collect(),
+            provenance: self.provenance.clone(),
+        }
+    }
+
+    pub fn verify(&self) -> Result<(), ReachAwareEnvelopeError> {
+        if self.app_state_root.is_empty()
+            || !Path::new(&self.app_state_root).is_absolute()
+            || self.provider_roots.is_empty()
+            || self.provenance.is_empty()
+            || self.provenance == "unbound"
+            || self
+                .provider_roots
+                .windows(2)
+                .any(|pair| pair[0].provider >= pair[1].provider)
+            || self.provider_roots.iter().any(|entry| {
+                entry.root.is_empty()
+                    || !Path::new(&entry.root).is_absolute()
+                    || entry.provenance.is_empty()
+                    || entry.provenance == "unbound"
+            })
+        {
+            return Err(ReachAwareEnvelopeError::UnsafeRoot(PathBuf::from(
+                self.provenance.clone(),
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwarePriorState {
+    pub target_id: String,
+    pub fingerprint: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareRecoveryEvidence {
+    pub writes_started: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_resources: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwarePrincipal {
+    pub session_id: String,
+    pub connection_scope_id: String,
+    pub authority_key_id: String,
+    pub authentication_tag: String,
+}
+
+impl ReachAwarePrincipal {
+    pub fn sign(
+        session_id: impl Into<String>,
+        connection_scope_id: impl Into<String>,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<Self, ReachAwareEnvelopeError> {
+        let mut principal = Self {
+            session_id: session_id.into(),
+            connection_scope_id: connection_scope_id.into(),
+            authority_key_id: authority_key.key_id(),
+            authentication_tag: String::new(),
+        };
+        validate_safe_text(&principal.session_id, "principal session")?;
+        validate_safe_text(&principal.connection_scope_id, "principal scope")?;
+        principal.authentication_tag = authority_key
+            .authenticate_reach_aware(&principal.signing_payload()?)
+            .map_err(ReachAwareEnvelopeError::Authentication)?;
+        Ok(principal)
+    }
+
+    pub fn verify(
+        &self,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), ReachAwareEnvelopeError> {
+        if self.authority_key_id != authority_key.key_id() {
+            return Err(ReachAwareEnvelopeError::AuthenticationFailed);
+        }
+        authority_key
+            .verify_reach_aware(&self.signing_payload()?, &self.authentication_tag)
+            .map_err(|_| ReachAwareEnvelopeError::AuthenticationFailed)
+    }
+
+    fn signing_payload(&self) -> Result<Vec<u8>, ReachAwareEnvelopeError> {
+        serde_json::to_vec(&serde_json::json!({
+            "sessionId": self.session_id,
+            "connectionScopeId": self.connection_scope_id,
+            "authorityKeyId": self.authority_key_id,
+        }))
+        .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareTransferCapability {
+    pub capability_id: String,
+    pub audience: String,
+    pub scope_digest: String,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub consumed: bool,
+    pub authority_key_id: String,
+    pub authentication_tag: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReachAwareEnvelopeError {
+    InvalidSchemaVersion,
+    InvalidOperation,
+    MissingRequiredField(&'static str),
+    InvalidJournalBinding,
+    InvalidCapability,
+    CapabilityUnavailable,
+    Authentication(String),
+    AuthenticationFailed,
+    FingerprintMismatch,
+    Serialization(String),
+    UnsafeRoot(PathBuf),
+}
+
+impl fmt::Display for ReachAwareEnvelopeError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidSchemaVersion => {
+                formatter.write_str("reach-aware schema version is unsupported")
+            }
+            Self::InvalidOperation => formatter.write_str("reach-aware operation is invalid"),
+            Self::MissingRequiredField(field) => {
+                write!(formatter, "reach-aware envelope is missing {field}")
+            }
+            Self::InvalidJournalBinding => {
+                formatter.write_str("reach-aware journal owner or revision is invalid")
+            }
+            Self::InvalidCapability => {
+                formatter.write_str("reach-aware transfer capability is invalid")
+            }
+            Self::CapabilityUnavailable => formatter
+                .write_str("reach-aware transfer capability is expired or already consumed"),
+            Self::Authentication(error) => {
+                write!(formatter, "reach-aware authentication failed: {error}")
+            }
+            Self::AuthenticationFailed => formatter.write_str("reach-aware authentication failed"),
+            Self::FingerprintMismatch => {
+                formatter.write_str("reach-aware envelope fingerprint mismatch")
+            }
+            Self::Serialization(error) => {
+                write!(formatter, "reach-aware serialization failed: {error}")
+            }
+            Self::UnsafeRoot(path) => {
+                write!(formatter, "reach-aware root is unsafe: {}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for ReachAwareEnvelopeError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ReachAwareControlOperationEnvelope {
+    pub schema_version: u32,
+    pub family: ReachAwareOperationFamily,
+    pub family_schema_version: u32,
+    pub operation_id: String,
+    pub operation_kind: String,
+    pub plan_fingerprint: String,
+    pub context: ControlResolvedContext,
+    pub connection_boundary: ConnectionBoundary,
+    pub provider_reach: ProviderReach,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_provider: Option<SelectedProviderAuthority>,
+    pub provider_coverage: ProviderReachCoverage,
+    pub expected_lifecycle: ProviderReachLifecycle,
+    pub lifecycle: ProviderReachLifecycle,
+    pub activation: EffectActivation,
+    pub roots: ReachAwareRootBinding,
+    pub audience: String,
+    pub issued_at_unix: i64,
+    pub expires_at_unix: i64,
+    pub owner: OwnerGeneration,
+    pub revision: StateRevision,
+    pub payload_reference: ReachAwarePayloadReference,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_state: Vec<ReachAwarePriorState>,
+    pub principal: ReachAwarePrincipal,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transfer_capability: Option<ReachAwareTransferCapability>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<ReachAwareRecoveryEvidence>,
+    pub envelope_fingerprint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authentication_tag: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub authority_key_id: String,
+}
+
+/// Fail-closed constructor for durable schema-v2 records.  Every field that
+/// affects authority, reach, persistence, or family interpretation must be
+/// supplied explicitly before an envelope can be fingerprinted or persisted.
+#[derive(Debug, Default)]
+pub struct ReachAwareControlOperationEnvelopeBuilder {
+    family: Option<ReachAwareOperationFamily>,
+    family_schema_version: Option<u32>,
+    operation_id: Option<String>,
+    operation_kind: Option<String>,
+    plan_fingerprint: Option<String>,
+    context: Option<ControlResolvedContext>,
+    connection_boundary: Option<ConnectionBoundary>,
+    provider_reach: Option<ProviderReach>,
+    selected_provider: Option<SelectedProviderAuthority>,
+    provider_coverage: Option<ProviderReachCoverage>,
+    expected_lifecycle: Option<ProviderReachLifecycle>,
+    lifecycle: Option<ProviderReachLifecycle>,
+    activation: Option<EffectActivation>,
+    roots: Option<ReachAwareRootBinding>,
+    audience: Option<String>,
+    issued_at_unix: Option<i64>,
+    expires_at_unix: Option<i64>,
+    owner: Option<OwnerGeneration>,
+    revision: Option<StateRevision>,
+    payload_reference: Option<ReachAwarePayloadReference>,
+    prior_state: Vec<ReachAwarePriorState>,
+    principal: Option<ReachAwarePrincipal>,
+    transfer_capability: Option<ReachAwareTransferCapability>,
+    recovery: Option<ReachAwareRecoveryEvidence>,
+}
+
+impl ReachAwareControlOperationEnvelopeBuilder {
+    #[must_use]
+    pub fn family(mut self, family: ReachAwareOperationFamily, schema_version: u32) -> Self {
+        self.family = Some(family);
+        self.family_schema_version = Some(schema_version);
+        self
+    }
+
+    #[must_use]
+    pub fn operation(
+        mut self,
+        operation_id: impl Into<String>,
+        operation_kind: impl Into<String>,
+        plan_fingerprint: impl Into<String>,
+    ) -> Self {
+        self.operation_id = Some(operation_id.into());
+        self.operation_kind = Some(operation_kind.into());
+        self.plan_fingerprint = Some(plan_fingerprint.into());
+        self
+    }
+
+    #[must_use]
+    pub fn context(mut self, context: ControlResolvedContext) -> Self {
+        self.context = Some(context);
+        self
+    }
+
+    #[must_use]
+    pub fn reach(
+        mut self,
+        boundary: ConnectionBoundary,
+        provider_reach: ProviderReach,
+        selected_provider: Option<SelectedProviderAuthority>,
+        coverage: ProviderReachCoverage,
+    ) -> Self {
+        self.connection_boundary = Some(boundary);
+        self.provider_reach = Some(provider_reach);
+        self.selected_provider = selected_provider;
+        self.provider_coverage = Some(coverage);
+        self
+    }
+
+    #[must_use]
+    pub fn lifecycle(
+        mut self,
+        expected: ProviderReachLifecycle,
+        lifecycle: ProviderReachLifecycle,
+        activation: EffectActivation,
+    ) -> Self {
+        self.expected_lifecycle = Some(expected);
+        self.lifecycle = Some(lifecycle);
+        self.activation = Some(activation);
+        self
+    }
+
+    #[must_use]
+    pub fn trusted_roots(mut self, roots: ReachAwareRootBinding) -> Self {
+        self.roots = Some(roots);
+        self
+    }
+
+    #[must_use]
+    pub fn authority(
+        mut self,
+        principal: ReachAwarePrincipal,
+        audience: impl Into<String>,
+        issued_at_unix: i64,
+        expires_at_unix: i64,
+    ) -> Self {
+        self.principal = Some(principal);
+        self.audience = Some(audience.into());
+        self.issued_at_unix = Some(issued_at_unix);
+        self.expires_at_unix = Some(expires_at_unix);
+        self
+    }
+
+    #[must_use]
+    pub fn journal_binding(mut self, owner: OwnerGeneration, revision: StateRevision) -> Self {
+        self.owner = Some(owner);
+        self.revision = Some(revision);
+        self
+    }
+
+    #[must_use]
+    pub fn payload_reference(mut self, payload: ReachAwarePayloadReference) -> Self {
+        self.payload_reference = Some(payload);
+        self
+    }
+
+    #[must_use]
+    pub fn prior_state(mut self, prior_state: Vec<ReachAwarePriorState>) -> Self {
+        self.prior_state = prior_state;
+        self
+    }
+
+    #[must_use]
+    pub fn transfer_capability(mut self, capability: Option<ReachAwareTransferCapability>) -> Self {
+        self.transfer_capability = capability;
+        self
+    }
+
+    #[must_use]
+    pub fn recovery(mut self, recovery: Option<ReachAwareRecoveryEvidence>) -> Self {
+        self.recovery = recovery;
+        self
+    }
+
+    pub fn build(self) -> Result<ReachAwareControlOperationEnvelope, ReachAwareEnvelopeError> {
+        let envelope = ReachAwareControlOperationEnvelope {
+            schema_version: REACH_AWARE_CONTROL_OPERATION_SCHEMA_VERSION,
+            family: self
+                .family
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("family"))?,
+            family_schema_version: self.family_schema_version.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("family schema version"),
+            )?,
+            operation_id: self.operation_id.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("operation id"),
+            )?,
+            operation_kind: self.operation_kind.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("operation kind"),
+            )?,
+            plan_fingerprint: self.plan_fingerprint.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("plan fingerprint"),
+            )?,
+            context: self
+                .context
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("context"))?,
+            connection_boundary: self.connection_boundary.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("connection boundary"),
+            )?,
+            provider_reach: self.provider_reach.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("provider reach"),
+            )?,
+            selected_provider: self.selected_provider,
+            provider_coverage: self.provider_coverage.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("provider coverage"),
+            )?,
+            expected_lifecycle: self.expected_lifecycle.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("expected lifecycle"),
+            )?,
+            lifecycle: self
+                .lifecycle
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("lifecycle"))?,
+            activation: self
+                .activation
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("activation"))?,
+            roots: self
+                .roots
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField(
+                    "trusted roots",
+                ))?,
+            audience: self
+                .audience
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("audience"))?,
+            issued_at_unix: self
+                .issued_at_unix
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("issued at"))?,
+            expires_at_unix: self
+                .expires_at_unix
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("expires at"))?,
+            owner: self
+                .owner
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField(
+                    "journal owner",
+                ))?,
+            revision: self
+                .revision
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField(
+                    "journal revision",
+                ))?,
+            payload_reference: self.payload_reference.ok_or(
+                ReachAwareEnvelopeError::MissingRequiredField("family payload reference"),
+            )?,
+            prior_state: self.prior_state,
+            principal: self
+                .principal
+                .ok_or(ReachAwareEnvelopeError::MissingRequiredField("principal"))?,
+            transfer_capability: self.transfer_capability,
+            recovery: self.recovery,
+            envelope_fingerprint: String::new(),
+            authentication_tag: String::new(),
+            authority_key_id: String::new(),
+        };
+        envelope.validate_complete()?;
+        let mut envelope = envelope;
+        envelope.envelope_fingerprint = envelope.compute_fingerprint()?;
+        Ok(envelope)
+    }
+}
+
+pub type ControlOperationEnvelopeV2 = ReachAwareControlOperationEnvelope;
+
+impl ReachAwareControlOperationEnvelope {
+    #[must_use]
+    pub fn builder() -> ReachAwareControlOperationEnvelopeBuilder {
+        ReachAwareControlOperationEnvelopeBuilder::default()
+    }
+
+    pub fn fingerprint(&self) -> Result<String, ReachAwareEnvelopeError> {
+        self.compute_fingerprint()
+    }
+
+    pub fn verify(&self) -> Result<(), ReachAwareEnvelopeError> {
+        if self.schema_version != REACH_AWARE_CONTROL_OPERATION_SCHEMA_VERSION {
+            return Err(ReachAwareEnvelopeError::InvalidSchemaVersion);
+        }
+        self.validate_complete()?;
+        if self.envelope_fingerprint != self.compute_fingerprint()? {
+            return Err(ReachAwareEnvelopeError::FingerprintMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn seal(
+        &mut self,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), ReachAwareEnvelopeError> {
+        self.verify()?;
+        self.authority_key_id = authority_key.key_id();
+        self.authentication_tag = authority_key
+            .authenticate_reach_aware(&self.signing_payload()?)
+            .map_err(ReachAwareEnvelopeError::Authentication)?;
+        Ok(())
+    }
+
+    pub fn verify_authenticated(
+        &self,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), ReachAwareEnvelopeError> {
+        self.verify()?;
+        self.principal.verify(authority_key)?;
+        if self.authority_key_id != authority_key.key_id() || self.authentication_tag.is_empty() {
+            return Err(ReachAwareEnvelopeError::AuthenticationFailed);
+        }
+        authority_key
+            .verify_reach_aware(&self.signing_payload()?, &self.authentication_tag)
+            .map_err(|_| ReachAwareEnvelopeError::AuthenticationFailed)
+    }
+
+    #[must_use]
+    pub fn redacted(&self) -> Self {
+        let mut redacted = self.clone();
+        redacted.roots = self.roots.redacted();
+        redacted.prior_state.iter_mut().for_each(|entry| {
+            entry.target_id = redact_path(&entry.target_id);
+        });
+        redacted.authentication_tag.clear();
+        redacted.envelope_fingerprint = redacted.compute_fingerprint().unwrap_or_default();
+        redacted
+    }
+
+    fn compute_fingerprint(&self) -> Result<String, ReachAwareEnvelopeError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            ReachAwareEnvelopeError::Serialization("envelope is not an object".to_string())
+        })?;
+        object.remove("envelopeFingerprint");
+        object.remove("authenticationTag");
+        object.remove("authorityKeyId");
+        Ok(crate::encode_lower_hex(&Sha256::digest(
+            serde_json::to_vec(&value)
+                .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))?,
+        )))
+    }
+
+    fn signing_payload(&self) -> Result<Vec<u8>, ReachAwareEnvelopeError> {
+        let mut value = serde_json::to_value(self)
+            .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))?;
+        let object = value.as_object_mut().ok_or_else(|| {
+            ReachAwareEnvelopeError::Serialization("envelope is not an object".to_string())
+        })?;
+        object.remove("authenticationTag");
+        serde_json::to_vec(&value)
+            .map_err(|error| ReachAwareEnvelopeError::Serialization(error.to_string()))
+    }
+
+    fn validate_complete(&self) -> Result<(), ReachAwareEnvelopeError> {
+        validate_safe_text(&self.operation_id, "operation id")?;
+        validate_safe_text(&self.operation_kind, "operation kind")?;
+        validate_safe_text(&self.plan_fingerprint, "plan fingerprint")?;
+        validate_safe_text(&self.context.repository_key, "repository key")?;
+        validate_safe_text(&self.context.workspace_key, "workspace key")?;
+        if self.family_schema_version == 0
+            || self.payload_reference.schema_version == 0
+            || self.payload_reference.family != self.family
+        {
+            return Err(ReachAwareEnvelopeError::InvalidOperation);
+        }
+        validate_safe_text(&self.audience, "audience")?;
+        if self.expires_at_unix <= self.issued_at_unix {
+            return Err(ReachAwareEnvelopeError::InvalidOperation);
+        }
+        self.roots.verify()?;
+        if self.principal.session_id.is_empty()
+            || self.principal.connection_scope_id.is_empty()
+            || self.principal.authority_key_id.is_empty()
+            || self.principal.authentication_tag.is_empty()
+        {
+            return Err(ReachAwareEnvelopeError::AuthenticationFailed);
+        }
+        if self.owner.owner_id.is_empty()
+            || self.owner.generation == 0
+            || self.revision.sequence == 0
+            || self.revision.fingerprint.is_empty()
+        {
+            return Err(ReachAwareEnvelopeError::InvalidJournalBinding);
+        }
+        validate_safe_text(&self.payload_reference.reference, "payload reference")?;
+        validate_safe_text(&self.payload_reference.payload_digest, "payload digest")?;
+        let normalized_coverage =
+            ProviderReachCoverage::new(self.provider_coverage.entries.clone());
+        if normalized_coverage != self.provider_coverage {
+            return Err(ReachAwareEnvelopeError::InvalidOperation);
+        }
+        if let Some(selected_provider) = self.provider_reach.provider()
+            && (self.roots.provider_roots.len() != 1
+                || self.roots.provider_roots[0].provider != selected_provider
+                || self
+                    .provider_coverage
+                    .included()
+                    .any(|entry| entry.provider != selected_provider))
+        {
+            return Err(ReachAwareEnvelopeError::InvalidOperation);
+        }
+        if let Some(boundary_provider) = self.connection_boundary.provider()
+            && (self.provider_reach == ProviderReach::All
+                || self.provider_reach.provider() != Some(boundary_provider))
+        {
+            return Err(ReachAwareEnvelopeError::InvalidOperation);
+        }
+        if let Some(selected) = self.selected_provider
+            && Some(selected.provider) != self.provider_reach.provider()
+        {
+            return Err(ReachAwareEnvelopeError::InvalidOperation);
+        }
+        if let Some(capability) = &self.transfer_capability {
+            if capability.consumed
+                || capability.audience != self.audience
+                || capability.issued_at_unix < self.issued_at_unix
+                || capability.expires_at_unix > self.expires_at_unix
+                || capability.expires_at_unix <= capability.issued_at_unix
+                || capability.scope_digest.is_empty()
+                || capability.authority_key_id.is_empty()
+                || capability.authentication_tag.is_empty()
+            {
+                return Err(ReachAwareEnvelopeError::InvalidCapability);
+            }
+        }
+        Ok(())
+    }
+}
+
+fn canonical_root(path: &Path) -> Result<String, ReachAwareEnvelopeError> {
+    let metadata = std::fs::symlink_metadata(path)
+        .map_err(|_| ReachAwareEnvelopeError::UnsafeRoot(path.to_path_buf()))?;
+    if metadata.file_type().is_symlink() {
+        return Err(ReachAwareEnvelopeError::UnsafeRoot(path.to_path_buf()));
+    }
+    let canonical = std::fs::canonicalize(path)
+        .map_err(|_| ReachAwareEnvelopeError::UnsafeRoot(path.to_path_buf()))?;
+    if !canonical.is_absolute() {
+        return Err(ReachAwareEnvelopeError::UnsafeRoot(canonical));
+    }
+    Ok(canonical.to_string_lossy().into_owned())
+}
+
+fn redact_path(path: &str) -> String {
+    if path.is_empty() {
+        return String::new();
+    }
+    format!(
+        "<private:{}>",
+        &crate::encode_lower_hex(&Sha256::digest(path.as_bytes()))[..16]
+    )
+}
+
+fn validate_safe_text(value: &str, _label: &str) -> Result<(), ReachAwareEnvelopeError> {
+    if value.is_empty() || value.chars().any(char::is_control) {
+        return Err(ReachAwareEnvelopeError::InvalidOperation);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
