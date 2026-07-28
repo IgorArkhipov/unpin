@@ -24,7 +24,9 @@ configuration for Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It
 normalizes provider-specific skills, MCP servers, plugins, hooks, agents, and
 settings into one inventory.
 
-Unpin `0.1.0-beta.3` is the first public beta. GitHub Releases provide
+Unpin `0.1.0-beta.4` adds reusable personal and repository inventory groups to
+the original beta foundation. Release artifacts are published only after
+required CI and provider evidence are complete. GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
 GNU/Linux. crates.io, package-manager distribution, and platform code signing
 are deferred. The full fixture-backed matrix and available-host validation run

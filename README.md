@@ -8,18 +8,20 @@ Internal agent workflow context may exist locally under `memory-bank/`, `.prompt
 
 ## Distribution status and quick start
 
-Unpin `0.1.0-beta.3` is the first public beta. GitHub Releases provide
+Unpin `0.1.0-beta.4` adds reusable personal and repository inventory groups to
+the original beta foundation. Release artifacts are published only after
+required CI and provider evidence are complete. GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
 GNU/Linux, together with CycloneDX SBOM attestations, SHA-256 checksums, and
 approved provider-matrix evidence. The binaries are not Apple-notarized or
 platform-code-signed. crates.io and package-manager distribution are deferred.
 
-Download the archive for your platform from
+After publication, download the archive for your platform from
 [GitHub Releases](https://github.com/IgorArkhipov/unpin/releases), verify it
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.1.0-beta.3-TARGET.tar.gz \
+gh attestation verify unpin-v0.1.0-beta.4-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -27,7 +29,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.1.0-beta.3-TARGET
+cd unpin-v0.1.0-beta.4-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"
