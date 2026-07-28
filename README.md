@@ -4,8 +4,6 @@ Unpin is a Rust CLI/TUI for local AI-agent configuration discovery, safe
 mutation, reusable inventory groups, snapshots, restore, and MCP-backed agent
 workflows.
 
-Internal agent workflow context may exist locally under `memory-bank/`, `.prompts/`, `.protocols/`, and `old/`, but those folders are excluded from git and are not part of the public repository surface.
-
 ## Distribution status and quick start
 
 Unpin `0.1.0-beta.4` adds reusable personal and repository inventory groups to
