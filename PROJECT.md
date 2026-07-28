@@ -58,7 +58,3 @@ run from source, the
 [local provider validation matrix](docs/local-provider-matrix.md) documents the
 release evidence procedure, and the [release guide](docs/RELEASING.md)
 documents publication.
-
-Copied TypeScript-era context under `old/` and agent workflow material under
-`memory-bank/`, `.prompts/`, and `.protocols/` are local-only and git-ignored so
-public commits stay focused on the Rust product source.
