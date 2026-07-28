@@ -165,6 +165,16 @@ fn reach_aware_v2_envelope_binds_provider_material_without_changing_v1() {
 }
 
 #[test]
+fn reach_aware_roots_allow_policy_only_operations_without_provider_paths() {
+    let state = TempDir::new().expect("state");
+    let roots =
+        ReachAwareRootBinding::from_provider_paths(state.path(), Vec::new(), "policy-store-only")
+            .expect("policy-only roots");
+    roots.verify().expect("valid policy-only roots");
+    assert!(roots.provider_roots.is_empty());
+}
+
+#[test]
 fn reach_aware_v2_builder_is_fail_closed_without_authority_and_journal_binding() {
     let error = ReachAwareControlOperationEnvelope::builder()
         .family(ReachAwareOperationFamily::NativeToggle, 1)

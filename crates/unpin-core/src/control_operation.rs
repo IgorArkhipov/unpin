@@ -215,11 +215,6 @@ impl ReachAwareRootBinding {
         let app_state_root = canonical_root(app_state_root.as_ref())?;
         let provenance = provenance.into();
         validate_safe_text(&provenance, "root provenance")?;
-        if provider_roots.is_empty() {
-            return Err(ReachAwareEnvelopeError::UnsafeRoot(PathBuf::from(
-                "provider roots",
-            )));
-        }
         let mut normalized = provider_roots
             .into_iter()
             .map(|(provider, root, provider_provenance)| {
@@ -268,7 +263,6 @@ impl ReachAwareRootBinding {
     pub fn verify(&self) -> Result<(), ReachAwareEnvelopeError> {
         if self.app_state_root.is_empty()
             || !Path::new(&self.app_state_root).is_absolute()
-            || self.provider_roots.is_empty()
             || self.provenance.is_empty()
             || self.provenance == "unbound"
             || self
@@ -1050,7 +1044,8 @@ impl ReachAwareControlOperationEnvelope {
         if normalized_coverage != self.provider_coverage {
             return Err(ReachAwareEnvelopeError::InvalidOperation);
         }
-        if let Some(selected_provider) = self.provider_reach.provider()
+        if self.family != ReachAwareOperationFamily::Profile
+            && let Some(selected_provider) = self.provider_reach.provider()
             && (self.roots.provider_roots.len() != 1
                 || self.roots.provider_roots[0].provider != selected_provider
                 || self

@@ -1,10 +1,14 @@
+mod support;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
+    fmt::Write as _,
     fs,
     path::{Path, PathBuf},
     thread,
 };
 
+use sha2::{Digest, Sha256};
 use tempfile::TempDir as RawTempDir;
 use unpin_core::{
     catalog::{
@@ -12,23 +16,29 @@ use unpin_core::{
         CapabilityOwnership, CapabilityScope, CapabilityStateEvidence, CapabilityTrustRequirements,
         Catalog, CatalogRecord, ContributionControl, ContributionEdge, ProviderView, ToolNamespace,
     },
+    control_operation::{ReachAwareOperationFamily, ReachAwarePrincipal, ReachAwareRootBinding},
     discovery::DiscoveryLayer,
     profiles::{
         ActivationRequirement, CapabilityLockSnapshot, CapabilityLockState, EnforcementKind,
         GatewaySelection, MAX_PROFILE_DEFINITION_BYTES, MemberSelectionKind, PolicyResolutionError,
         PolicyScope, ProfileDefinition, ProfileDefinitionEntry, ProfileProviderOperationController,
         ProfileProviderOperationError, ProfileProviderOperationStatus,
-        ProfileProviderTargetClassification, ProfileReference, ProfileRevisionSet,
-        ProfileSelection, ProfileSourceScope, ProfileValidationError, ProviderPolicy,
-        ResolutionPolicies, ResolvedGatewayMode, ResolvedProfileSelection, ScopePolicy,
-        capability_lock_enforcement, compile_profile, propose_profile,
-        resolve_effective_capabilities, resolve_effective_gateway, resolve_effective_policy,
+        ProfileProviderReachAwareApplyContext, ProfileProviderTargetClassification,
+        ProfileReference, ProfileRevisionSet, ProfileSelection, ProfileSourceScope,
+        ProfileValidationError, ProviderPolicy, ResolutionPolicies, ResolvedGatewayMode,
+        ResolvedProfileSelection, ScopePolicy, capability_lock_enforcement, compile_profile,
+        propose_profile, resolve_effective_capabilities, resolve_effective_gateway,
+        resolve_effective_policy,
         store::{ProfileStore, ProfileStoreError},
     },
-    provider_reach::{ProviderReach, SelectedProviderProvenance},
+    provider_reach::{ConnectionBoundary, ProviderReach, SelectedProviderProvenance},
     providers::ProviderId,
+    sessions::SessionAuthorityKey,
     state::atomic_json::OwnerGeneration,
+    transitions::{TransitionJournalStore, TransitionLifecycle},
 };
+
+use support::{control_authorization, control_context};
 
 struct TempDir {
     _inner: RawTempDir,
@@ -301,6 +311,47 @@ fn named_profile_revision() -> unpin_core::profiles::CompiledProfileRevision {
         .expect("named profile revision")
 }
 
+fn profile_reach_context(
+    app_state_root: &Path,
+    authority_key: &SessionAuthorityKey,
+    approval_context: &unpin_core::approval::ControlApprovalContext,
+    boundary: ConnectionBoundary,
+) -> ProfileProviderReachAwareApplyContext {
+    let session_id = "profile-reach-session";
+    let scope = sha256_hex(
+        format!(
+            "{}\0{}\0{}",
+            approval_context.repository_key(),
+            approval_context.workspace_key(),
+            session_id
+        )
+        .as_bytes(),
+    );
+    ProfileProviderReachAwareApplyContext {
+        approval_context: approval_context.clone(),
+        roots: ReachAwareRootBinding::from_provider_paths(
+            app_state_root,
+            Vec::new(),
+            "profile-policy-store",
+        )
+        .expect("profile policy roots"),
+        principal: ReachAwarePrincipal::sign(session_id, scope, boundary, authority_key)
+            .expect("profile reach principal"),
+        audience: "unpin-core-profile-provider-apply-v2".to_string(),
+        issued_at_unix: 1_000,
+        expires_at_unix: 1_060,
+        now_unix: 1_000,
+    }
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut encoded = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut encoded, "{byte:02x}").expect("write to String");
+    }
+    encoded
+}
+
 #[test]
 fn selected_provider_profile_materializes_absent_override_without_touching_generic_policy() {
     let temp = TempDir::new();
@@ -352,6 +403,218 @@ fn selected_provider_profile_materializes_absent_override_without_touching_gener
             .profile,
         ProfileSelection::Profile { .. }
     ));
+}
+
+#[test]
+fn reach_aware_profile_apply_attaches_v2_journal_and_replays_without_second_cas() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    fs::create_dir_all(&state).expect("state directory");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    store
+        .save(&target, &ScopePolicy::default(), None, owner())
+        .expect("seed policy");
+    let authority_key = SessionAuthorityKey::new([0x64; 32]);
+    let controller = ProfileProviderOperationController::new(&state)
+        .with_session_authority_key(authority_key.clone());
+    let plan = controller
+        .plan(
+            &target,
+            &named_profile_revision(),
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
+        )
+        .expect("profile provider plan");
+    let approval_context = control_context("profile-repository", "profile-workspace");
+    let expectation = plan
+        .approval_expectation(&approval_context, "profile-reach-session")
+        .expect("approval expectation");
+    let durable = profile_reach_context(
+        &state,
+        &authority_key,
+        &approval_context,
+        ConnectionBoundary::All,
+    );
+    let applied = controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(&state, &expectation, "profile-reach-first", 1_000),
+            durable.clone(),
+            "profile-reach-actor",
+        )
+        .expect("reach-aware profile apply");
+    assert_eq!(applied.status, ProfileProviderOperationStatus::Applied);
+    let revision = applied.revision.clone().expect("applied revision");
+    let mut drifted_policy = applied.policy.clone();
+    drifted_policy.gateway = GatewaySelection::Native;
+    let drifted_revision = store
+        .save(
+            &target,
+            &drifted_policy,
+            Some(&revision),
+            OwnerGeneration::new("profile-drift", 3).expect("drift owner"),
+        )
+        .expect("ambient policy drift after terminal result");
+
+    let retry = controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(&state, &expectation, "profile-reach-retry", 1_000),
+            durable,
+            "profile-reach-actor",
+        )
+        .expect("terminal reach-aware replay");
+    assert_eq!(retry, applied);
+    assert_eq!(
+        store
+            .load(&target)
+            .expect("load policy")
+            .expect("policy snapshot")
+            .revision,
+        drifted_revision
+    );
+
+    let journal = TransitionJournalStore::new(&state)
+        .list()
+        .expect("transition journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == plan.operation_id)
+        .expect("profile transition journal");
+    assert_eq!(journal.lifecycle, TransitionLifecycle::Committed);
+    assert_eq!(
+        journal.terminal_code.as_deref(),
+        Some("provider-reach-applied")
+    );
+    let envelope = journal.reach_aware.expect("reach-aware envelope");
+    assert_eq!(envelope.schema_version, 2);
+    assert_eq!(envelope.family, ReachAwareOperationFamily::Profile);
+    assert_eq!(envelope.plan_fingerprint, plan.plan_fingerprint);
+    assert!(envelope.roots.provider_roots.is_empty());
+    envelope
+        .verify_authenticated(&authority_key)
+        .expect("authenticated profile envelope");
+    let payload_path = state
+        .join("transactions")
+        .join("payloads")
+        .join("profile")
+        .join(format!("{}.json", plan.operation_id));
+    let payload = fs::read_to_string(&payload_path).expect("profile family payload");
+    assert!(!payload.contains("credentialAlias"));
+    assert!(!payload.contains("secret"));
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(payload_path)
+                .expect("profile family payload metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+}
+
+#[test]
+fn reach_aware_profile_apply_rejects_app_state_root_drift_before_policy_cas() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    let drift = temp.path().join("drift");
+    fs::create_dir_all(&state).expect("state directory");
+    fs::create_dir_all(&drift).expect("drift directory");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    let seeded = store
+        .save(&target, &ScopePolicy::default(), None, owner())
+        .expect("seed policy");
+    let authority_key = SessionAuthorityKey::new([0x64; 32]);
+    let controller = ProfileProviderOperationController::new(&state)
+        .with_session_authority_key(authority_key.clone());
+    let plan = controller
+        .plan(&target, &named_profile_revision(), ProviderReach::all())
+        .expect("profile provider plan");
+    let approval_context = control_context("profile-repository", "profile-workspace");
+    let expectation = plan
+        .approval_expectation(&approval_context, "profile-reach-session")
+        .expect("approval expectation");
+
+    let error = controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(&state, &expectation, "profile-reach-root-drift", 1_000),
+            profile_reach_context(
+                &drift,
+                &authority_key,
+                &approval_context,
+                ConnectionBoundary::All,
+            ),
+            "profile-reach-actor",
+        )
+        .expect_err("root drift must reject");
+    assert!(matches!(
+        error,
+        ProfileProviderOperationError::ReachAware(_)
+    ));
+    assert_eq!(
+        store
+            .load(&target)
+            .expect("load policy")
+            .expect("policy snapshot")
+            .revision,
+        seeded
+    );
+    assert!(!state.join("transactions").exists());
+}
+
+#[test]
+fn reach_aware_profile_apply_rejects_expired_authority_before_policy_cas() {
+    let temp = TempDir::new();
+    let state = temp.path().join("state");
+    fs::create_dir_all(&state).expect("state directory");
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let store = unpin_core::profiles::PolicyStore::new(&state);
+    let seeded = store
+        .save(&target, &ScopePolicy::default(), None, owner())
+        .expect("seed policy");
+    let authority_key = SessionAuthorityKey::new([0x64; 32]);
+    let controller = ProfileProviderOperationController::new(&state)
+        .with_session_authority_key(authority_key.clone());
+    let plan = controller
+        .plan(&target, &named_profile_revision(), ProviderReach::all())
+        .expect("profile provider plan");
+    let approval_context = control_context("profile-repository", "profile-workspace");
+    let expectation = plan
+        .approval_expectation(&approval_context, "profile-reach-session")
+        .expect("approval expectation");
+    let mut durable = profile_reach_context(
+        &state,
+        &authority_key,
+        &approval_context,
+        ConnectionBoundary::All,
+    );
+    durable.now_unix = durable.expires_at_unix;
+
+    let error = controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(&state, &expectation, "profile-reach-expired", 1_000),
+            durable,
+            "profile-reach-actor",
+        )
+        .expect_err("expired authority must reject");
+    assert!(matches!(
+        error,
+        ProfileProviderOperationError::ReachAware(_)
+    ));
+    assert_eq!(
+        store
+            .load(&target)
+            .expect("load policy")
+            .expect("policy snapshot")
+            .revision,
+        seeded
+    );
+    assert!(!state.join("transactions").exists());
 }
 
 #[test]
@@ -520,6 +783,9 @@ fn provider_profile_fingerprint_is_stable_for_target_order_and_recovery_is_not_p
     let mut changed = first.clone();
     changed.targets[0].post_state_fingerprint.push('0');
     assert!(changed.verify().is_err());
+    let mut changed_operation_id = first.clone();
+    changed_operation_id.operation_id.push('0');
+    assert!(changed_operation_id.verify().is_err());
 
     let result = controller
         .apply_with_verifier(&first, "profile-provider-test", |_| {
