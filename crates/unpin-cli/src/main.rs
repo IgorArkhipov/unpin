@@ -659,7 +659,12 @@ fn main() -> ExitCode {
                                                 &approval_context,
                                                 unpin_core::provider_reach::ConnectionBoundary::All,
                                                 reach_input,
-                                                Vec::new(),
+                                                vec![
+                                                    unpin_core::provider_reach::SelectedProviderAuthority::new(
+                                                        item.provider,
+                                                        unpin_core::provider_reach::SelectedProviderProvenance::ExplicitInput,
+                                                    ),
+                                                ],
                                             ) {
                                                 Ok(plan) => plan,
                                                 Err(error) => {
