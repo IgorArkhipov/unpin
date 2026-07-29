@@ -569,11 +569,14 @@ impl GroupPlanner {
             .any(ProviderCoverageEntry::is_reach_exclusion);
         let disposition = if exceptional || (included_count == 0 && reach_exclusions) {
             GroupPlanDisposition::Blocked
-        } else if !actionable {
+        } else if !actionable && !reach_exclusions {
             GroupPlanDisposition::NoOp
         } else if mode == GroupPlanMode::PreviewOnly {
             GroupPlanDisposition::Preview
         } else {
+            // A selected-provider subset with no writes still needs a durable
+            // handoff so the excluded members are reported as `partial` rather
+            // than being mistaken for an ordinary no-op.
             GroupPlanDisposition::Actionable
         };
         let response_id = secure_random_identifier("group-response", 16)
@@ -749,7 +752,7 @@ fn expected_group_disposition(plan: &GroupTogglePlan) -> GroupPlanDisposition {
         .any(ProviderCoverageEntry::is_reach_exclusion);
     if has_blocker || (included_count == 0 && has_reach_exclusions) {
         GroupPlanDisposition::Blocked
-    } else if !actionable {
+    } else if !actionable && !has_reach_exclusions {
         GroupPlanDisposition::NoOp
     } else if plan.mode == GroupPlanMode::PreviewOnly {
         GroupPlanDisposition::Preview
@@ -908,15 +911,34 @@ fn build_parent_transition(
     repository_key: &str,
     workspace_key: &str,
 ) -> Result<TransitionPlan, TransitionPlanError> {
-    TransitionPlan::new(
-        operation_id,
-        TransitionKind::InventoryGroupApply,
-        TransitionContext {
-            repository_key: repository_key.to_string(),
-            workspace_key: workspace_key.to_string(),
-            session_id: None,
-            profile_digest: None,
-        },
+    let effects = if resources.is_empty() {
+        // TransitionPlan requires at least one effect. For an actionable
+        // selected-provider plan whose included members are already correct,
+        // retain a deterministic terminal selection effect so the reviewed
+        // partial outcome has a durable operation/journal without inventing a
+        // provider write target.
+        let pre_fingerprint = encode_lower_hex(&Sha256::digest(
+            format!("inventory-group-terminal-pre\0{operation_id}").as_bytes(),
+        ));
+        let post_fingerprint = encode_lower_hex(&Sha256::digest(
+            format!("inventory-group-terminal-post\0{operation_id}").as_bytes(),
+        ));
+        let resource_digest = encode_lower_hex(&Sha256::digest(
+            format!("inventory-group-terminal-resource\0{operation_id}").as_bytes(),
+        ));
+        vec![TransitionEffect {
+            effect_id: "inventory-group-selection-effect".to_string(),
+            kind: TransitionEffectKind::ReplaceProviderConfig,
+            resource_id: format!("inventory-group-selection-{}", &resource_digest[..24]),
+            target_type: "inventory-group-selection".to_string(),
+            summary: "Record one reviewed inventory group selection".to_string(),
+            authority: EffectAuthority::UserManaged,
+            activation: EffectActivation::RestartRequired,
+            expected_pre_fingerprint: Some(pre_fingerprint),
+            expected_post_fingerprint: Some(post_fingerprint),
+            provider_views: Vec::new(),
+        }]
+    } else {
         resources
             .iter()
             .map(|resource| TransitionEffect {
@@ -931,7 +953,18 @@ fn build_parent_transition(
                 expected_post_fingerprint: Some(resource.expected_post_fingerprint.clone()),
                 provider_views: resource.provider_views.clone(),
             })
-            .collect(),
+            .collect()
+    };
+    TransitionPlan::new(
+        operation_id,
+        TransitionKind::InventoryGroupApply,
+        TransitionContext {
+            repository_key: repository_key.to_string(),
+            workspace_key: workspace_key.to_string(),
+            session_id: None,
+            profile_digest: None,
+        },
+        effects,
     )
 }
 
@@ -1351,6 +1384,7 @@ mod tests {
                 ),
             )
             .expect("selected-provider plan");
+        assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
         assert_eq!(plan.members.len(), 2);
         assert_eq!(plan.total_members, 2);
         assert_eq!(

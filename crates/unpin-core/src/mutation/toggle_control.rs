@@ -1,4 +1,7 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -10,9 +13,11 @@ use crate::{
     },
     control_operation::{
         ControlResolvedContext, ReachAwareControlOperationEnvelope, ReachAwareOperationFamily,
-        ReachAwarePayloadReference, ReachAwarePrincipal, ReachAwareRootBinding,
+        ReachAwarePayloadReference, ReachAwarePrincipal, ReachAwarePriorState,
+        ReachAwareRootBinding,
     },
     discovery::DiscoveryItem,
+    groups::{index_source_views, shared_source_crosses_provider_reach},
     mutation::{
         BackupAuthenticationKey, TogglePlanInput, ToggleResult, ToggleStatus,
         apply_authorized_toggle_transaction, apply_authorized_toggle_transaction_reach_aware,
@@ -24,6 +29,7 @@ use crate::{
         ProviderReachRequest, SelectedProviderAuthority, SelectedProviderProvenance,
     },
     sessions::SessionAuthorityKey,
+    state::atomic_json::{AtomicJsonStore, OwnerGeneration, StateError, StateResourceLock},
     transitions::{
         EffectActivation, EffectAuthority, TransitionContext, TransitionEffect,
         TransitionEffectKind, TransitionJournal, TransitionJournalStore, TransitionKind,
@@ -32,6 +38,30 @@ use crate::{
 };
 
 pub const NATIVE_TOGGLE_PLAN_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeToggleHandoff {
+    pub operation_id: String,
+    pub plan_fingerprint: String,
+    pub expires_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct NativeToggleOperationRecord {
+    schema_version: u32,
+    plan: NativeTogglePlan,
+}
+
+impl NativeToggleOperationRecord {
+    fn verify(&self) -> Result<(), NativeToggleControlError> {
+        if self.schema_version != NATIVE_TOGGLE_PLAN_SCHEMA_VERSION {
+            return Err(NativeToggleControlError::InvalidPlan);
+        }
+        self.plan.verify()
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -108,9 +138,168 @@ impl NativeToggleController {
         }
     }
 
+    /// Seal an authenticated native-toggle handoff without performing a
+    /// provider write. Consumers must load this family-owned payload before
+    /// applying so ambient discovery cannot replace the reviewed plan.
+    pub fn seal_handoff(
+        &self,
+        reviewed: &NativeTogglePlan,
+        context: &ControlApprovalContext,
+        roots: ReachAwareRootBinding,
+        audience: impl Into<String>,
+        issued_at_unix: i64,
+        expires_at_unix: i64,
+    ) -> Result<NativeToggleHandoff, NativeToggleControlError> {
+        reviewed.verify()?;
+        roots
+            .verify()
+            .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
+        let authority_key = self.session_authority_key.as_ref().ok_or_else(|| {
+            NativeToggleControlError::ReachAware(
+                "native toggle handoff requires session authority key".to_string(),
+            )
+        })?;
+        let expectation = reviewed.approval_expectation(context)?;
+        let session_id = reviewed.transition.operation_id.clone();
+        let scope_digest = crate::encode_lower_hex(&Sha256::digest(
+            format!(
+                "{}\0{}\0{}",
+                expectation.repository_key, expectation.workspace_key, session_id
+            )
+            .as_bytes(),
+        ));
+        let principal = ReachAwarePrincipal::sign(
+            session_id,
+            scope_digest,
+            derived_connection_boundary(reviewed.provider_reach),
+            authority_key,
+        )
+        .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
+        let family = ReachAwareOperationFamily::NativeToggle;
+        let selected_provider = reviewed.provider_reach.provider().map(|provider| {
+            SelectedProviderAuthority::new(
+                provider,
+                reviewed
+                    .provider_reach
+                    .provenance()
+                    .unwrap_or(SelectedProviderProvenance::ExactIndividualTarget),
+            )
+        });
+        let activation = reviewed
+            .transition
+            .effects
+            .first()
+            .map_or(EffectActivation::RestartRequired, |effect| {
+                effect.activation
+            });
+        let builder = ReachAwareControlOperationEnvelope::builder()
+            .family(family, NATIVE_TOGGLE_PLAN_SCHEMA_VERSION)
+            .operation(
+                reviewed.transition.operation_id.clone(),
+                reviewed.transition.kind.as_str(),
+                reviewed.plan_fingerprint.clone(),
+            )
+            .context(ControlResolvedContext {
+                repository_key: reviewed.transition.context.repository_key.clone(),
+                workspace_key: reviewed.transition.context.workspace_key.clone(),
+                session_id: reviewed.transition.context.session_id.clone(),
+                profile_digest: reviewed.transition.context.profile_digest.clone(),
+            })
+            .reach(
+                principal.connection_boundary,
+                reviewed.provider_reach,
+                selected_provider,
+                reviewed.coverage.clone(),
+            )
+            .lifecycle(
+                ProviderReachLifecycle::Applied,
+                ProviderReachLifecycle::Applied,
+                activation,
+            )
+            .trusted_roots(roots)
+            .authority(principal, audience, issued_at_unix, expires_at_unix)
+            .payload_reference(ReachAwarePayloadReference {
+                family,
+                schema_version: NATIVE_TOGGLE_PLAN_SCHEMA_VERSION,
+                reference: native_toggle_payload_reference(&reviewed.transition.operation_id),
+                payload_digest: reviewed.plan_fingerprint.clone(),
+            })
+            .prior_state(
+                reviewed
+                    .transition
+                    .effects
+                    .iter()
+                    .map(|effect| ReachAwarePriorState {
+                        target_id: effect.resource_id.clone(),
+                        fingerprint: effect.expected_pre_fingerprint.clone().unwrap_or_default(),
+                    })
+                    .collect(),
+            );
+        let (payload_path, payload_store) =
+            native_toggle_payload_store(&self.app_state_root, &reviewed.transition.operation_id);
+        let lock_path = payload_path.with_file_name(".native-toggle-operation-domain");
+        let _execution_lock = StateResourceLock::acquire(&lock_path)
+            .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
+        create_or_verify_native_toggle_payload(&payload_store, reviewed)?;
+        let store = TransitionJournalStore::new(&self.app_state_root);
+        let handle = store.create_or_attach_reach_aware(
+            &reviewed.transition,
+            OwnerGeneration::new("native-toggle-control", 1)
+                .map_err(|_| NativeToggleControlError::GenerationOverflow)?,
+            builder,
+            authority_key,
+        )?;
+        let envelope = handle.journal.reach_aware.as_ref().ok_or_else(|| {
+            NativeToggleControlError::ReachAware(
+                "native toggle handoff journal is missing schema-v2 envelope".to_string(),
+            )
+        })?;
+        envelope
+            .verify_authenticated(authority_key)
+            .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?;
+        Ok(NativeToggleHandoff {
+            operation_id: reviewed.transition.operation_id.clone(),
+            plan_fingerprint: reviewed.plan_fingerprint.clone(),
+            expires_at_unix,
+        })
+    }
+
+    pub fn load_handoff(
+        &self,
+        operation_id: &str,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let (_, store) = native_toggle_payload_store(&self.app_state_root, operation_id);
+        let snapshot = store
+            .load::<NativeToggleOperationRecord>()
+            .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?
+            .ok_or_else(|| {
+                NativeToggleControlError::ReachAware("native toggle handoff not found".to_string())
+            })?;
+        let record = snapshot.value;
+        record.verify()?;
+        if record.plan.transition.operation_id != operation_id {
+            return Err(NativeToggleControlError::ReachAware(
+                "native toggle handoff operation id does not match payload".to_string(),
+            ));
+        }
+        Ok(record.plan)
+    }
+
     pub fn plan(
         &self,
         item: DiscoveryItem,
+        context: &ControlApprovalContext,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let inventory = [item.clone()];
+        self.plan_with_inventory(item, &inventory, context)
+    }
+
+    /// Plan a native toggle against the complete discovery inventory so a
+    /// provider-scoped request cannot move a source another provider exposes.
+    pub fn plan_with_inventory(
+        &self,
+        item: DiscoveryItem,
+        inventory: &[DiscoveryItem],
         context: &ControlApprovalContext,
     ) -> Result<NativeTogglePlan, NativeToggleControlError> {
         let request = ProviderReachRequest::new(
@@ -118,7 +307,7 @@ impl NativeToggleController {
             ProviderReachInput::Omitted,
             DerivedTargetKind::Individual,
         );
-        self.plan_with_reach_request(item, context, request)
+        self.plan_with_reach_request_in_inventory(item, inventory, context, request)
     }
 
     /// Resolve connection and explicit selected-provider authority before the
@@ -132,13 +321,35 @@ impl NativeToggleController {
         reach: ProviderReachInput,
         authority_candidates: Vec<SelectedProviderAuthority>,
     ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let inventory = [item.clone()];
+        self.plan_with_reach_in_inventory(
+            item,
+            &inventory,
+            context,
+            boundary,
+            reach,
+            authority_candidates,
+        )
+    }
+
+    /// Resolve selected-provider authority using the complete inventory before
+    /// native planning so shared sources outside the requested reach block.
+    pub fn plan_with_reach_in_inventory(
+        &self,
+        item: DiscoveryItem,
+        inventory: &[DiscoveryItem],
+        context: &ControlApprovalContext,
+        boundary: ConnectionBoundary,
+        reach: ProviderReachInput,
+        authority_candidates: Vec<SelectedProviderAuthority>,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
         let request = ProviderReachRequest {
             boundary,
             reach,
             target_kind: DerivedTargetKind::Individual,
             authority_candidates,
         };
-        self.plan_with_reach_request(item, context, request)
+        self.plan_with_reach_request_in_inventory(item, inventory, context, request)
     }
 
     /// Request-shaped alias for operation adapters that already construct the
@@ -149,9 +360,30 @@ impl NativeToggleController {
         context: &ControlApprovalContext,
         request: ProviderReachRequest,
     ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let inventory = [item.clone()];
+        self.plan_with_reach_request_in_inventory(item, &inventory, context, request)
+    }
+
+    /// Request-shaped native planning with the complete discovered inventory.
+    pub fn plan_with_reach_request_in_inventory(
+        &self,
+        item: DiscoveryItem,
+        inventory: &[DiscoveryItem],
+        context: &ControlApprovalContext,
+        request: ProviderReachRequest,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
         let resolution = request
             .validate_before_discovery()?
             .reconcile_exact_target(Some(item.provider))?;
+        if shared_source_crosses_provider_reach(
+            &item,
+            &resolution.reach,
+            &index_source_views(inventory),
+        ) {
+            return Err(NativeToggleControlError::Blocked(
+                "shared-source-crosses-provider-reach".to_string(),
+            ));
+        }
         let journals = self.planning_journals()?;
         self.plan_with_resolution_and_journals(item, context, &journals, resolution.reach, None)
     }
@@ -421,6 +653,79 @@ impl NativeToggleController {
                 Err(NativeToggleControlError::Blocked(reason))
             }
         }
+    }
+}
+
+fn native_toggle_payload_store(
+    app_state_root: &Path,
+    operation_id: &str,
+) -> (PathBuf, AtomicJsonStore) {
+    let path = app_state_root
+        .join("transactions")
+        .join("payloads")
+        .join("native-toggle")
+        .join(format!("{}.json", crate::encode_path_segment(operation_id)));
+    let store = AtomicJsonStore::new(path.clone(), NATIVE_TOGGLE_PLAN_SCHEMA_VERSION);
+    (path, store)
+}
+
+fn native_toggle_payload_reference(operation_id: &str) -> String {
+    format!(
+        "native-toggle/{}.json",
+        crate::encode_path_segment(operation_id)
+    )
+}
+
+fn native_toggle_operation_owner(
+    operation_id: &str,
+    generation: u64,
+) -> Result<OwnerGeneration, NativeToggleControlError> {
+    let digest = crate::encode_lower_hex(&Sha256::digest(operation_id.as_bytes()));
+    OwnerGeneration::new(format!("native-toggle-{}", &digest[..32]), generation)
+        .map_err(|_| NativeToggleControlError::GenerationOverflow)
+}
+
+fn create_or_verify_native_toggle_payload(
+    store: &AtomicJsonStore,
+    plan: &NativeTogglePlan,
+) -> Result<(), NativeToggleControlError> {
+    if let Some(snapshot) = store
+        .load::<NativeToggleOperationRecord>()
+        .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?
+    {
+        snapshot.value.verify()?;
+        if snapshot.value.plan != *plan {
+            return Err(NativeToggleControlError::PlanFingerprintMismatch);
+        }
+        return Ok(());
+    }
+    let record = NativeToggleOperationRecord {
+        schema_version: NATIVE_TOGGLE_PLAN_SCHEMA_VERSION,
+        plan: plan.clone(),
+    };
+    match store.compare_and_swap(
+        None,
+        native_toggle_operation_owner(&plan.transition.operation_id, 1)?,
+        &record,
+    ) {
+        Ok(_) => Ok(()),
+        Err(StateError::StaleRevision { .. }) => {
+            let snapshot = store
+                .load::<NativeToggleOperationRecord>()
+                .map_err(|error| NativeToggleControlError::ReachAware(error.to_string()))?
+                .ok_or_else(|| {
+                    NativeToggleControlError::ReachAware(
+                        "native toggle handoff disappeared during create".to_string(),
+                    )
+                })?;
+            snapshot.value.verify()?;
+            if snapshot.value.plan == *plan {
+                Ok(())
+            } else {
+                Err(NativeToggleControlError::PlanFingerprintMismatch)
+            }
+        }
+        Err(error) => Err(NativeToggleControlError::ReachAware(error.to_string())),
     }
 }
 

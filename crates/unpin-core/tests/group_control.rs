@@ -27,7 +27,7 @@ use unpin_core::{
         issue_group_approval_challenge, verify_group_approval_challenge,
     },
     mutation::{BackupAuthenticationKey, RestoreController, RestoreStatus},
-    provider_reach::ConnectionBoundary,
+    provider_reach::{ConnectionBoundary, ProviderReach, SelectedProviderProvenance},
     providers::ProviderId,
     sessions::SessionAuthorityKey,
     state::atomic_json::OwnerGeneration,
@@ -36,7 +36,9 @@ use unpin_core::{
 
 use support::{control_authorization, control_context};
 
-const NOW_UNIX: i64 = 1_000;
+// Keep synthetic authority windows ahead of the real wall clock now that
+// journal attachment validates expiry against trusted system time.
+const NOW_UNIX: i64 = 4_000_000_000;
 
 struct GroupHarness {
     _root: TempDir,
@@ -1513,6 +1515,109 @@ fn no_op_plan_creates_no_operation_challenge_or_artifact_state() {
             .join("groups")
             .join("approval-artifacts")
             .exists()
+    );
+}
+
+#[test]
+fn selected_reach_noop_with_exclusion_is_partial_without_write_boundary() {
+    let harness = GroupHarness::new();
+    let discovery = discover_all(harness.context.discovery_roots()).expect("group discovery");
+    let excluded = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "zed:global:configured-mcp:github")
+        .map(GroupMemberIdentity::try_from)
+        .transpose()
+        .expect("excluded member identity")
+        .expect("Zed fixture member");
+    let personal = PersonalGroupStore::new(harness.context.clone());
+    let current = personal
+        .load("implementation")
+        .expect("load group")
+        .expect("implementation group");
+    let mut members = current.definition.members;
+    members.push(excluded.clone());
+    personal
+        .replace(
+            &GroupDefinitionV1::new("implementation", members).expect("expanded definition"),
+            Some(&current.revision),
+            OwnerGeneration::new("group-control-test", 2).expect("definition owner"),
+        )
+        .expect("expand group");
+
+    let plan = harness
+        .controller
+        .plan_with_reach(
+            &GroupRef::qualified(GroupScope::Personal, "implementation").expect("reference"),
+            GroupTargetState::Enable,
+            10,
+            GroupPlanMode::TuiDirect,
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
+        )
+        .expect("selected-provider no-op plan");
+    assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
+    assert_eq!(
+        plan.lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Partial
+    );
+    assert!(plan.cohorts.is_empty());
+    assert!(plan.resources.is_empty());
+    assert!(
+        plan.transition.is_some(),
+        "partial handoff needs a transition"
+    );
+    plan.verify().expect("partial plan verifies");
+
+    let expectation = harness.expectation(&plan);
+    let result = harness
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-partial-noop",
+                NOW_UNIX,
+            ),
+            harness.reach_context(
+                &SessionAuthorityKey::new([0x53; 32]),
+                harness.codex_roots(harness.context.app_state_root()),
+                ConnectionBoundary::All,
+                "unpin-core-inventory-group-apply-v1",
+                NOW_UNIX,
+                NOW_UNIX + 60,
+            ),
+        )
+        .expect("partial no-op apply");
+    assert_eq!(
+        result.lifecycle,
+        unpin_core::groups::GroupOperationLifecycle::Partial
+    );
+    assert_eq!(
+        result.provider_reach_lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Partial
+    );
+
+    let operation = harness
+        .controller
+        .operation(&result.operation_id)
+        .expect("operation evidence")
+        .expect("operation record");
+    assert!(!operation.provider_writes_started);
+    let journal = TransitionJournalStore::new(harness.context.app_state_root())
+        .list()
+        .expect("transition journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == result.operation_id)
+        .expect("partial group journal");
+    assert_eq!(journal.lifecycle, TransitionLifecycle::Committed);
+    assert!(
+        !journal
+            .reach_aware
+            .expect("reach-aware envelope")
+            .recovery
+            .expect("recovery evidence")
+            .writes_started
     );
 }
 

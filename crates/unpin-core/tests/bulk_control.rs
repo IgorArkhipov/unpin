@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
     thread,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use sha2::{Digest, Sha256};
@@ -129,14 +130,21 @@ impl DurableBulkFixture {
             &session_authority_key,
         )
         .expect("signed bulk principal");
+        let now_unix = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock after Unix epoch")
+                .as_secs(),
+        )
+        .expect("Unix timestamp fits i64");
         let durable = BulkToggleReachAwareApplyContext {
             approval_context,
             roots,
             principal,
             audience: BULK_TOGGLE_APPROVAL_AUDIENCE.to_string(),
-            issued_at_unix: 100,
-            expires_at_unix: 200,
-            now_unix: 150,
+            issued_at_unix: now_unix,
+            expires_at_unix: now_unix + 3_600,
+            now_unix,
         };
         Self {
             _fixture_copy: fixture_copy,
@@ -538,12 +546,15 @@ fn durable_bulk_handoff_survives_restart_and_terminal_replay_is_idempotent() {
         "sealing the handoff must not write provider state"
     );
 
+    let mut resumed_durable = fixture.durable.clone();
+    resumed_durable.issued_at_unix += 1;
+    resumed_durable.expires_at_unix += 1;
     let applied = fixture
         .controller
         .apply_with_reach_aware(
             &fixture.plan,
             fixture.authorization("bulk-first-apply"),
-            fixture.durable.clone(),
+            resumed_durable,
             fixture.discovery.clone(),
         )
         .expect("apply reviewed bulk operation");
@@ -564,8 +575,8 @@ fn durable_bulk_handoff_survives_restart_and_terminal_replay_is_idempotent() {
         .apply_with_reach_aware(
             &fixture.plan,
             fixture.authorization("bulk-terminal-replay"),
-            fixture.durable,
-            fixture.discovery,
+            fixture.durable.clone(),
+            fixture.discovery.clone(),
         )
         .expect("terminal replay returns sealed result");
     assert_eq!(replay, applied);
@@ -575,6 +586,26 @@ fn durable_bulk_handoff_survives_restart_and_terminal_replay_is_idempotent() {
             .count(),
         backups_before_replay,
         "terminal replay must not perform another provider write"
+    );
+
+    let mut expired_replay_context = fixture.durable.clone();
+    expired_replay_context.now_unix = expired_replay_context.expires_at_unix;
+    let expired_replay = fixture
+        .controller
+        .apply_with_reach_aware(
+            &fixture.plan,
+            fixture.authorization("bulk-expired-terminal-replay"),
+            expired_replay_context,
+            fixture.discovery,
+        )
+        .expect("expired terminal replay returns cached result");
+    assert_eq!(expired_replay, applied);
+    assert_eq!(
+        fs::read_dir(fixture.app_state_root.join("backups"))
+            .expect("bulk backup directory after expired replay")
+            .count(),
+        backups_before_replay,
+        "expired terminal replay must not perform another provider write"
     );
 }
 

@@ -82,6 +82,25 @@ impl ProfilePolicyScope {
     }
 }
 
+fn sign_reviewed_profile_principal(
+    plan: &ProfileProviderOperationPlan,
+    expectation: &unpin_core::approval::ApprovalExpectation,
+    authority_key: &SessionAuthorityKey,
+) -> Result<ReachAwarePrincipal, String> {
+    // The TUI has no caller-provided identity. The reviewed operation id and
+    // scope digest are sealed plan facts, and the local session authority key
+    // signs them into an operation-specific principal. This is equivalent to
+    // trusted local session state for this one operation; it is not a lease or
+    // an identity claim accepted from the UI.
+    ReachAwarePrincipal::sign(
+        plan.operation_id.clone(),
+        profile_reach_scope_digest(expectation, &plan.operation_id),
+        ConnectionBoundary::All,
+        authority_key,
+    )
+    .map_err(|error| error.to_string())
+}
+
 #[derive(Debug, Clone)]
 struct ReviewedProfilePlan {
     compiled: CompiledProfileRevision,
@@ -273,9 +292,13 @@ impl ProfileWorkflow {
             }
             for target in &reviewed.plan.targets {
                 details.push(format!(
-                    "target: {} classification={} activation={:?}",
+                    "target: {} classification={} presence={:?} inherited-before={:?} effect={:?} future-activation={:?} activation={:?}",
                     target.provider.as_str(),
                     target.classification.as_str(),
+                    target.local_presence,
+                    target.generic_profile_inherited_before,
+                    target.generic_policy_effect,
+                    target.future_activation,
                     target.activation,
                 ));
             }
@@ -338,7 +361,13 @@ impl ProfileWorkflow {
             ProviderReach::selected(provider, SelectedProviderProvenance::TuiControl)
         });
         let plan = ProfileProviderOperationController::new(app_state_root)
-            .plan_with_gateway(&target, &compiled, provider_reach, self.backend.selection())
+            .plan_with_gateway_and_discovery(
+                &target,
+                &compiled,
+                provider_reach,
+                self.backend.selection(),
+                discovery,
+            )
             .map_err(|error| error.to_string())?;
         let expectation = plan
             .approval_expectation(context, &plan.operation_id)
@@ -423,13 +452,8 @@ impl ProfileWorkflow {
             "unpin-tui-profile-provider",
         )
         .map_err(|error| error.to_string())?;
-        let principal = ReachAwarePrincipal::sign(
-            reviewed.plan.operation_id.clone(),
-            profile_reach_scope_digest(&expectation, &reviewed.plan.operation_id),
-            ConnectionBoundary::All,
-            authority_key,
-        )
-        .map_err(|error| error.to_string())?;
+        let principal =
+            sign_reviewed_profile_principal(&reviewed.plan, &expectation, authority_key)?;
         let now_unix = unix_now();
         let durable = ProfileProviderReachAwareApplyContext {
             approval_context: context.clone(),
@@ -657,6 +681,37 @@ mod tests {
         assert_eq!(workflow.backend(), ProfileBackend::Gateway);
         assert_eq!(workflow.phase(), WorkflowPhase::Browsing);
         assert!(!workflow.confirm());
+    }
+
+    #[test]
+    fn reviewed_profile_principal_is_signed_from_local_plan_facts_only() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let context = ControlApprovalContext::new("repo", "worktree").unwrap();
+        let discovery = DiscoveryOutput::default();
+        let mut workflow = workflow();
+        workflow.plan(&discovery, &root, &context).unwrap();
+        let reviewed = workflow.reviewed.as_ref().expect("reviewed profile plan");
+        let expectation = reviewed
+            .plan
+            .approval_expectation(&context, &reviewed.plan.operation_id)
+            .unwrap();
+        let key = authority_key();
+        let principal = sign_reviewed_profile_principal(&reviewed.plan, &expectation, &key)
+            .expect("signed local principal");
+        principal.verify(&key).expect("signed principal verifies");
+        assert_eq!(principal.session_id, reviewed.plan.operation_id);
+        assert_eq!(
+            principal.connection_scope_id,
+            profile_reach_scope_digest(&expectation, &reviewed.plan.operation_id)
+        );
+
+        let mut caller_metadata_tamper = principal.clone();
+        caller_metadata_tamper.session_id = "caller-claimed-session".to_string();
+        assert!(
+            caller_metadata_tamper.verify(&key).is_err(),
+            "caller metadata cannot replace the signed operation principal"
+        );
     }
 
     #[test]

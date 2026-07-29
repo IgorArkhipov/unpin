@@ -21,7 +21,8 @@ use unpin_core::{
     profiles::{
         ActivationRequirement, CapabilityLockSnapshot, CapabilityLockState, EnforcementKind,
         GatewaySelection, MAX_PROFILE_DEFINITION_BYTES, MemberSelectionKind, PolicyResolutionError,
-        PolicyScope, ProfileDefinition, ProfileDefinitionEntry, ProfileProviderOperationController,
+        PolicyScope, ProfileDefinition, ProfileDefinitionEntry, ProfileProviderGenericPolicyEffect,
+        ProfileProviderLocalPresence, ProfileProviderOperationController,
         ProfileProviderOperationError, ProfileProviderOperationStatus,
         ProfileProviderReachAwareApplyContext, ProfileProviderTargetClassification,
         ProfileReference, ProfileRevisionSet, ProfileSelection, ProfileSourceScope,
@@ -338,9 +339,11 @@ fn profile_reach_context(
         principal: ReachAwarePrincipal::sign(session_id, scope, boundary, authority_key)
             .expect("profile reach principal"),
         audience: "unpin-core-profile-provider-apply-v2".to_string(),
-        issued_at_unix: 1_000,
-        expires_at_unix: 1_060,
-        now_unix: 1_000,
+        // Keep the synthetic authority window ahead of the real wall clock now
+        // that journal attachment validates expiry against trusted system time.
+        issued_at_unix: 4_000_000_000,
+        expires_at_unix: 4_000_000_060,
+        now_unix: 4_000_000_000,
     }
 }
 
@@ -646,6 +649,96 @@ fn existing_inherit_provider_override_is_classified_as_replace() {
         plan.targets[0].classification,
         ProfileProviderTargetClassification::Replace
     );
+}
+
+#[test]
+fn profile_target_review_facts_cover_classification_and_local_presence() {
+    let revision = named_profile_revision();
+    let target = unpin_core::profiles::PolicyTarget::Global;
+    let desired_profile = ProfileSelection::Profile {
+        reference: ProfileReference::from(&revision),
+    };
+
+    for (classification, prior_provider_policy, expected_inherited, expected_effect) in [
+        (
+            ProfileProviderTargetClassification::Create,
+            None,
+            true,
+            ProfileProviderGenericPolicyEffect::CreateOverride,
+        ),
+        (
+            ProfileProviderTargetClassification::Replace,
+            Some(ProviderPolicy {
+                profile: ProfileSelection::Native,
+                ..ProviderPolicy::default()
+            }),
+            false,
+            ProfileProviderGenericPolicyEffect::ReplaceOverride,
+        ),
+        (
+            ProfileProviderTargetClassification::AlreadyMatches,
+            Some(ProviderPolicy {
+                profile: desired_profile.clone(),
+                ..ProviderPolicy::default()
+            }),
+            false,
+            ProfileProviderGenericPolicyEffect::AlreadyProviderSpecific,
+        ),
+    ] {
+        for present in [true, false] {
+            let temp = TempDir::new();
+            let state = temp.path().join("state");
+            let store = unpin_core::profiles::PolicyStore::new(&state);
+            let prior = ScopePolicy {
+                providers: prior_provider_policy
+                    .clone()
+                    .map_or_else(BTreeMap::new, |policy| {
+                        BTreeMap::from([(ProviderId::Codex, policy)])
+                    }),
+                ..ScopePolicy::default()
+            };
+            store
+                .save(&target, &prior, None, owner())
+                .expect("seed policy");
+            let present_providers = if present {
+                BTreeSet::from([ProviderId::Codex])
+            } else {
+                BTreeSet::new()
+            };
+            let plan = ProfileProviderOperationController::new(&state)
+                .plan_with_provider_presence(
+                    &target,
+                    &revision,
+                    ProviderReach::selected(
+                        ProviderId::Codex,
+                        SelectedProviderProvenance::ExplicitInput,
+                    ),
+                    &present_providers,
+                )
+                .expect("presence-aware provider plan");
+            let reviewed = &plan.targets[0];
+            assert_eq!(reviewed.classification, classification);
+            assert_eq!(
+                reviewed.local_presence,
+                Some(if present {
+                    ProfileProviderLocalPresence::Present
+                } else {
+                    ProfileProviderLocalPresence::Absent
+                })
+            );
+            assert_eq!(
+                reviewed.generic_profile_inherited_before,
+                Some(expected_inherited)
+            );
+            assert_eq!(reviewed.generic_policy_effect, Some(expected_effect));
+            assert_eq!(reviewed.future_activation, Some(!present));
+            assert_eq!(
+                reviewed.activation,
+                unpin_core::transitions::EffectActivation::NextSessionOnly
+            );
+            plan.verify().expect("presence-aware plan fingerprint");
+        }
+    }
 }
 
 #[test]

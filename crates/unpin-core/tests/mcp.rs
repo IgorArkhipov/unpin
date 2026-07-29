@@ -29,7 +29,7 @@ use unpin_core::{
         UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME, UNPIN_MCP_TOOL_NAMES, handle_mcp_request,
         handle_stdio_request_once, handle_stdio_requests,
     },
-    mutation::{BackupAuthenticationKey, authenticate_legacy_backup},
+    mutation::{BackupAuthenticationKey, BulkToggleController, authenticate_legacy_backup},
     profiles::{
         CapabilityLockSnapshot, PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope,
         ProfileStore, compile_profile,
@@ -751,6 +751,27 @@ fn bulk_preflight_rejects_missing_reach_and_provider_only_selectors() {
         malformed_reach["reason"],
         "providerReach has unsupported fields"
     );
+    let spoofed_provenance = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "ids": ["claude:global:tool:settings:safe-shell"]
+            },
+            "targetEnabled": false,
+            "maxItems": 1,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude",
+                "provenance": "pinned-mcp-boundary"
+            }
+        }),
+    );
+    assert_eq!(spoofed_provenance["status"], "blocked");
+    assert_eq!(
+        spoofed_provenance["reason"],
+        "providerReach has unsupported fields"
+    );
 }
 
 #[test]
@@ -825,10 +846,10 @@ fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_writing() {
     context.backup_authentication_key = None;
     context.authentication.backup_authentication = McpCredentialReadiness::missing();
     let arguments = json!({
-        "provider": "claude",
+        "provider": "pi",
         "kind": "skill",
         "layer": "project",
-        "id": "claude:project:skill:example-claude-skill",
+        "id": "pi:project:skill:example-pi-project-skill",
         "targetEnabled": false
     });
 
@@ -1914,6 +1935,10 @@ fn bulk_apply_with_matching_fingerprint_returns_handoff_without_writes() {
         }
     });
     let planned = call_tool(&context, "unpin_plan_toggle_items", request.clone());
+    let operation_id = planned["operationId"]
+        .as_str()
+        .expect("operation id")
+        .to_string();
     let fingerprint = planned["planFingerprint"]
         .as_str()
         .expect("plan fingerprint")
@@ -1930,12 +1955,56 @@ fn bulk_apply_with_matching_fingerprint_returns_handoff_without_writes() {
     );
 
     assert_eq!(applied["status"], "human-action-required");
-    assert_eq!(applied["operationKind"], "toggle-items");
+    assert_eq!(applied["schemaVersion"], 2);
+    assert_eq!(applied["operationId"], operation_id);
     assert_eq!(applied["planFingerprint"], fingerprint);
-    assert_eq!(applied["contractVariant"], "legacy-bulk-handoff");
-    assert_eq!(applied["legacyBulkHandoff"], true);
-    assert!(applied.get("controlContractVersion").is_none());
-    assert!(applied.get("operation").is_none());
+    assert_eq!(applied["handoff"]["operationId"], operation_id);
+    assert_eq!(applied["handoff"]["planFingerprint"], fingerprint);
+    assert_eq!(applied["operationV2"]["schemaVersion"], 2);
+    assert_eq!(applied["operationV2"]["family"], "bulk-toggle");
+    assert_eq!(applied["operationV2"]["operationId"], operation_id);
+    assert_eq!(applied["operationV2"]["planFingerprint"], fingerprint);
+    assert!(applied["operationV2"].get("roots").is_some());
+    assert!(applied["operationV2"].get("principal").is_some());
+    assert!(applied["operationV2"].get("payloadReference").is_some());
+    assert!(applied["operationV2"].get("authenticationTag").is_some());
+    assert!(applied.get("legacyBulkHandoff").is_none());
+    let loaded = BulkToggleController::new(&context.app_state_root)
+        .load_handoff(&operation_id)
+        .expect("MCP handoff is loadable by the CLI controller");
+    assert_eq!(loaded.operation_id, operation_id);
+    assert_eq!(loaded.plan_fingerprint, fingerprint);
+
+    let status = call_tool(
+        &context,
+        "unpin_get_control_status",
+        json!({"operationId": operation_id}),
+    );
+    let operations = status["control"]["operations"]
+        .as_array()
+        .expect("filtered operations");
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0]["operationId"], operation_id);
+    assert_eq!(operations[0]["reachAware"]["schemaVersion"], 2);
+
+    let mut pinned = context.clone();
+    pinned.provider_scope = McpProviderScope::Provider(ProviderId::Claude);
+    let pinned_status = call_tool(
+        &pinned,
+        "unpin_get_control_status",
+        json!({"operationId": operation_id}),
+    );
+    let pinned_operations = pinned_status["control"]["operations"]
+        .as_array()
+        .expect("pinned operations");
+    assert_eq!(pinned_operations.len(), 1);
+    assert!(
+        pinned_operations[0]["reachAware"]["providerCoverage"]["entries"]
+            .as_array()
+            .expect("pinned provider coverage")
+            .iter()
+            .all(|entry| entry["provider"] == "claude")
+    );
     assert!(settings_plugin_enabled(&settings_path, "safe-shell"));
     assert!(!app_state.path().join("backups").exists());
 }
@@ -2854,7 +2923,14 @@ fn profile_provider_mcp_handoff_binds_operation_and_fingerprint() {
         planned["providerCoverage"]
     );
     assert_eq!(planned["plan"]["coverage"], planned["providerCoverage"]);
-    assert_eq!(planned["targets"].as_array().expect("targets").len(), 2);
+    let targets = planned["targets"].as_array().expect("targets");
+    assert_eq!(targets.len(), 2);
+    assert!(targets.iter().all(|target| {
+        target["localPresence"].is_string()
+            && target["genericProfileInheritedBefore"].is_boolean()
+            && target["genericPolicyEffect"].is_string()
+            && target["futureActivation"].is_boolean()
+    }));
     let operation_id = planned["operationId"].as_str().expect("operation id");
     let fingerprint = planned["planFingerprint"].as_str().expect("fingerprint");
     assert_eq!(operation_id, format!("profile-provider-{fingerprint}"));
@@ -2901,8 +2977,7 @@ fn control_status_operation_id_is_optional_and_non_disclosing_without_journal() 
         filtered["control"]["operations"]
             .as_array()
             .expect("operations")
-            .iter()
-            .all(|operation| operation.get("reachAware").is_none())
+            .is_empty()
     );
     let error = call_tool_error(
         &context,
@@ -3176,15 +3251,15 @@ fn legacy_apply_request_gets_versioned_non_mutating_migration_response() {
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let target = fixture_copy
         .path()
-        .join("claude/project/.claude/skills/example-claude-skill/SKILL.md");
+        .join("pi/project/.pi/skills/example-pi-project-skill/SKILL.md");
     let result = call_tool(
         &context_with_roots(fixture_copy.path(), app_state.path()),
         "unpin_apply_toggle_item",
         json!({
-            "provider": "claude",
+            "provider": "pi",
             "kind": "skill",
             "layer": "project",
-            "id": "claude:project:skill:example-claude-skill",
+            "id": "pi:project:skill:example-pi-project-skill",
             "targetEnabled": false,
             "requireConfirmation": true,
             "confirm": true
@@ -4373,18 +4448,18 @@ fn plans_single_skill_and_hands_off_apply_without_writing() {
     let context = context_with_roots(fixture_copy.path(), app_state.path());
     let original_skill = fixture_copy
         .path()
-        .join("claude")
+        .join("pi")
         .join("project")
-        .join(".claude")
+        .join(".pi")
         .join("skills")
-        .join("example-claude-skill")
+        .join("example-pi-project-skill")
         .join("SKILL.md");
 
     let selector = json!({
-        "provider": "claude",
+        "provider": "pi",
         "kind": "skill",
         "layer": "project",
-        "id": "claude:project:skill:example-claude-skill",
+        "id": "pi:project:skill:example-pi-project-skill",
         "targetEnabled": false
     });
 

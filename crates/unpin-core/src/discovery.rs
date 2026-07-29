@@ -95,7 +95,7 @@ impl DiscoveryRoots {
             opencode_project: root.join("opencode").join("project"),
             shared_global: root.join("shared").join("global"),
             shared_project: root.join("shared").join("project"),
-            zed_global: root.join("zed").join("global"),
+            zed_global: root.join("zed").join("global").join(".config").join("zed"),
             zed_project: root.join("zed").join("project"),
             scan_project_scopes: false,
             app_state_root: None,
@@ -127,7 +127,7 @@ impl DiscoveryRoots {
             opencode_project: project_root.to_path_buf(),
             shared_global: home_root.to_path_buf(),
             shared_project: project_root.to_path_buf(),
-            zed_global: home_root.to_path_buf(),
+            zed_global: home_root.join(".config").join("zed"),
             zed_project: project_root.to_path_buf(),
             scan_project_scopes: true,
             app_state_root: None,
@@ -2468,11 +2468,7 @@ pub(crate) fn discover_zed(
         ProviderId::Zed,
         DiscoveryLayer::Global,
         &[(
-            roots
-                .zed_global
-                .join(".config")
-                .join("zed")
-                .join("AGENTS.md"),
+            roots.zed_global.join("AGENTS.md"),
             "zed:global:setting:agents-md",
             "AGENTS.md",
         )],
@@ -2489,11 +2485,7 @@ pub(crate) fn discover_zed(
         items,
     );
 
-    let global_settings_path = roots
-        .zed_global
-        .join(".config")
-        .join("zed")
-        .join("settings.json");
+    let global_settings_path = roots.zed_global.join("settings.json");
     let live_zed_global_mcp_ids = discover_zed_settings(
         &global_settings_path,
         DiscoveryLayer::Global,

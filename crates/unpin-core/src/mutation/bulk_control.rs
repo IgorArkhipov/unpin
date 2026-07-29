@@ -9,6 +9,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
     path::{Component, Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -437,6 +438,22 @@ pub struct BulkToggleOperationStatus {
     pub plan: BulkTogglePlan,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_result: Option<BulkToggleApplyResult>,
+    /// Effective status reconciled from the authenticated transition journal.
+    /// This is intentionally not serialized as part of the family payload;
+    /// callers should not derive status from the planned lifecycle alone.
+    #[serde(skip, default = "default_bulk_status_lifecycle")]
+    observed_lifecycle: ProviderReachLifecycle,
+}
+
+impl BulkToggleOperationStatus {
+    #[must_use]
+    pub const fn lifecycle(&self) -> ProviderReachLifecycle {
+        self.observed_lifecycle
+    }
+}
+
+const fn default_bulk_status_lifecycle() -> ProviderReachLifecycle {
+    ProviderReachLifecycle::Blocked
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -607,12 +624,26 @@ pub struct BulkToggleController {
 impl BulkToggleController {
     #[must_use]
     pub fn new(app_state_root: impl Into<PathBuf>) -> Self {
+        let app_state_root = app_state_root.into();
         Self {
-            app_state_root: app_state_root.into(),
+            app_state_root: std::fs::canonicalize(&app_state_root).unwrap_or(app_state_root),
             backup_authentication_key: None,
             session_authority_key: None,
             trusted_roots: None,
         }
+    }
+
+    /// Configure the session authority used for authenticated status reads.
+    /// Unlike apply/seal, status does not need backup authentication or trusted
+    /// provider roots, so this narrower constructor keeps read-only callers
+    /// from having to manufacture write credentials.
+    #[must_use]
+    pub fn with_session_authority_key(
+        mut self,
+        session_authority_key: SessionAuthorityKey,
+    ) -> Self {
+        self.session_authority_key = Some(session_authority_key);
+        self
     }
 
     #[must_use]
@@ -921,20 +952,21 @@ impl BulkToggleController {
         let (payload_path, _) = bulk_payload_store(&self.app_state_root, &plan.operation_id);
         let lock_path = payload_path.with_file_name(".bulk-toggle-operation-domain");
         let _execution_lock = StateResourceLock::acquire(&lock_path)?;
-        self.seal_handoff_locked(plan, durable)
+        self.seal_handoff_locked(plan, durable, false)
     }
 
     fn seal_handoff_locked(
         &self,
         plan: &BulkTogglePlan,
         durable: &BulkToggleReachAwareApplyContext,
+        allow_expired_terminal: bool,
     ) -> Result<BulkToggleHandoff, BulkTogglePlanError> {
         plan.verify()?;
         let authority_key = self
             .session_authority_key
             .as_ref()
             .ok_or(BulkTogglePlanError::ReachAwareAuthorityRequired)?;
-        self.verify_reach_aware_context(plan, durable, authority_key)?;
+        self.verify_reach_aware_context(plan, durable, authority_key, allow_expired_terminal)?;
         let transition = bulk_transition_plan(
             plan,
             &durable.approval_context,
@@ -1017,21 +1049,45 @@ impl BulkToggleController {
     }
 
     pub fn load_handoff(&self, operation_id: &str) -> Result<BulkTogglePlan, BulkTogglePlanError> {
-        Ok(self.load_handoff_status(operation_id)?.plan)
+        let (_, store) = bulk_payload_store(&self.app_state_root, operation_id);
+        let snapshot = store
+            .load::<BulkToggleOperationRecord>()?
+            .ok_or_else(|| BulkTogglePlanError::ReachAware("bulk handoff not found".to_string()))?;
+        snapshot.value.verify()?;
+        Ok(snapshot.value.plan)
     }
 
     pub fn load_handoff_status(
         &self,
         operation_id: &str,
     ) -> Result<BulkToggleOperationStatus, BulkTogglePlanError> {
-        let (_, store) = bulk_payload_store(&self.app_state_root, operation_id);
+        let authority_key = self
+            .session_authority_key
+            .as_ref()
+            .ok_or(BulkTogglePlanError::ReachAwareAuthorityRequired)?;
+        let (payload_path, store) = bulk_payload_store(&self.app_state_root, operation_id);
+        let lock_path = payload_path.with_file_name(".bulk-toggle-operation-domain");
+        let _execution_lock = StateResourceLock::acquire(&lock_path)?;
         let snapshot = store
             .load::<BulkToggleOperationRecord>()?
             .ok_or_else(|| BulkTogglePlanError::ReachAware("bulk handoff not found".to_string()))?;
-        snapshot.value.verify()?;
+        let record = snapshot.value;
+        record.verify()?;
+        let journal = TransitionJournalStore::new(&self.app_state_root)
+            .list()?
+            .into_iter()
+            .find(|journal| journal.operation_id == operation_id)
+            .ok_or_else(|| {
+                BulkTogglePlanError::ReachAware(
+                    "bulk handoff transition journal is missing".to_string(),
+                )
+            })?;
+        verify_bulk_status_journal(&record, &journal, authority_key)?;
+        let observed_lifecycle = observed_bulk_status_lifecycle(&record, &journal)?;
         Ok(BulkToggleOperationStatus {
-            plan: snapshot.value.plan,
-            terminal_result: snapshot.value.terminal_result,
+            plan: record.plan,
+            terminal_result: record.terminal_result,
+            observed_lifecycle,
         })
     }
 
@@ -1059,7 +1115,22 @@ impl BulkToggleController {
             bulk_payload_store(&self.app_state_root, &plan.operation_id);
         let lock_path = payload_path.with_file_name(".bulk-toggle-operation-domain");
         let _execution_lock = StateResourceLock::acquire(&lock_path)?;
-        self.seal_handoff_locked(plan, &durable)?;
+        let mut durable = durable;
+        let mut allow_expired_terminal = false;
+        if let Some(journal) = TransitionJournalStore::new(&self.app_state_root)
+            .list()?
+            .into_iter()
+            .find(|journal| journal.operation_id == plan.operation_id)
+            && let Some(envelope) = journal.reach_aware
+        {
+            envelope
+                .verify_authenticated(authority_key)
+                .map_err(|error| BulkTogglePlanError::ReachAware(error.to_string()))?;
+            durable.issued_at_unix = envelope.issued_at_unix;
+            durable.expires_at_unix = envelope.expires_at_unix;
+            allow_expired_terminal = journal.lifecycle.is_terminal();
+        }
+        self.seal_handoff_locked(plan, &durable, allow_expired_terminal)?;
         let snapshot = payload_store
             .load::<BulkToggleOperationRecord>()?
             .ok_or_else(|| BulkTogglePlanError::ReachAware("bulk handoff not found".to_string()))?;
@@ -1319,6 +1390,7 @@ impl BulkToggleController {
         plan: &BulkTogglePlan,
         durable: &BulkToggleReachAwareApplyContext,
         authority_key: &SessionAuthorityKey,
+        allow_expired_terminal: bool,
     ) -> Result<(), BulkTogglePlanError> {
         durable
             .principal
@@ -1338,7 +1410,7 @@ impl BulkToggleController {
             || durable.roots.app_state_root != canonical_existing_path(&self.app_state_root)?
             || durable.audience != BULK_TOGGLE_APPROVAL_AUDIENCE
             || durable.issued_at_unix > durable.now_unix
-            || durable.expires_at_unix <= durable.now_unix
+            || (!allow_expired_terminal && durable.expires_at_unix <= durable.now_unix)
             || durable.principal.connection_boundary
                 != derived_connection_boundary(plan.provider_reach)
             || durable.principal.connection_scope_id
@@ -1505,6 +1577,154 @@ fn bulk_payload_reference(operation_id: &str) -> String {
         "bulk-toggle/{}.json",
         crate::encode_path_segment(operation_id)
     )
+}
+
+fn verify_bulk_status_journal(
+    record: &BulkToggleOperationRecord,
+    journal: &crate::transitions::TransitionJournal,
+    authority_key: &SessionAuthorityKey,
+) -> Result<(), BulkTogglePlanError> {
+    let envelope = journal.reach_aware.as_ref().ok_or_else(|| {
+        BulkTogglePlanError::ReachAware(
+            "recovery-required: bulk handoff transition journal has no reach-aware envelope"
+                .to_string(),
+        )
+    })?;
+    envelope
+        .verify_authenticated(authority_key)
+        .map_err(|error| {
+            BulkTogglePlanError::ReachAware(format!(
+                "recovery-required: bulk handoff envelope authentication failed: {error}"
+            ))
+        })?;
+    let session_id = envelope.context.session_id.as_deref().ok_or_else(|| {
+        BulkTogglePlanError::ReachAware(
+            "recovery-required: bulk handoff journal is missing session context".to_string(),
+        )
+    })?;
+    let context = ControlApprovalContext::new(
+        &envelope.context.repository_key,
+        &envelope.context.workspace_key,
+    )
+    .map_err(|error| BulkTogglePlanError::ReachAware(error.to_string()))?;
+    let transition = bulk_transition_plan(&record.plan, &context, session_id)?;
+    journal.verify_plan(&transition).map_err(|error| {
+        BulkTogglePlanError::ReachAware(format!(
+            "recovery-required: bulk handoff journal does not match payload: {error}"
+        ))
+    })?;
+
+    let expected_payload = ReachAwarePayloadReference {
+        family: ReachAwareOperationFamily::BulkToggle,
+        schema_version: BULK_TOGGLE_PLAN_SCHEMA_VERSION,
+        reference: bulk_payload_reference(&record.plan.operation_id),
+        payload_digest: record.plan.plan_fingerprint.clone(),
+    };
+    if envelope.family != ReachAwareOperationFamily::BulkToggle
+        || envelope.family_schema_version != BULK_TOGGLE_PLAN_SCHEMA_VERSION
+        || envelope.operation_id != record.plan.operation_id
+        || envelope.operation_kind != TransitionKind::BulkToggle.as_str()
+        || envelope.plan_fingerprint != record.plan.plan_fingerprint
+        || envelope.context.profile_digest.is_some()
+        || envelope.connection_boundary != envelope.principal.connection_boundary
+        || envelope.provider_reach != record.plan.provider_reach
+        || envelope.expected_lifecycle != record.plan.lifecycle
+        || envelope.payload_reference != expected_payload
+    {
+        return Err(BulkTogglePlanError::ReachAware(
+            "recovery-required: bulk handoff journal authority does not match payload".to_string(),
+        ));
+    }
+
+    if !journal.lifecycle.is_terminal() && envelope.is_expired_at(bulk_unix_now()?) {
+        return Err(BulkTogglePlanError::ReachAware(
+            "recovery-required: bulk handoff envelope has expired".to_string(),
+        ));
+    }
+
+    match (&record.terminal_lifecycle, &record.terminal_result) {
+        (Some(lifecycle), Some(result)) => {
+            if !journal.lifecycle.is_terminal() || envelope.lifecycle != *lifecycle {
+                return Err(BulkTogglePlanError::ReachAware(
+                    "recovery-required: bulk payload has a terminal result without a matching terminal journal"
+                        .to_string(),
+                ));
+            }
+            let journal_matches = match journal.lifecycle {
+                TransitionLifecycle::Committed => matches!(
+                    lifecycle,
+                    ProviderReachLifecycle::Applied
+                        | ProviderReachLifecycle::Partial
+                        | ProviderReachLifecycle::NoOp
+                ),
+                TransitionLifecycle::RolledBack => matches!(
+                    lifecycle,
+                    ProviderReachLifecycle::Blocked
+                        | ProviderReachLifecycle::NoTargetsInProviderReach
+                ),
+                TransitionLifecycle::NeedsRepair => {
+                    *lifecycle == ProviderReachLifecycle::RecoveryRequired
+                }
+                _ => false,
+            };
+            if !journal_matches || result.lifecycle != *lifecycle {
+                return Err(BulkTogglePlanError::ReachAware(
+                    "recovery-required: bulk terminal lifecycle is inconsistent".to_string(),
+                ));
+            }
+        }
+        (None, None) if journal.lifecycle.is_terminal() => {
+            return Err(BulkTogglePlanError::ReachAware(
+                "recovery-required: bulk terminal journal is missing family result".to_string(),
+            ));
+        }
+        (None, None) => {}
+        _ => {
+            return Err(BulkTogglePlanError::ReachAware(
+                "recovery-required: bulk payload terminal fields are inconsistent".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn observed_bulk_status_lifecycle(
+    record: &BulkToggleOperationRecord,
+    journal: &crate::transitions::TransitionJournal,
+) -> Result<ProviderReachLifecycle, BulkTogglePlanError> {
+    if let Some(result) = &record.terminal_result {
+        return Ok(result.lifecycle);
+    }
+    if journal.lifecycle.is_terminal() {
+        return Err(BulkTogglePlanError::ReachAware(
+            "recovery-required: terminal bulk journal has no authenticated result".to_string(),
+        ));
+    }
+    if record.writes_started
+        || matches!(
+            journal.lifecycle,
+            TransitionLifecycle::Applying
+                | TransitionLifecycle::Cancelling
+                | TransitionLifecycle::RollingBack
+                | TransitionLifecycle::Recovering
+        )
+    {
+        Ok(ProviderReachLifecycle::RecoveryRequired)
+    } else {
+        // A sealed handoff is not an applied result.  Keep the planned
+        // lifecycle in the plan, but expose a safe status projection until the
+        // journal reaches a terminal checkpoint.
+        Ok(ProviderReachLifecycle::Blocked)
+    }
+}
+
+fn bulk_unix_now() -> Result<i64, BulkTogglePlanError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| BulkTogglePlanError::ReachAware(error.to_string()))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| BulkTogglePlanError::ReachAware("clock value overflowed".to_string()))
 }
 
 fn bulk_operation_owner(

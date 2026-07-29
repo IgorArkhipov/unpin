@@ -17,7 +17,8 @@ use crate::control::{
     build_control_status,
 };
 use crate::control_operation::{
-    ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle, ControlResolvedContext,
+    ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
+    ControlResolvedContext, ReachAwarePrincipal, ReachAwareRootBinding,
 };
 use crate::discovery::{
     DiscoveryItem, DiscoveryKind, DiscoveryOutput, DiscoveryRoots, ProviderId, discover_all,
@@ -32,17 +33,18 @@ use crate::groups::{
 };
 use crate::hooks::HookTrustStore;
 use crate::mutation::{
-    BackupAuthenticationKey, BackupSummary, BulkToggleController, BulkTogglePlan,
-    BulkTogglePlanError, BulkTogglePlanStatus, BulkToggleRequest, BulkToggleSelector,
-    CONTROL_PLANE_PROTECTED_REASON, NativeToggleController, RestoreController,
-    is_control_plane_protected_disable, load_backup_summaries_authenticated,
+    BULK_TOGGLE_APPROVAL_AUDIENCE, BackupAuthenticationKey, BackupSummary, BulkToggleController,
+    BulkTogglePlan, BulkTogglePlanError, BulkTogglePlanStatus, BulkToggleReachAwareApplyContext,
+    BulkToggleRequest, BulkToggleSelector, CONTROL_PLANE_PROTECTED_REASON, NativeToggleController,
+    RestoreController, is_control_plane_protected_disable, load_backup_summaries_authenticated,
 };
 use crate::profiles::{
     CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, CompiledProfileRevision,
-    GatewaySelection, PolicyChange, PolicyStore, PolicyTarget, ProfileDefinition,
-    ProfilePolicyController, ProfileProviderOperationController, ProfileReference,
-    ProfileSelection, ProfileSourceScope, ProfileStore, capability_lock_enforcement,
-    compile_profile, propose_profile, resolve_effective_gateway,
+    GatewaySelection, PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyChange, PolicyStore, PolicyTarget,
+    ProfileDefinition, ProfilePolicyController, ProfileProviderOperationController,
+    ProfileProviderReachAwareApplyContext, ProfileReference, ProfileSelection, ProfileSourceScope,
+    ProfileStore, capability_lock_enforcement, compile_profile, profile_reach_scope_digest,
+    propose_profile, resolve_effective_gateway,
 };
 use crate::provider_reach::{
     ConnectionBoundary, DerivedTargetKind, ProviderReachInput, ProviderReachLifecycle,
@@ -56,8 +58,8 @@ use crate::snapshots::build_inventory_summary;
 use crate::state::workspace::resolve_workspace_identity;
 use crate::{
     approval::{
-        ApprovalExpectation, ApprovalKey, ApprovalVerifier, ControlApprovalContext,
-        approval_binding_digest, authorize_control,
+        ApprovalExpectation, ApprovalKey, ApprovalVerifier, CONTROL_APPROVAL_AUDIENCE,
+        ControlApprovalContext, approval_binding_digest, authorize_control,
     },
     transitions::{EffectActivation, TransitionContext, TransitionJournalStore, TransitionPlan},
 };
@@ -111,6 +113,7 @@ const HOOK_TRUST_APPROVAL_AUDIENCE: &str = "unpin-core-hook-trust";
 const MAX_MCP_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
 const UNPIN_CONTROL_CONTRACT_VERSION: u32 = 2;
 const DEFAULT_MCP_DISCOVERY_CACHE_TTL: Duration = Duration::from_millis(250);
+const MCP_HANDOFF_TTL_SECONDS: i64 = 60 * 60;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -1609,9 +1612,11 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
     require_only_fields(arguments, &["operationId"], "control status arguments")?;
     let operation_id = optional_string(arguments, "operationId")?;
     let discovery = discover_scoped_cached(context)?;
+    let app_state_root =
+        std::fs::canonicalize(&context.app_state_root).map_err(|error| error.to_string())?;
     let mut control = build_control_status(
         &discovery,
-        &context.app_state_root,
+        &app_state_root,
         &context.project_root,
         context
             .session_authority_key
@@ -1621,7 +1626,10 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
     .map_err(|error| error.to_string())?;
     context.provider_scope.filter_control_status(&mut control);
     if let Some(operation_id) = operation_id {
-        let journals = TransitionJournalStore::new(&context.app_state_root)
+        control
+            .operations
+            .retain(|operation| operation.operation_id == operation_id);
+        let journals = TransitionJournalStore::new(&app_state_root)
             .list()
             .map_err(|error| error.to_string())?;
         if let Some(authorization) =
@@ -1639,6 +1647,9 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
             )
             .map_err(|error| error.to_string())?;
         }
+        control.operations.retain(|operation| {
+            operation.operation_id == operation_id && operation.reach_aware.is_some()
+        });
     }
     Ok(json!({
         "status": "ok",
@@ -1682,20 +1693,29 @@ fn reach_aware_status_authorization(
         .provider_scope
         .provider()
         .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
-    if envelope.connection_boundary != configured_boundary {
-        return Ok(None);
-    }
     let capability_scope_digest = envelope
         .transfer_capability
         .as_ref()
         .map_or_else(String::new, |capability| capability.scope_digest.clone());
-    Ok(Some(ReachAwareStatusAuthorization::new(
+    let authorization = ReachAwareStatusAuthorization::new(
         envelope.principal.clone(),
         envelope.audience.clone(),
         capability_scope_digest,
         now_unix,
         None,
-    )))
+    );
+    match (configured_boundary, envelope.connection_boundary) {
+        (ConnectionBoundary::All, ConnectionBoundary::All)
+        | (ConnectionBoundary::Pinned(_), ConnectionBoundary::Pinned(_))
+            if configured_boundary == envelope.connection_boundary =>
+        {
+            Ok(Some(authorization))
+        }
+        (ConnectionBoundary::Pinned(provider), ConnectionBoundary::All) => Ok(Some(
+            authorization.with_requested_boundary(ConnectionBoundary::Pinned(provider)),
+        )),
+        _ => Ok(None),
+    }
 }
 
 fn list_catalog(context: &McpContext, arguments: &Value) -> Result<Value, String> {
@@ -1955,6 +1975,7 @@ fn require_hook_profile_membership(
 
 fn plan_profile_provider(context: &McpContext, arguments: &Value) -> Result<Value, String> {
     let (revision, plan) = profile_provider_plan(context, arguments)?;
+    let operation_v2 = seal_profile_provider_handoff(context, &plan)?;
     let status = if plan.no_op { "no-op" } else { "planned" };
     let expected_lifecycle = if plan.no_op {
         ProviderReachLifecycle::NoOp
@@ -1978,6 +1999,11 @@ fn plan_profile_provider(context: &McpContext, arguments: &Value) -> Result<Valu
             status,
             expected_lifecycle,
         )?,
+        "operationV2": operation_v2,
+        "handoff": {
+            "operationId": plan.operation_id,
+            "planFingerprint": plan.plan_fingerprint,
+        },
         "profile": revision,
         "plan": plan,
         "humanApprovalRequired": !plan.no_op,
@@ -1990,14 +2016,26 @@ fn plan_profile_provider(context: &McpContext, arguments: &Value) -> Result<Valu
 }
 
 fn apply_profile_provider(context: &McpContext, arguments: &Value) -> Result<Value, String> {
-    let (revision, plan) = profile_provider_plan(context, arguments)?;
     let operation_id = required_string(arguments, "operationId")?;
-    if operation_id != plan.operation_id {
-        return Err(
-            "operation id does not match current reviewed profile provider plan".to_string(),
-        );
+    let app_state_root =
+        std::fs::canonicalize(&context.app_state_root).map_err(|error| error.to_string())?;
+    let session_key = context
+        .session_authority_key
+        .clone()
+        .ok_or_else(|| "session authority key is unavailable".to_string())?;
+    let controller = ProfileProviderOperationController::new(&app_state_root)
+        .with_session_authority_key(session_key);
+    let plan = controller.load_handoff(operation_id).map_err(|error| {
+        format!("operation id does not match sealed profile provider handoff: {error}")
+    })?;
+    if let Some(profile_id) = arguments.get("profileId").and_then(Value::as_str)
+        && profile_id != plan.profile.profile_id
+    {
+        return Err("profile id does not match sealed profile provider operation".to_string());
     }
     require_plan_fingerprint(arguments, &plan.plan_fingerprint)?;
+    let revision = compile_stored_profile(context, &plan.profile.profile_id)?;
+    let operation_v2 = sealed_profile_provider_operation(&app_state_root, &plan.operation_id)?;
     let lifecycle = if plan.no_op {
         ProviderReachLifecycle::NoOp
     } else {
@@ -2029,6 +2067,11 @@ fn apply_profile_provider(context: &McpContext, arguments: &Value) -> Result<Val
             },
             lifecycle,
         )?,
+        "operationV2": operation_v2,
+        "handoff": {
+            "operationId": plan.operation_id,
+            "planFingerprint": plan.plan_fingerprint,
+        },
         "profile": revision,
         "plan": plan,
         "continuation": if plan.no_op {
@@ -2037,6 +2080,85 @@ fn apply_profile_provider(context: &McpContext, arguments: &Value) -> Result<Val
             "MCP cannot mint human approval; review and apply this exact fingerprint in Unpin CLI or TUI, then read control status."
         },
     }))
+}
+
+fn seal_profile_provider_handoff(
+    context: &McpContext,
+    plan: &crate::profiles::ProfileProviderOperationPlan,
+) -> Result<Value, String> {
+    let app_state_root =
+        std::fs::canonicalize(&context.app_state_root).map_err(|error| error.to_string())?;
+    let session_key = context
+        .session_authority_key
+        .clone()
+        .ok_or_else(|| "session authority key is unavailable".to_string())?;
+    let approval_context = control_approval_context(context)?;
+    let session_id = plan.operation_id.clone();
+    let expectation = plan
+        .approval_expectation(&approval_context, &session_id)
+        .map_err(|error| error.to_string())?;
+    let connection_boundary = match plan.provider_reach {
+        crate::provider_reach::ProviderReach::All => ConnectionBoundary::All,
+        crate::provider_reach::ProviderReach::Selected { provider, .. } => {
+            ConnectionBoundary::Pinned(provider)
+        }
+    };
+    let principal = ReachAwarePrincipal::sign(
+        session_id,
+        profile_reach_scope_digest(&expectation, &plan.operation_id),
+        connection_boundary,
+        &session_key,
+    )
+    .map_err(|error| error.to_string())?;
+    let now_unix = current_unix_seconds().map_err(|error| error.to_string())?;
+    let expires_at_unix = now_unix
+        .checked_add(MCP_HANDOFF_TTL_SECONDS)
+        .ok_or_else(|| "MCP handoff expiry overflowed".to_string())?;
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &app_state_root,
+        Vec::new(),
+        "mcp-profile-provider",
+    )
+    .map_err(|error| error.to_string())?;
+    let durable = ProfileProviderReachAwareApplyContext {
+        approval_context,
+        roots,
+        principal,
+        audience: PROFILE_PROVIDER_APPROVAL_AUDIENCE.to_string(),
+        issued_at_unix: now_unix,
+        expires_at_unix,
+        now_unix,
+    };
+    let controller = ProfileProviderOperationController::new(&app_state_root)
+        .with_session_authority_key(session_key);
+    let handoff = controller
+        .seal_handoff(plan, &durable)
+        .map_err(|error| error.to_string())?;
+    if handoff.operation_id != plan.operation_id
+        || handoff.plan_fingerprint != plan.plan_fingerprint
+    {
+        return Err("sealed profile provider handoff does not match reviewed plan".to_string());
+    }
+    sealed_profile_provider_operation(&app_state_root, &plan.operation_id)
+}
+
+fn sealed_profile_provider_operation(
+    app_state_root: &Path,
+    operation_id: &str,
+) -> Result<Value, String> {
+    let matching = TransitionJournalStore::new(app_state_root)
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|journal| journal.operation_id == operation_id)
+        .collect::<Vec<_>>();
+    let [journal] = matching.as_slice() else {
+        return Err("sealed profile provider handoff journal is unavailable".to_string());
+    };
+    let envelope = journal.reach_aware.as_ref().ok_or_else(|| {
+        "sealed profile provider handoff is missing operation schema v2".to_string()
+    })?;
+    serde_json::to_value(envelope).map_err(|error| error.to_string())
 }
 
 fn profile_provider_plan(
@@ -2095,8 +2217,11 @@ fn profile_provider_plan(
         "gateway" => GatewaySelection::Gateway,
         _ => return Err("mode must be native or gateway".to_string()),
     };
+    let discovery = context
+        .discovery_cache
+        .get_or_discover(&context.discovery_roots)?;
     let plan = ProfileProviderOperationController::new(&context.app_state_root)
-        .plan_with_gateway(&target, &revision, provider_reach, gateway)
+        .plan_with_gateway_and_discovery(&target, &revision, provider_reach, gateway, &discovery)
         .map_err(|error| error.to_string())?;
     Ok((revision, plan))
 }
@@ -2929,7 +3054,11 @@ fn legacy_bulk_human_action_required(operation_kind: &str, plan_fingerprint: &st
     })
 }
 
-fn reach_aware_bulk_human_action_required(plan: &BulkTogglePlan, plan_fingerprint: &str) -> Value {
+fn reach_aware_bulk_human_action_required(
+    plan: &BulkTogglePlan,
+    plan_fingerprint: &str,
+    operation_v2: Value,
+) -> Value {
     let mut response = legacy_bulk_human_action_required("toggle-items", plan_fingerprint);
     response["schemaVersion"] = json!(crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION);
     response["operationId"] = json!(plan.operation_id);
@@ -2966,6 +3095,16 @@ fn reach_aware_bulk_human_action_required(plan: &BulkTogglePlan, plan_fingerprin
             "guidance": "Review and apply this fingerprint in Unpin CLI or TUI."
         }
     });
+    if let Some(object) = response.as_object_mut() {
+        object.remove("contractVariant");
+        object.remove("legacyBulkHandoff");
+    }
+    response["handoff"] = json!({
+        "operationId": plan.operation_id,
+        "planFingerprint": plan.plan_fingerprint,
+        "expiresAtUnix": operation_v2.get("expiresAtUnix").cloned().unwrap_or(Value::Null),
+    });
+    response["operationV2"] = operation_v2;
     response
 }
 
@@ -3200,13 +3339,19 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         Ok(approval_context) => approval_context,
         Err(error) => return blocked_value(error),
     };
-    let controlled = match NativeToggleController::new(&context.app_state_root).plan_with_reach(
-        item,
-        &approval_context,
-        boundary,
-        reach,
-        authority_candidates,
-    ) {
+    let inventory = match discover_all(&context.discovery_roots) {
+        Ok(inventory) => inventory,
+        Err(error) => return blocked_value(error.to_string()),
+    };
+    let controlled = match NativeToggleController::new(&context.app_state_root)
+        .plan_with_reach_in_inventory(
+            item,
+            &inventory.items,
+            &approval_context,
+            boundary,
+            reach,
+            authority_candidates,
+        ) {
         Ok(controlled) => controlled,
         Err(error) => return blocked_value(error.to_string()),
     };
@@ -3289,19 +3434,29 @@ fn apply_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         Ok(context) => context,
         Err(error) => return blocked_value(error),
     };
-    let controlled = match NativeToggleController::new(&context.app_state_root).plan_with_reach(
-        item,
-        &approval_context,
-        boundary,
-        reach,
-        authority_candidates,
-    ) {
+    let inventory = match discover_all(&context.discovery_roots) {
+        Ok(inventory) => inventory,
+        Err(error) => return blocked_value(error.to_string()),
+    };
+    let controlled = match NativeToggleController::new(&context.app_state_root)
+        .plan_with_reach_in_inventory(
+            item,
+            &inventory.items,
+            &approval_context,
+            boundary,
+            reach,
+            authority_candidates,
+        ) {
         Ok(controlled) => controlled,
         Err(error) => return blocked_value(error.to_string()),
     };
     if controlled.plan_fingerprint != fingerprint {
         return blocked_value("plan fingerprint does not match current reviewed plan");
     }
+    let operation_v2 = match seal_native_toggle_handoff(context, &controlled, &approval_context) {
+        Ok(operation) => operation,
+        Err(error) => return blocked_value(error),
+    };
     let expectation = match controlled.approval_expectation(&approval_context) {
         Ok(expectation) => expectation,
         Err(error) => return blocked_value(error.to_string()),
@@ -3346,9 +3501,84 @@ fn apply_single_toggle(context: &McpContext, arguments: &Value) -> Value {
             "guidance": "Review and apply this fingerprint in Unpin CLI or TUI."
         }
     });
+    response["operationV2"] = operation_v2;
+    response["handoff"] = json!({
+        "operationId": response["operationId"].clone(),
+        "planFingerprint": response["planFingerprint"].clone(),
+        "expiresAtUnix": response["operationV2"]["expiresAtUnix"].clone(),
+    });
     response["operationKind"] = json!("toggle-item");
     response["operationReference"] = json!(format!("toggle-item:{fingerprint}"));
     response
+}
+
+fn seal_native_toggle_handoff(
+    context: &McpContext,
+    plan: &crate::mutation::NativeTogglePlan,
+    approval_context: &ControlApprovalContext,
+) -> Result<Value, String> {
+    let app_state_root =
+        std::fs::canonicalize(&context.app_state_root).map_err(|error| error.to_string())?;
+    let session_key = context
+        .session_authority_key
+        .clone()
+        .ok_or_else(|| "session authority key is unavailable".to_string())?;
+    let providers = plan
+        .coverage
+        .included()
+        .map(|entry| entry.provider)
+        .collect::<BTreeSet<_>>();
+    let provider_roots = providers
+        .into_iter()
+        .map(|provider| {
+            (
+                provider,
+                mcp_provider_root(&context.discovery_roots, provider),
+                "mcp-discovery-root".to_string(),
+            )
+        })
+        .collect();
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &app_state_root,
+        provider_roots,
+        "mcp-native-toggle",
+    )
+    .map_err(|error| error.to_string())?;
+    let now_unix = current_unix_seconds().map_err(|error| error.to_string())?;
+    let expires_at_unix = now_unix
+        .checked_add(MCP_HANDOFF_TTL_SECONDS)
+        .ok_or_else(|| "MCP handoff expiry overflowed".to_string())?;
+    let controller =
+        NativeToggleController::with_session_authority_key(&app_state_root, session_key);
+    let handoff = controller
+        .seal_handoff(
+            plan,
+            approval_context,
+            roots,
+            CONTROL_APPROVAL_AUDIENCE,
+            now_unix,
+            expires_at_unix,
+        )
+        .map_err(|error| error.to_string())?;
+    if handoff.operation_id != plan.transition.operation_id
+        || handoff.plan_fingerprint != plan.plan_fingerprint
+    {
+        return Err("sealed native toggle handoff does not match reviewed plan".to_string());
+    }
+    let matching = TransitionJournalStore::new(&app_state_root)
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|journal| journal.operation_id == plan.transition.operation_id)
+        .collect::<Vec<_>>();
+    let [journal] = matching.as_slice() else {
+        return Err("sealed native toggle handoff journal is unavailable".to_string());
+    };
+    let envelope = journal
+        .reach_aware
+        .as_ref()
+        .ok_or_else(|| "sealed native toggle handoff is missing operation schema v2".to_string())?;
+    serde_json::to_value(envelope).map_err(|error| error.to_string())
 }
 
 fn plan_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
@@ -3404,7 +3634,117 @@ fn apply_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
         return response;
     }
 
-    reach_aware_bulk_human_action_required(&current_plan, current_fingerprint)
+    match seal_bulk_toggle_handoff(context, &current_plan) {
+        Ok(operation_v2) => {
+            reach_aware_bulk_human_action_required(&current_plan, current_fingerprint, operation_v2)
+        }
+        Err(error) => blocked_value(error),
+    }
+}
+
+fn seal_bulk_toggle_handoff(context: &McpContext, plan: &BulkTogglePlan) -> Result<Value, String> {
+    let app_state_root =
+        std::fs::canonicalize(&context.app_state_root).map_err(|error| error.to_string())?;
+    let backup_key = context
+        .backup_authentication_key
+        .clone()
+        .ok_or_else(|| "backup authentication key is unavailable".to_string())?;
+    let session_key = context
+        .session_authority_key
+        .clone()
+        .ok_or_else(|| "session authority key is unavailable".to_string())?;
+    let approval_context = control_approval_context(context)?;
+    let session_id = plan.operation_id.clone();
+    let expectation = plan
+        .approval_expectation(&approval_context, &session_id)
+        .map_err(|error| error.to_string())?;
+    let scope_digest = crate::mutation::reach_scope_digest(&expectation, &session_id);
+    let connection_boundary = context
+        .provider_scope
+        .provider()
+        .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
+    let roots = bulk_mcp_root_binding(context, plan)?;
+    let principal =
+        ReachAwarePrincipal::sign(session_id, scope_digest, connection_boundary, &session_key)
+            .map_err(|error| error.to_string())?;
+    let now_unix = current_unix_seconds().map_err(|error| error.to_string())?;
+    let expires_at_unix = now_unix
+        .checked_add(MCP_HANDOFF_TTL_SECONDS)
+        .ok_or_else(|| "MCP handoff expiry overflowed".to_string())?;
+    let durable = BulkToggleReachAwareApplyContext {
+        approval_context,
+        roots: roots.clone(),
+        principal,
+        audience: BULK_TOGGLE_APPROVAL_AUDIENCE.to_string(),
+        issued_at_unix: now_unix,
+        expires_at_unix,
+        now_unix,
+    };
+    let controller = BulkToggleController::new(&app_state_root).with_reach_aware_authority(
+        backup_key,
+        session_key,
+        roots,
+    );
+    let handoff = controller
+        .seal_handoff(plan, &durable)
+        .map_err(|error| error.to_string())?;
+    if handoff.operation_id != plan.operation_id
+        || handoff.plan_fingerprint != plan.plan_fingerprint
+    {
+        return Err("sealed bulk handoff does not match reviewed plan".to_string());
+    }
+    let matching = TransitionJournalStore::new(&app_state_root)
+        .list()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|journal| journal.operation_id == plan.operation_id)
+        .collect::<Vec<_>>();
+    let [journal] = matching.as_slice() else {
+        return Err("sealed bulk handoff journal is unavailable".to_string());
+    };
+    let envelope = journal
+        .reach_aware
+        .as_ref()
+        .ok_or_else(|| "sealed bulk handoff is missing operation schema v2".to_string())?;
+    serde_json::to_value(envelope).map_err(|error| error.to_string())
+}
+
+fn bulk_mcp_root_binding(
+    context: &McpContext,
+    plan: &BulkTogglePlan,
+) -> Result<ReachAwareRootBinding, String> {
+    let providers = plan
+        .provider_coverage
+        .included()
+        .map(|entry| entry.provider)
+        .collect::<BTreeSet<_>>();
+    let provider_roots = providers
+        .into_iter()
+        .map(|provider| {
+            (
+                provider,
+                mcp_provider_root(&context.discovery_roots, provider),
+                "mcp-discovery-root".to_string(),
+            )
+        })
+        .collect();
+    ReachAwareRootBinding::from_provider_paths(
+        &context.app_state_root,
+        provider_roots,
+        "mcp-bulk-toggle",
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn mcp_provider_root(roots: &DiscoveryRoots, provider: ProviderId) -> PathBuf {
+    match provider {
+        ProviderId::Claude => roots.claude_global.clone(),
+        ProviderId::Codex => roots.codex_global.clone(),
+        ProviderId::Cursor => roots.cursor_config.clone(),
+        ProviderId::Pi => roots.pi_global.clone(),
+        ProviderId::OpenCode => roots.opencode_global.clone(),
+        ProviderId::Zed => roots.zed_global.clone(),
+    }
 }
 
 #[derive(Debug)]
@@ -3509,18 +3849,14 @@ fn parse_bulk_provider_reach(
                     "providerReach.provider is required on an all-provider connection".to_string()
                 })?,
             };
-            let provenance = object
-                .get("provenance")
-                .cloned()
-                .map(|value| {
-                    serde_json::from_value(value)
-                        .map_err(|error| format!("invalid providerReach provenance: {error}"))
-                })
-                .transpose()?
-                .unwrap_or(crate::provider_reach::SelectedProviderProvenance::ExplicitInput);
+            let provenance = if object.contains_key("provider") {
+                crate::provider_reach::SelectedProviderProvenance::ExplicitInput
+            } else {
+                crate::provider_reach::SelectedProviderProvenance::PinnedMcpBoundary
+            };
             if object
                 .keys()
-                .any(|key| !matches!(key.as_str(), "mode" | "provider" | "provenance"))
+                .any(|key| !matches!(key.as_str(), "mode" | "provider"))
             {
                 return Err("providerReach has unsupported fields".to_string());
             }
@@ -4707,7 +5043,10 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "layer": string_enum(&["global", "project"]),
                 "id": non_empty_string_schema(),
                 "targetEnabled": { "type": "boolean" },
-                "providerReach": { "type": ["string", "object"] },
+                    "providerReach": provider_reach_input_schema(
+                        &provider_ids,
+                        provider_scope.provider().is_none(),
+                    ),
                 "requireConfirmation": { "type": "boolean" },
                 "confirm": { "type": "boolean" }
             }
@@ -4721,7 +5060,10 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "layer": string_enum(&["global", "project"]),
                 "id": non_empty_string_schema(),
                 "targetEnabled": { "type": "boolean" },
-                "providerReach": { "type": ["string", "object"] },
+                    "providerReach": provider_reach_input_schema(
+                        &provider_ids,
+                        provider_scope.provider().is_none(),
+                    ),
                 "requireConfirmation": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
                 "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
                 "planFingerprint": non_empty_string_schema()
@@ -4738,7 +5080,10 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "planFingerprint": { "type": "string" },
                 "maxItems": { "type": "integer", "minimum": 0 },
                 "allowEmptySelection": { "type": "boolean" },
-                "providerReach": { "type": ["string", "object"] },
+                    "providerReach": provider_reach_input_schema(
+                        &provider_ids,
+                        provider_scope.provider().is_none(),
+                    ),
                 "acknowledgeWholeInventory": { "type": "boolean" }
             }
         }),
@@ -4753,7 +5098,10 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "planFingerprint": { "type": "string" },
                 "maxItems": { "type": "integer", "minimum": 0 },
                 "allowEmptySelection": { "type": "boolean" },
-                "providerReach": { "type": ["string", "object"] },
+                    "providerReach": provider_reach_input_schema(
+                        &provider_ids,
+                        provider_scope.provider().is_none(),
+                    ),
                 "acknowledgeWholeInventory": { "type": "boolean" }
             }
         }),
@@ -5144,6 +5492,47 @@ fn string_enum(values: &[&str]) -> Value {
     json!({
         "type": "string",
         "enum": values
+    })
+}
+
+fn provider_reach_input_schema(provider_ids: &[&str], selected_provider_required: bool) -> Value {
+    let mut selected_required = vec![json!("mode")];
+    if selected_provider_required {
+        selected_required.push(json!("provider"));
+    }
+    json!({
+        "oneOf": [
+            {
+                "type": "string",
+                "enum": ["all", "all-providers", "omitted"]
+            },
+            {
+                "type": "object",
+                "required": ["mode"],
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["all", "all-providers"]
+                    }
+                },
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "required": selected_required,
+                "properties": {
+                    "mode": {
+                        "type": "string",
+                        "enum": ["selected", "selected-provider"]
+                    },
+                    "provider": {
+                        "type": "string",
+                        "enum": provider_ids
+                    }
+                },
+                "additionalProperties": false
+            }
+        ]
     })
 }
 

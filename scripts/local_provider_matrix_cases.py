@@ -42,16 +42,25 @@ def shared_source_contract(
     if initial_item.get("kind") != "skill":
         return None
     source_path = initial_item["sourcePath"]
+    item_id = initial_item["id"]
+    state_path = initial_item["statePath"]
     views = [
         item
         for item in read_full_inventory(binary, fixture_root, app_state_root)["items"]
-        if item.get("sourcePath") == source_path and item.get("enabled") is True
+        if item.get("sourcePath") == source_path
+        and item.get("statePath") == state_path
+        and item.get("id") != item_id
     ]
-    if len(views) < 2:
+    if not views:
         return None
     return {
         "sourcePath": source_path,
-        "itemIds": sorted(item["id"] for item in views),
+        "statePath": state_path,
+        "targetId": item_id,
+        "counterpartStates": {
+            item["id"]: bool(item["enabled"])
+            for item in sorted(views, key=lambda item: item["id"])
+        },
         "providers": sorted({item["provider"] for item in views}),
     }
 
@@ -66,17 +75,28 @@ def assert_shared_source_state(
 ) -> None:
     if contract is None:
         return
+
     views = [
         item
         for item in read_full_inventory(binary, fixture_root, app_state_root)["items"]
         if item.get("sourcePath") == contract["sourcePath"]
+        and item.get("statePath") == contract["statePath"]
+        and item.get("id") != contract["targetId"]
     ]
-    item_ids = sorted(item["id"] for item in views)
-    states = {item.get("enabled") for item in views}
-    if item_ids != contract["itemIds"] or states != {expected_enabled}:
+    counterpart_states = {
+        item["id"]: bool(item["enabled"])
+        for item in sorted(views, key=lambda item: item["id"])
+    }
+    if counterpart_states.keys() != contract["counterpartStates"].keys():
         raise MatrixFailure(
-            f"{slug} shared-source fan-out mismatch: expected ids {contract['itemIds']} "
-            f"at enabled={expected_enabled}, got ids {item_ids} with states {sorted(states)}"
+            f"{slug} shared-source counterpart inventory changed: "
+            f"expected {sorted(contract['counterpartStates'])}, "
+            f"got {sorted(counterpart_states)}"
+        )
+    if any(enabled != expected_enabled for enabled in counterpart_states.values()):
+        raise MatrixFailure(
+            f"{slug} shared-source counterparts did not match enabled={expected_enabled}: "
+            f"{counterpart_states}"
         )
 
 
@@ -261,16 +281,23 @@ def run_cli_scenario(
 
     no_write_fixture_digest = digest_path(fixture_root)
     no_write_app_state_digest = digest_path(app_state_root)
-    plan = parse_json_output(
-        run_command(
-            fixture_toggle_command(
-                binary, fixture_root, app_state_root, scenario
-            )
-        ).stdout
+    plan_process = run_command(
+        fixture_toggle_command(binary, fixture_root, app_state_root, scenario),
+        check=shared_contract is None,
     )
+    plan = parse_json_output(plan_process.stdout)
     write_json(case_root / "01-plan.json", plan)
-    if plan.get("status") not in {"dry-run", "planned"}:
-        raise MatrixFailure(f"{scenario['slug']} dry run did not plan")
+    if shared_contract is None:
+        if plan.get("status") not in {"dry-run", "planned"}:
+            raise MatrixFailure(f"{scenario['slug']} dry run did not plan")
+    elif (
+        plan_process.returncode == 0
+        or plan.get("status") != "blocked"
+        or "shared-source-crosses-provider-reach" not in json.dumps(plan, sort_keys=True)
+    ):
+        raise MatrixFailure(
+            f"{scenario['slug']} did not block a shared source outside provider reach"
+        )
     if (
         digest_path(fixture_root) != canonical_fixture_digest
         or digest_path(fixture_root) != no_write_fixture_digest
@@ -279,6 +306,24 @@ def run_cli_scenario(
         raise MatrixFailure(f"{scenario['slug']} dry run changed fixtures")
     if (app_state_root / "backups").exists():
         raise MatrixFailure(f"{scenario['slug']} dry run created a backup")
+
+    if shared_contract is not None:
+        result = {
+            **scenario,
+            "status": "passed",
+            "states": {"initial": initial_enabled, "final": initial_enabled},
+            "operationTypes": [],
+            "backupAuthentication": [],
+            "auditEvents": {},
+            "fixtureDigestRestored": True,
+            "sharedSourceFanout": {
+                "asserted": True,
+                "providers": shared_contract["providers"],
+                "blockedBeforeWrite": True,
+            },
+        }
+        write_json(case_root / "summary.json", result)
+        return result
 
     first = parse_json_output(
         run_command(
@@ -301,14 +346,6 @@ def run_cli_scenario(
     write_json(case_root / "03-inventory-after-first.json", after_first)
     if after_first_enabled == initial_enabled:
         raise MatrixFailure(f"{scenario['slug']} first apply did not invert state")
-    assert_shared_source_state(
-        binary,
-        fixture_root,
-        app_state_root,
-        shared_contract,
-        after_first_enabled,
-        scenario["slug"],
-    )
 
     second_plan = parse_json_output(
         run_command(
@@ -337,14 +374,6 @@ def run_cli_scenario(
     write_json(case_root / "06-inventory-after-second.json", after_second)
     if after_second_enabled != initial_enabled:
         raise MatrixFailure(f"{scenario['slug']} second apply did not restore initial state")
-    assert_shared_source_state(
-        binary,
-        fixture_root,
-        app_state_root,
-        shared_contract,
-        after_second_enabled,
-        scenario["slug"],
-    )
 
     restore_second_plan = parse_json_output(
         run_command(
@@ -378,14 +407,6 @@ def run_cli_scenario(
     write_json(case_root / "09-inventory-after-restore-second.json", after_restore_second)
     if after_restore_second_enabled == initial_enabled:
         raise MatrixFailure(f"{scenario['slug']} second backup did not restore inverse state")
-    assert_shared_source_state(
-        binary,
-        fixture_root,
-        app_state_root,
-        shared_contract,
-        after_restore_second_enabled,
-        scenario["slug"],
-    )
 
     restore_first_plan = parse_json_output(
         run_command(
@@ -416,14 +437,6 @@ def run_cli_scenario(
     final_digest = digest_path(fixture_root)
     if final_enabled != initial_enabled or final_digest != canonical_fixture_digest:
         raise MatrixFailure(f"{scenario['slug']} did not recover byte-exact initial state")
-    assert_shared_source_state(
-        binary,
-        fixture_root,
-        app_state_root,
-        shared_contract,
-        final_enabled,
-        scenario["slug"],
-    )
 
     result = {
         **scenario,
@@ -627,6 +640,52 @@ def run_mcp_session(
             f"{scenario['slug']} MCP did not preserve CLI/TUI human approval boundary"
         )
 
+    if shared_contract is not None:
+        selection = {
+            "provider": scenario["provider"],
+            "kind": scenario["kind"],
+            "layer": scenario["layer"],
+            "id": scenario["id"],
+            "targetEnabled": target_enabled,
+        }
+        no_write_fixture_digest = digest_path(fixture_root)
+        no_write_app_state_digest = digest_path(app_state_root)
+        plan = mcp_call(
+            session,
+            request_id="plan-shared-source",
+            name="unpin_plan_toggle_item",
+            arguments=selection,
+        )
+        write_json(case_root / "01-plan.json", plan)
+        if (
+            plan.get("status") != "blocked"
+            or "shared-source-crosses-provider-reach"
+            not in json.dumps(plan, sort_keys=True)
+            or digest_path(fixture_root) != canonical_fixture_digest
+            or digest_path(fixture_root) != no_write_fixture_digest
+            or digest_path(app_state_root) != no_write_app_state_digest
+            or (app_state_root / "backups").exists()
+        ):
+            raise MatrixFailure(
+                f"{scenario['slug']} MCP did not block shared source before writes"
+            )
+        result = {
+            **scenario,
+            "status": "passed",
+            "confirmationBlocked": True,
+            "states": {"initial": initial_enabled, "final": initial_enabled},
+            "backupAuthentication": [],
+            "auditEvents": {},
+            "fixtureDigestRestored": True,
+            "sharedSourceFanout": {
+                "asserted": True,
+                "providers": shared_contract["providers"],
+                "blockedBeforeWrite": True,
+            },
+        }
+        write_json(case_root / "summary.json", result)
+        return result
+
     no_write_group_fixture_digest = digest_path(fixture_root)
     no_write_group_app_state_digest = digest_path(app_state_root)
     group_list = mcp_call(
@@ -670,6 +729,10 @@ def run_mcp_session(
             "group": inventory_group,
             "targetEnabled": target_enabled,
             "maxMembers": 256,
+            "providerReach": {
+                "mode": "selected",
+                "provider": scenario["provider"],
+            },
         },
     )
     write_json(case_root / "01-inventory-group-plan.json", group_plan)
@@ -690,7 +753,8 @@ def run_mcp_session(
         or planned_member_keys != inspected_member_keys
         or not any(member.get("outcome") == "changed" for member in planned_members)
         or any(
-            member.get("outcome") not in {"changed", "already-correct"}
+            member.get("outcome")
+            not in {"changed", "already-correct", "out-of-provider-reach"}
             or member.get("requestedEnabled") != target_enabled
             for member in planned_members
         )
@@ -756,9 +820,13 @@ def run_mcp_session(
         or first_handoff.get("operation", {}).get("lifecycle")
         != "awaiting-human-action"
         or digest_path(fixture_root) != no_write_fixture_digest
-        or digest_path(app_state_root) != no_write_app_state_digest
+        # A handoff persists its durable operation state under app_state_root,
+        # but must not create a provider backup before the CLI/TUI approves it.
+        or first_handoff.get("backupId") is not None
     ):
-        raise MatrixFailure(f"{scenario['slug']} MCP first handoff wrote state")
+        raise MatrixFailure(
+            f"{scenario['slug']} MCP first handoff changed provider state or created a backup"
+        )
 
     first = parse_json_output(
         run_command(
@@ -1130,6 +1198,46 @@ def run_tui_scenario(
         or backup_ids(app_state_root)
     ):
         raise MatrixFailure(f"{scenario['slug']} TUI applied without confirmation")
+
+    if shared_contract is not None:
+        no_write_fixture_digest = digest_path(fixture_root)
+        no_write_app_state = durable_app_state_snapshot(app_state_root)
+        drive_tui_toggle(
+            binary,
+            fixture_root,
+            app_state_root,
+            scenario["id"],
+            confirm=True,
+        )
+        after_blocked = read_inventory(binary, fixture_root, app_state_root, scenario)
+        write_json(case_root / "01-inventory-after-blocked.json", after_blocked)
+        if (
+            bool(find_item(after_blocked, scenario["id"])["enabled"])
+            != initial_enabled
+            or digest_path(fixture_root) != canonical_fixture_digest
+            or digest_path(fixture_root) != no_write_fixture_digest
+            or durable_app_state_snapshot(app_state_root) != no_write_app_state
+            or backup_ids(app_state_root)
+        ):
+            raise MatrixFailure(
+                f"{scenario['slug']} TUI did not block shared source before writes"
+            )
+        result = {
+            **scenario,
+            "status": "passed",
+            "confirmationBlocked": True,
+            "states": {"initial": initial_enabled, "final": initial_enabled},
+            "backupAuthentication": [],
+            "auditEvents": {},
+            "fixtureDigestRestored": True,
+            "sharedSourceFanout": {
+                "asserted": True,
+                "providers": shared_contract["providers"],
+                "blockedBeforeWrite": True,
+            },
+        }
+        write_json(case_root / "summary.json", result)
+        return result
 
     before_first_backups = backup_ids(app_state_root)
     drive_tui_toggle(

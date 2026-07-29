@@ -3,16 +3,20 @@ use std::{collections::BTreeSet, path::Path};
 use serde_json::json;
 use unpin_core::{
     approval::ControlApprovalContext,
-    control_operation::{ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle},
+    control_operation::{
+        ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
+        ReachAwarePrincipal, ReachAwareRootBinding,
+    },
     discovery::{DiscoveryItem, DiscoveryOutput},
     groups::{
-        GROUP_DEFINITION_SCHEMA_VERSION, GroupAccessContext, GroupApplyResult,
-        GroupApprovalArtifactStore, GroupApprovalChallengeClaims, GroupController,
-        GroupDefinitionV1, GroupDefinitionView, GroupHistoryRecord, GroupMemberIdentity,
-        GroupOperationLifecycle, GroupPlanDisposition, GroupPlanMode, GroupPlanner, GroupRecord,
-        GroupRef, GroupResolver, GroupRevision, GroupScope, GroupTargetState, GroupTogglePlan,
-        McpGroupSessionLeaseStore, PersonalGroupStore, RepositoryGroupStore,
-        authenticate_group_approval_challenge, validate_new_group_members,
+        GROUP_APPROVAL_AUDIENCE, GROUP_DEFINITION_SCHEMA_VERSION, GroupAccessContext,
+        GroupApplyResult, GroupApprovalArtifactStore, GroupApprovalChallengeClaims,
+        GroupController, GroupDefinitionV1, GroupDefinitionView, GroupHistoryRecord,
+        GroupMemberIdentity, GroupOperationLifecycle, GroupPlanDisposition, GroupPlanMode,
+        GroupPlanner, GroupReachAwareApplyContext, GroupRecord, GroupRef, GroupResolver,
+        GroupRevision, GroupScope, GroupTargetState, GroupTogglePlan, McpGroupSessionLeaseStore,
+        PersonalGroupStore, RepositoryGroupStore, authenticate_group_approval_challenge,
+        validate_new_group_members,
     },
     mutation::BackupAuthenticationKey,
     provider_reach::{
@@ -1159,7 +1163,71 @@ impl GroupWorkflow {
             backup_key.clone(),
             authority_key.clone(),
         );
-        let result = match controller.apply(&reviewed.plan, authorization) {
+        let result = if reviewed.plan.schema_version
+            >= unpin_core::groups::GROUP_PLAN_SCHEMA_VERSION
+        {
+            let session_id = reviewed
+                .plan
+                .operation_id
+                .clone()
+                .ok_or_else(|| "reach-aware group operation id is missing".to_string())?;
+            let provider_roots = reviewed
+                .plan
+                .provider_coverage
+                .included()
+                .map(|entry| entry.provider)
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .map(|provider| {
+                    (
+                        provider,
+                        group_provider_root(
+                            self.resolver
+                                .as_ref()
+                                .expect("group resolver available")
+                                .context()
+                                .discovery_roots(),
+                            provider,
+                        )
+                        .to_path_buf(),
+                        "tui-discovery-root".to_string(),
+                    )
+                })
+                .collect();
+            let roots = ReachAwareRootBinding::from_provider_paths(
+                app_state_root,
+                provider_roots,
+                "unpin-tui-inventory-group",
+            )
+            .map_err(|error| error.to_string())?;
+            let scope_digest = group_reach_scope_digest(&expectation, &session_id);
+            let boundary = match reviewed.plan.provider_reach {
+                ProviderReach::Selected {
+                    provider,
+                    provenance:
+                        unpin_core::provider_reach::SelectedProviderProvenance::PinnedMcpBoundary,
+                } => ConnectionBoundary::Pinned(provider),
+                ProviderReach::All | ProviderReach::Selected { .. } => ConnectionBoundary::All,
+            };
+            let principal =
+                ReachAwarePrincipal::sign(session_id, scope_digest, boundary, authority_key)
+                    .map_err(|error| error.to_string())?;
+            let now_unix = unix_now();
+            let durable = GroupReachAwareApplyContext {
+                roots,
+                principal,
+                audience: GROUP_APPROVAL_AUDIENCE.to_string(),
+                issued_at_unix: now_unix,
+                expires_at_unix: now_unix + 3600,
+                now_unix,
+            };
+            controller.apply_with_reach_aware(&reviewed.plan, authorization, durable)
+        } else {
+            // Keep the schema-v1 adapter available only for genuinely legacy
+            // plans; all current group plans carry the reach-aware contract.
+            controller.apply(&reviewed.plan, authorization)
+        };
+        let result = match result {
             Ok(result) => result,
             Err(error) => {
                 let provider_writes_started = reviewed
@@ -1167,9 +1235,7 @@ impl GroupWorkflow {
                     .operation_id
                     .as_deref()
                     .and_then(|operation_id| controller.operation(operation_id).ok().flatten())
-                    .is_some_and(|operation| {
-                        operation.provider_writes_started || operation.terminal_result.is_some()
-                    });
+                    .is_some_and(|operation| operation.provider_writes_started);
                 if provider_writes_started {
                     self.phase = WorkflowPhase::RecoveryRequired;
                     return Err(format!(
@@ -1412,6 +1478,27 @@ fn target_label(target: GroupTargetState) -> &'static str {
     }
 }
 
+fn group_provider_root(
+    roots: &unpin_core::discovery::DiscoveryRoots,
+    provider: ProviderId,
+) -> &Path {
+    match provider {
+        ProviderId::Claude => roots.claude_global.as_path(),
+        ProviderId::Codex => roots.codex_global.as_path(),
+        ProviderId::Cursor => roots.cursor_config.as_path(),
+        ProviderId::Pi => roots.pi_global.as_path(),
+        ProviderId::OpenCode => roots.opencode_global.as_path(),
+        ProviderId::Zed => roots.zed_global.as_path(),
+    }
+}
+
+fn group_reach_scope_digest(
+    expectation: &unpin_core::approval::ApprovalExpectation,
+    session_id: &str,
+) -> String {
+    unpin_core::mutation::reach_scope_digest(expectation, session_id)
+}
+
 fn disposition_label(disposition: GroupPlanDisposition) -> &'static str {
     match disposition {
         GroupPlanDisposition::Preview => "preview",
@@ -1645,6 +1732,95 @@ mod tests {
             .expect("load group")
             .expect("stored group");
         assert_eq!(stored.definition.members, vec![identity]);
+    }
+
+    #[test]
+    fn reach_aware_group_apply_uses_signed_context_for_partial_noop() {
+        let (_root, mut workflow, discovery) = workflow_with_fixture();
+        let codex_item = discovery
+            .items
+            .iter()
+            .find(|item| item.id == "codex:global:configured-mcp:github")
+            .expect("Codex fixture MCP");
+        let zed_item = discovery
+            .items
+            .iter()
+            .find(|item| item.id == "zed:global:configured-mcp:github")
+            .expect("Zed fixture MCP");
+        let codex = GroupMemberIdentity::try_from(codex_item).expect("Codex identity");
+        let zed = GroupMemberIdentity::try_from(zed_item).expect("Zed identity");
+        let store = workflow
+            .resolver
+            .as_ref()
+            .expect("group resolver")
+            .personal_store()
+            .clone();
+        store
+            .create(
+                &GroupDefinitionV1::new("reach-aware-partial", vec![codex]).expect("definition"),
+                OwnerGeneration::new("tui-reach-aware-test", 1).expect("owner"),
+            )
+            .expect("create group");
+        let current = store
+            .load("reach-aware-partial")
+            .expect("load created group")
+            .expect("created group");
+        store
+            .replace(
+                &GroupDefinitionV1::new(
+                    "reach-aware-partial",
+                    vec![current.definition.members[0].clone(), zed],
+                )
+                .expect("mixed definition"),
+                Some(&current.revision),
+                OwnerGeneration::new("tui-reach-aware-test", 2).expect("owner"),
+            )
+            .expect("expand group");
+        workflow.refresh(&discovery).expect("refresh groups");
+        workflow.selected = workflow
+            .records
+            .iter()
+            .position(|record| record.definition.name == "reach-aware-partial")
+            .expect("selected mixed group");
+        workflow.target = if codex_item.enabled {
+            GroupTargetState::Enable
+        } else {
+            GroupTargetState::Disable
+        };
+        workflow.provider_reach =
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::TuiControl);
+        let access = workflow
+            .resolver
+            .as_ref()
+            .expect("resolver")
+            .context()
+            .clone();
+        let approval_context =
+            ControlApprovalContext::new(access.repository_key(), access.workspace_key())
+                .expect("approval context");
+        workflow
+            .plan(&approval_context)
+            .expect("plan partial group");
+        assert!(workflow.confirm());
+        let backup_key = BackupAuthenticationKey::new([0x62; 32]);
+        let outcome = workflow
+            .apply_active(
+                access.app_state_root(),
+                access.workspace_root(),
+                &approval_context,
+                &SessionAuthorityKey::new([0x53; 32]),
+                Some(&backup_key),
+                true,
+            )
+            .expect("reach-aware partial apply");
+        assert!(matches!(
+            outcome,
+            GroupApplyOutcome::Direct {
+                lifecycle: GroupOperationLifecycle::Partial,
+                ..
+            }
+        ));
+        assert_eq!(workflow.phase, WorkflowPhase::Partial);
     }
 
     #[test]

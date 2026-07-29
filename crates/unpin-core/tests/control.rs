@@ -1,4 +1,10 @@
-use std::{collections::BTreeSet, fs, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -41,6 +47,15 @@ fn fixtures_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
+}
+
+fn wall_clock_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_secs()
+        .try_into()
+        .expect("Unix timestamp fits i64")
 }
 
 #[test]
@@ -241,6 +256,7 @@ fn reach_aware_v2_journal_attachment_binds_revision_and_redacts_provider_roots()
     let mut handle = store
         .create_or_attach(&plan, owner.clone())
         .expect("create journal");
+    let issued_at_unix = wall_clock_unix();
     let make_builder = || {
         ReachAwareControlOperationEnvelope::builder()
             .family(ReachAwareOperationFamily::NativeToggle, 1)
@@ -273,7 +289,12 @@ fn reach_aware_v2_journal_attachment_binds_revision_and_redacts_provider_roots()
                 EffectActivation::RestartRequired,
             )
             .trusted_roots(roots.clone())
-            .authority(principal.clone(), "unpin-test-audience", 100, 200)
+            .authority(
+                principal.clone(),
+                "unpin-test-audience",
+                issued_at_unix,
+                issued_at_unix + 60,
+            )
             .payload_reference(ReachAwarePayloadReference {
                 family: ReachAwareOperationFamily::NativeToggle,
                 schema_version: 1,
@@ -291,6 +312,12 @@ fn reach_aware_v2_journal_attachment_binds_revision_and_redacts_provider_roots()
         .expect("attached envelope");
     assert_eq!(envelope.owner, owner);
     assert_eq!(envelope.revision.sequence, 1);
+    assert!(
+        store
+            .attach_reach_aware_builder(&mut handle, make_builder(), &key)
+            .is_ok(),
+        "a live persisted envelope may be reattached with the same authority"
+    );
     let redacted = envelope.redacted();
     let rendered = serde_json::to_string(&redacted).expect("redacted envelope");
     assert!(!rendered.contains(provider_root.to_string_lossy().as_ref()));
@@ -649,6 +676,19 @@ fn reach_aware_transfer_capability_rejects_invalid_contexts_and_is_consumed_once
             )
             .is_err()
     );
+    let transfer_issued_at_unix = wall_clock_unix();
+    let transfer_expires_at_unix = transfer_issued_at_unix + 60;
+    let capability = ReachAwareTransferCapability::issue(
+        "transfer-live",
+        "control-audience",
+        "scope-digest",
+        "transfer-operation",
+        &recipient,
+        transfer_issued_at_unix,
+        transfer_expires_at_unix,
+        &authority_key,
+    )
+    .expect("live signed capability");
 
     let provider_root = fs::canonicalize(provider_root).expect("canonical provider root");
     let roots = ReachAwareRootBinding::from_provider_paths(
@@ -722,7 +762,12 @@ fn reach_aware_transfer_capability_rejects_invalid_contexts_and_is_consumed_once
             EffectActivation::RestartRequired,
         )
         .trusted_roots(roots)
-        .authority(issuer, "control-audience", 100, 200)
+        .authority(
+            issuer,
+            "control-audience",
+            transfer_issued_at_unix,
+            transfer_expires_at_unix,
+        )
         .journal_binding(owner.clone(), revision)
         .payload_reference(ReachAwarePayloadReference {
             family: ReachAwareOperationFamily::NativeToggle,
@@ -745,7 +790,7 @@ fn reach_aware_transfer_capability_rejects_invalid_contexts_and_is_consumed_once
             "control-audience",
             "scope-digest",
             &recipient,
-            150,
+            transfer_issued_at_unix,
             &authority_key,
         )
         .expect("first durable consumption");
@@ -753,7 +798,7 @@ fn reach_aware_transfer_capability_rejects_invalid_contexts_and_is_consumed_once
         recipient.clone(),
         "control-audience",
         "scope-digest",
-        150,
+        transfer_issued_at_unix,
         None,
     );
     project_reach_aware_operation_status(
@@ -860,14 +905,16 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
         &authority_key,
     )
     .expect("pinned principal");
+    let status_issued_at_unix = wall_clock_unix();
+    let status_expires_at_unix = status_issued_at_unix + 60;
     let pinned_capability = ReachAwareTransferCapability::issue(
         "status-transfer",
         "control-audience",
         "status-scope-digest",
         &plan.operation_id,
         &pinned_principal,
-        100,
-        200,
+        status_issued_at_unix,
+        status_expires_at_unix,
         &authority_key,
     )
     .expect("status transfer capability");
@@ -915,7 +962,12 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
             EffectActivation::RestartRequired,
         )
         .trusted_roots(roots)
-        .authority(principal.clone(), "control-audience", 100, 200)
+        .authority(
+            principal.clone(),
+            "control-audience",
+            status_issued_at_unix,
+            status_expires_at_unix,
+        )
         .payload_reference(ReachAwarePayloadReference {
             family: ReachAwareOperationFamily::NativeToggle,
             schema_version: 1,
@@ -926,16 +978,31 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
     store
         .attach_reach_aware_builder(&mut handle, builder, &authority_key)
         .expect("attach envelope");
+    store
+        .consume_reach_aware_transfer_capability(
+            &mut handle,
+            &pinned_capability,
+            "control-audience",
+            "status-scope-digest",
+            &pinned_principal,
+            status_issued_at_unix,
+            &authority_key,
+        )
+        .expect("durably consume status transfer capability");
     let journal = handle.journal.clone();
     let authorization = ReachAwareStatusAuthorization::new(
         pinned_principal,
         "control-audience",
         "status-scope-digest",
-        150,
+        status_issued_at_unix,
         Some(pinned_capability),
     );
     let projection = project_reach_aware_operation_status(&journal, &authorization, &authority_key)
         .expect("authorized projection");
+    let repeated_projection =
+        project_reach_aware_operation_status(&journal, &authorization, &authority_key)
+            .expect("durable transfer supports repeat status reads");
+    assert_eq!(repeated_projection, projection);
     let rendered = serde_json::to_string(&projection).expect("projection JSON");
     assert!(rendered.contains("codex-visible-target"));
     assert!(!rendered.contains("zed-secret-path"));
@@ -990,7 +1057,7 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
     let filter = ReachAwareStatusFilter {
         operation_id: Some("status-operation".to_string()),
         family: Some(ReachAwareOperationFamily::NativeToggle),
-        lifecycle: Some(ProviderReachLifecycle::Partial),
+        lifecycle: Some(ProviderReachLifecycle::RecoveryRequired),
         provider: Some(ProviderId::Codex),
     };
     let projections = project_reach_aware_operations(
@@ -1077,8 +1144,45 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
         .as_ref()
         .expect("nested reach-aware status");
     assert_eq!(attached.schema_version, 2);
-    assert_eq!(attached.lifecycle, ProviderReachLifecycle::Partial);
-    assert!(!control.operations[0].recovery_required);
+    assert_eq!(attached.lifecycle, ProviderReachLifecycle::RecoveryRequired);
+    assert!(control.operations[0].recovery_required);
+
+    // Terminal status is repeatable for the original authenticated principal and
+    // no longer needs a transfer capability on each read.
+    handle
+        .journal
+        .record(
+            TransitionLifecycle::Committed,
+            "status-test-committed",
+            None,
+        )
+        .expect("terminal journal transition");
+    store.save(&mut handle).expect("save terminal journal");
+    let terminal_journal = handle.journal.clone();
+    let terminal_authorization = ReachAwareStatusAuthorization::new(
+        principal,
+        "control-audience",
+        "status-scope-digest",
+        150,
+        None,
+    );
+    let terminal_projection = project_reach_aware_operation_status(
+        &terminal_journal,
+        &terminal_authorization,
+        &authority_key,
+    )
+    .expect("same-principal terminal status");
+    let repeated_terminal_projection = project_reach_aware_operation_status(
+        &terminal_journal,
+        &terminal_authorization,
+        &authority_key,
+    )
+    .expect("repeat same-principal terminal status");
+    assert_eq!(repeated_terminal_projection, terminal_projection);
+    assert_eq!(
+        terminal_projection.lifecycle,
+        ProviderReachLifecycle::Partial
+    );
 
     let mut unauthorized_control = control.clone();
     unauthorized_control.operations[0].reach_aware = None;
@@ -1340,7 +1444,7 @@ fn create_reach_aware_journal(
     root: &Path,
     authority_key: &SessionAuthorityKey,
     operation_id: &str,
-    expires_at_unix: i64,
+    _expires_at_unix: i64,
     reach_lifecycle: ProviderReachLifecycle,
     lifecycle: TransitionLifecycle,
 ) {
@@ -1412,7 +1516,7 @@ fn create_reach_aware_journal(
             EffectActivation::RestartRequired,
         )
         .trusted_roots(roots)
-        .authority(principal, "control-audience", 100, expires_at_unix)
+        .authority(principal, "control-audience", 100, _expires_at_unix)
         .payload_reference(ReachAwarePayloadReference {
             family: ReachAwareOperationFamily::NativeToggle,
             schema_version: 1,
@@ -1421,11 +1525,22 @@ fn create_reach_aware_journal(
         });
     let owner = OwnerGeneration::new(format!("{operation_id}-owner"), 1).expect("owner");
     let mut handle = store
-        .create_or_attach(&plan, owner)
+        .create_or_attach(&plan, owner.clone())
         .expect("create journal");
-    store
-        .attach_reach_aware_builder(&mut handle, builder, authority_key)
-        .expect("attach reach-aware envelope");
+    let mut envelope = builder
+        .journal_binding(
+            owner,
+            unpin_core::state::atomic_json::StateRevision {
+                sequence: 1,
+                fingerprint: "g".repeat(64),
+            },
+        )
+        .build()
+        .expect("build reach-aware envelope");
+    envelope
+        .seal(authority_key)
+        .expect("seal reach-aware envelope");
+    handle.journal.reach_aware = Some(envelope);
     handle
         .journal
         .record(lifecycle, lifecycle.as_str(), None)

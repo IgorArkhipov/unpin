@@ -2,6 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, fs, io,
     path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -374,16 +375,57 @@ impl TransitionJournalStore {
         builder: ReachAwareControlOperationEnvelopeBuilder,
         authority_key: &SessionAuthorityKey,
     ) -> Result<(), JournalError> {
+        let now_unix = unix_now()?;
+        self.attach_reach_aware_builder_at(handle, builder, authority_key, now_unix)
+    }
+
+    /// Attach a reach-aware envelope using an explicitly supplied Unix clock.
+    ///
+    /// Production callers should use [`Self::attach_reach_aware_builder`],
+    /// which samples the system clock. The `_at` form keeps journal tests and
+    /// deterministic recovery simulations independent of wall-clock time.
+    pub(crate) fn attach_reach_aware_builder_at(
+        &self,
+        handle: &mut JournalHandle,
+        builder: ReachAwareControlOperationEnvelopeBuilder,
+        authority_key: &SessionAuthorityKey,
+        now_unix: i64,
+    ) -> Result<(), JournalError> {
         if let Some(existing) = &handle.journal.reach_aware {
             existing
                 .verify_authenticated(authority_key)
                 .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+            // Build a candidate using the current CAS binding solely to
+            // compare immutable authority fields.  Lifecycle/recovery evidence
+            // changes as the operation progresses, and the journal revision
+            // advances on every checkpoint, so those fields are deliberately
+            // excluded by `same_authority_binding`.
+            let candidate = builder
+                .journal_binding(handle.owner.clone(), handle.revision.clone())
+                .build()
+                .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+            // The persisted envelope owns the authority window. Reusing an
+            // operation after wall-clock expiry is rejected even when a caller
+            // replays the original issued/expiry timestamps.
+            if !handle.journal.lifecycle.is_terminal() && existing.is_expired_at(now_unix) {
+                return Err(JournalError::ReachAwareEnvelope(
+                    "reach-aware envelope has expired".to_string(),
+                ));
+            }
+            if !existing.same_authority_binding(&candidate) {
+                return Err(JournalError::OperationConflict);
+            }
             return Ok(());
         }
         let mut envelope = builder
             .journal_binding(handle.owner.clone(), handle.revision.clone())
             .build()
             .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        if !handle.journal.lifecycle.is_terminal() && envelope.is_expired_at(now_unix) {
+            return Err(JournalError::ReachAwareEnvelope(
+                "reach-aware envelope has expired".to_string(),
+            ));
+        }
         envelope
             .seal(authority_key)
             .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
@@ -758,6 +800,16 @@ fn validate_event_code(code: &str) -> Result<(), JournalError> {
     } else {
         Ok(())
     }
+}
+
+fn unix_now() -> Result<i64, JournalError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| {
+        JournalError::ReachAwareEnvelope("system clock value overflowed Unix timestamp".to_string())
+    })
 }
 
 #[derive(Debug)]

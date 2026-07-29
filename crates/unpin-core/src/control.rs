@@ -136,6 +136,10 @@ pub struct ReachAwareStatusAuthorization {
     pub capability_scope_digest: String,
     pub now_unix: i64,
     pub transfer_capability: Option<ReachAwareTransferCapability>,
+    /// Optional caller-requested view boundary.  This can narrow an
+    /// all-provider authenticated principal for redaction, but can never widen
+    /// either the principal's authenticated boundary or the envelope boundary.
+    pub requested_boundary: Option<ConnectionBoundary>,
 }
 
 impl ReachAwareStatusAuthorization {
@@ -153,7 +157,14 @@ impl ReachAwareStatusAuthorization {
             capability_scope_digest: capability_scope_digest.into(),
             now_unix,
             transfer_capability,
+            requested_boundary: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_requested_boundary(mut self, boundary: ConnectionBoundary) -> Self {
+        self.requested_boundary = Some(boundary);
+        self
     }
 }
 
@@ -319,12 +330,13 @@ pub fn project_reach_aware_operation_status(
     let selected_provider = envelope
         .selected_provider
         .filter(|selected| connection_boundary.allows(selected.provider));
+    let lifecycle = reconcile_reach_aware_lifecycle(journal, envelope);
     Ok(ReachAwareOperationStatus {
         schema_version: REACH_AWARE_STATUS_SCHEMA_VERSION,
         operation_id: envelope.operation_id.clone(),
         operation_kind: envelope.operation_kind.clone(),
         family: envelope.family,
-        lifecycle: envelope.lifecycle,
+        lifecycle,
         expected_lifecycle: envelope.expected_lifecycle,
         provider_reach: envelope.provider_reach,
         selected_provider,
@@ -458,7 +470,17 @@ fn authorize_reach_aware_status(
             "status audience is not authorized".into(),
         ));
     }
-    let connection_boundary = authorization.principal.connection_boundary;
+    let principal_boundary = authorization.principal.connection_boundary;
+    let connection_boundary = authorization
+        .requested_boundary
+        .unwrap_or(principal_boundary);
+    if !boundary_is_within(connection_boundary, principal_boundary)
+        || !boundary_is_within(connection_boundary, envelope.connection_boundary)
+    {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "requested status boundary is wider than authenticated authority".into(),
+        ));
+    }
     if let ConnectionBoundary::Pinned(provider) = connection_boundary
         && (!envelope.connection_boundary.allows(provider)
             || envelope
@@ -486,7 +508,7 @@ fn authorize_reach_aware_status(
             "transfer capability scope is not authorized".into(),
         ));
     }
-    if bound_capability.connection_boundary != connection_boundary {
+    if bound_capability.connection_boundary != principal_boundary {
         return Err(ControlStatusError::ReachAwareAuthorization(
             "transfer capability connection boundary is not authorized".into(),
         ));
@@ -497,7 +519,7 @@ fn authorize_reach_aware_status(
     {
         if consumption.principal_session_id != authorization.principal.session_id
             || consumption.principal_scope_id != authorization.principal.connection_scope_id
-            || consumption.connection_boundary != connection_boundary
+            || consumption.connection_boundary != principal_boundary
         {
             return Err(ControlStatusError::ReachAwareAuthorization(
                 "transferred principal is not authorized".into(),
@@ -508,6 +530,19 @@ fn authorize_reach_aware_status(
             .map_err(|error| ControlStatusError::ReachAwareRecord(error.to_string()))?;
         return Ok(connection_boundary);
     }
+
+    // A transfer capability is a one-use bridge into an operation's active
+    // authority.  Once the operation is terminal, its authenticated result is
+    // intentionally repeatable.  Before terminalization, however, accepting
+    // the serialized capability on every status request would turn a transfer
+    // into a replayable cross-principal read; only the durable consumption
+    // receipt may authorize an active/nonterminal status.
+    if !journal.lifecycle.is_terminal() {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "transfer capability must be durably consumed before nonterminal status".into(),
+        ));
+    }
+
     let capability = authorization.transfer_capability.as_ref().ok_or_else(|| {
         ControlStatusError::ReachAwareAuthorization("transfer capability is required".into())
     })?;
@@ -527,6 +562,44 @@ fn authorize_reach_aware_status(
         )
         .map_err(ControlStatusError::from)?;
     Ok(connection_boundary)
+}
+
+fn boundary_is_within(requested: ConnectionBoundary, authority: ConnectionBoundary) -> bool {
+    match authority {
+        ConnectionBoundary::All => true,
+        ConnectionBoundary::Pinned(provider) => requested == ConnectionBoundary::Pinned(provider),
+    }
+}
+
+fn reconcile_reach_aware_lifecycle(
+    journal: &TransitionJournal,
+    envelope: &ReachAwareControlOperationEnvelope,
+) -> ProviderReachLifecycle {
+    match journal.lifecycle {
+        crate::transitions::TransitionLifecycle::Committed => envelope.lifecycle,
+        crate::transitions::TransitionLifecycle::RolledBack => {
+            if envelope.lifecycle == ProviderReachLifecycle::RecoveryRequired {
+                ProviderReachLifecycle::RecoveryRequired
+            } else {
+                ProviderReachLifecycle::Blocked
+            }
+        }
+        crate::transitions::TransitionLifecycle::NeedsRepair
+        | crate::transitions::TransitionLifecycle::Applying
+        | crate::transitions::TransitionLifecycle::Cancelling
+        | crate::transitions::TransitionLifecycle::RollingBack
+        | crate::transitions::TransitionLifecycle::Recovering => {
+            ProviderReachLifecycle::RecoveryRequired
+        }
+        // A plan/approval that has not entered a provider write is not an
+        // applied result.  The reach-aware status vocabulary has no separate
+        // "in progress" value, so expose the safe non-authorized projection.
+        crate::transitions::TransitionLifecycle::Planned
+        | crate::transitions::TransitionLifecycle::AwaitingHumanAction
+        | crate::transitions::TransitionLifecycle::Approved
+        | crate::transitions::TransitionLifecycle::Locked
+        | crate::transitions::TransitionLifecycle::BackedUp => ProviderReachLifecycle::Blocked,
+    }
 }
 
 pub fn build_persistent_control_metadata(

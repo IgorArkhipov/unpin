@@ -211,7 +211,9 @@ fn plan(args: BulkPlanArgs, require_handoff: bool) -> ExitCode {
                 }
                 None
             }
-            Err(error) => return command_error_exit_code(args.json, "blocked", &error, 3),
+            Err(error) => {
+                return command_error_exit_code(args.json, "blocked", &error.to_string(), 3);
+            }
         }
     } else {
         None
@@ -275,36 +277,55 @@ fn apply(args: BulkApplyArgs) -> ExitCode {
                 Err(error) => return command_error_exit_code(args.json, "blocked", &error, 3),
             };
             match controller.apply_with_reach_aware(&plan, authorization, durable, discovery) {
-                Ok(result) => return render_apply_result(&result, args.json),
-                Err(error) => {
-                    return command_error_exit_code(
-                        args.json,
-                        lifecycle_status_for_plan_error(&error),
-                        &error.to_string(),
-                        lifecycle_status_exit_code(lifecycle_status_for_plan_error(&error)),
-                    );
-                }
+                Ok(result) => render_apply_result(&result, args.json),
+                Err(error) => command_error_exit_code(
+                    args.json,
+                    lifecycle_status_for_plan_error(&error),
+                    &error.to_string(),
+                    lifecycle_status_exit_code(lifecycle_status_for_plan_error(&error)),
+                ),
             }
         }
-        Err(error) => return command_error_exit_code(args.json, "blocked", &error, 3),
+        Err(error) => command_error_exit_code(args.json, "blocked", &error, 3),
     }
 }
 
 fn status(args: BulkStatusArgs) -> ExitCode {
+    let fixture_mode = args.roots.fixture_root.is_some();
     let config = match resolve_config(&args.roots, args.app_state_root.clone()) {
         Ok(config) => config,
         Err(error) => return command_error_exit(args.json, "failed", &error.to_string()),
     };
-    let controller = BulkToggleController::new(&config.app_state_root);
+    let session_key =
+        match credentials::resolve_session_authority_key(fixture_mode, &config.app_state_root) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return command_error_exit_code(
+                    args.json,
+                    "blocked",
+                    "session authority key missing; run `unpin auth session init`",
+                    3,
+                );
+            }
+            Err(error) => return command_error_exit_code(args.json, "blocked", &error, 3),
+        };
+    let controller =
+        BulkToggleController::new(&config.app_state_root).with_session_authority_key(session_key);
     let operation = match controller.load_handoff_status(&args.operation_id) {
         Ok(operation) => operation,
-        Err(error) => return command_error_exit_code(args.json, "blocked", &error.to_string(), 3),
+        Err(error) => {
+            let status = lifecycle_status_for_plan_error(&error);
+            return command_error_exit_code(
+                args.json,
+                status,
+                &error.to_string(),
+                lifecycle_status_exit_code(status),
+            );
+        }
     };
+    let lifecycle = operation.lifecycle();
     let plan = operation.plan;
     let terminal_result = operation.terminal_result;
-    let lifecycle = terminal_result
-        .as_ref()
-        .map_or(plan.lifecycle, |result| result.lifecycle);
     let provider_reach = terminal_result
         .as_ref()
         .map_or(plan.provider_reach, |result| result.provider_reach);
@@ -576,7 +597,9 @@ fn lifecycle_status_exit_code(status: &str) -> u8 {
 
 fn lifecycle_status_for_plan_error(error: &impl std::fmt::Display) -> &'static str {
     let text = error.to_string();
-    if text.contains("no targets") {
+    if text.contains("recovery-required") {
+        "recovery-required"
+    } else if text.contains("no targets") {
         "no-targets"
     } else {
         "blocked"

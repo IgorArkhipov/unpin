@@ -1392,14 +1392,16 @@ impl TuiState {
             ));
             return false;
         };
-        let (plan, blocked_reason, target_enabled) =
-            match self.native_toggle_controller().plan(item.clone(), context) {
-                Ok(plan) => {
-                    let target_enabled = plan.preview.target_enabled;
-                    (Some(plan), None, target_enabled)
-                }
-                Err(error) => (None, Some(error.to_string()), !item.enabled),
-            };
+        let (plan, blocked_reason, target_enabled) = match self
+            .native_toggle_controller()
+            .plan_with_inventory(item.clone(), &self.items, context)
+        {
+            Ok(plan) => {
+                let target_enabled = plan.preview.target_enabled;
+                (Some(plan), None, target_enabled)
+            }
+            Err(error) => (None, Some(error.to_string()), !item.enabled),
+        };
         let staged = StagedToggle {
             item: item.clone(),
             plan,
@@ -1499,10 +1501,11 @@ impl TuiState {
                     continue;
                 };
                 staged.item = current_item.clone();
-                match self
-                    .native_toggle_controller()
-                    .plan(current_item.clone(), context)
-                {
+                match self.native_toggle_controller().plan_with_inventory(
+                    current_item.clone(),
+                    &self.items,
+                    context,
+                ) {
                     Ok(plan) => {
                         staged.plan = Some(plan);
                         staged.blocked_reason = None;
@@ -3720,6 +3723,37 @@ mod tests {
     }
 
     #[test]
+    fn state_blocks_shared_source_outside_selected_provider_reach() {
+        let mut claude = item(
+            "claude:global:skill:shared",
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        );
+        claude.source_path = "/fixtures/shared/SKILL.md".to_string();
+        claude.state_path = "/fixtures/shared".to_string();
+        let mut cursor = item(
+            "cursor:global:skill:@compat/claude/shared",
+            ProviderId::Cursor,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        );
+        cursor.source_path.clone_from(&claude.source_path);
+        cursor.state_path.clone_from(&claude.state_path);
+        let mut state = TuiState::new(discovery(vec![claude, cursor]));
+
+        assert!(state.stage_selected_toggle());
+        let staged = state.staged.values().next().expect("staged item");
+        assert!(staged.plan.is_none());
+        assert_eq!(
+            staged.blocked_reason.as_deref(),
+            Some("native toggle blocked: shared-source-crosses-provider-reach")
+        );
+    }
+
+    #[test]
     fn staged_inventory_uses_full_identity_for_same_id_items() {
         let mut state = TuiState::new(discovery(vec![
             item(
@@ -4094,36 +4128,53 @@ mod tests {
         let app_state = TempDir::new().expect("temp app state");
         let fixture_copy = TempDir::new().expect("temp fixture copy");
         copy_dir_all(&fixtures_root(), fixture_copy.path());
-        let project_root = fixture_copy.path().join("claude/project");
+        let project_root = fixture_copy.path().join("pi/project");
         let roots =
             DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(app_state.path());
         let mut discovery = discover_all(&roots).expect("fixture discovery");
-        let missing_skill = project_root.join(".claude/skills/zz-missing");
-        discovery.items.push(skill_item_at(
-            "claude:project:skill:zz-missing",
-            &missing_skill,
-        ));
+        let missing_skill = project_root.join(".pi/skills/zz-missing");
+        let mut missing_item = skill_item_at("pi:project:skill:zz-missing", &missing_skill);
+        missing_item.provider = ProviderId::Pi;
+        discovery.items.push(missing_item);
         let mut state = TuiState::new_with_paths_and_roots(
             discovery,
             app_state.path().to_path_buf(),
             project_root.clone(),
             roots,
         );
-        state.provider_filter = ProviderFilter::Provider(ProviderId::Claude);
+        state.provider_filter = ProviderFilter::Provider(ProviderId::Pi);
         state.layer_filter = LayerFilter::Layer(DiscoveryLayer::Project);
         state.category_filter = CategoryFilter::Category(DiscoveryCategory::Skill);
         state.clamp_selected();
-        assert_eq!(state.visible_count(), 2);
-        assert_eq!(
-            state.selected_item().expect("existing selected skill").id,
-            "claude:project:skill:example-claude-skill"
-        );
+        assert_eq!(state.visible_count(), 4);
+        for _ in 0..state.visible_count() {
+            if state
+                .selected_item()
+                .is_some_and(|item| item.id == "pi:project:skill:example-pi-project-skill")
+            {
+                break;
+            }
+            state.move_next();
+        }
+        let existing_id = state
+            .selected_item()
+            .expect("existing selected skill")
+            .id
+            .clone();
 
         assert!(state.stage_selected_toggle());
-        state.move_next();
+        for _ in 0..state.visible_count() {
+            if state
+                .selected_item()
+                .is_some_and(|item| item.id == "pi:project:skill:zz-missing")
+            {
+                break;
+            }
+            state.move_next();
+        }
         assert_eq!(
             state.selected_item().expect("missing selected skill").id,
-            "claude:project:skill:zz-missing"
+            "pi:project:skill:zz-missing"
         );
         assert!(state.stage_selected_toggle());
         assert!(state.confirm_staged());
@@ -4148,12 +4199,12 @@ mod tests {
         assert!(!state.pending_confirmation());
         assert_eq!(
             state.staged_summary_strings(),
-            vec!["- claude:project:skill:zz-missing -> off"]
+            vec!["- pi:project:skill:zz-missing -> off"]
         );
 
         let output = render_headless_state(&state);
         assert!(output.contains("Last action: error: Applied 1/2 staged changes"));
-        assert!(output.contains("claude:project:skill:zz-missing blocked:"));
+        assert!(output.contains("pi:project:skill:zz-missing blocked:"));
         assert!(!output.contains("refresh failed:"));
         assert!(!output.contains("snapshot failed:"));
 
@@ -4164,13 +4215,13 @@ mod tests {
             snapshot
                 .items
                 .iter()
-                .all(|item| item.id != "claude:project:skill:zz-missing")
+                .all(|item| item.id != "pi:project:skill:zz-missing")
         );
         assert!(
             !snapshot
                 .items
                 .iter()
-                .find(|item| item.id == "claude:project:skill:example-claude-skill")
+                .find(|item| item.id == existing_id)
                 .expect("snapshot applied skill")
                 .enabled
         );
@@ -4181,7 +4232,7 @@ mod tests {
         let app_state = TempDir::new().expect("temp app state");
         let fixture_copy = TempDir::new().expect("temp fixture copy");
         copy_dir_all(&fixtures_root(), fixture_copy.path());
-        let project_root = fixture_copy.path().join("claude/project");
+        let project_root = fixture_copy.path().join("pi/project");
         let roots =
             DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(app_state.path());
         let discovery = discover_all(&roots).expect("fixture discovery");
@@ -4207,10 +4258,19 @@ mod tests {
             project_root.clone(),
             roots,
         );
-        state.provider_filter = ProviderFilter::Provider(ProviderId::Claude);
+        state.provider_filter = ProviderFilter::Provider(ProviderId::Pi);
         state.layer_filter = LayerFilter::Layer(DiscoveryLayer::Project);
         state.category_filter = CategoryFilter::Category(DiscoveryCategory::Skill);
         state.clamp_selected();
+        for _ in 0..state.visible_count() {
+            if state
+                .selected_item()
+                .is_some_and(|item| item.id == "pi:project:skill:example-pi-project-skill")
+            {
+                break;
+            }
+            state.move_next();
+        }
         let original_state_path = PathBuf::from(
             &state
                 .selected_item()
@@ -4236,7 +4296,7 @@ mod tests {
         let stale_item = latest
             .items
             .iter()
-            .find(|item| item.id == "claude:project:skill:example-claude-skill")
+            .find(|item| item.id == "pi:project:skill:example-pi-project-skill")
             .expect("seeded snapshot skill");
         assert!(stale_item.enabled);
     }
@@ -4246,7 +4306,7 @@ mod tests {
         let app_state = TempDir::new().expect("temp app state");
         let fixture_copy = TempDir::new().expect("temp fixture copy");
         copy_dir_all(&fixtures_root(), fixture_copy.path());
-        let project_root = fixture_copy.path().join("claude").join("project");
+        let project_root = fixture_copy.path().join("pi").join("project");
         let roots =
             DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(app_state.path());
         let discovery = discover_all(&roots).expect("fixture discovery");
@@ -4256,15 +4316,24 @@ mod tests {
             project_root.clone(),
             roots,
         );
-        state.provider_filter = ProviderFilter::Provider(ProviderId::Claude);
+        state.provider_filter = ProviderFilter::Provider(ProviderId::Pi);
         state.layer_filter = LayerFilter::Layer(DiscoveryLayer::Project);
         state.category_filter = CategoryFilter::Category(DiscoveryCategory::Skill);
         state.clamp_selected();
+        for _ in 0..state.visible_count() {
+            if state
+                .selected_item()
+                .is_some_and(|item| item.id == "pi:project:skill:example-pi-project-skill")
+            {
+                break;
+            }
+            state.move_next();
+        }
 
         let selected_before = state.selected_item().expect("selected skill");
         assert_eq!(
             selected_before.id,
-            "claude:project:skill:example-claude-skill"
+            "pi:project:skill:example-pi-project-skill"
         );
         let original_state_path = PathBuf::from(&selected_before.state_path);
         assert!(original_state_path.exists());
@@ -4281,11 +4350,13 @@ mod tests {
         assert_eq!(state.backups.len(), 1);
         assert_eq!(
             state.backups[0].selection.id,
-            "claude:project:skill:example-claude-skill"
+            "pi:project:skill:example-pi-project-skill"
         );
         assert!(!state.backups[0].target_enabled);
         let selected_after = state
-            .selected_item()
+            .items
+            .iter()
+            .find(|item| item.id == "pi:project:skill:example-pi-project-skill")
             .unwrap_or_else(|| panic!("{}", render_headless_state(&state)));
         assert!(!selected_after.enabled);
         assert!(
@@ -4305,7 +4376,7 @@ mod tests {
         let snapshot_item = snapshot
             .items
             .iter()
-            .find(|item| item.id == "claude:project:skill:example-claude-skill")
+            .find(|item| item.id == "pi:project:skill:example-pi-project-skill")
             .expect("snapshot item");
         assert!(!snapshot_item.enabled);
         assert!(

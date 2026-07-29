@@ -1543,6 +1543,48 @@ fn native_toggle_rejects_selected_provider_conflict_before_native_planning() {
 }
 
 #[test]
+fn native_toggle_blocks_shared_source_outside_selected_provider_reach() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let discovery = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "claude:global:skill:example-claude-global-skill")
+        .cloned()
+        .expect("Claude shared skill");
+
+    let error = NativeToggleController::new(app_state.path())
+        .plan_with_reach_in_inventory(
+            item,
+            &discovery.items,
+            &control_context("test-repository", "test-workspace"),
+            ConnectionBoundary::All,
+            ProviderReachInput::selected(
+                ProviderId::Claude,
+                SelectedProviderProvenance::ExplicitInput,
+            ),
+            vec![unpin_core::provider_reach::SelectedProviderAuthority::new(
+                ProviderId::Claude,
+                SelectedProviderProvenance::ExplicitInput,
+            )],
+        )
+        .expect_err("shared source must block before native planning");
+
+    assert!(matches!(
+        error,
+        NativeToggleControlError::Blocked(reason)
+            if reason == "shared-source-crosses-provider-reach"
+    ));
+    assert!(
+        !app_state.path().join("journals").exists(),
+        "shared-source guard must run before transition state"
+    );
+}
+
+#[test]
 fn native_toggle_review_fingerprint_ignores_journal_generation() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");

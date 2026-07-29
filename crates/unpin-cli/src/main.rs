@@ -25,7 +25,9 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unpin_core::{
     approval::ControlApprovalContext,
     capabilities::{CAPABILITY_ROWS, validate_capability_matrix, validate_provider_fixtures},
-    config::{LoadConfigOptions, UnpinConfig, UnpinConfigOverrides, load_config},
+    config::{
+        LoadConfigOptions, UnpinConfig, UnpinConfigOverrides, load_config, normalize_absolute_path,
+    },
     control::build_persistent_control_metadata,
     control_operation::{
         ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
@@ -60,7 +62,7 @@ struct Cli {
     command: Option<Commands>,
 }
 
-#[derive(Debug, Clone, Args)]
+#[derive(Debug, Clone, Default, Args)]
 struct DiscoveryRootArgs {
     /// Discover from a deterministic fixture root instead of live provider roots.
     #[arg(long)]
@@ -68,12 +70,30 @@ struct DiscoveryRootArgs {
     /// Home root used to resolve global provider configuration.
     #[arg(long)]
     home_root: Option<PathBuf>,
+    /// Claude configuration root (overrides CLAUDE_CONFIG_DIR).
+    #[arg(long)]
+    claude_root: Option<PathBuf>,
+    /// Codex configuration root (overrides CODEX_HOME).
+    #[arg(long)]
+    codex_root: Option<PathBuf>,
     /// Project root used to resolve project-scoped provider state.
     #[arg(long)]
     project_root: Option<PathBuf>,
     /// Cursor app-support root used to resolve Cursor profiles and workspace state.
     #[arg(long)]
     cursor_root: Option<PathBuf>,
+    /// Cursor configuration root (defaults to ~/.cursor).
+    #[arg(long)]
+    cursor_config_root: Option<PathBuf>,
+    /// Pi agent configuration root (overrides PI_CODING_AGENT_DIR).
+    #[arg(long)]
+    pi_root: Option<PathBuf>,
+    /// OpenCode configuration root (overrides OPENCODE_CONFIG_DIR and XDG_CONFIG_HOME).
+    #[arg(long)]
+    opencode_root: Option<PathBuf>,
+    /// Zed settings root (overrides XDG_CONFIG_HOME/zed).
+    #[arg(long)]
+    zed_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
@@ -654,8 +674,9 @@ fn main() -> ExitCode {
                                                     unpin_core::provider_reach::ProviderReachInput::All
                                                 }
                                             };
-                                            let plan = match controller.plan_with_reach(
+                                            let plan = match controller.plan_with_reach_in_inventory(
                                                 item.clone(),
+                                                &discovery.items,
                                                 &approval_context,
                                                 unpin_core::provider_reach::ConnectionBoundary::All,
                                                 reach_input,
@@ -861,6 +882,7 @@ fn main() -> ExitCode {
                 home_root,
                 project_root,
                 cursor_root,
+                ..DiscoveryRootArgs::default()
             };
             let config = match resolve_config(&roots, app_state_root) {
                 Ok(config) => config,
@@ -1970,15 +1992,71 @@ fn resolve_discovery_roots_with_config(
     args: &DiscoveryRootArgs,
     config: &UnpinConfig,
 ) -> Result<DiscoveryRoots, String> {
+    resolve_discovery_roots_with_config_and_environment(args, config, &|name| env::var_os(name))
+}
+
+fn resolve_discovery_roots_with_config_and_environment(
+    args: &DiscoveryRootArgs,
+    config: &UnpinConfig,
+    environment: &impl Fn(&str) -> Option<OsString>,
+) -> Result<DiscoveryRoots, String> {
     if let Some(fixture_root) = &args.fixture_root {
         return Ok(DiscoveryRoots::fixture_root(fixture_root));
     }
 
-    Ok(DiscoveryRoots::from_locations(
-        home_root(args)?,
-        &config.project_root,
-        &config.cursor_root,
-    ))
+    let home_root = home_root(args)?;
+    let cwd = env::current_dir().map_err(|error| error.to_string())?;
+    let normalize =
+        |path: PathBuf| normalize_absolute_path(path, cwd.as_path(), home_root.as_path());
+    let environment_path = |name: &str| {
+        environment(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+
+    let mut roots =
+        DiscoveryRoots::from_locations(&home_root, &config.project_root, &config.cursor_root);
+
+    if let Some(claude_root) = args
+        .claude_root
+        .clone()
+        .or_else(|| environment_path("CLAUDE_CONFIG_DIR"))
+    {
+        roots.claude_global = normalize(claude_root);
+        roots.claude_user_state = roots.claude_global.join(".claude.json");
+    }
+    roots.codex_global = normalize(
+        args.codex_root
+            .clone()
+            .or_else(|| environment_path("CODEX_HOME"))
+            .unwrap_or_else(|| home_root.join(".codex")),
+    );
+    roots.cursor_config = normalize(
+        args.cursor_config_root
+            .clone()
+            .unwrap_or_else(|| home_root.join(".cursor")),
+    );
+    roots.pi_global = normalize(
+        args.pi_root
+            .clone()
+            .or_else(|| environment_path("PI_CODING_AGENT_DIR"))
+            .unwrap_or_else(|| home_root.join(".pi").join("agent")),
+    );
+    roots.opencode_global = normalize(
+        args.opencode_root
+            .clone()
+            .or_else(|| environment_path("OPENCODE_CONFIG_DIR"))
+            .or_else(|| environment_path("XDG_CONFIG_HOME").map(|root| root.join("opencode")))
+            .unwrap_or_else(|| home_root.join(".config").join("opencode")),
+    );
+    roots.zed_global = normalize(
+        args.zed_root
+            .clone()
+            .or_else(|| environment_path("XDG_CONFIG_HOME").map(|root| root.join("zed")))
+            .unwrap_or_else(|| home_root.join(".config").join("zed")),
+    );
+
+    Ok(roots)
 }
 
 fn resolve_config(
@@ -2355,6 +2433,150 @@ fn native_toggle_control_error_status(error: &NativeToggleControlError) -> &'sta
         "recovery-required"
     } else {
         "blocked"
+    }
+}
+
+#[cfg(test)]
+mod provider_root_tests {
+    use std::collections::BTreeMap;
+
+    use tempfile::TempDir;
+    use unpin_core::config::UnpinConfigPaths;
+
+    use super::*;
+
+    fn test_config(root: &Path) -> UnpinConfig {
+        UnpinConfig {
+            version: 1,
+            app_state_root: root.join("state"),
+            cursor_root: root.join("cursor-app-support"),
+            project_root: root.join("project"),
+            config_paths: UnpinConfigPaths {
+                user_config_path: root.join("user-config.json"),
+                project_config_path: root.join("project-config.json"),
+            },
+        }
+    }
+
+    #[test]
+    fn resolves_supported_provider_environment_roots() {
+        let root = TempDir::new().expect("provider root test directory");
+        let home = root.path().join("home");
+        let active = root.path().join("active");
+        let args = DiscoveryRootArgs {
+            home_root: Some(home.clone()),
+            ..DiscoveryRootArgs::default()
+        };
+        let config = test_config(root.path());
+        let environment = BTreeMap::from([
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                active.join("claude").into_os_string(),
+            ),
+            (
+                "CODEX_HOME".to_string(),
+                active.join("codex").into_os_string(),
+            ),
+            (
+                "PI_CODING_AGENT_DIR".to_string(),
+                active.join("pi").into_os_string(),
+            ),
+            (
+                "OPENCODE_CONFIG_DIR".to_string(),
+                active.join("opencode").into_os_string(),
+            ),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                active.join("xdg").into_os_string(),
+            ),
+        ]);
+
+        let roots = resolve_discovery_roots_with_config_and_environment(&args, &config, &|name| {
+            environment.get(name).cloned()
+        })
+        .expect("provider roots");
+
+        assert_eq!(roots.claude_global, active.join("claude"));
+        assert_eq!(
+            roots.claude_user_state,
+            active.join("claude").join(".claude.json")
+        );
+        assert_eq!(roots.codex_global, active.join("codex"));
+        assert_eq!(roots.cursor_config, home.join(".cursor"));
+        assert_eq!(roots.pi_global, active.join("pi"));
+        assert_eq!(roots.opencode_global, active.join("opencode"));
+        assert_eq!(roots.zed_global, active.join("xdg").join("zed"));
+    }
+
+    #[test]
+    fn explicit_provider_roots_override_environment() {
+        let root = TempDir::new().expect("provider root test directory");
+        let explicit = root.path().join("explicit");
+        let environment_root = root.path().join("environment");
+        let args = DiscoveryRootArgs {
+            home_root: Some(root.path().join("home")),
+            claude_root: Some(explicit.join("claude")),
+            codex_root: Some(explicit.join("codex")),
+            cursor_config_root: Some(explicit.join("cursor")),
+            pi_root: Some(explicit.join("pi")),
+            opencode_root: Some(explicit.join("opencode")),
+            zed_root: Some(explicit.join("zed")),
+            ..DiscoveryRootArgs::default()
+        };
+        let config = test_config(root.path());
+        let environment = BTreeMap::from([
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                environment_root.join("claude").into_os_string(),
+            ),
+            (
+                "CODEX_HOME".to_string(),
+                environment_root.join("codex").into_os_string(),
+            ),
+            (
+                "PI_CODING_AGENT_DIR".to_string(),
+                environment_root.join("pi").into_os_string(),
+            ),
+            (
+                "OPENCODE_CONFIG_DIR".to_string(),
+                environment_root.join("opencode").into_os_string(),
+            ),
+            (
+                "XDG_CONFIG_HOME".to_string(),
+                environment_root.join("xdg").into_os_string(),
+            ),
+        ]);
+
+        let roots = resolve_discovery_roots_with_config_and_environment(&args, &config, &|name| {
+            environment.get(name).cloned()
+        })
+        .expect("provider roots");
+
+        assert_eq!(roots.claude_global, explicit.join("claude"));
+        assert_eq!(roots.codex_global, explicit.join("codex"));
+        assert_eq!(roots.cursor_config, explicit.join("cursor"));
+        assert_eq!(roots.pi_global, explicit.join("pi"));
+        assert_eq!(roots.opencode_global, explicit.join("opencode"));
+        assert_eq!(roots.zed_global, explicit.join("zed"));
+    }
+
+    #[test]
+    fn opencode_falls_back_to_xdg_config_home() {
+        let root = TempDir::new().expect("provider root test directory");
+        let xdg = root.path().join("xdg");
+        let args = DiscoveryRootArgs {
+            home_root: Some(root.path().join("home")),
+            ..DiscoveryRootArgs::default()
+        };
+        let config = test_config(root.path());
+
+        let roots = resolve_discovery_roots_with_config_and_environment(&args, &config, &|name| {
+            (name == "XDG_CONFIG_HOME").then(|| xdg.clone().into_os_string())
+        })
+        .expect("provider roots");
+
+        assert_eq!(roots.opencode_global, xdg.join("opencode"));
+        assert_eq!(roots.zed_global, xdg.join("zed"));
     }
 }
 

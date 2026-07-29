@@ -377,10 +377,18 @@ impl GroupController {
         }
 
         drop(definition_lock);
-        operation.mark_provider_writes_started()?;
-        operation_revision = store.save(&operation, &operation_revision, owner.clone())?;
-
+        let mut provider_writes_marked = false;
         for (cohort, prepared) in reviewed.cohorts.iter().zip(prepared_cohorts) {
+            if !provider_writes_marked && !prepared.members.is_empty() {
+                // Every included cohort has completed fresh preflight above.
+                // Persist the recovery boundary only when the first prepared
+                // provider write is about to be dispatched; plans that finish
+                // as no-op/reach-excluded never enter recovery merely because
+                // they were applied.
+                operation.mark_provider_writes_started()?;
+                operation_revision = store.save(&operation, &operation_revision, owner.clone())?;
+                provider_writes_marked = true;
+            }
             match (&execution_inputs, &discovery_index, &source_views) {
                 (Ok((_, journals)), Some(discovery), Some(source_views)) => self
                     .apply_prepared_cohort(
@@ -1448,6 +1456,22 @@ fn roll_up(members: &[GroupApplyMemberResult]) -> GroupOperationLifecycle {
     }) {
         return GroupOperationLifecycle::RecoveryRequired;
     }
+    let has_reach_exclusion = members
+        .iter()
+        .any(|member| member.status == GroupApplyMemberStatus::OutOfProviderReach);
+    let has_nonreach_exceptional = members.iter().any(|member| {
+        matches!(
+            member.status,
+            GroupApplyMemberStatus::Blocked
+                | GroupApplyMemberStatus::Missing
+                | GroupApplyMemberStatus::Failed
+        )
+    });
+    if has_reach_exclusion && !has_nonreach_exceptional {
+        // Reach exclusions are intentional scope, not failed members. This
+        // remains partial even when every in-reach member was already correct.
+        return GroupOperationLifecycle::Partial;
+    }
     let succeeded = members
         .iter()
         .any(|member| member.status == GroupApplyMemberStatus::Changed);
@@ -1721,6 +1745,17 @@ mod tests {
         assert_eq!(
             roll_up(&[member_result(GroupApplyMemberStatus::AlreadyCorrect)]),
             GroupOperationLifecycle::Completed
+        );
+    }
+
+    #[test]
+    fn reach_exclusions_without_changes_roll_up_as_partial() {
+        assert_eq!(
+            roll_up(&[
+                member_result(GroupApplyMemberStatus::AlreadyCorrect),
+                member_result(GroupApplyMemberStatus::OutOfProviderReach),
+            ]),
+            GroupOperationLifecycle::Partial
         );
     }
 }

@@ -354,19 +354,35 @@ Explicit live-style roots:
 cargo run -p unpin-cli -- list \
   --home-root "$HOME" \
   --project-root "$PWD" \
+  --codex-root "${CODEX_HOME:-$HOME/.codex}" \
+  --cursor-config-root "$HOME/.cursor" \
   --cursor-root "$HOME/Library/Application Support/Cursor/User"
 ```
 
 On GNU/Linux, Cursor's default app-support root is
 `$HOME/.config/Cursor/User`; omit `--cursor-root` to use the platform default.
+Provider-specific configuration flags take precedence over host environment
+signals. Without those flags, Unpin follows `CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+`PI_CODING_AGENT_DIR`, `OPENCODE_CONFIG_DIR`, and `XDG_CONFIG_HOME` where the
+provider supports them. Cursor does not document a configuration-root
+environment override, so use `--cursor-config-root` when `$HOME/.cursor` is not
+the active location. `--zed-root` names the directory containing Zed's global
+`settings.json`.
 
 ## Configuration
 
 Unpin resolves command roots in this order:
 
-1. Defaults: current directory for the project root, `~/.config/unpin` for Unpin-owned state, `$HOME/.cursor/mcp.json` for Cursor global MCP config, `<project>/.cursor/mcp.json` for Cursor project MCP config, and the platform Cursor user-data directory for Cursor app-support state (`~/Library/Application Support/Cursor/User` on macOS or `~/.config/Cursor/User` on GNU/Linux).
+1. Defaults and supported host environment signals: current directory for the
+   project root, `~/.config/unpin` for Unpin-owned state, active provider
+   configuration roots such as `$CODEX_HOME`, `$HOME/.cursor/mcp.json` for
+   Cursor global MCP config, `<project>/.cursor/mcp.json` for Cursor project MCP
+   config, and the platform Cursor user-data directory for Cursor app-support
+   state (`~/Library/Application Support/Cursor/User` on macOS or
+   `~/.config/Cursor/User` on GNU/Linux).
 2. User config: `~/.config/unpin/config.json`.
-3. CLI flags such as `--project-root`, `--app-state-root`, and `--cursor-root`.
+3. CLI flags such as `--project-root`, `--app-state-root`, `--cursor-root`, and
+   the provider-specific `--*-root` flags.
 
 Repository-owned `<projectRoot>/.unpin.json` is untrusted. It cannot set
 `projectRoot`, `appStateRoot`, or `cursorRoot`; put command roots in the user

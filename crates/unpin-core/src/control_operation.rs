@@ -964,6 +964,49 @@ impl ReachAwareControlOperationEnvelope {
         Ok(())
     }
 
+    /// Return whether the envelope's persisted authority window has expired.
+    ///
+    /// The journal is the source of truth for an attached operation.  Callers
+    /// that are reattaching an interrupted operation must use this value rather
+    /// than a newly supplied handoff timestamp, otherwise a caller could extend
+    /// an expired write authority simply by rebuilding the envelope.
+    #[must_use]
+    pub const fn is_expired_at(&self, now_unix: i64) -> bool {
+        now_unix >= self.expires_at_unix
+    }
+
+    /// Compare the immutable authority binding of two envelopes.
+    ///
+    /// Lifecycle and recovery evidence are intentionally excluded because they
+    /// are durable operation progress, not caller authority.  The journal
+    /// owner/revision binding is also excluded: the revision advances whenever
+    /// progress is checkpointed.  Every operation, scope, root, timestamp,
+    /// principal, payload and capability field remains bound and must match.
+    #[must_use]
+    pub fn same_authority_binding(&self, other: &Self) -> bool {
+        self.schema_version == other.schema_version
+            && self.family == other.family
+            && self.family_schema_version == other.family_schema_version
+            && self.operation_id == other.operation_id
+            && self.operation_kind == other.operation_kind
+            && self.plan_fingerprint == other.plan_fingerprint
+            && self.context == other.context
+            && self.connection_boundary == other.connection_boundary
+            && self.provider_reach == other.provider_reach
+            && self.selected_provider == other.selected_provider
+            && self.provider_coverage == other.provider_coverage
+            && self.expected_lifecycle == other.expected_lifecycle
+            && self.activation == other.activation
+            && self.roots == other.roots
+            && self.audience == other.audience
+            && self.issued_at_unix == other.issued_at_unix
+            && self.expires_at_unix == other.expires_at_unix
+            && self.payload_reference == other.payload_reference
+            && self.prior_state == other.prior_state
+            && self.principal == other.principal
+            && self.transfer_capability == other.transfer_capability
+    }
+
     #[must_use]
     pub fn redacted(&self) -> Self {
         let mut redacted = self.clone();

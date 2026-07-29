@@ -24,6 +24,7 @@ use crate::{
         ReachAwarePayloadReference, ReachAwarePrincipal, ReachAwarePriorState,
         ReachAwareRecoveryEvidence, ReachAwareRootBinding,
     },
+    discovery::DiscoveryOutput,
     provider_reach::{
         ConnectionBoundary, ProviderCoverageEntry, ProviderReach, ProviderReachCoverage,
         ProviderReachLifecycle, SelectedProviderAuthority, SelectedProviderProvenance,
@@ -78,6 +79,53 @@ impl ProfileProviderTargetClassification {
     }
 }
 
+/// Trusted local inventory state for one provider target.
+///
+/// This is intentionally separate from the presence of a persisted policy
+/// override: an override may exist even when the provider is not installed or
+/// discoverable locally, and an installed provider may have no override yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProfileProviderLocalPresence {
+    Present,
+    Absent,
+}
+
+impl ProfileProviderLocalPresence {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Present => "present",
+            Self::Absent => "absent",
+        }
+    }
+}
+
+/// How an explicit provider override changes generic profile inheritance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ProfileProviderGenericPolicyEffect {
+    /// A newly created override takes this provider out of generic inheritance.
+    #[serde(rename = "stop-inheriting")]
+    CreateOverride,
+    /// An existing provider override is replaced by the reviewed profile.
+    #[serde(rename = "replace-override")]
+    ReplaceOverride,
+    /// The provider-specific profile already matches and inheritance is unchanged.
+    #[serde(rename = "already-provider-specific")]
+    AlreadyProviderSpecific,
+}
+
+impl ProfileProviderGenericPolicyEffect {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::CreateOverride => "stop-inheriting",
+            Self::ReplaceOverride => "replace-override",
+            Self::AlreadyProviderSpecific => "already-provider-specific",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileProviderTarget {
@@ -85,6 +133,22 @@ pub struct ProfileProviderTarget {
     pub prior_provider_policy: Option<ProviderPolicy>,
     pub desired_provider_policy: ProviderPolicy,
     pub classification: ProfileProviderTargetClassification,
+    /// Populated by discovery-aware planners. `None` is retained for legacy
+    /// callers that cannot provide trusted local inventory state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_presence: Option<ProfileProviderLocalPresence>,
+    /// Whether this provider resolved its profile from the generic policy
+    /// before the explicit target was considered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generic_profile_inherited_before: Option<bool>,
+    /// The inheritance effect disclosed to a reviewer before apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generic_policy_effect: Option<ProfileProviderGenericPolicyEffect>,
+    /// Absent providers are activated on a future/next session, never by this
+    /// policy-store write. The existing `activation` remains authoritative for
+    /// the operation as a whole.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub future_activation: Option<bool>,
     pub activation: EffectActivation,
     pub pre_state_fingerprint: String,
     pub post_state_fingerprint: String,
@@ -183,8 +247,17 @@ pub struct ProfileProviderOperationResult {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProfileProviderHandoff {
+    pub operation_id: String,
+    pub plan_fingerprint: String,
+    pub expires_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct ProfileProviderOperationRecord {
     schema_version: u32,
+    plan: ProfileProviderOperationPlan,
     plan_fingerprint: String,
     writes_started: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +270,7 @@ impl ProfileProviderOperationRecord {
     fn planned(plan: &ProfileProviderOperationPlan) -> Self {
         Self {
             schema_version: PROFILE_PROVIDER_OPERATION_SCHEMA_VERSION,
+            plan: plan.clone(),
             plan_fingerprint: plan.plan_fingerprint.clone(),
             writes_started: false,
             terminal_lifecycle: None,
@@ -209,7 +283,9 @@ impl ProfileProviderOperationRecord {
         plan: &ProfileProviderOperationPlan,
     ) -> Result<(), ProfileProviderOperationError> {
         self.verify_shape()?;
-        if self.plan_fingerprint != plan.plan_fingerprint
+        self.plan.verify()?;
+        if self.plan != *plan
+            || self.plan_fingerprint != plan.plan_fingerprint
             || self
                 .terminal_result
                 .as_ref()
@@ -394,7 +470,7 @@ impl ProfileProviderOperationController {
         revision: &CompiledProfileRevision,
         provider_reach: ProviderReach,
     ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
-        self.plan_with_gateway_selection(target, revision, provider_reach, None)
+        self.plan_with_gateway_selection(target, revision, provider_reach, None, None)
     }
 
     pub fn plan_with_gateway(
@@ -404,7 +480,175 @@ impl ProfileProviderOperationController {
         provider_reach: ProviderReach,
         gateway: GatewaySelection,
     ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
-        self.plan_with_gateway_selection(target, revision, provider_reach, Some(gateway))
+        self.plan_with_gateway_selection(target, revision, provider_reach, Some(gateway), None)
+    }
+
+    /// Plan with provider presence derived from trusted discovery inventory.
+    ///
+    /// The existing [`Self::plan`] and [`Self::plan_with_gateway`] entry points
+    /// remain compatible for callers that do not have discovery data; their
+    /// target facts intentionally serialize as absent. CLI, TUI, and MCP
+    /// adapters should use this method whenever they have a fresh discovery
+    /// result so reviewers can distinguish an absent provider from a present
+    /// provider that merely lacks an override.
+    pub fn plan_with_gateway_and_discovery(
+        &self,
+        target: &PolicyTarget,
+        revision: &CompiledProfileRevision,
+        provider_reach: ProviderReach,
+        gateway: GatewaySelection,
+        discovery: &DiscoveryOutput,
+    ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
+        let present_providers = profile_provider_presence_from_discovery(discovery);
+        self.plan_with_gateway_selection(
+            target,
+            revision,
+            provider_reach,
+            Some(gateway),
+            Some(&present_providers),
+        )
+    }
+
+    /// Persist an authenticated, reviewed profile-provider operation without
+    /// mutating provider policy. The later CLI/TUI apply must consume this
+    /// exact payload instead of deriving a fresh plan from ambient state.
+    pub fn seal_handoff(
+        &self,
+        plan: &ProfileProviderOperationPlan,
+        durable: &ProfileProviderReachAwareApplyContext,
+    ) -> Result<ProfileProviderHandoff, ProfileProviderOperationError> {
+        plan.verify()?;
+        let authority_key = self
+            .session_authority_key
+            .as_ref()
+            .ok_or(ProfileProviderOperationError::SessionAuthorityRequired)?;
+        let expectation =
+            plan.approval_expectation(&durable.approval_context, &durable.principal.session_id)?;
+        self.verify_reach_aware_context(plan, &expectation, durable, authority_key)?;
+        let transition = profile_transition_plan(
+            plan,
+            &durable.approval_context,
+            &durable.principal.session_id,
+        )?;
+        let (payload_path, payload_store) =
+            profile_payload_store(self.policies.app_state_root(), &plan.operation_id);
+        let lock_path = payload_path.with_file_name(".profile-provider-operation-domain");
+        let _execution_lock = StateResourceLock::acquire(&lock_path)?;
+        let (payload, _) = load_or_create_profile_payload(&payload_store, plan)?;
+        payload.verify(plan)?;
+
+        let family = ReachAwareOperationFamily::Profile;
+        let selected_provider = plan.provider_reach.provider().map(|provider| {
+            SelectedProviderAuthority::new(
+                provider,
+                plan.provider_reach
+                    .provenance()
+                    .unwrap_or(SelectedProviderProvenance::ExplicitInput),
+            )
+        });
+        let expected_lifecycle = if plan.no_op {
+            ProviderReachLifecycle::NoOp
+        } else {
+            ProviderReachLifecycle::Applied
+        };
+        let builder = ReachAwareControlOperationEnvelope::builder()
+            .family(family, PROFILE_PROVIDER_OPERATION_SCHEMA_VERSION)
+            .operation(
+                plan.operation_id.clone(),
+                transition.kind.as_str(),
+                plan.plan_fingerprint.clone(),
+            )
+            .context(ControlResolvedContext {
+                repository_key: transition.context.repository_key.clone(),
+                workspace_key: transition.context.workspace_key.clone(),
+                session_id: transition.context.session_id.clone(),
+                profile_digest: transition.context.profile_digest.clone(),
+            })
+            .reach(
+                durable.principal.connection_boundary,
+                plan.provider_reach,
+                selected_provider,
+                plan.coverage.clone(),
+            )
+            .lifecycle(expected_lifecycle, expected_lifecycle, plan.activation)
+            .trusted_roots(durable.roots.clone())
+            .authority(
+                durable.principal.clone(),
+                durable.audience.clone(),
+                durable.issued_at_unix,
+                durable.expires_at_unix,
+            )
+            .payload_reference(ReachAwarePayloadReference {
+                family,
+                schema_version: PROFILE_PROVIDER_OPERATION_SCHEMA_VERSION,
+                reference: profile_payload_reference(&plan.operation_id),
+                payload_digest: plan.plan_fingerprint.clone(),
+            })
+            .prior_state(
+                plan.targets
+                    .iter()
+                    .map(|target| ReachAwarePriorState {
+                        target_id: format!("profile:{}", target.provider.as_str()),
+                        fingerprint: target.pre_state_fingerprint.clone(),
+                    })
+                    .collect(),
+            );
+        let store = TransitionJournalStore::new(self.policies.app_state_root());
+        let handle = store.create_or_attach_reach_aware(
+            &transition,
+            operation_owner(&plan.operation_id)?,
+            builder,
+            authority_key,
+        )?;
+        verify_attached_profile_envelope(&handle, plan, durable)?;
+        Ok(ProfileProviderHandoff {
+            operation_id: plan.operation_id.clone(),
+            plan_fingerprint: plan.plan_fingerprint.clone(),
+            expires_at_unix: durable.expires_at_unix,
+        })
+    }
+
+    pub fn load_handoff(
+        &self,
+        operation_id: &str,
+    ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
+        let (_, store) = profile_payload_store(self.policies.app_state_root(), operation_id);
+        let snapshot = store
+            .load::<ProfileProviderOperationRecord>()?
+            .ok_or_else(|| {
+                ProfileProviderOperationError::ReachAware(
+                    "profile provider handoff not found".to_string(),
+                )
+            })?;
+        let record = snapshot.value;
+        record.verify(&record.plan)?;
+        if record.plan.operation_id != operation_id {
+            return Err(ProfileProviderOperationError::ReachAware(
+                "profile provider handoff operation id does not match payload".to_string(),
+            ));
+        }
+        Ok(record.plan)
+    }
+
+    /// Plan with an already-derived trusted provider inventory.
+    ///
+    /// This lower-level form is useful to headless callers that have already
+    /// validated a discovery result and to fixture tests. The set must come
+    /// from trusted discovery/provider inventory, not caller metadata.
+    pub fn plan_with_provider_presence(
+        &self,
+        target: &PolicyTarget,
+        revision: &CompiledProfileRevision,
+        provider_reach: ProviderReach,
+        present_providers: &BTreeSet<ProviderId>,
+    ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
+        self.plan_with_gateway_selection(
+            target,
+            revision,
+            provider_reach,
+            None,
+            Some(present_providers),
+        )
     }
 
     fn plan_with_gateway_selection(
@@ -413,6 +657,7 @@ impl ProfileProviderOperationController {
         revision: &CompiledProfileRevision,
         provider_reach: ProviderReach,
         gateway: Option<GatewaySelection>,
+        present_providers: Option<&BTreeSet<ProviderId>>,
     ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
         revision.verify_digest().map_err(|error| {
             ProfileProviderOperationError::InvalidProfileRevision(error.to_string())
@@ -467,11 +712,42 @@ impl ProfileProviderOperationController {
             let pre_state_fingerprint = serialized_fingerprint(&prior_provider_policy)?;
             let post_state_fingerprint =
                 serialized_fingerprint(&Some(desired_provider_policy.clone()))?;
+            let target_facts = present_providers.map(|present_providers| {
+                let local_presence = if present_providers.contains(&provider) {
+                    ProfileProviderLocalPresence::Present
+                } else {
+                    ProfileProviderLocalPresence::Absent
+                };
+                let generic_profile_inherited_before = prior_provider_policy
+                    .as_ref()
+                    .is_none_or(|policy| policy.profile.is_inherit());
+                let generic_policy_effect = match classification {
+                    ProfileProviderTargetClassification::Create => {
+                        ProfileProviderGenericPolicyEffect::CreateOverride
+                    }
+                    ProfileProviderTargetClassification::Replace => {
+                        ProfileProviderGenericPolicyEffect::ReplaceOverride
+                    }
+                    ProfileProviderTargetClassification::AlreadyMatches => {
+                        ProfileProviderGenericPolicyEffect::AlreadyProviderSpecific
+                    }
+                };
+                (
+                    local_presence,
+                    generic_profile_inherited_before,
+                    generic_policy_effect,
+                    matches!(local_presence, ProfileProviderLocalPresence::Absent),
+                )
+            });
             targets.push(ProfileProviderTarget {
                 provider,
                 prior_provider_policy: prior_provider_policy.clone(),
                 desired_provider_policy,
                 classification,
+                local_presence: target_facts.map(|facts| facts.0),
+                generic_profile_inherited_before: target_facts.map(|facts| facts.1),
+                generic_policy_effect: target_facts.map(|facts| facts.2),
+                future_activation: target_facts.map(|facts| facts.3),
                 activation: EffectActivation::NextSessionOnly,
                 pre_state_fingerprint: pre_state_fingerprint.clone(),
                 post_state_fingerprint,
@@ -1344,6 +1620,17 @@ fn effective_supported_providers(revision: &CompiledProfileRevision) -> BTreeSet
             .flat_map(|member| member.providers.iter().copied())
             .collect()
     }
+}
+
+/// Return providers represented by the trusted discovery inventory.
+///
+/// Presence is based on provider-qualified discovery items, not on persisted
+/// profile overrides and never on caller-supplied provider metadata.
+#[must_use]
+pub fn profile_provider_presence_from_discovery(
+    discovery: &DiscoveryOutput,
+) -> BTreeSet<ProviderId> {
+    discovery.items.iter().map(|item| item.provider).collect()
 }
 
 fn serialized_fingerprint<T: Serialize>(

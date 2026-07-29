@@ -9,7 +9,7 @@ use unpin_core::{
         ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
         DurableControlError, ReachAwarePrincipal, ReachAwareRootBinding,
     },
-    discovery::{DiscoveryRoots, discover_all},
+    discovery::{DiscoveryOutput, discover_all},
     profiles::{
         CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, GatewaySelection,
         PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyApplyStatus, PolicyChange, PolicyControlError,
@@ -730,10 +730,11 @@ fn apply_profile(
         Ok(None) => return command_error_exit(options.json, "failed", "profile not found"),
         Err(error) => return command_error_exit(options.json, "failed", &error),
     };
-    let compiled = match compile_current(&options, &config, &entry.definition, entry.scope) {
-        Ok(compiled) => compiled,
-        Err(error) => return command_error_exit(options.json, "failed", &error),
-    };
+    let (compiled, discovery) =
+        match compile_current_with_discovery(&options, &config, &entry.definition, entry.scope) {
+            Ok(compiled) => compiled,
+            Err(error) => return command_error_exit(options.json, "failed", &error),
+        };
     let identity = match config.workspace_identity() {
         Ok(identity) => identity,
         Err(error) => return command_error_exit(options.json, "failed", &error.to_string()),
@@ -759,6 +760,7 @@ fn apply_profile(
             &config,
             &store,
             &compiled,
+            &discovery,
             &identity,
             target,
             provider,
@@ -903,6 +905,7 @@ fn apply_profile_with_reach(
     config: &unpin_core::config::UnpinConfig,
     store: &ProfileStore,
     compiled: &unpin_core::profiles::CompiledProfileRevision,
+    discovery: &DiscoveryOutput,
     identity: &WorkspaceIdentity,
     target: PolicyTarget,
     provider: Option<ProviderId>,
@@ -937,7 +940,7 @@ fn apply_profile_with_reach(
         }
     };
     let controller = ProfileProviderOperationController::new(&config.app_state_root);
-    let plan = match controller.plan_with_gateway(
+    let plan = match controller.plan_with_gateway_and_discovery(
         &target,
         compiled,
         provider_reach,
@@ -945,6 +948,7 @@ fn apply_profile_with_reach(
             ProfileModeArg::Native => GatewaySelection::Native,
             ProfileModeArg::Gateway => GatewaySelection::Gateway,
         },
+        discovery,
     ) {
         Ok(plan) => plan,
         Err(error) => {
@@ -988,9 +992,13 @@ fn apply_profile_with_reach(
             );
             for target in &plan.targets {
                 println!(
-                    "  {} classification={} activation={:?}",
+                    "  {} classification={} presence={:?} inherited-before={:?} effect={:?} future-activation={:?} activation={:?}",
                     target.provider.as_str(),
                     target.classification.as_str(),
+                    target.local_presence,
+                    target.generic_profile_inherited_before,
+                    target.generic_policy_effect,
+                    target.future_activation,
                     target.activation
                 );
             }
@@ -1062,15 +1070,14 @@ fn apply_profile_with_reach(
             return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
         }
     };
-    let principal = match ReachAwarePrincipal::sign(
-        session_id.clone(),
-        profile_reach_scope_digest(&expectation, &session_id),
-        ConnectionBoundary::All,
-        &session_key,
-    ) {
+    // The CLI does not accept caller metadata as identity. The reviewed
+    // operation id and scope digest are signed with the locally resolved
+    // session authority key, yielding an operation-specific trusted principal
+    // without minting an ad-hoc lease.
+    let principal = match sign_reviewed_profile_principal(&plan, &expectation, &session_key) {
         Ok(principal) => principal,
         Err(error) => {
-            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+            return crate::command_error_exit_code(options.json, "blocked", &error, 3);
         }
     };
     let now_unix = unix_now();
@@ -1151,6 +1158,23 @@ fn apply_profile_with_reach(
     })
 }
 
+fn sign_reviewed_profile_principal(
+    plan: &unpin_core::profiles::ProfileProviderOperationPlan,
+    expectation: &unpin_core::approval::ApprovalExpectation,
+    session_key: &unpin_core::sessions::SessionAuthorityKey,
+) -> Result<ReachAwarePrincipal, String> {
+    // The operation id and scope digest come from the reviewed plan and its
+    // approval expectation; no command-line caller metadata is interpreted as
+    // identity. The local credential signature is the trusted boundary.
+    ReachAwarePrincipal::sign(
+        plan.operation_id.clone(),
+        profile_reach_scope_digest(expectation, &plan.operation_id),
+        ConnectionBoundary::All,
+        session_key,
+    )
+    .map_err(|error| error.to_string())
+}
+
 fn profile_provider_error_status(error: &ProfileProviderOperationError) -> &'static str {
     if matches!(
         error,
@@ -1216,19 +1240,29 @@ fn compile_current(
     definition: &ProfileDefinition,
     source_scope: ProfileSourceScope,
 ) -> Result<unpin_core::profiles::CompiledProfileRevision, String> {
-    let roots = resolve_discovery_roots_with_config(&options.roots, config)?
-        .with_app_state_root(&config.app_state_root);
-    compile_from_roots(&roots, definition, source_scope)
+    compile_current_with_discovery(options, config, definition, source_scope)
+        .map(|(compiled, _)| compiled)
 }
 
-fn compile_from_roots(
-    roots: &DiscoveryRoots,
+fn compile_current_with_discovery(
+    options: &ProfileRootOptions,
+    config: &unpin_core::config::UnpinConfig,
     definition: &ProfileDefinition,
     source_scope: ProfileSourceScope,
-) -> Result<unpin_core::profiles::CompiledProfileRevision, String> {
-    let discovery = discover_all(roots).map_err(|error| error.to_string())?;
+) -> Result<
+    (
+        unpin_core::profiles::CompiledProfileRevision,
+        DiscoveryOutput,
+    ),
+    String,
+> {
+    let roots = resolve_discovery_roots_with_config(&options.roots, config)?
+        .with_app_state_root(&config.app_state_root);
+    let discovery = discover_all(&roots).map_err(|error| error.to_string())?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
-    compile_profile(definition, &catalog, source_scope).map_err(|error| error.to_string())
+    let compiled =
+        compile_profile(definition, &catalog, source_scope).map_err(|error| error.to_string())?;
+    Ok((compiled, discovery))
 }
 
 fn render_profiles(json_output: bool, profiles: &[ProfileDefinitionEntry]) -> ExitCode {
@@ -1316,5 +1350,60 @@ mod recovery_status_tests {
         ));
 
         assert_eq!(policy_control_error_status(&error), "recovery-required");
+    }
+}
+
+#[cfg(test)]
+mod profile_principal_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use unpin_core::{
+        discovery::DiscoveryOutput,
+        profiles::{
+            PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileProviderOperationController,
+            ProfileSourceScope,
+        },
+        provider_reach::ProviderReach,
+        providers::ProviderId,
+        sessions::SessionAuthorityKey,
+    };
+
+    #[test]
+    fn reviewed_profile_principal_rejects_caller_metadata_tampering() {
+        let temp = tempfile::TempDir::new().expect("principal test root");
+        let state_root = std::fs::canonicalize(temp.path()).expect("canonical principal root");
+        let catalog = Catalog::from_discovery(&DiscoveryOutput::default()).expect("empty catalog");
+        let definition = ProfileDefinition {
+            version: PROFILE_DEFINITION_VERSION,
+            id: "principal-review".to_string(),
+            display_name: "Principal review".to_string(),
+            description: None,
+            members: Vec::new(),
+            provider_members: std::collections::BTreeMap::new(),
+            supported_providers: BTreeSet::from([ProviderId::Codex]),
+        };
+        let compiled =
+            compile_profile(&definition, &catalog, ProfileSourceScope::Global).expect("profile");
+        let controller = ProfileProviderOperationController::new(&state_root);
+        let plan = controller
+            .plan(&PolicyTarget::Global, &compiled, ProviderReach::all())
+            .expect("provider plan");
+        let context = ControlApprovalContext::new("principal-repo", "principal-workspace")
+            .expect("approval context");
+        let expectation = plan
+            .approval_expectation(&context, &plan.operation_id)
+            .expect("expectation");
+        let key = SessionAuthorityKey::new([0x7a; 32]);
+        let principal =
+            sign_reviewed_profile_principal(&plan, &expectation, &key).expect("signed principal");
+        principal.verify(&key).expect("principal verifies");
+
+        let mut tampered = principal;
+        tampered.connection_scope_id = "caller-supplied-scope".to_string();
+        assert!(
+            tampered.verify(&key).is_err(),
+            "caller metadata must not replace the signed scope"
+        );
     }
 }
