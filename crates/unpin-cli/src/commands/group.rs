@@ -18,9 +18,14 @@ use unpin_core::{
         group_definition_change_fingerprint, load_group_operation_inspection,
         validate_new_group_members,
     },
+    provider_reach::{
+        ConnectionBoundary, DerivedTargetKind, ProviderReachLifecycle, ProviderReachRequest,
+        SelectedProviderAuthority, SelectedProviderProvenance,
+    },
     state::atomic_json::OwnerGeneration,
 };
 
+use super::ProviderReachArg;
 use crate::{
     DiscoveryRootArgs, command_error_exit, group_store::ScopedGroupStore, parse_provider_id,
     resolve_config, resolve_discovery_roots_with_config,
@@ -114,6 +119,13 @@ pub(crate) enum GroupCommands {
         target: GroupTargetArg,
         #[arg(long, default_value_t = 256)]
         max_members: usize,
+        /// Mutation reach. Group plans require an explicit selected or all
+        /// provider choice.
+        #[arg(long, alias = "provider-reach", value_enum)]
+        reach: Option<ProviderReachArg>,
+        /// Provider authority for selected-provider reach.
+        #[arg(long)]
+        selected_provider: Option<String>,
     },
     /// Review an authenticated MCP challenge and issue a one-time approval artifact.
     Approve {
@@ -242,7 +254,16 @@ pub(crate) fn run(command: GroupCommands) -> ExitCode {
             group,
             target,
             max_members,
-        } => plan(options, &group, target.into(), max_members),
+            reach,
+            selected_provider,
+        } => plan(
+            options,
+            &group,
+            target.into(),
+            max_members,
+            reach,
+            selected_provider.as_deref(),
+        ),
         GroupCommands::Approve {
             options,
             challenge,
@@ -656,6 +677,8 @@ fn plan(
     group: &str,
     target: GroupTargetState,
     max_members: usize,
+    reach: Option<ProviderReachArg>,
+    selected_provider: Option<&str>,
 ) -> ExitCode {
     let (context, _) = match context(&options) {
         Ok(context) => context,
@@ -665,20 +688,72 @@ fn plan(
         Ok(reference) => reference,
         Err(error) => return command_error_exit(options.json, "failed", &error.to_string()),
     };
-    let plan = match GroupPlanner::new(resolver(&context)).plan(
+    let selected_provider = match selected_provider {
+        Some(provider) => match parse_provider_id(provider) {
+            Some(provider) => Some(provider),
+            None => {
+                return crate::command_error_exit_code(
+                    options.json,
+                    "blocked",
+                    "unsupported selected provider",
+                    3,
+                );
+            }
+        },
+        None => None,
+    };
+    let reach_input = match reach {
+        Some(reach) => match reach.input(selected_provider) {
+            Ok(reach) => reach,
+            Err(error) => {
+                return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+            }
+        },
+        None => unpin_core::provider_reach::ProviderReachInput::Omitted,
+    };
+    let mut reach_request = ProviderReachRequest::new(
+        ConnectionBoundary::All,
+        reach_input,
+        DerivedTargetKind::Group,
+    );
+    if let Some(provider) = selected_provider {
+        reach_request = reach_request.with_authority(SelectedProviderAuthority::new(
+            provider,
+            SelectedProviderProvenance::ExplicitInput,
+        ));
+    }
+    let plan = match GroupPlanner::new(resolver(&context)).plan_with_provider_reach_request(
         &reference,
         target,
         max_members,
         GroupPlanMode::PreviewOnly,
+        reach_request,
     ) {
         Ok(plan) => plan,
-        Err(error) => return command_error_exit(options.json, "blocked", &error.to_string()),
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
     };
-    render_json_or_debug(
+    let exit = group_reach_lifecycle_exit(plan.lifecycle);
+    let rendered = render_json_or_debug(
         options.json,
         "plan",
         serde_json::to_value(plan).expect("group plan JSON"),
-    )
+    );
+    if rendered == ExitCode::SUCCESS {
+        exit
+    } else {
+        rendered
+    }
+}
+
+fn group_reach_lifecycle_exit(lifecycle: ProviderReachLifecycle) -> ExitCode {
+    ExitCode::from(match lifecycle {
+        ProviderReachLifecycle::Applied | ProviderReachLifecycle::NoOp => 0,
+        ProviderReachLifecycle::Partial => 2,
+        ProviderReachLifecycle::Blocked | ProviderReachLifecycle::NoTargetsInProviderReach => 3,
+        ProviderReachLifecycle::RecoveryRequired => 4,
+    })
 }
 
 fn approve(options: GroupRootOptions, challenge: &str) -> ExitCode {

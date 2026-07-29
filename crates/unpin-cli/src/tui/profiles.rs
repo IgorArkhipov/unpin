@@ -6,16 +6,19 @@ use unpin_core::{
     catalog::Catalog,
     control_operation::{
         ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
-        DurableControlError,
+        ReachAwarePrincipal, ReachAwareRootBinding,
     },
     discovery::DiscoveryOutput,
     profiles::{
         CapabilityLockEnforcement, CapabilityLockSnapshot, CompiledProfileRevision,
-        GatewaySelection, PolicyApplyStatus, PolicyChange, PolicyChangePlan, PolicyControlError,
-        PolicyTarget, ProfileDefinitionEntry, ProfilePolicyController, ProfileReference,
-        ProfileSelection, ProfileStore, ResolutionPolicies, capability_lock_enforcement,
-        compile_profile, resolve_effective_gateway,
+        GatewaySelection, PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyTarget, ProfileDefinitionEntry,
+        ProfileProviderOperationController, ProfileProviderOperationError,
+        ProfileProviderOperationPlan, ProfileProviderOperationStatus,
+        ProfileProviderReachAwareApplyContext, ProfileStore, ResolutionPolicies,
+        capability_lock_enforcement, compile_profile, profile_reach_scope_digest,
+        resolve_effective_gateway,
     },
+    provider_reach::{ConnectionBoundary, ProviderReach, SelectedProviderProvenance},
     providers::ProviderId,
     sessions::SessionAuthorityKey,
     state::atomic_json::OwnerGeneration,
@@ -82,7 +85,7 @@ impl ProfilePolicyScope {
 #[derive(Debug, Clone)]
 struct ReviewedProfilePlan {
     compiled: CompiledProfileRevision,
-    plan: PolicyChangePlan,
+    plan: ProfileProviderOperationPlan,
     envelope: ControlOperationEnvelope,
 }
 
@@ -258,6 +261,24 @@ impl ProfileWorkflow {
         if let Some(reviewed) = &self.reviewed {
             details.push(format!("plan: {}", reviewed.plan.plan_fingerprint));
             details.push(format!("activation: {:?}", reviewed.plan.activation));
+            details.push(format!("reach: {:?}", reviewed.plan.provider_reach));
+            for coverage in &reviewed.plan.coverage.entries {
+                details.push(format!(
+                    "coverage: {} target={} included={} reason={}",
+                    coverage.provider.as_str(),
+                    coverage.target_id,
+                    coverage.included,
+                    coverage.reason.map_or("none", |reason| reason.as_str()),
+                ));
+            }
+            for target in &reviewed.plan.targets {
+                details.push(format!(
+                    "target: {} classification={} activation={:?}",
+                    target.provider.as_str(),
+                    target.classification.as_str(),
+                    target.activation,
+                ));
+            }
         }
         if let Some(envelope) = &self.last_envelope {
             details.push(format!(
@@ -313,23 +334,14 @@ impl ProfileWorkflow {
                     .map_err(|error| error.to_string())?
             }
         };
-        let provider = self.provider;
-        let plan = ProfilePolicyController::new(app_state_root)
-            .plan_with_revisions(
-                target,
-                provider,
-                PolicyChange {
-                    profile: Some(ProfileSelection::Profile {
-                        reference: ProfileReference::from(&compiled),
-                    }),
-                    gateway: Some(self.backend.selection()),
-                    capability_lock: None,
-                },
-                std::slice::from_ref(&compiled),
-            )
+        let provider_reach = self.provider.map_or(ProviderReach::All, |provider| {
+            ProviderReach::selected(provider, SelectedProviderProvenance::TuiControl)
+        });
+        let plan = ProfileProviderOperationController::new(app_state_root)
+            .plan_with_gateway(&target, &compiled, provider_reach, self.backend.selection())
             .map_err(|error| error.to_string())?;
         let expectation = plan
-            .approval_expectation(context)
+            .approval_expectation(context, &plan.operation_id)
             .map_err(|error| error.to_string())?;
         let envelope = ControlOperationEnvelope::from_expectation(
             &expectation,
@@ -342,12 +354,16 @@ impl ProfileWorkflow {
                     .to_string(),
             }),
             false,
-            provider.map_or_else(|| ProviderId::ALL.to_vec(), |provider| vec![provider]),
+            plan.coverage
+                .included()
+                .map(|coverage| coverage.provider)
+                .collect(),
             json!({
                 "profile": compiled,
                 "plan": plan,
                 "policyScope": self.scope.label(),
-                "provider": provider,
+                "providerReach": provider_reach,
+                "providerCoverage": plan.coverage,
             }),
         );
         self.reviewed = Some(ReviewedProfilePlan {
@@ -390,7 +406,7 @@ impl ProfileWorkflow {
             .ok_or_else(|| "profile plan is missing".to_string())?;
         let expectation = reviewed
             .plan
-            .approval_expectation(context)
+            .approval_expectation(context, &reviewed.plan.operation_id)
             .map_err(|error| error.to_string())?;
         let authorization = credentials::authorize_reviewed_control_decision(
             fixture_mode,
@@ -401,53 +417,92 @@ impl ProfileWorkflow {
             "unpin-tui-profile-approval",
             unix_now(),
         )?;
+        let roots = ReachAwareRootBinding::from_provider_paths(
+            app_state_root,
+            Vec::new(),
+            "unpin-tui-profile-provider",
+        )
+        .map_err(|error| error.to_string())?;
+        let principal = ReachAwarePrincipal::sign(
+            reviewed.plan.operation_id.clone(),
+            profile_reach_scope_digest(&expectation, &reviewed.plan.operation_id),
+            ConnectionBoundary::All,
+            authority_key,
+        )
+        .map_err(|error| error.to_string())?;
+        let now_unix = unix_now();
+        let durable = ProfileProviderReachAwareApplyContext {
+            approval_context: context.clone(),
+            roots,
+            principal,
+            audience: PROFILE_PROVIDER_APPROVAL_AUDIENCE.to_string(),
+            issued_at_unix: now_unix,
+            expires_at_unix: now_unix + 3600,
+            now_unix,
+        };
         ProfileStore::new(app_state_root)
             .materialize_revision(
                 &reviewed.compiled,
-                OwnerGeneration::new("unpin-tui-profile", 1).map_err(|error| error.to_string())?,
+                OwnerGeneration::new("unpin-tui-profile-provider", 1)
+                    .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-        let result = match ProfilePolicyController::with_session_authority_key(
-            app_state_root,
-            authority_key.clone(),
-        )
-        .apply(&reviewed.plan, authorization, context, "unpin-tui-profile")
-        {
+        let result = match ProfileProviderOperationController::new(app_state_root)
+            .with_session_authority_key(authority_key.clone())
+            .apply_with_reach_aware(
+                &reviewed.plan,
+                authorization,
+                durable,
+                "unpin-tui-profile-provider",
+            ) {
             Ok(result) => result,
             Err(error) => {
                 if matches!(
                     &error,
-                    PolicyControlError::Durable(DurableControlError::RecoveryRequired(_))
+                    ProfileProviderOperationError::RecoveryRequired { .. }
                 ) {
                     self.phase = WorkflowPhase::RecoveryRequired;
                 }
                 return Err(error.to_string());
             }
         };
-        let lifecycle = if result.status == PolicyApplyStatus::NoOp {
-            ControlOperationLifecycle::NoOp
-        } else {
-            ControlOperationLifecycle::Applied
+        let (phase, lifecycle) = match result.status {
+            ProfileProviderOperationStatus::Applied => {
+                (WorkflowPhase::Applied, ControlOperationLifecycle::Applied)
+            }
+            ProfileProviderOperationStatus::NoOp => {
+                (WorkflowPhase::Applied, ControlOperationLifecycle::NoOp)
+            }
+            ProfileProviderOperationStatus::Blocked => {
+                (WorkflowPhase::Blocked, ControlOperationLifecycle::Blocked)
+            }
+            ProfileProviderOperationStatus::RecoveryRequired => (
+                WorkflowPhase::RecoveryRequired,
+                ControlOperationLifecycle::RecoveryRequired,
+            ),
         };
         self.last_envelope = Some(ControlOperationEnvelope::from_expectation(
             &expectation,
             &reviewed.plan.plan_fingerprint,
-            result.activation,
+            reviewed.plan.activation,
             lifecycle,
             None,
             false,
             reviewed
                 .plan
-                .provider
-                .map_or_else(|| ProviderId::ALL.to_vec(), |provider| vec![provider]),
+                .coverage
+                .included()
+                .map(|coverage| coverage.provider)
+                .collect(),
             json!({
                 "profile": reviewed.compiled,
                 "result": result,
                 "policyScope": self.scope.label(),
-                "provider": reviewed.plan.provider,
+                "providerReach": reviewed.plan.provider_reach,
+                "providerCoverage": reviewed.plan.coverage,
             }),
         ));
-        self.phase = WorkflowPhase::Applied;
+        self.phase = phase;
         self.last_error = None;
         Ok(self.last_envelope.as_ref().expect("result envelope set"))
     }
@@ -532,7 +587,10 @@ mod tests {
                     description: None,
                     members: Vec::new(),
                     provider_members: BTreeMap::new(),
-                    supported_providers: std::collections::BTreeSet::new(),
+                    supported_providers: std::collections::BTreeSet::from([
+                        ProviderId::Claude,
+                        ProviderId::Codex,
+                    ]),
                 },
                 revision: None,
             }],
@@ -559,6 +617,14 @@ mod tests {
         assert_eq!(
             envelope.lifecycle,
             ControlOperationLifecycle::AwaitingHumanAction
+        );
+        assert_eq!(envelope.details["providerReach"], "all");
+        assert_eq!(
+            envelope.details["providerCoverage"]["entries"]
+                .as_array()
+                .expect("profile coverage")
+                .len(),
+            2
         );
         assert_eq!(workflow.phase(), WorkflowPhase::Planned);
         assert!(workflow.confirm());
@@ -652,7 +718,7 @@ mod tests {
         assert!(global.policy.profile.is_inherit());
         assert!(matches!(
             global.policy.providers[&provider].profile,
-            ProfileSelection::Profile { .. }
+            unpin_core::profiles::ProfileSelection::Profile { .. }
         ));
         let workspace = PolicyTarget::workspace("repo", "worktree").unwrap();
         assert!(store.load(&workspace).unwrap().is_none());

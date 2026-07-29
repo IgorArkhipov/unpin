@@ -15,6 +15,11 @@ use unpin_core::{
         authenticate_group_approval_challenge, validate_new_group_members,
     },
     mutation::BackupAuthenticationKey,
+    provider_reach::{
+        ConnectionBoundary, DerivedTargetKind, ProviderReach, ProviderReachInput,
+        ProviderReachRequest, SelectedProviderProvenance,
+    },
+    providers::ProviderId,
     sessions::SessionAuthorityKey,
     state::atomic_json::OwnerGeneration,
     transitions::EffectActivation,
@@ -183,6 +188,7 @@ pub(super) struct GroupWorkflow {
     pending_definition: Option<ReviewedDefinitionChange>,
     reviewed_mcp_handoff: Option<ReviewedMcpHandoff>,
     target: GroupTargetState,
+    provider_reach: ProviderReach,
     reviewed: Option<ReviewedGroupPlan>,
     phase: WorkflowPhase,
     last_envelope: Option<ControlOperationEnvelope>,
@@ -209,6 +215,7 @@ impl GroupWorkflow {
             pending_definition: None,
             reviewed_mcp_handoff: None,
             target: GroupTargetState::Enable,
+            provider_reach: ProviderReach::All,
             reviewed: None,
             phase: WorkflowPhase::Browsing,
             last_envelope: None,
@@ -328,6 +335,22 @@ impl GroupWorkflow {
         self.reset_review();
     }
 
+    pub(super) fn cycle_provider_reach(&mut self) {
+        self.provider_reach = match self.provider_reach {
+            ProviderReach::All => {
+                ProviderReach::selected(ProviderId::ALL[0], SelectedProviderProvenance::TuiControl)
+            }
+            ProviderReach::Selected { provider, .. } => ProviderId::ALL
+                .iter()
+                .position(|candidate| *candidate == provider)
+                .and_then(|index| ProviderId::ALL.get(index + 1).copied())
+                .map_or(ProviderReach::All, |provider| {
+                    ProviderReach::selected(provider, SelectedProviderProvenance::TuiControl)
+                }),
+        };
+        self.reset_review();
+    }
+
     pub(super) fn rows(&self, visible_members: &[&DiscoveryItem]) -> Vec<String> {
         if self.screen == GroupScreen::Members {
             let selected_members = self
@@ -410,9 +433,10 @@ impl GroupWorkflow {
 
     pub(super) fn details(&self) -> Vec<String> {
         let mut details = vec![format!(
-            "Groups: {} | target={} | phase={} | screen={:?}",
+            "Groups: {} | target={} | reach={:?} | phase={} | screen={:?}",
             self.groups.len(),
             target_label(self.target),
+            self.provider_reach,
             self.phase.label(),
             self.screen,
         )];
@@ -530,13 +554,23 @@ impl GroupWorkflow {
         }
         if let Some(reviewed) = &self.reviewed {
             details.push(format!(
-                "review: {} members={} cohorts={} resources={} fingerprint={}",
+                "review: {} reach={:?} members={} cohorts={} resources={} fingerprint={}",
                 disposition_label(reviewed.plan.disposition),
+                reviewed.plan.provider_reach,
                 reviewed.plan.total_members,
                 reviewed.plan.cohorts.len(),
                 reviewed.plan.resources.len(),
                 reviewed.plan.plan_fingerprint,
             ));
+            for coverage in &reviewed.plan.provider_coverage.entries {
+                details.push(format!(
+                    "coverage: {} target={} included={} reason={}",
+                    coverage.provider.as_str(),
+                    coverage.target_id,
+                    coverage.included,
+                    coverage.reason.map_or("none", |reason| reason.as_str()),
+                ));
+            }
             for member in &reviewed.plan.members {
                 details.push(format!(
                     "effect: {} outcome={:?} reason={}",
@@ -947,12 +981,20 @@ impl GroupWorkflow {
             .ok_or_else(|| "inventory group context is unavailable".to_string())?;
         let reference =
             GroupRef::parse(&group.qualified_name).map_err(|error| error.to_string())?;
+        let reach = match self.provider_reach {
+            ProviderReach::All => ProviderReachInput::All,
+            ProviderReach::Selected {
+                provider,
+                provenance,
+            } => ProviderReachInput::selected(provider, provenance),
+        };
         let plan = GroupPlanner::new(resolver)
-            .plan(
+            .plan_with_provider_reach_request(
                 &reference,
                 self.target,
                 group.members.len().max(1),
                 GroupPlanMode::TuiDirect,
+                ProviderReachRequest::new(ConnectionBoundary::All, reach, DerivedTargetKind::Group),
             )
             .map_err(|error| error.to_string())?;
         if plan.disposition != GroupPlanDisposition::Actionable {
@@ -978,10 +1020,9 @@ impl GroupWorkflow {
                 activation.max(resource.activation)
             });
         let providers = plan
-            .definition_view
             .provider_coverage
-            .iter()
-            .copied()
+            .included()
+            .map(|entry| entry.provider)
             .collect();
         let envelope = ControlOperationEnvelope::from_expectation(
             &expectation,
@@ -1290,7 +1331,7 @@ fn group_lifecycle_presentation(
             None,
         )),
         GroupOperationLifecycle::Partial => Ok((
-            WorkflowPhase::Blocked,
+            WorkflowPhase::Partial,
             ControlOperationLifecycle::Blocked,
             Some(
                 "inventory group operation completed partially; review member results and backup evidence",
@@ -1505,6 +1546,24 @@ mod tests {
     }
 
     #[test]
+    fn changing_group_provider_reach_invalidates_confirmation() {
+        let mut workflow = GroupWorkflow::empty();
+        workflow.phase = WorkflowPhase::Confirmed;
+
+        workflow.cycle_provider_reach();
+
+        assert_eq!(workflow.phase, WorkflowPhase::Browsing);
+        assert!(matches!(
+            workflow.provider_reach,
+            ProviderReach::Selected {
+                provider: ProviderId::Claude,
+                provenance: SelectedProviderProvenance::TuiControl,
+            }
+        ));
+        assert!(!workflow.confirm());
+    }
+
+    #[test]
     fn definition_review_rejects_new_read_only_inventory_member() {
         let (_root, mut workflow, discovery) = workflow_with_fixture();
         let read_only = discovery
@@ -1681,16 +1740,18 @@ mod tests {
 
     #[test]
     fn group_lifecycle_presentation_preserves_partial_failed_and_recovery_outcomes() {
-        for lifecycle in [
-            GroupOperationLifecycle::Partial,
-            GroupOperationLifecycle::Failed,
-        ] {
-            let (phase, envelope_lifecycle, error) =
-                group_lifecycle_presentation(lifecycle).expect("terminal presentation");
-            assert_eq!(phase, WorkflowPhase::Blocked);
-            assert_eq!(envelope_lifecycle, ControlOperationLifecycle::Blocked);
-            assert!(error.is_some());
-        }
+        let (phase, envelope_lifecycle, error) =
+            group_lifecycle_presentation(GroupOperationLifecycle::Partial)
+                .expect("partial presentation");
+        assert_eq!(phase, WorkflowPhase::Partial);
+        assert_eq!(envelope_lifecycle, ControlOperationLifecycle::Blocked);
+        assert!(error.is_some());
+        let (phase, envelope_lifecycle, error) =
+            group_lifecycle_presentation(GroupOperationLifecycle::Failed)
+                .expect("failed presentation");
+        assert_eq!(phase, WorkflowPhase::Blocked);
+        assert_eq!(envelope_lifecycle, ControlOperationLifecycle::Blocked);
+        assert!(error.is_some());
         let (phase, envelope_lifecycle, error) =
             group_lifecycle_presentation(GroupOperationLifecycle::RecoveryRequired)
                 .expect("recovery presentation");

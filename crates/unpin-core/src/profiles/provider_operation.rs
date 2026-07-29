@@ -41,8 +41,8 @@ use crate::{
 };
 
 use super::{
-    CompiledProfileRevision, PolicyStore, PolicyStoreError, PolicyTarget, ProfileReference,
-    ProfileSelection, ProviderPolicy, ScopePolicy,
+    CompiledProfileRevision, GatewaySelection, PolicyStore, PolicyStoreError, PolicyTarget,
+    ProfileReference, ProfileSelection, ProviderPolicy, ScopePolicy,
 };
 
 pub const PROFILE_PROVIDER_OPERATION_SCHEMA_VERSION: u32 = 2;
@@ -152,8 +152,10 @@ impl ProfileProviderOperationPlan {
         context: &ControlApprovalContext,
         session_id: &str,
     ) -> Result<ApprovalExpectation, ProfileProviderOperationError> {
-        Ok(profile_transition_plan(self, context, session_id)?
-            .approval_expectation(CONTROL_APPROVAL_ISSUER, PROFILE_PROVIDER_APPROVAL_AUDIENCE))
+        let mut expectation = profile_transition_plan(self, context, session_id)?
+            .approval_expectation(CONTROL_APPROVAL_ISSUER, PROFILE_PROVIDER_APPROVAL_AUDIENCE);
+        expectation.effect_graph_digest = self.plan_fingerprint.clone();
+        Ok(expectation)
     }
 }
 
@@ -392,6 +394,26 @@ impl ProfileProviderOperationController {
         revision: &CompiledProfileRevision,
         provider_reach: ProviderReach,
     ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
+        self.plan_with_gateway_selection(target, revision, provider_reach, None)
+    }
+
+    pub fn plan_with_gateway(
+        &self,
+        target: &PolicyTarget,
+        revision: &CompiledProfileRevision,
+        provider_reach: ProviderReach,
+        gateway: GatewaySelection,
+    ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
+        self.plan_with_gateway_selection(target, revision, provider_reach, Some(gateway))
+    }
+
+    fn plan_with_gateway_selection(
+        &self,
+        target: &PolicyTarget,
+        revision: &CompiledProfileRevision,
+        provider_reach: ProviderReach,
+        gateway: Option<GatewaySelection>,
+    ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
         revision.verify_digest().map_err(|error| {
             ProfileProviderOperationError::InvalidProfileRevision(error.to_string())
         })?;
@@ -425,9 +447,15 @@ impl ProfileProviderOperationController {
         for provider in target_providers {
             let prior_provider_policy = current_policy.providers.get(&provider).cloned();
             let mut desired_provider_policy = prior_provider_policy.clone().unwrap_or_default();
+            if let Some(gateway) = gateway {
+                desired_provider_policy.gateway = gateway;
+            }
             let classification = match prior_provider_policy.as_ref() {
                 None => ProfileProviderTargetClassification::Create,
-                Some(policy) if policy.profile == desired_selection => {
+                Some(policy)
+                    if policy.profile == desired_selection
+                        && gateway.is_none_or(|gateway| policy.gateway == gateway) =>
+                {
                     ProfileProviderTargetClassification::AlreadyMatches
                 }
                 Some(_) => ProfileProviderTargetClassification::Replace,
@@ -772,7 +800,7 @@ impl ProfileProviderOperationController {
             ));
         }
         let expected_boundary = derived_connection_boundary(plan.provider_reach);
-        let expected_scope = reach_scope_digest(expectation, &durable.principal.session_id);
+        let expected_scope = profile_reach_scope_digest(expectation, &durable.principal.session_id);
         if durable.audience != PROFILE_PROVIDER_APPROVAL_AUDIENCE
             || durable.issued_at_unix > durable.now_unix
             || durable.expires_at_unix <= durable.now_unix
@@ -1101,7 +1129,7 @@ fn derived_connection_boundary(provider_reach: ProviderReach) -> ConnectionBound
     }
 }
 
-fn reach_scope_digest(expectation: &ApprovalExpectation, session_id: &str) -> String {
+pub fn profile_reach_scope_digest(expectation: &ApprovalExpectation, session_id: &str) -> String {
     crate::encode_lower_hex(&Sha256::digest(
         format!(
             "{}\0{}\0{}",

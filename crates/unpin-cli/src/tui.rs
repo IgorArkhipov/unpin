@@ -59,6 +59,7 @@ pub(super) enum WorkflowPhase {
     Planned,
     Confirmed,
     Applied,
+    Partial,
     RecoveryRequired,
     Blocked,
 }
@@ -70,6 +71,7 @@ impl WorkflowPhase {
             Self::Planned => "planned",
             Self::Confirmed => "confirmed",
             Self::Applied => "applied",
+            Self::Partial => "partial",
             Self::RecoveryRequired => "recovery-required",
             Self::Blocked => "blocked",
         }
@@ -1056,6 +1058,12 @@ impl TuiState {
     fn cycle_profile_provider(&mut self) {
         if self.view == TuiView::Profiles {
             self.profile_workflow.cycle_provider();
+        }
+    }
+
+    fn cycle_group_provider_reach(&mut self) {
+        if self.view == TuiView::Groups {
+            self.group_workflow.cycle_provider_reach();
         }
     }
 
@@ -2093,7 +2101,7 @@ fn render_headless_state(state: &TuiState) -> String {
 
     lines.push(String::new());
     lines.push(
-        "Commands: v view | j/k move | m action/backend | s profile-scope | r profile-provider | f force | p provider | l layer | c category | / search | space plan | enter confirm | a apply | groups: X export-MCP | u unstage | q quit"
+        "Commands: v view | j/k move | m action/backend | s profile-scope | r profile-provider | P group-reach | f force | p provider-filter | l layer | c category | / search | space plan | enter confirm | a apply | groups: X export-MCP | u unstage | q quit"
             .to_string(),
     );
     lines.join("\n")
@@ -2269,6 +2277,10 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
             }
             KeyCode::Char('p') => {
                 state.cycle_provider_filter();
+                true
+            }
+            KeyCode::Char('P') => {
+                state.cycle_group_provider_reach();
                 true
             }
             KeyCode::Char('l') => {
@@ -3110,7 +3122,7 @@ mod tests {
                     description: None,
                     members: Vec::new(),
                     provider_members: BTreeMap::new(),
-                    supported_providers: std::collections::BTreeSet::new(),
+                    supported_providers: std::collections::BTreeSet::from([ProviderId::Codex]),
                 },
                 None,
                 OwnerGeneration::new("tui-profile-workflow-test", 1).unwrap(),

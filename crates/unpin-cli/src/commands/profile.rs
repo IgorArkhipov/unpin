@@ -7,20 +7,28 @@ use unpin_core::{
     catalog::{CapabilityId, Catalog},
     control_operation::{
         ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
-        DurableControlError,
+        DurableControlError, ReachAwarePrincipal, ReachAwareRootBinding,
     },
     discovery::{DiscoveryRoots, discover_all},
     profiles::{
         CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, GatewaySelection,
-        PolicyApplyStatus, PolicyChange, PolicyControlError, PolicyStore, PolicyTarget,
-        ProfileDefinition, ProfileDefinitionEntry, ProfilePolicyController, ProfileReference,
+        PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyApplyStatus, PolicyChange, PolicyControlError,
+        PolicyStore, PolicyTarget, ProfileDefinition, ProfileDefinitionEntry,
+        ProfilePolicyController, ProfileProviderOperationController, ProfileProviderOperationError,
+        ProfileProviderOperationStatus, ProfileProviderReachAwareApplyContext, ProfileReference,
         ProfileSelection, ProfileSourceScope, ProfileStore, capability_lock_enforcement,
-        compile_profile, propose_profile, resolve_effective_gateway,
+        compile_profile, profile_reach_scope_digest, propose_profile, resolve_effective_gateway,
+    },
+    provider_reach::{
+        ConnectionBoundary, DerivedTargetKind, ProviderReachRequest, SelectedProviderAuthority,
+        SelectedProviderProvenance,
     },
     providers::ProviderId,
     state::atomic_json::OwnerGeneration,
+    state::workspace::WorkspaceIdentity,
 };
 
+use super::ProviderReachArg;
 use crate::{
     DiscoveryRootArgs, command_error_exit, credentials, parse_provider_id, resolve_config,
     resolve_discovery_roots_with_config, unix_now,
@@ -75,6 +83,10 @@ pub(crate) enum ProfileCommands {
         /// Provider-specific override. Omit for generic scope policy.
         #[arg(long)]
         provider: Option<String>,
+        /// Reach-aware provider targeting. Omit to preserve the legacy generic
+        /// profile/gateway policy workflow.
+        #[arg(long, alias = "provider-reach", value_enum)]
+        reach: Option<ProviderReachArg>,
         /// Persistent scope receiving selection.
         #[arg(long, value_enum, default_value_t = PolicyScopeArg::Workspace)]
         scope: PolicyScopeArg,
@@ -182,6 +194,7 @@ pub(crate) fn run(command: ProfileCommands) -> ExitCode {
             options,
             id,
             provider,
+            reach,
             scope,
             mode,
             apply,
@@ -191,6 +204,7 @@ pub(crate) fn run(command: ProfileCommands) -> ExitCode {
             options,
             &id,
             provider.as_deref(),
+            reach,
             scope,
             mode,
             apply,
@@ -693,6 +707,7 @@ fn apply_profile(
     options: ProfileRootOptions,
     id: &str,
     provider: Option<&str>,
+    reach: Option<ProviderReachArg>,
     scope: PolicyScopeArg,
     mode: ProfileModeArg,
     apply: bool,
@@ -738,6 +753,22 @@ fn apply_profile(
             }
         }
     };
+    if let Some(reach) = reach {
+        return apply_profile_with_reach(
+            &options,
+            &config,
+            &store,
+            &compiled,
+            &identity,
+            target,
+            provider,
+            reach,
+            mode,
+            apply,
+            confirm,
+            reviewed_fingerprint,
+        );
+    }
     let controller = ProfilePolicyController::new(&config.app_state_root);
     let change = PolicyChange {
         profile: Some(ProfileSelection::Profile {
@@ -864,6 +895,282 @@ fn apply_profile(
         );
     }
     ExitCode::SUCCESS
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_profile_with_reach(
+    options: &ProfileRootOptions,
+    config: &unpin_core::config::UnpinConfig,
+    store: &ProfileStore,
+    compiled: &unpin_core::profiles::CompiledProfileRevision,
+    identity: &WorkspaceIdentity,
+    target: PolicyTarget,
+    provider: Option<ProviderId>,
+    reach: ProviderReachArg,
+    mode: ProfileModeArg,
+    apply: bool,
+    confirm: bool,
+    reviewed_fingerprint: Option<&str>,
+) -> ExitCode {
+    let reach_input = match reach.input(provider) {
+        Ok(reach) => reach,
+        Err(error) => return crate::command_error_exit_code(options.json, "blocked", &error, 3),
+    };
+    let mut reach_request = ProviderReachRequest::new(
+        ConnectionBoundary::All,
+        reach_input,
+        DerivedTargetKind::Profile,
+    );
+    if let Some(provider) = provider {
+        reach_request = reach_request.with_authority(SelectedProviderAuthority::new(
+            provider,
+            SelectedProviderProvenance::ExplicitInput,
+        ));
+    }
+    let provider_reach = match reach_request
+        .validate_before_discovery()
+        .and_then(|preflight| preflight.reconcile_exact_target(None))
+    {
+        Ok(resolution) => resolution.reach,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
+    };
+    let controller = ProfileProviderOperationController::new(&config.app_state_root);
+    let plan = match controller.plan_with_gateway(
+        &target,
+        compiled,
+        provider_reach,
+        match mode {
+            ProfileModeArg::Native => GatewaySelection::Native,
+            ProfileModeArg::Gateway => GatewaySelection::Gateway,
+        },
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return crate::command_error_exit_code(
+                options.json,
+                profile_provider_error_status(&error),
+                &error.to_string(),
+                profile_provider_error_exit(&error),
+            );
+        }
+    };
+    if !apply {
+        if options.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "statusVersion": 2,
+                    "status": if plan.no_op { "no-op" } else { "planned" },
+                    "operationId": plan.operation_id,
+                    "planFingerprint": plan.plan_fingerprint,
+                    "providerReach": plan.provider_reach,
+                    "providerCoverage": plan.coverage,
+                    "activation": plan.activation,
+                    "targets": plan.targets,
+                    "humanAction": {
+                        "code": "confirm-and-apply",
+                        "guidance": "Review provider reach, provenance, coverage, target classifications, activation, and fingerprint before apply."
+                    },
+                    "plan": plan,
+                }))
+                .expect("reach-aware profile plan JSON")
+            );
+        } else {
+            println!(
+                "profile {} reach={:?} targets={} activation={:?} fingerprint={}",
+                compiled.profile_id,
+                plan.provider_reach,
+                plan.targets.len(),
+                plan.activation,
+                plan.plan_fingerprint
+            );
+            for target in &plan.targets {
+                println!(
+                    "  {} classification={} activation={:?}",
+                    target.provider.as_str(),
+                    target.classification.as_str(),
+                    target.activation
+                );
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if !confirm {
+        return crate::command_error_exit_code(options.json, "blocked", "confirmation-required", 3);
+    }
+    if reviewed_fingerprint != Some(plan.plan_fingerprint.as_str()) {
+        return crate::command_error_exit_code(
+            options.json,
+            "blocked",
+            "plan-fingerprint-mismatch",
+            3,
+        );
+    }
+    let fixture_mode = options.roots.fixture_root.is_some();
+    if let Err(error) = unpin_core::fixture::require_fixture_write_sandbox(
+        fixture_mode,
+        [
+            config.app_state_root.as_path(),
+            config.project_root.as_path(),
+        ],
+    ) {
+        return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+    }
+    let session_key =
+        match credentials::resolve_session_authority_key(fixture_mode, &config.app_state_root) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return crate::command_error_exit_code(
+                    options.json,
+                    "blocked",
+                    "session authority key missing; run `unpin auth session init`",
+                    3,
+                );
+            }
+            Err(error) => {
+                return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+            }
+        };
+    let approval_context =
+        match ControlApprovalContext::new(&identity.repository_key, &identity.workspace_key) {
+            Ok(context) => context,
+            Err(error) => {
+                return crate::command_error_exit_code(
+                    options.json,
+                    "blocked",
+                    &error.to_string(),
+                    3,
+                );
+            }
+        };
+    let session_id = plan.operation_id.clone();
+    let expectation = match plan.approval_expectation(&approval_context, &session_id) {
+        Ok(expectation) => expectation,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
+    };
+    let roots = match ReachAwareRootBinding::from_provider_paths(
+        &config.app_state_root,
+        Vec::new(),
+        "unpin-cli-profile-provider",
+    ) {
+        Ok(roots) => roots,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
+    };
+    let principal = match ReachAwarePrincipal::sign(
+        session_id.clone(),
+        profile_reach_scope_digest(&expectation, &session_id),
+        ConnectionBoundary::All,
+        &session_key,
+    ) {
+        Ok(principal) => principal,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
+    };
+    let now_unix = unix_now();
+    let durable = ProfileProviderReachAwareApplyContext {
+        approval_context: approval_context.clone(),
+        roots,
+        principal,
+        audience: PROFILE_PROVIDER_APPROVAL_AUDIENCE.to_string(),
+        issued_at_unix: now_unix,
+        expires_at_unix: now_unix + 3600,
+        now_unix,
+    };
+    let authorization = match credentials::authorize_reviewed_control_decision(
+        fixture_mode,
+        &config.app_state_root,
+        &expectation,
+        &plan.plan_fingerprint,
+        reviewed_fingerprint,
+        "unpin-cli-profile-provider-approval",
+        now_unix,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+        }
+    };
+    if let Err(error) = store.materialize_revision(
+        compiled,
+        OwnerGeneration::new("unpin-cli-profile-provider", 1).expect("static owner is valid"),
+    ) {
+        return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+    }
+    let result = match ProfileProviderOperationController::new(&config.app_state_root)
+        .with_session_authority_key(session_key)
+        .apply_with_reach_aware(&plan, authorization, durable, "unpin-cli-profile-provider")
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return crate::command_error_exit_code(
+                options.json,
+                profile_provider_error_status(&error),
+                &error.to_string(),
+                profile_provider_error_exit(&error),
+            );
+        }
+    };
+    let status = match result.status {
+        ProfileProviderOperationStatus::Applied => "applied",
+        ProfileProviderOperationStatus::NoOp => "no-op",
+        ProfileProviderOperationStatus::Blocked => "blocked",
+        ProfileProviderOperationStatus::RecoveryRequired => "recovery-required",
+    };
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "statusVersion": 2,
+                "status": status,
+                "operationId": plan.operation_id,
+                "planFingerprint": plan.plan_fingerprint,
+                "providerReach": plan.provider_reach,
+                "providerCoverage": plan.coverage,
+                "activation": plan.activation,
+                "result": result,
+            }))
+            .expect("reach-aware profile apply JSON")
+        );
+    } else {
+        println!(
+            "profile {} {status}; reach={:?} activation={:?}",
+            compiled.profile_id, plan.provider_reach, plan.activation
+        );
+    }
+    ExitCode::from(match result.status {
+        ProfileProviderOperationStatus::Applied | ProfileProviderOperationStatus::NoOp => 0,
+        ProfileProviderOperationStatus::Blocked => 3,
+        ProfileProviderOperationStatus::RecoveryRequired => 4,
+    })
+}
+
+fn profile_provider_error_status(error: &ProfileProviderOperationError) -> &'static str {
+    if matches!(
+        error,
+        ProfileProviderOperationError::RecoveryRequired { .. }
+    ) {
+        "recovery-required"
+    } else {
+        "blocked"
+    }
+}
+
+fn profile_provider_error_exit(error: &ProfileProviderOperationError) -> u8 {
+    if matches!(
+        error,
+        ProfileProviderOperationError::RecoveryRequired { .. }
+    ) {
+        4
+    } else {
+        3
+    }
 }
 
 fn context(
