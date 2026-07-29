@@ -1230,13 +1230,12 @@ fn group_apply_response(
     };
     let mut operation = serde_json::to_value(operation)
         .map_err(|_| "inventory group operation result is unavailable".to_string())?;
-    if let Some(allowed) = plan.provider_reach.provider() {
-        if let Some(result_value) = operation
+    if let Some(allowed) = plan.provider_reach.provider()
+        && let Some(result_value) = operation
             .get_mut("details")
             .and_then(|details| details.get_mut("result"))
-        {
-            *result_value = public_group_result_value(result, Some(allowed));
-        }
+    {
+        *result_value = public_group_result_value(result, Some(allowed));
     }
     Ok(json!({
         "status": status,

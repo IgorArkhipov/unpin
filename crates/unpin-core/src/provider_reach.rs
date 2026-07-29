@@ -239,10 +239,10 @@ impl ProviderReachRequest {
         }
 
         let pinned_provider = self.boundary.provider();
-        if matches!(self.reach, ProviderReachInput::All) {
-            if let Some(provider) = pinned_provider {
-                return Err(ProviderReachError::BoundaryWidening { provider });
-            }
+        if matches!(self.reach, ProviderReachInput::All)
+            && let Some(provider) = pinned_provider
+        {
+            return Err(ProviderReachError::BoundaryWidening { provider });
         }
 
         let mut authority: Option<SelectedProviderAuthority> = None;
@@ -599,12 +599,10 @@ impl ProviderReachCoverage {
         &self.entries
     }
 
-    #[must_use]
     pub fn included(&self) -> impl Iterator<Item = &ProviderCoverageEntry> {
         self.entries.iter().filter(|entry| entry.included)
     }
 
-    #[must_use]
     pub fn excluded(&self) -> impl Iterator<Item = &ProviderCoverageEntry> {
         self.entries.iter().filter(|entry| entry.is_excluded())
     }

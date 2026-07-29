@@ -268,7 +268,7 @@ fn plan_toggle_dispatch(input: TogglePlanInput) -> ToggleResult {
 
     let backup_authentication_key = input.backup_authentication_key.as_ref();
 
-    if is_supported_codex_skill(&input.item) && !input.item.is_shared_skill_source() {
+    if input.item.uses_codex_skill_config_state() {
         if input.apply {
             return apply_codex_skill_toggle(
                 input.app_state_root,
@@ -465,7 +465,7 @@ fn is_live_provider_config_state_path(item: &DiscoveryItem) -> bool {
         && (matches!(
             item.category,
             DiscoveryCategory::PluginConfig | DiscoveryCategory::ConfiguredMcp
-        ) || (is_supported_codex_skill(item) && !item.is_shared_skill_source()))
+        ) || item.uses_codex_skill_config_state())
 }
 
 fn validate_mutation_plan_targets(plan: ToggleResult) -> ToggleResult {
@@ -793,12 +793,10 @@ fn apply_authorized_toggle_transaction_with_policy(
     };
     if handle.journal.reach_aware.is_none()
         && let Some(builder) = reach_builder.take()
-    {
-        if let Err(error) =
+        && let Err(error) =
             store.attach_reach_aware_builder(&mut handle, builder, &reach_authority_key)
-        {
-            return blocked_result_from_plan(dry_run, error.to_string());
-        }
+    {
+        return blocked_result_from_plan(dry_run, error.to_string());
     }
     if handle.journal.lifecycle.is_terminal() {
         return cached_native_toggle_result(
@@ -8596,10 +8594,6 @@ fn path_string(path: PathBuf) -> String {
 
 fn is_supported_codex_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Codex && item.category == DiscoveryCategory::ConfiguredMcp
-}
-
-fn is_supported_codex_skill(item: &DiscoveryItem) -> bool {
-    item.provider == ProviderId::Codex && item.category == DiscoveryCategory::Skill
 }
 
 fn is_supported_pi_file_skill(item: &DiscoveryItem) -> bool {

@@ -940,8 +940,7 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
     assert!(
         projection
             .excluded_provider_counts
-            .get(&ProviderId::Zed)
-            .is_some()
+            .contains_key(&ProviderId::Zed)
     );
     let zed_unauthorized = {
         let zed_principal = unpin_core::control_operation::ReachAwarePrincipal::sign(

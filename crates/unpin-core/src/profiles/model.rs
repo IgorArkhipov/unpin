@@ -565,6 +565,7 @@ struct CompiledDigestBody<'a> {
     requires_local_review: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compiled_digest(
     schema_version: u32,
     profile_id: &str,

@@ -153,7 +153,35 @@ impl NativeToggleController {
             .validate_before_discovery()?
             .reconcile_exact_target(Some(item.provider))?;
         let journals = self.planning_journals()?;
-        self.plan_with_resolution_and_journals(item, context, &journals, resolution.reach)
+        self.plan_with_resolution_and_journals(item, context, &journals, resolution.reach, None)
+    }
+
+    pub(crate) fn plan_with_reach_for_session(
+        &self,
+        item: DiscoveryItem,
+        context: &ControlApprovalContext,
+        boundary: ConnectionBoundary,
+        reach: ProviderReachInput,
+        authority_candidates: Vec<SelectedProviderAuthority>,
+        session_id: &str,
+    ) -> Result<NativeTogglePlan, NativeToggleControlError> {
+        let request = ProviderReachRequest {
+            boundary,
+            reach,
+            target_kind: DerivedTargetKind::Individual,
+            authority_candidates,
+        };
+        let resolution = request
+            .validate_before_discovery()?
+            .reconcile_exact_target(Some(item.provider))?;
+        let journals = self.planning_journals()?;
+        self.plan_with_resolution_and_journals(
+            item,
+            context,
+            &journals,
+            resolution.reach,
+            Some(session_id),
+        )
     }
 
     pub(crate) fn planning_journals(
@@ -178,7 +206,7 @@ impl NativeToggleController {
         let resolution = request
             .validate_before_discovery()?
             .reconcile_exact_target(Some(item.provider))?;
-        self.plan_with_resolution_and_journals(item, context, journals, resolution.reach)
+        self.plan_with_resolution_and_journals(item, context, journals, resolution.reach, None)
     }
 
     fn plan_with_resolution_and_journals(
@@ -187,6 +215,7 @@ impl NativeToggleController {
         context: &ControlApprovalContext,
         journals: &[TransitionJournal],
         provider_reach: ProviderReach,
+        session_id: Option<&str>,
     ) -> Result<NativeTogglePlan, NativeToggleControlError> {
         let coverage = ProviderReachCoverage::new(vec![ProviderCoverageEntry::included(
             item.provider,
@@ -209,7 +238,7 @@ impl NativeToggleController {
                     .unwrap_or_else(|| "native toggle cannot be planned".to_string()),
             ));
         }
-        let transition = toggle_transition(&preview, context, journals)?;
+        let transition = toggle_transition(&preview, context, journals, session_id)?;
         let plan = NativeTogglePlan {
             schema_version: NATIVE_TOGGLE_PLAN_SCHEMA_VERSION,
             plan_fingerprint: toggle_plan_fingerprint(&preview, &transition)?,
@@ -434,6 +463,7 @@ fn toggle_transition(
     preview: &ToggleResult,
     context: &ControlApprovalContext,
     journals: &[TransitionJournal],
+    session_id: Option<&str>,
 ) -> Result<TransitionPlan, NativeToggleControlError> {
     let encoded = serde_json::to_vec(preview)
         .map_err(|error| NativeToggleControlError::Serialization(error.to_string()))?;
@@ -445,7 +475,7 @@ fn toggle_transition(
     let transition_context = TransitionContext {
         repository_key: context.repository_key().to_string(),
         workspace_key: context.workspace_key().to_string(),
-        session_id: None,
+        session_id: session_id.map(str::to_string),
         profile_digest: None,
     };
     let context_bytes = serde_json::to_vec(&transition_context)

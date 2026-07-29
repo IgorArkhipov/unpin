@@ -52,6 +52,7 @@ pub struct GroupReachAwareApplyContext {
     pub audience: String,
     pub issued_at_unix: i64,
     pub expires_at_unix: i64,
+    pub now_unix: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -661,6 +662,8 @@ impl GroupController {
             ));
         }
         if durable.audience != GROUP_APPROVAL_AUDIENCE
+            || durable.issued_at_unix > durable.now_unix
+            || durable.expires_at_unix <= durable.now_unix
             || durable.principal.connection_boundary
                 != derived_connection_boundary(reviewed.provider_reach)
             || expectation

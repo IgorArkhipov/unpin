@@ -545,7 +545,7 @@ fn recursive_cursor_skill_scan_warns_and_continues_past_unreadable_categories() 
 }
 
 #[test]
-fn applies_codex_native_config_state_only_to_non_shared_skills() {
+fn applies_codex_native_config_state_without_disabling_other_shared_skill_views() {
     let fixture_copy = tempfile::TempDir::new().expect("temp fixture copy");
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let shared_skill_path = fixture_copy
@@ -559,7 +559,7 @@ fn applies_codex_native_config_state_only_to_non_shared_skills() {
     fs::write(
         &config_path,
         format!(
-            "{config}\n[[skills.config]] # stale shared override\npath = {:?}\nenabled = false\n\n[[skills.config]] # native override\npath = {:?}\nenabled = false\n",
+            "{config}\n[[skills.config]] # shared override\npath = {:?}\nenabled = false\n\n[[skills.config]] # native override\npath = {:?}\nenabled = false\n",
             shared_skill_path.to_string_lossy(),
             admin_skill_path.to_string_lossy(),
         ),
@@ -573,19 +573,26 @@ fn applies_codex_native_config_state_only_to_non_shared_skills() {
         .iter()
         .find(|item| item.id == "codex:global:skill:example-shared-global-skill")
         .expect("Codex shared skill");
-    assert!(codex_item.enabled);
+    assert!(!codex_item.enabled);
     assert_eq!(codex_item.mutability, DiscoveryMutability::ReadWrite);
     assert_eq!(codex_item.source_path, shared_skill_path.to_string_lossy());
-    assert_ne!(codex_item.state_path, config_path.to_string_lossy());
+    assert_eq!(codex_item.state_path, config_path.to_string_lossy());
 
-    let cursor_item = result
-        .items
-        .iter()
-        .find(|item| item.id == "cursor:global:skill:@compat/agents/example-shared-global-skill")
-        .expect("Cursor view of shared skill");
-    assert!(cursor_item.enabled);
-    assert_eq!(cursor_item.mutability, DiscoveryMutability::ReadWrite);
-    assert_ne!(cursor_item.state_path, config_path.to_string_lossy());
+    for item_id in [
+        "cursor:global:skill:@compat/agents/example-shared-global-skill",
+        "pi:global:skill:@compat/agents/example-shared-global-skill",
+        "opencode:global:skill:@compat/agents/example-shared-global-skill",
+        "zed:global:skill:example-shared-global-skill",
+    ] {
+        let item = result
+            .items
+            .iter()
+            .find(|item| item.id == item_id)
+            .unwrap_or_else(|| panic!("{item_id} shared skill view"));
+        assert!(item.enabled, "{item_id} remains enabled");
+        assert_eq!(item.mutability, DiscoveryMutability::ReadWrite);
+        assert_ne!(item.state_path, config_path.to_string_lossy());
+    }
 
     let admin_item = result
         .items
@@ -596,13 +603,9 @@ fn applies_codex_native_config_state_only_to_non_shared_skills() {
     assert_eq!(admin_item.mutability, DiscoveryMutability::ReadWrite);
     assert_eq!(admin_item.source_path, admin_skill_path.to_string_lossy());
     assert_eq!(admin_item.state_path, config_path.to_string_lossy());
-    assert!(result.warnings.iter().any(|warning| {
+    assert!(!result.warnings.iter().any(|warning| {
         warning.provider == ProviderId::Codex
-            && warning.layer == Some(DiscoveryLayer::Global)
             && warning.code == "shared-skill-native-config-ignored"
-            && warning
-                .message
-                .contains(shared_skill_path.to_string_lossy().as_ref())
     }));
 }
 

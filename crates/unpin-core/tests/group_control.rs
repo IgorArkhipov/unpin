@@ -182,6 +182,7 @@ impl GroupHarness {
             audience: audience.to_string(),
             issued_at_unix,
             expires_at_unix,
+            now_unix: NOW_UNIX,
         }
     }
 
@@ -283,13 +284,12 @@ fn reach_aware_group_apply_attaches_v2_journal_and_replays_without_writes() {
     assert_eq!(envelope.principal, durable.principal);
     assert_eq!(envelope.audience, durable.audience);
     assert_eq!(envelope.prior_state.len(), plan.members.len());
-    assert_eq!(
+    assert!(
         envelope
             .recovery
             .as_ref()
             .expect("recovery evidence")
-            .writes_started,
-        true
+            .writes_started
     );
     assert_eq!(
         envelope
@@ -436,6 +436,48 @@ fn reach_aware_group_apply_rejects_controller_root_drift_before_provider_writes(
             .join("operations")
             .exists()
     );
+}
+
+#[test]
+fn reach_aware_group_apply_rejects_expired_authority_before_provider_writes() {
+    let harness = GroupHarness::new();
+    let authority_key = SessionAuthorityKey::new([0x53; 32]);
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    let expectation = harness.expectation(&plan);
+    let mut durable = harness.reach_context(
+        &authority_key,
+        harness.codex_roots(harness.context.app_state_root()),
+        ConnectionBoundary::All,
+        "unpin-core-inventory-group-apply-v1",
+        NOW_UNIX,
+        NOW_UNIX + 60,
+    );
+    durable.now_unix = durable.expires_at_unix;
+    let before = fs::read_to_string(&harness.config_path).expect("provider config before expiry");
+
+    let error = harness
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-reach-aware-expired",
+                NOW_UNIX,
+            ),
+            durable,
+        )
+        .expect_err("expired reach-aware authority must reject");
+
+    assert!(matches!(
+        error,
+        unpin_core::groups::GroupControlError::ReachAware(_)
+    ));
+    assert_eq!(
+        fs::read_to_string(&harness.config_path).expect("provider config after expiry"),
+        before
+    );
+    assert!(!harness.context.app_state_root().join("backups").exists());
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {

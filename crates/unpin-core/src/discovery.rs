@@ -285,6 +285,15 @@ impl DiscoveryItem {
     }
 
     #[must_use]
+    pub fn uses_codex_skill_config_state(&self) -> bool {
+        self.provider == ProviderId::Codex
+            && self.category == DiscoveryCategory::Skill
+            && Path::new(&self.state_path)
+                .file_name()
+                .is_some_and(|name| name == "config.toml")
+    }
+
+    #[must_use]
     pub fn is_catalog_adoption_candidate(&self) -> bool {
         self.enabled
             && self.mutability == DiscoveryMutability::ReadWrite
@@ -920,11 +929,6 @@ pub(crate) fn discover_codex(
         items,
         warnings,
     )?;
-    warn_ignored_codex_shared_skill_config_states(
-        &items[skill_item_start..],
-        &skill_config_states,
-        warnings,
-    );
     let global_agent_root = roots.codex_global.join("agents");
     let live_agent_ids = discover_agent_files(
         &global_agent_root,
@@ -1077,43 +1081,13 @@ fn apply_codex_skill_config_states(
 ) {
     let state_path = path_string(config_path);
     for item in items {
-        if item.provider != ProviderId::Codex
-            || item.category != DiscoveryCategory::Skill
-            || item.is_shared_skill_source()
-        {
+        if item.provider != ProviderId::Codex || item.category != DiscoveryCategory::Skill {
             continue;
         }
 
         item.enabled = states.get(&item.source_path).copied().unwrap_or(true);
         item.mutability = DiscoveryMutability::ReadWrite;
         item.state_path.clone_from(&state_path);
-    }
-}
-
-fn warn_ignored_codex_shared_skill_config_states(
-    items: &[DiscoveryItem],
-    states: &BTreeMap<String, bool>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) {
-    let mut warned_paths = BTreeSet::new();
-    for item in items {
-        if item.provider != ProviderId::Codex
-            || !item.is_shared_skill_source()
-            || !states.contains_key(&item.source_path)
-            || !warned_paths.insert(item.source_path.clone())
-        {
-            continue;
-        }
-
-        warnings.push(DiscoveryWarning {
-            provider: ProviderId::Codex,
-            layer: Some(item.layer),
-            code: "shared-skill-native-config-ignored".to_string(),
-            message: format!(
-                "Codex skills.config entry for shared skill {} is ignored; remove the native entry because Unpin vault state controls every provider loading this source",
-                item.source_path
-            ),
-        });
     }
 }
 

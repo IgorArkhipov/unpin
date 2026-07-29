@@ -567,9 +567,7 @@ impl GroupPlanner {
         let reach_exclusions = provider_coverage
             .excluded()
             .any(ProviderCoverageEntry::is_reach_exclusion);
-        let disposition = if exceptional {
-            GroupPlanDisposition::Blocked
-        } else if included_count == 0 && reach_exclusions {
+        let disposition = if exceptional || (included_count == 0 && reach_exclusions) {
             GroupPlanDisposition::Blocked
         } else if !actionable {
             GroupPlanDisposition::NoOp
@@ -703,6 +701,7 @@ pub(crate) fn shared_source_has_unlisted_view(
     source_views: &BTreeMap<String, BTreeSet<GroupMemberIdentity>>,
 ) -> bool {
     item.is_shared_skill_source()
+        && !item.uses_codex_skill_config_state()
         && source_views
             .get(item.source_path.as_str())
             .is_some_and(|views| views.iter().any(|identity| !selected.contains(identity)))
@@ -1282,6 +1281,22 @@ mod tests {
             &BTreeSet::from(
                 [GroupMemberIdentity::try_from(&listed_item).expect("listed identity")]
             ),
+            &source_views,
+        ));
+
+        listed_item.provider = ProviderId::Codex;
+        listed_item.id = "codex:global:skill:listed".to_string();
+        listed_item.source_path = "/fixture/.agents/skills/listed/SKILL.md".to_string();
+        listed_item.state_path = "/fixture/.codex/config.toml".to_string();
+        let mut other_provider_item = listed_item.clone();
+        other_provider_item.provider = ProviderId::Cursor;
+        other_provider_item.id = "cursor:global:skill:@compat/agents/listed".to_string();
+        let inventory = vec![listed_item.clone(), other_provider_item];
+        let source_views = index_source_views(&inventory);
+
+        assert!(!shared_source_has_unlisted_view(
+            &listed_item,
+            &BTreeSet::from([GroupMemberIdentity::try_from(&listed_item).expect("Codex identity")]),
             &source_views,
         ));
     }

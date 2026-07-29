@@ -3416,6 +3416,96 @@ fn applies_codex_skill_native_config_toggle_without_moving_admin_source() {
 }
 
 #[test]
+fn applies_codex_shared_skill_toggle_without_moving_shared_source() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let skill_path = fixture_copy
+        .path()
+        .join("shared/global/.agents/skills/example-shared-global-skill/SKILL.md");
+
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:example-shared-global-skill")
+        .expect("Codex shared skill");
+    assert!(item.enabled);
+    assert_eq!(item.state_path, config_path.to_string_lossy());
+
+    let disable_plan = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: false,
+        backup_authentication_key: None,
+    });
+    assert_eq!(disable_plan.status, ToggleStatus::DryRun);
+    assert_eq!(disable_plan.operations[0].operation_type, "replaceFile");
+    assert!(
+        disable_plan
+            .operations
+            .iter()
+            .all(|operation| operation.operation_type != "renamePath")
+    );
+
+    let disabled_apply = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(disabled_apply.status, ToggleStatus::Applied);
+    assert!(skill_path.is_file(), "shared skill source remains in place");
+    assert!(!app_state.path().join("vault").exists());
+    let disabled_config = fs::read_to_string(&config_path).expect("disabled Codex config");
+    assert!(disabled_config.contains(&format!("path = {:?}", skill_path.to_string_lossy())));
+    assert!(disabled_config.contains("enabled = false"));
+    assert!(disabled_config.contains("[plugins.safe-shell]\nenabled = true"));
+    assert!(disabled_config.contains("[mcp_servers.github]"));
+    assert!(disabled_config.contains("[hooks.PreToolUse]\ncommand = \"echo\""));
+
+    let disabled_discovery = discover_all(&roots).expect("disabled discovery");
+    let disabled_item = disabled_discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:example-shared-global-skill")
+        .expect("disabled Codex shared skill");
+    assert!(!disabled_item.enabled);
+    for item_id in [
+        "cursor:global:skill:@compat/agents/example-shared-global-skill",
+        "pi:global:skill:@compat/agents/example-shared-global-skill",
+        "opencode:global:skill:@compat/agents/example-shared-global-skill",
+        "zed:global:skill:example-shared-global-skill",
+    ] {
+        assert!(
+            disabled_discovery
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .is_some_and(|item| item.enabled),
+            "{item_id} remains enabled"
+        );
+    }
+
+    let enabled_apply = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: disabled_item.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(enabled_apply.status, ToggleStatus::Applied);
+    assert!(enabled_apply.target_enabled);
+    assert!(skill_path.is_file());
+    assert!(
+        fs::read_to_string(&config_path)
+            .expect("enabled Codex config")
+            .contains("enabled = true")
+    );
+}
+
+#[test]
 fn blocks_codex_skill_toggle_when_native_config_has_duplicate_paths() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
@@ -3985,14 +4075,6 @@ fn shared_skills_move_to_vault_and_restore_origin() {
         (
             "claude:project:skill:example-claude-skill",
             "claude/project/.claude/skills/example-claude-skill",
-        ),
-        (
-            "codex:global:skill:example-shared-global-skill",
-            "shared/global/.agents/skills/example-shared-global-skill",
-        ),
-        (
-            "codex:project:skill:example-shared-project-skill",
-            "shared/project/.agents/skills/example-shared-project-skill",
         ),
         (
             "cursor:global:skill:@compat/agents/example-shared-global-skill",

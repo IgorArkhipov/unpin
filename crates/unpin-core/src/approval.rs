@@ -312,6 +312,47 @@ impl ControlAuthorization {
             nonce: self.nonce,
         })
     }
+
+    pub(crate) fn attenuate_for_bulk_child(
+        &self,
+        parent_expectation: &ApprovalExpectation,
+        child_expectation: &ApprovalExpectation,
+        parent_plan_fingerprint: &str,
+        child_plan_fingerprint: &str,
+    ) -> Result<Self, ApprovalError> {
+        self.assert_matches(parent_expectation)?;
+        let mut child_expectation = child_expectation.clone();
+        child_expectation.resources.sort();
+        if child_expectation.repository_key != parent_expectation.repository_key
+            || child_expectation.workspace_key != parent_expectation.workspace_key
+            || child_expectation.session_id != parent_expectation.session_id
+            || !crate::is_lower_hex_digest(
+                parent_plan_fingerprint
+                    .strip_prefix("sha256:")
+                    .unwrap_or(parent_plan_fingerprint),
+            )
+            || !crate::is_lower_hex_digest(child_plan_fingerprint)
+        {
+            return Err(ApprovalError::BindingMismatch);
+        }
+        let payload = serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "purpose": "bulk-toggle-child-capability-v1",
+            "parentDecisionDigest": self.decision_digest,
+            "parentExpectation": parent_expectation,
+            "childExpectation": child_expectation,
+            "parentPlanFingerprint": parent_plan_fingerprint,
+            "childPlanFingerprint": child_plan_fingerprint,
+        }))
+        .map_err(|error| ApprovalError::Serialization(error.to_string()))?;
+        let decision_digest = crate::encode_lower_hex(&Sha256::digest(payload));
+        Ok(Self {
+            operation_id: child_expectation.operation_id.clone(),
+            expectation: child_expectation,
+            decision_digest,
+            nonce: self.nonce,
+        })
+    }
 }
 
 pub fn authorize_control(
