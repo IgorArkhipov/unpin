@@ -3807,8 +3807,21 @@ fn toggle_plans_skill_disable_json_dry_run() {
 
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("toggle stdout is json");
+    assert_eq!(value["statusVersion"], 2);
     assert_eq!(value["status"], "dry-run");
     assert_eq!(value["targetEnabled"], false);
+    assert_eq!(value["providerReach"]["selected"]["provider"], "claude");
+    assert_eq!(
+        value["providerReach"]["selected"]["provenance"],
+        "exact-individual-target"
+    );
+    assert_eq!(
+        value["providerCoverage"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         value["selection"]["id"],
         "claude:project:skill:example-claude-skill"
@@ -3827,6 +3840,124 @@ fn toggle_plans_skill_disable_json_dry_run() {
     assert!(value.get("backupId").is_none());
     assert!(value.get("reason").is_none());
     assert!(!app_state.path().join("vault").exists());
+}
+
+#[test]
+fn bulk_handoff_apply_and_status_preserve_reviewed_reach() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let fixture_root = fs::canonicalize(fixture_copy.path()).expect("canonical fixture copy root");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    let item_id = "codex:global:skill:admin/example-codex-admin-skill";
+
+    let omitted_reach = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "plan", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args([
+            "--provider",
+            "codex",
+            "--id",
+            item_id,
+            "--disable",
+            "--json",
+        ])
+        .output()
+        .expect("bulk plan without reach");
+    assert_eq!(omitted_reach.status.code(), Some(3));
+    let omitted: serde_json::Value =
+        serde_json::from_slice(&omitted_reach.stdout).expect("omitted reach JSON");
+    assert_eq!(omitted["status"], "blocked");
+    assert!(
+        omitted["reason"]
+            .as_str()
+            .expect("omitted reach reason")
+            .contains("selected provider")
+    );
+
+    let handoff = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "handoff", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args([
+            "--provider",
+            "codex",
+            "--selected-provider",
+            "codex",
+            "--reach",
+            "selected",
+            "--id",
+            item_id,
+            "--disable",
+            "--json",
+        ])
+        .output()
+        .expect("bulk handoff");
+    assert!(
+        handoff.status.success(),
+        "bulk handoff should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value =
+        serde_json::from_slice(&handoff.stdout).expect("bulk handoff JSON");
+    assert_eq!(handoff["statusVersion"], 2);
+    assert_eq!(handoff["providerReach"]["selected"]["provider"], "codex");
+    assert_eq!(
+        handoff["providerReach"]["selected"]["provenance"],
+        "explicit-input"
+    );
+    let operation_id = handoff["operationId"].as_str().expect("bulk operation id");
+    let fingerprint = handoff["planFingerprint"]
+        .as_str()
+        .expect("bulk plan fingerprint");
+    assert_eq!(handoff["handoff"]["operationId"], operation_id);
+    assert_eq!(handoff["handoff"]["planFingerprint"], fingerprint);
+
+    let applied = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "apply", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id])
+        .args(["--plan-fingerprint", fingerprint, "--confirm", "--json"])
+        .output()
+        .expect("bulk apply");
+    assert!(
+        applied.status.success(),
+        "bulk apply should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: serde_json::Value =
+        serde_json::from_slice(&applied.stdout).expect("bulk apply JSON");
+    assert_eq!(applied["statusVersion"], 2);
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["operationId"], operation_id);
+    assert_eq!(applied["planFingerprint"], fingerprint);
+
+    let status = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "status", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id, "--json"])
+        .output()
+        .expect("bulk status");
+    assert!(status.status.success());
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("bulk status JSON");
+    assert_eq!(status["statusVersion"], 2);
+    assert_eq!(status["status"], "applied");
+    assert_eq!(status["operationId"], operation_id);
+    assert_eq!(status["result"]["lifecycle"], "applied");
 }
 
 #[test]

@@ -391,8 +391,13 @@ impl BulkTogglePlan {
         context: &ControlApprovalContext,
         session_id: &str,
     ) -> Result<ApprovalExpectation, BulkTogglePlanError> {
-        Ok(bulk_transition_plan(self, context, session_id)?
-            .approval_expectation(CONTROL_APPROVAL_ISSUER, BULK_TOGGLE_APPROVAL_AUDIENCE))
+        let mut expectation = bulk_transition_plan(self, context, session_id)?
+            .approval_expectation(CONTROL_APPROVAL_ISSUER, BULK_TOGGLE_APPROVAL_AUDIENCE);
+        // Human approval reviews the complete reach-aware plan, including its
+        // selected reach, coverage and exclusions, rather than only the
+        // transition effect list.
+        expectation.effect_graph_digest = unprefixed_digest(&self.plan_fingerprint)?;
+        Ok(expectation)
     }
 }
 
@@ -424,6 +429,14 @@ pub struct BulkToggleHandoff {
     pub operation_id: String,
     pub plan_fingerprint: String,
     pub expires_at_unix: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BulkToggleOperationStatus {
+    pub plan: BulkTogglePlan,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_result: Option<BulkToggleApplyResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1004,12 +1017,22 @@ impl BulkToggleController {
     }
 
     pub fn load_handoff(&self, operation_id: &str) -> Result<BulkTogglePlan, BulkTogglePlanError> {
+        Ok(self.load_handoff_status(operation_id)?.plan)
+    }
+
+    pub fn load_handoff_status(
+        &self,
+        operation_id: &str,
+    ) -> Result<BulkToggleOperationStatus, BulkTogglePlanError> {
         let (_, store) = bulk_payload_store(&self.app_state_root, operation_id);
         let snapshot = store
             .load::<BulkToggleOperationRecord>()?
             .ok_or_else(|| BulkTogglePlanError::ReachAware("bulk handoff not found".to_string()))?;
         snapshot.value.verify()?;
-        Ok(snapshot.value.plan)
+        Ok(BulkToggleOperationStatus {
+            plan: snapshot.value.plan,
+            terminal_result: snapshot.value.terminal_result,
+        })
     }
 
     pub fn apply_with_reach_aware(
@@ -1842,7 +1865,9 @@ const fn derived_connection_boundary(provider_reach: ProviderReach) -> Connectio
     }
 }
 
-fn reach_scope_digest(expectation: &ApprovalExpectation, session_id: &str) -> String {
+/// Stable scope identifier used to bind a reach-aware handoff to its
+/// repository/workspace/session authority tuple.
+pub fn reach_scope_digest(expectation: &ApprovalExpectation, session_id: &str) -> String {
     crate::encode_lower_hex(&Sha256::digest(
         format!(
             "{}\0{}\0{}",

@@ -168,6 +168,15 @@ enum Commands {
         /// Provider to select, such as claude, codex, or cursor.
         #[arg(long)]
         provider: Option<String>,
+        /// Mutation reach: selected provider or all providers. This is distinct
+        /// from discovery/list visibility filters.
+        #[arg(
+            long,
+            alias = "provider-reach",
+            value_enum,
+            default_value_t = commands::ProviderReachArg::Selected
+        )]
+        reach: commands::ProviderReachArg,
         /// Kind to select, such as skill or mcp.
         #[arg(long)]
         kind: Option<String>,
@@ -189,6 +198,12 @@ enum Commands {
         /// Render machine-readable JSON.
         #[arg(long)]
         json: bool,
+    },
+    /// Plan and apply reach-aware bulk native toggles.
+    #[command(alias = "bulk-toggle", alias = "toggle-bulk")]
+    Bulk {
+        #[command(subcommand)]
+        command: commands::toggle::BulkCommands,
     },
     /// Restore one previously saved backup.
     Restore {
@@ -547,6 +562,7 @@ fn main() -> ExitCode {
             roots,
             app_state_root,
             provider,
+            reach,
             kind,
             layer,
             id,
@@ -630,9 +646,21 @@ fn main() -> ExitCode {
                                                 Ok(None) => NativeToggleController::new(&toggle_state_root),
                                                 Err(error) => return command_error_exit(json, "blocked", &error),
                                             };
-                                            let plan = match controller
-                                                .plan(item.clone(), &approval_context)
-                                            {
+                                            let reach_input = match reach {
+                                                commands::ProviderReachArg::Selected => {
+                                                    unpin_core::provider_reach::ProviderReachInput::Omitted
+                                                }
+                                                commands::ProviderReachArg::All => {
+                                                    unpin_core::provider_reach::ProviderReachInput::All
+                                                }
+                                            };
+                                            let plan = match controller.plan_with_reach(
+                                                item.clone(),
+                                                &approval_context,
+                                                unpin_core::provider_reach::ConnectionBoundary::All,
+                                                reach_input,
+                                                Vec::new(),
+                                            ) {
                                                 Ok(plan) => plan,
                                                 Err(error) => {
                                                     return command_error_exit(
@@ -721,12 +749,17 @@ fn main() -> ExitCode {
                                                 ) {
                                                     Ok(result) => result,
                                                     Err(error) => {
-                                                        return command_error_exit(
+                                                        return command_error_exit_code(
                                                             json,
                                                             native_toggle_control_error_status(
                                                                 &error,
                                                             ),
                                                             &error.to_string(),
+                                                            lifecycle_exit_code(
+                                                                native_toggle_control_error_status(
+                                                                    &error,
+                                                                ),
+                                                            ),
                                                         );
                                                     }
                                                 }
@@ -1027,6 +1060,7 @@ fn main() -> ExitCode {
             }
         }
         Some(Commands::Session { command }) => commands::session::run(command),
+        Some(Commands::Bulk { command }) => commands::toggle::run(command),
         Some(Commands::Catalog { command }) => commands::catalog::run(command),
         Some(Commands::Profile { command }) => commands::profile::run(command),
         Some(Commands::Group { command }) => commands::group::run(command),
@@ -1852,6 +1886,29 @@ fn command_error_exit(json: bool, status: &str, reason: &str) -> ExitCode {
     }
 }
 
+fn command_error_exit_code(json: bool, status: &str, reason: &str, code: u8) -> ExitCode {
+    match render_command_error(json, status, reason) {
+        Ok(output) => {
+            if json {
+                println!("{output}");
+            } else {
+                eprintln!("{output}");
+            }
+        }
+        Err(error) => eprintln!("{error}"),
+    }
+    ExitCode::from(code)
+}
+
+fn lifecycle_exit_code(status: &str) -> u8 {
+    match status {
+        "partial" => 2,
+        "blocked" | "no-targets" | "no-targets-in-provider-reach" => 3,
+        "recovery-required" => 4,
+        _ => 1,
+    }
+}
+
 fn render_command_error(
     json: bool,
     status: &str,
@@ -2129,6 +2186,7 @@ fn render_controlled_toggle(
 ) -> Result<String, serde_json::Error> {
     if json {
         let mut value = toggle_json_value(result);
+        value["statusVersion"] = serde_json::json!(2);
         value["planFingerprint"] = serde_json::json!(plan_fingerprint);
         value["operation"] = serde_json::to_value(operation)?;
         return serde_json::to_string_pretty(&value);
@@ -2140,6 +2198,7 @@ fn render_controlled_toggle(
 
 fn toggle_json_value(result: &ToggleResult) -> serde_json::Value {
     let mut value = serde_json::json!({
+        "statusVersion": 2,
         "status": toggle_status_name(result.status),
         "selection": result.selection,
         "targetEnabled": result.target_enabled,
@@ -2159,6 +2218,14 @@ fn toggle_json_value(result: &ToggleResult) -> serde_json::Value {
             .map(describe_target)
             .collect::<Vec<_>>(),
     });
+
+    if let Some(reach) = result.provider_reach {
+        value["providerReach"] = serde_json::to_value(reach).unwrap_or(serde_json::Value::Null);
+    }
+    if let Some(coverage) = &result.coverage {
+        value["providerCoverage"] =
+            serde_json::to_value(coverage).unwrap_or(serde_json::Value::Null);
+    }
 
     if let Some(reason) = &result.reason {
         value["reason"] = serde_json::json!(reason);
