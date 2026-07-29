@@ -296,6 +296,102 @@ through the same MCP control plane.
 Bulk plans require an explicit maximum item count. Prefer one-item plans while
 learning the workflow.
 
+## Reach-aware plans and handoffs (schema v2)
+
+Reach is the mutation authority for a reviewed operation. It is not a list or
+discovery filter, and it is not the MCP connection boundary. The server's
+`--provider` scope remains a hard boundary: a plan may narrow that boundary,
+but a reach request can never widen it. A visibility filter therefore never
+grants write authority by itself.
+
+Every item, bulk, group, and named-profile operation follows the same
+plan-first sequence:
+
+1. Discover the current inventory and control status. Resolve exact provider,
+   layer, kind, item or capability IDs, mutability, and revisions.
+2. Choose the operation reach explicitly: `All providers`, or `Selected
+   provider` with the provider that owns the mutation. For an exact item, the
+   item provider may establish `exact-individual-target` provenance. Other
+   selected-provider plans must report why authority was established, such as
+   `explicit-input`, `tui-control`, or `pinned-mcp-boundary`.
+3. Call the family-specific plan tool. Do not infer reach from a list filter,
+   a connected provider, or the providers that happen to appear in a result.
+4. Review the complete plan before requesting an apply handoff. The review
+   must include `providerReach`, selected-provider provenance (when present),
+   every `providerCoverage` entry, included and excluded providers, exclusion
+   reasons, target state, activation/lifecycle, blocked items, and the exact
+   plan fingerprint. Group and profile plans must also show their member or
+   provider target classifications.
+5. Preserve the exact `operationId` and `planFingerprint` together. Applying
+   with either value changed, omitted, or copied from another plan is invalid.
+
+Bulk selectors must contain a non-provider criterion (for example an explicit
+ID, kind, category, layer, or enabled-state filter). A selector that resolves
+the whole provider inventory requires an explicit whole-inventory
+acknowledgement (`acknowledgeWholeInventory=true`); an empty result is only
+valid when the plan also carries an intentional empty-selection
+acknowledgement. This prevents a provider filter or a broad connection from
+silently becoming a whole-inventory write.
+
+### MCP-to-CLI/TUI handoff
+
+MCP plan and apply tools are review and transport surfaces; they do not mint
+human approval. After the plan is reviewed, request the structured handoff and
+complete it through the CLI or TUI with the same operation ID, fingerprint,
+reach, provider authority, and resolved roots. For bulk CLI handoff, use the
+exact operation and fingerprint returned by the MCP plan; do not reconstruct a
+new selector from a changed visible filter. Named profile operations use the
+provider-operation controller, while generic profile policy and capability
+lock contracts retain their existing policy semantics.
+
+Approval and transfer records are short-lived and audience-bound. Their
+expiry, session, workspace/repository context, root binding, and selected
+provider authority are part of the reviewed scope. A transfer may be consumed
+once; a duplicate request can return the authenticated terminal result but
+must never replay provider writes. Restarting the host or CLI does not extend
+expiry or authorize a different operation.
+
+### Tamper, drift, and restart behavior
+
+The CLI/TUI and MCP implementation reject a handoff when any of these change:
+
+- operation ID, plan fingerprint, reach, provenance, provider coverage, or
+  acknowledgement;
+- connection/session/workspace context, trusted roots, authority tag, or
+  approval/transfer audience and expiry;
+- provider state, inventory identities, source fingerprints, group revision,
+  profile/catalog revision, or any other pre-state fingerprint reviewed by the
+  plan.
+
+On rejection, stop and request fresh discovery and a fresh plan. Never retry a
+stale handoff merely because the visible item still has the same name. After a
+restart, poll operation status by the exact operation ID until the durable
+record is terminal, then rediscover the affected providers. A terminal result
+is safe to read again; it is not permission to run a second write.
+
+Lifecycle is explicit and must remain distinct in machine-readable output:
+
+| Lifecycle | Meaning | CLI exit |
+| --- | --- | ---: |
+| `applied` / `no-op` | All reviewed targets completed or already matched. | `0` |
+| `partial` | Some targets completed and others did not; preserve backups and evidence. | `2` |
+| `blocked` / `no-targets-in-provider-reach` | No provider write was authorized or no target was in the selected reach. | `3` |
+| `recovery-required` | A write or rollback needs manual repair or authenticated restore. | `4` |
+
+Do not collapse `partial`, `blocked`, no-targets, and
+`recovery-required` into a generic failure. For partial or recovery-required
+results, stop automatic retries, retain operation and backup IDs, and follow
+the reported repair/restore path before starting a new plan.
+
+Reach-aware projections use schema-v2 (schema version 2) and add reach,
+provenance, coverage, acknowledgement, lifecycle, and durable handoff fields
+only to the operation families that support them. This is deliberately scoped:
+unrelated schema-v1 inventory, list, discovery, restore, policy, gateway,
+session, and hook contracts remain valid and must not be made to require
+schema-v2 fields.
+Clients should ignore additive v2 fields when consuming an older family and
+must not rename or reinterpret existing v1 fields.
+
 For copy-ready requests covering one-item changes, bounded project allowlists,
 inventory groups, reusable profiles, session-specific profiles, capability
 locks, hook trust, and restore, use the

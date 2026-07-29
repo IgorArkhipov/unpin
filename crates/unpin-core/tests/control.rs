@@ -8,7 +8,9 @@ use unpin_core::{
     approval::{ApprovalExpectation, ApprovalResourceBinding},
     bridges::HookCoverageStatus,
     control::{
-        ReachAwareStatusAuthorization, ReachAwareStatusFilter, build_control_status,
+        CatalogControlSummary, ControlOperationStatus, ControlStatus,
+        ReachAwareStatusAuthorization, ReachAwareStatusFilter,
+        attach_reach_aware_status_for_operation, build_control_status,
         project_reach_aware_operation_status, project_reach_aware_operations,
     },
     control_operation::{
@@ -1029,6 +1031,148 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
         .expect("unauthorized list is non-disclosing")
         .is_empty()
     );
+
+    let mut control = ControlStatus {
+        schema_version: 1,
+        repository_key: journal.repository_key.clone(),
+        workspace_key: journal.workspace_key.clone(),
+        catalog: CatalogControlSummary::default(),
+        profiles: Vec::new(),
+        policies: Default::default(),
+        gateways: Vec::new(),
+        sessions: Vec::new(),
+        operations: vec![ControlOperationStatus {
+            operation_id: journal.operation_id.clone(),
+            operation_kind: journal.operation_kind.clone(),
+            lifecycle: journal.lifecycle,
+            effect_graph_digest: journal.effect_graph_digest.clone(),
+            authorization_recorded: true,
+            resources: Vec::new(),
+            terminal_code: journal.terminal_code.clone(),
+            recovery_required: false,
+            reach_aware: None,
+        }],
+        hooks: Vec::new(),
+    };
+    let before_unfiltered = control.clone();
+    attach_reach_aware_status_for_operation(
+        &mut control,
+        std::slice::from_ref(&journal),
+        None,
+        &authorization,
+        &authority_key,
+    )
+    .expect("empty operation filter preserves generic status");
+    assert_eq!(control, before_unfiltered);
+    attach_reach_aware_status_for_operation(
+        &mut control,
+        std::slice::from_ref(&journal),
+        Some("status-operation"),
+        &authorization,
+        &authority_key,
+    )
+    .expect("exact operation filter attaches authorized projection");
+    let attached = control.operations[0]
+        .reach_aware
+        .as_ref()
+        .expect("nested reach-aware status");
+    assert_eq!(attached.schema_version, 2);
+    assert_eq!(attached.lifecycle, ProviderReachLifecycle::Partial);
+    assert!(!control.operations[0].recovery_required);
+
+    let mut unauthorized_control = control.clone();
+    unauthorized_control.operations[0].reach_aware = None;
+    attach_reach_aware_status_for_operation(
+        &mut unauthorized_control,
+        std::slice::from_ref(&journal),
+        Some("status-operation"),
+        &unauthorized,
+        &authority_key,
+    )
+    .expect("unauthorized exact operation remains non-disclosing");
+    assert!(unauthorized_control.operations[0].reach_aware.is_none());
+    let ambiguity = attach_reach_aware_status_for_operation(
+        &mut control,
+        &[journal.clone(), journal.clone()],
+        Some("status-operation"),
+        &authorization,
+        &authority_key,
+    )
+    .expect_err("duplicate authorized operation ids must fail closed");
+    assert!(ambiguity.to_string().contains("multiple authorized"));
+}
+
+#[test]
+fn reach_aware_status_attachment_preserves_canonical_lifecycle_states() {
+    let temp = TempDir::new().expect("temporary status root");
+    let root = fs::canonicalize(temp.path()).expect("canonical status root");
+    let authority_key = SessionAuthorityKey::new([0x74; 32]);
+
+    for (suffix, lifecycle) in [
+        ("applied", ProviderReachLifecycle::Applied),
+        ("partial", ProviderReachLifecycle::Partial),
+        ("blocked", ProviderReachLifecycle::Blocked),
+        ("recovery", ProviderReachLifecycle::RecoveryRequired),
+    ] {
+        let operation_id = format!("status-{suffix}");
+        let store = TransitionJournalStore::new(&root);
+        let journal = create_reach_aware_status_journal(
+            &store,
+            &root,
+            &authority_key,
+            &operation_id,
+            lifecycle,
+        );
+        let principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+            format!("{operation_id}-session"),
+            format!("{operation_id}-scope"),
+            ConnectionBoundary::All,
+            &authority_key,
+        )
+        .expect("status principal");
+        let authorization =
+            ReachAwareStatusAuthorization::new(principal, "control-audience", "", 500, None);
+        let mut control = ControlStatus {
+            schema_version: 1,
+            repository_key: journal.repository_key.clone(),
+            workspace_key: journal.workspace_key.clone(),
+            catalog: CatalogControlSummary::default(),
+            profiles: Vec::new(),
+            policies: Default::default(),
+            gateways: Vec::new(),
+            sessions: Vec::new(),
+            operations: vec![ControlOperationStatus {
+                operation_id: journal.operation_id.clone(),
+                operation_kind: journal.operation_kind.clone(),
+                lifecycle: journal.lifecycle,
+                effect_graph_digest: journal.effect_graph_digest.clone(),
+                authorization_recorded: true,
+                resources: Vec::new(),
+                terminal_code: journal.terminal_code.clone(),
+                recovery_required: false,
+                reach_aware: None,
+            }],
+            hooks: Vec::new(),
+        };
+
+        attach_reach_aware_status_for_operation(
+            &mut control,
+            std::slice::from_ref(&journal),
+            Some(&operation_id),
+            &authorization,
+            &authority_key,
+        )
+        .expect("authorized lifecycle attachment");
+        let attached = control.operations[0]
+            .reach_aware
+            .as_ref()
+            .expect("attached lifecycle");
+        assert_eq!(attached.lifecycle, lifecycle);
+        assert_eq!(
+            control.operations[0].recovery_required,
+            lifecycle == ProviderReachLifecycle::RecoveryRequired
+        );
+    }
 }
 
 #[test]
@@ -1156,6 +1300,50 @@ fn create_reach_aware_gc_journal(
     expires_at_unix: i64,
     lifecycle: TransitionLifecycle,
 ) {
+    create_reach_aware_journal(
+        store,
+        root,
+        authority_key,
+        operation_id,
+        expires_at_unix,
+        ProviderReachLifecycle::Applied,
+        lifecycle,
+    );
+}
+
+fn create_reach_aware_status_journal(
+    store: &TransitionJournalStore,
+    root: &Path,
+    authority_key: &SessionAuthorityKey,
+    operation_id: &str,
+    lifecycle: ProviderReachLifecycle,
+) -> unpin_core::transitions::TransitionJournal {
+    create_reach_aware_journal(
+        store,
+        root,
+        authority_key,
+        operation_id,
+        1_000,
+        lifecycle,
+        TransitionLifecycle::Committed,
+    );
+    store
+        .list()
+        .expect("status journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == operation_id)
+        .expect("created status journal")
+}
+
+fn create_reach_aware_journal(
+    store: &TransitionJournalStore,
+    root: &Path,
+    authority_key: &SessionAuthorityKey,
+    operation_id: &str,
+    expires_at_unix: i64,
+    reach_lifecycle: ProviderReachLifecycle,
+    lifecycle: TransitionLifecycle,
+) {
     let provider_root = root.join(format!("{operation_id}-provider"));
     fs::create_dir(&provider_root).expect("provider root");
     let roots = ReachAwareRootBinding::from_provider_paths(
@@ -1219,8 +1407,8 @@ fn create_reach_aware_gc_journal(
             ]),
         )
         .lifecycle(
-            ProviderReachLifecycle::Applied,
-            ProviderReachLifecycle::Applied,
+            reach_lifecycle,
+            reach_lifecycle,
             EffectActivation::RestartRequired,
         )
         .trusted_roots(roots)

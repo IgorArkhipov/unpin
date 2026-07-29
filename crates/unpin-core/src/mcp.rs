@@ -12,7 +12,10 @@ use sha2::{Digest, Sha256};
 
 use crate::capabilities::{validate_capability_matrix, validate_provider_fixtures};
 use crate::catalog::{Catalog, CatalogRecord, adoption::plan_discovered_adoption};
-use crate::control::{ControlStatus, build_control_status};
+use crate::control::{
+    ControlStatus, ReachAwareStatusAuthorization, attach_reach_aware_status_for_operation,
+    build_control_status,
+};
 use crate::control_operation::{
     ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle, ControlResolvedContext,
 };
@@ -37,12 +40,13 @@ use crate::mutation::{
 use crate::profiles::{
     CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, CompiledProfileRevision,
     GatewaySelection, PolicyChange, PolicyStore, PolicyTarget, ProfileDefinition,
-    ProfilePolicyController, ProfileReference, ProfileSelection, ProfileSourceScope, ProfileStore,
-    capability_lock_enforcement, compile_profile, propose_profile, resolve_effective_gateway,
+    ProfilePolicyController, ProfileProviderOperationController, ProfileReference,
+    ProfileSelection, ProfileSourceScope, ProfileStore, capability_lock_enforcement,
+    compile_profile, propose_profile, resolve_effective_gateway,
 };
 use crate::provider_reach::{
     ConnectionBoundary, DerivedTargetKind, ProviderReachInput, ProviderReachLifecycle,
-    ProviderReachRequest,
+    ProviderReachRequest, SelectedProviderAuthority, SelectedProviderProvenance,
 };
 use crate::sessions::{
     GatewayModeAction, GatewayModeController, GatewayModeTarget, GatewayWorkflowController,
@@ -55,7 +59,7 @@ use crate::{
         ApprovalExpectation, ApprovalKey, ApprovalVerifier, ControlApprovalContext,
         approval_binding_digest, authorize_control,
     },
-    transitions::{EffectActivation, TransitionContext, TransitionPlan},
+    transitions::{EffectActivation, TransitionContext, TransitionJournalStore, TransitionPlan},
 };
 
 // Keep the public MCP contract in one Unpin-owned namespace.
@@ -83,6 +87,8 @@ pub const UNPIN_MCP_TOOL_NAMES: &[&str] = &[
     "unpin_validate_profile",
     "unpin_plan_profile_policy",
     "unpin_apply_profile_policy",
+    "unpin_plan_profile_provider",
+    "unpin_apply_profile_provider",
     "unpin_get_capability_locks",
     "unpin_plan_capability_lock",
     "unpin_apply_capability_lock",
@@ -726,6 +732,12 @@ fn handle_tool_call(context: &McpContext, request: &Value) -> Result<Value, Stri
         "unpin_apply_profile_policy" => {
             structured_result(apply_profile_policy(context, &arguments)?)
         }
+        "unpin_plan_profile_provider" => {
+            structured_result(plan_profile_provider(context, &arguments)?)
+        }
+        "unpin_apply_profile_provider" => {
+            structured_result(apply_profile_provider(context, &arguments)?)
+        }
         "unpin_get_capability_locks" => {
             structured_result(get_capability_locks(context, &arguments)?)
         }
@@ -857,7 +869,10 @@ fn plan_inventory_group(context: &McpContext, arguments: &Value) -> Result<Value
         .provider_scope
         .provider()
         .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
-    let reach = parse_bulk_provider_reach(arguments.get("providerReach"))?;
+    let reach = parse_bulk_provider_reach(
+        arguments.get("providerReach"),
+        context.provider_scope.provider(),
+    )?;
     let reach_request = ProviderReachRequest::new(boundary, reach, DerivedTargetKind::Group);
     // This validation is deliberately before group discovery and provider
     // planning. An all-provider MCP connection must state its reach explicitly.
@@ -1238,8 +1253,27 @@ fn group_apply_response(
         *result_value = public_group_result_value(result, Some(allowed));
     }
     Ok(json!({
+        "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
         "status": status,
+        "operationId": result.operation_id,
+        "planFingerprint": result.plan_fingerprint,
+        "providerReach": result.provider_reach,
+        "providerCoverage": result.provider_coverage,
+        "lifecycle": result.provider_reach_lifecycle,
         "operation": operation,
+        "operationV2": {
+            "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+            "family": "group-toggle",
+            "operationId": result.operation_id,
+            "operationKind": "inventory-group-apply",
+            "planFingerprint": result.plan_fingerprint,
+            "providerReach": result.provider_reach,
+            "providerCoverage": result.provider_coverage,
+            "lifecycle": status,
+            "expectedLifecycle": result.provider_reach_lifecycle,
+            "activation": activation,
+            "humanAction": null
+        }
     }))
 }
 
@@ -1572,7 +1606,8 @@ fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> 
 }
 
 fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, String> {
-    require_empty_object(arguments)?;
+    require_only_fields(arguments, &["operationId"], "control status arguments")?;
+    let operation_id = optional_string(arguments, "operationId")?;
     let discovery = discover_scoped_cached(context)?;
     let mut control = build_control_status(
         &discovery,
@@ -1585,11 +1620,82 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
     )
     .map_err(|error| error.to_string())?;
     context.provider_scope.filter_control_status(&mut control);
+    if let Some(operation_id) = operation_id {
+        let journals = TransitionJournalStore::new(&context.app_state_root)
+            .list()
+            .map_err(|error| error.to_string())?;
+        if let Some(authorization) =
+            reach_aware_status_authorization(context, operation_id, &journals)?
+        {
+            attach_reach_aware_status_for_operation(
+                &mut control,
+                &journals,
+                Some(operation_id),
+                &authorization,
+                context
+                    .session_authority_key
+                    .as_ref()
+                    .ok_or_else(|| "session authority key is unavailable".to_string())?,
+            )
+            .map_err(|error| error.to_string())?;
+        }
+    }
     Ok(json!({
         "status": "ok",
         "control": control,
         "warnings": discovery.warnings
     }))
+}
+
+/// A regular MCP connection has no caller-supplied session identity.  Reuse
+/// only the authenticated principal sealed in the journal and require its
+/// connection boundary to equal this MCP context's configured boundary.  The
+/// journal's signature, not caller metadata, establishes the identity; missing
+/// or mismatched records remain non-disclosing v1 status rather than becoming
+/// a journal lookup oracle.
+fn reach_aware_status_authorization(
+    context: &McpContext,
+    operation_id: &str,
+    journals: &[crate::transitions::TransitionJournal],
+) -> Result<Option<ReachAwareStatusAuthorization>, String> {
+    let Some(session_key) = context.session_authority_key.as_ref() else {
+        return Ok(None);
+    };
+    let now_unix = current_unix_seconds().map_err(|error| error.to_string())?;
+    let matching = journals
+        .iter()
+        .filter(|journal| journal.operation_id == operation_id)
+        .collect::<Vec<_>>();
+    if matching.len() > 1 {
+        return Err("reach-aware status authorization is unavailable".to_string());
+    }
+    let Some(journal) = matching.into_iter().next() else {
+        return Ok(None);
+    };
+    let Some(envelope) = journal.reach_aware.as_ref() else {
+        return Ok(None);
+    };
+    envelope
+        .verify_authenticated(session_key)
+        .map_err(|_| "reach-aware status authorization is unavailable".to_string())?;
+    let configured_boundary = context
+        .provider_scope
+        .provider()
+        .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
+    if envelope.connection_boundary != configured_boundary {
+        return Ok(None);
+    }
+    let capability_scope_digest = envelope
+        .transfer_capability
+        .as_ref()
+        .map_or_else(String::new, |capability| capability.scope_digest.clone());
+    Ok(Some(ReachAwareStatusAuthorization::new(
+        envelope.principal.clone(),
+        envelope.audience.clone(),
+        capability_scope_digest,
+        now_unix,
+        None,
+    )))
 }
 
 fn list_catalog(context: &McpContext, arguments: &Value) -> Result<Value, String> {
@@ -1845,6 +1951,206 @@ fn require_hook_profile_membership(
     } else {
         Err("hook is not selected by compiled profile".to_string())
     }
+}
+
+fn plan_profile_provider(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (revision, plan) = profile_provider_plan(context, arguments)?;
+    let status = if plan.no_op { "no-op" } else { "planned" };
+    let expected_lifecycle = if plan.no_op {
+        ProviderReachLifecycle::NoOp
+    } else {
+        ProviderReachLifecycle::Applied
+    };
+    Ok(json!({
+        "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+        "status": status,
+        "operationId": plan.operation_id,
+        "planFingerprint": plan.plan_fingerprint,
+        "providerReach": plan.provider_reach,
+        "providerCoverage": plan.coverage,
+        "activation": plan.activation,
+        "expectedLifecycle": expected_lifecycle,
+        "targets": plan.targets,
+        "operation": profile_provider_operation_value(
+            context,
+            &revision,
+            &plan,
+            status,
+            expected_lifecycle,
+        )?,
+        "profile": revision,
+        "plan": plan,
+        "humanApprovalRequired": !plan.no_op,
+        "continuation": if plan.no_op {
+            "No provider policy change is required; retain this operation id for status inspection."
+        } else {
+            "Review provider reach, provenance, coverage, target classifications, and fingerprint, then call unpin_apply_profile_provider."
+        },
+    }))
+}
+
+fn apply_profile_provider(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    let (revision, plan) = profile_provider_plan(context, arguments)?;
+    let operation_id = required_string(arguments, "operationId")?;
+    if operation_id != plan.operation_id {
+        return Err(
+            "operation id does not match current reviewed profile provider plan".to_string(),
+        );
+    }
+    require_plan_fingerprint(arguments, &plan.plan_fingerprint)?;
+    let lifecycle = if plan.no_op {
+        ProviderReachLifecycle::NoOp
+    } else {
+        ProviderReachLifecycle::Applied
+    };
+    let status = if plan.no_op {
+        "no-op"
+    } else {
+        "human-action-required"
+    };
+    Ok(json!({
+        "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+        "status": status,
+        "operationId": plan.operation_id,
+        "planFingerprint": plan.plan_fingerprint,
+        "providerReach": plan.provider_reach,
+        "providerCoverage": plan.coverage,
+        "activation": plan.activation,
+        "expectedLifecycle": lifecycle,
+        "targets": plan.targets,
+        "operation": profile_provider_operation_value(
+            context,
+            &revision,
+            &plan,
+            if plan.no_op {
+                "no-op"
+            } else {
+                "awaiting-human-action"
+            },
+            lifecycle,
+        )?,
+        "profile": revision,
+        "plan": plan,
+        "continuation": if plan.no_op {
+            "No provider policy change is required."
+        } else {
+            "MCP cannot mint human approval; review and apply this exact fingerprint in Unpin CLI or TUI, then read control status."
+        },
+    }))
+}
+
+fn profile_provider_plan(
+    context: &McpContext,
+    arguments: &Value,
+) -> Result<
+    (
+        CompiledProfileRevision,
+        crate::profiles::ProfileProviderOperationPlan,
+    ),
+    String,
+> {
+    require_only_fields(
+        arguments,
+        &[
+            "profileId",
+            "mode",
+            "scope",
+            "provider",
+            "providerReach",
+            "operationId",
+            "confirm",
+            "planFingerprint",
+        ],
+        "profile provider operation arguments",
+    )?;
+    let profile_id = required_string(arguments, "profileId")?;
+    let revision = compile_stored_profile(context, profile_id)?;
+    let requested_provider = optional_provider(context, arguments)?;
+    let boundary = context
+        .provider_scope
+        .provider()
+        .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
+    let mut reach_request = ProviderReachRequest::new(
+        boundary,
+        parse_bulk_provider_reach(
+            arguments.get("providerReach"),
+            context.provider_scope.provider(),
+        )?,
+        DerivedTargetKind::Profile,
+    );
+    if let Some(provider) = requested_provider {
+        reach_request = reach_request.with_authority(SelectedProviderAuthority::new(
+            provider,
+            SelectedProviderProvenance::ExplicitInput,
+        ));
+    }
+    let provider_reach = reach_request
+        .validate_before_discovery()
+        .and_then(|preflight| preflight.reconcile_exact_target(None))
+        .map_err(|error| error.to_string())?
+        .reach;
+    let (_, target) = control_targets(context, arguments, provider_reach.provider())?;
+    let gateway = match required_string(arguments, "mode")? {
+        "native" => GatewaySelection::Native,
+        "gateway" => GatewaySelection::Gateway,
+        _ => return Err("mode must be native or gateway".to_string()),
+    };
+    let plan = ProfileProviderOperationController::new(&context.app_state_root)
+        .plan_with_gateway(&target, &revision, provider_reach, gateway)
+        .map_err(|error| error.to_string())?;
+    Ok((revision, plan))
+}
+
+fn profile_provider_operation_value(
+    context: &McpContext,
+    revision: &CompiledProfileRevision,
+    plan: &crate::profiles::ProfileProviderOperationPlan,
+    lifecycle: &str,
+    expected_lifecycle: ProviderReachLifecycle,
+) -> Result<Value, String> {
+    let approval_context = control_approval_context(context)?;
+    let boundary = context
+        .provider_scope
+        .provider()
+        .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
+    let selected_provider = plan.provider_reach.provider().map(|provider| {
+        json!(SelectedProviderAuthority::new(
+            provider,
+            plan.provider_reach
+                .provenance()
+                .unwrap_or(SelectedProviderProvenance::ExplicitInput),
+        ))
+    });
+    Ok(json!({
+        "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+        "family": "profile",
+        "familySchemaVersion": crate::profiles::PROFILE_PROVIDER_OPERATION_SCHEMA_VERSION,
+        "operationId": plan.operation_id,
+        "operationKind": "apply-profile",
+        "planFingerprint": plan.plan_fingerprint,
+        "context": {
+            "repositoryKey": approval_context.repository_key(),
+            "workspaceKey": approval_context.workspace_key(),
+            "profileDigest": plan.profile.digest
+        },
+        "connectionBoundary": boundary,
+        "providerReach": plan.provider_reach,
+        "selectedProvider": selected_provider,
+        "providerCoverage": plan.coverage,
+        "expectedLifecycle": expected_lifecycle,
+        "lifecycle": lifecycle,
+        "activation": plan.activation,
+        "humanAction": (lifecycle == "planned" || lifecycle == "awaiting-human-action").then(|| json!({
+            "code": "confirm-and-apply",
+            "guidance": "Review and apply this fingerprint in Unpin CLI or TUI."
+        })),
+        "retryable": true,
+        "details": {
+            "profile": revision,
+            "targets": plan.targets,
+            "inverseEvidence": plan.inverse_evidence,
+        }
+    }))
 }
 
 fn plan_profile_policy(context: &McpContext, arguments: &Value) -> Result<Value, String> {
@@ -2623,6 +2929,46 @@ fn legacy_bulk_human_action_required(operation_kind: &str, plan_fingerprint: &st
     })
 }
 
+fn reach_aware_bulk_human_action_required(plan: &BulkTogglePlan, plan_fingerprint: &str) -> Value {
+    let mut response = legacy_bulk_human_action_required("toggle-items", plan_fingerprint);
+    response["schemaVersion"] = json!(crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION);
+    response["operationId"] = json!(plan.operation_id);
+    response["providerReach"] = json!(plan.provider_reach);
+    response["providerCoverage"] = json!(plan.provider_coverage);
+    response["lifecycle"] = json!(plan.lifecycle);
+    response["expectedLifecycle"] = json!(match plan.lifecycle {
+        ProviderReachLifecycle::Applied | ProviderReachLifecycle::Partial => "applied",
+        ProviderReachLifecycle::NoOp => "no-op",
+        ProviderReachLifecycle::NoTargetsInProviderReach => "no-targets-in-provider-reach",
+        ProviderReachLifecycle::Blocked => "blocked",
+        ProviderReachLifecycle::RecoveryRequired => "recovery-required",
+    });
+    response["targets"] = json!(
+        plan.included
+            .iter()
+            .map(|entry| &entry.item)
+            .collect::<Vec<_>>()
+    );
+    response["reachExclusions"] = json!(plan.provider_coverage.excluded().collect::<Vec<_>>());
+    response["operationV2"] = json!({
+        "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+        "family": "bulk-toggle",
+        "operationId": plan.operation_id,
+        "operationKind": "bulk-toggle",
+        "planFingerprint": plan_fingerprint,
+        "providerReach": plan.provider_reach,
+        "providerCoverage": plan.provider_coverage,
+        "lifecycle": "awaiting-human-action",
+        "expectedLifecycle": plan.lifecycle,
+        "activation": "live",
+        "humanAction": {
+            "code": "confirm-and-apply",
+            "guidance": "Review and apply this fingerprint in Unpin CLI or TUI."
+        }
+    });
+    response
+}
+
 fn legacy_plan_fingerprint(operation_kind: &str, plan: &Value) -> String {
     bulk_plan_fingerprint(json!({
         "schemaVersion": 1,
@@ -2733,7 +3079,10 @@ fn individual_reach_inputs(
         .provider_scope
         .provider()
         .map_or(ConnectionBoundary::All, ConnectionBoundary::Pinned);
-    let reach = parse_bulk_provider_reach(arguments.get("providerReach"))?;
+    let reach = parse_bulk_provider_reach(
+        arguments.get("providerReach"),
+        context.provider_scope.provider(),
+    )?;
     let mut authority_candidates = Vec::new();
     if let Some(provider) = arguments.get("provider") {
         let provider = provider
@@ -2783,6 +3132,7 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
             Err(error) => return blocked_value(error.to_string()),
         };
         let mut plan = json!({
+            "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
             "status": "planned",
             "selection": item.clone(),
             "targetEnabled": target_enabled,
@@ -2801,6 +3151,7 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
             "blocked": null,
             "warnings": []
         });
+        plan["providerCoverage"] = plan["coverage"].clone();
         plan["planFingerprint"] = json!(legacy_plan_fingerprint("toggle-item", &plan));
         let approval_context = match control_approval_context(context) {
             Ok(context) => context,
@@ -2808,11 +3159,12 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         };
         let fingerprint = plan["planFingerprint"]
             .as_str()
-            .expect("single toggle no-op plan includes fingerprint");
+            .expect("single toggle no-op plan includes fingerprint")
+            .to_owned();
         let operation = ControlOperationEnvelope::new(
             format!("native-toggle-no-op-{fingerprint}"),
             "native-toggle",
-            fingerprint,
+            fingerprint.clone(),
             ControlResolvedContext {
                 repository_key: approval_context.repository_key().to_string(),
                 workspace_key: approval_context.workspace_key().to_string(),
@@ -2829,6 +3181,18 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         plan["controlContractVersion"] = json!(UNPIN_CONTROL_CONTRACT_VERSION);
         plan["operation"] =
             serde_json::to_value(operation).expect("control operation envelope serializes");
+        plan["operationV2"] = json!({
+            "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+            "family": "native-toggle",
+            "operationId": format!("native-toggle-no-op-{fingerprint}"),
+            "operationKind": "native-toggle",
+            "planFingerprint": fingerprint,
+            "providerReach": resolved.reach,
+            "providerCoverage": plan["providerCoverage"].clone(),
+            "lifecycle": "no-op",
+            "expectedLifecycle": "no-op",
+            "activation": "live"
+        });
         return plan;
     }
 
@@ -2873,10 +3237,24 @@ fn plan_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         serde_json::to_value(controlled.provider_reach).expect("provider reach serializes");
     plan["coverage"] =
         serde_json::to_value(&controlled.coverage).expect("provider coverage serializes");
+    plan["schemaVersion"] = json!(crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION);
+    plan["providerCoverage"] = plan["coverage"].clone();
     plan["planFingerprint"] = json!(controlled.plan_fingerprint);
     plan["controlContractVersion"] = json!(UNPIN_CONTROL_CONTRACT_VERSION);
     plan["operation"] =
         serde_json::to_value(operation).expect("control operation envelope serializes");
+    plan["operationV2"] = json!({
+        "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+        "family": "native-toggle",
+        "operationId": controlled.transition.operation_id,
+        "operationKind": "native-toggle",
+        "planFingerprint": controlled.plan_fingerprint,
+        "providerReach": controlled.provider_reach,
+        "providerCoverage": controlled.coverage,
+        "lifecycle": "planned",
+        "expectedLifecycle": "applied",
+        "activation": activation
+    });
     plan["continuation"] =
         json!("Review this plan, then call unpin_apply_toggle_item with its planFingerprint.");
     plan
@@ -2936,6 +3314,9 @@ fn apply_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         .map_or(EffectActivation::RestartRequired, |effect| {
             effect.activation
         });
+    let operation_id = controlled.transition.operation_id.clone();
+    let provider_reach = controlled.provider_reach;
+    let provider_coverage = controlled.coverage.clone();
     let mut response = human_action_required(control_operation(
         &expectation,
         fingerprint,
@@ -2944,6 +3325,27 @@ fn apply_single_toggle(context: &McpContext, arguments: &Value) -> Value {
         Some(provider),
         json!({"plan": controlled}),
     ));
+    response["schemaVersion"] = json!(crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION);
+    response["operationId"] = json!(operation_id.clone());
+    response["providerReach"] = json!(provider_reach);
+    response["providerCoverage"] = json!(provider_coverage.clone());
+    response["coverage"] = json!(provider_coverage.clone());
+    response["operationV2"] = json!({
+        "schemaVersion": crate::provider_reach::PROVIDER_REACH_SCHEMA_VERSION,
+        "family": "native-toggle",
+        "operationId": operation_id,
+        "operationKind": "native-toggle",
+        "planFingerprint": fingerprint,
+        "providerReach": provider_reach,
+        "providerCoverage": provider_coverage,
+        "lifecycle": "awaiting-human-action",
+        "expectedLifecycle": "applied",
+        "activation": activation,
+        "humanAction": {
+            "code": "confirm-and-apply",
+            "guidance": "Review and apply this fingerprint in Unpin CLI or TUI."
+        }
+    });
     response["operationKind"] = json!("toggle-item");
     response["operationReference"] = json!(format!("toggle-item:{fingerprint}"));
     response
@@ -3002,7 +3404,7 @@ fn apply_bulk_toggle_items(context: &McpContext, arguments: &Value) -> Value {
         return response;
     }
 
-    legacy_bulk_human_action_required("toggle-items", current_fingerprint)
+    reach_aware_bulk_human_action_required(&current_plan, current_fingerprint)
 }
 
 #[derive(Debug)]
@@ -3027,8 +3429,11 @@ fn build_bulk_plan(
     validate_selector(selector_value).map_err(BulkBuildError::Message)?;
     let selector = serde_json::from_value::<BulkToggleSelector>(selector_value.clone())
         .map_err(|error| BulkBuildError::Message(format!("invalid selector: {error}")))?;
-    let reach = parse_bulk_provider_reach(arguments.get("providerReach"))
-        .map_err(BulkBuildError::Message)?;
+    let reach = parse_bulk_provider_reach(
+        arguments.get("providerReach"),
+        context.provider_scope.provider(),
+    )
+    .map_err(BulkBuildError::Message)?;
     let allow_empty_selection = match arguments.get("allowEmptySelection") {
         None => false,
         Some(value) => value.as_bool().ok_or_else(|| {
@@ -3064,7 +3469,10 @@ fn build_bulk_plan(
     Ok((plan, warnings))
 }
 
-fn parse_bulk_provider_reach(value: Option<&Value>) -> Result<ProviderReachInput, String> {
+fn parse_bulk_provider_reach(
+    value: Option<&Value>,
+    pinned_provider: Option<ProviderId>,
+) -> Result<ProviderReachInput, String> {
     let Some(value) = value else {
         return Ok(ProviderReachInput::Omitted);
     };
@@ -3092,11 +3500,15 @@ fn parse_bulk_provider_reach(value: Option<&Value>) -> Result<ProviderReachInput
             Ok(ProviderReachInput::All)
         }
         "selected" | "selected-provider" => {
-            let provider = object
-                .get("provider")
-                .and_then(Value::as_str)
-                .ok_or_else(|| "providerReach.provider is required".to_string())
-                .and_then(parse_provider_id)?;
+            let provider = match object.get("provider") {
+                Some(value) => value
+                    .as_str()
+                    .ok_or_else(|| "providerReach.provider must be a string".to_string())
+                    .and_then(parse_provider_id)?,
+                None => pinned_provider.ok_or_else(|| {
+                    "providerReach.provider is required on an all-provider connection".to_string()
+                })?,
+            };
             let provenance = object
                 .get("provenance")
                 .cloned()
@@ -3210,12 +3622,14 @@ fn bulk_plan_value(plan: &BulkTogglePlan, warnings: Vec<Value>) -> Value {
     };
     let mut response = json!({
         "schemaVersion": plan.schema_version,
+        "operationId": plan.operation_id,
         "status": status,
         "selector": plan.selector,
         "targetEnabled": plan.target_enabled,
         "allowEmptySelection": plan.allow_empty_selection,
         "providerReach": plan.provider_reach,
         "coverage": plan.provider_coverage,
+        "providerCoverage": plan.provider_coverage,
         "acknowledgement": plan.acknowledgement,
         "lifecycle": plan.lifecycle,
         "applyMode": "fingerprint-required",
@@ -4088,6 +4502,8 @@ fn tool_title(name: &str) -> &'static str {
         "unpin_validate_profile" => "Validate Unpin profile",
         "unpin_plan_profile_policy" => "Plan Unpin profile policy",
         "unpin_apply_profile_policy" => "Request Unpin profile policy apply",
+        "unpin_plan_profile_provider" => "Plan Unpin provider profile operation",
+        "unpin_apply_profile_provider" => "Request Unpin provider profile apply",
         "unpin_get_capability_locks" => "Get Unpin capability locks",
         "unpin_plan_capability_lock" => "Plan Unpin capability lock",
         "unpin_apply_capability_lock" => "Request Unpin capability lock apply",
@@ -4170,6 +4586,12 @@ fn tool_description(name: &str) -> &'static str {
         }
         "unpin_apply_profile_policy" => {
             "Validate an exact profile policy fingerprint and return a CLI human-approval handoff without writing."
+        }
+        "unpin_plan_profile_provider" => {
+            "Plan a named compiled profile for the explicitly reviewed provider reach without writing."
+        }
+        "unpin_apply_profile_provider" => {
+            "Validate an exact provider-profile reach fingerprint and return a schema-v2 CLI human-approval handoff without writing."
         }
         "unpin_get_capability_locks" => {
             "Return global provider capability lock revisions and conservative enforcement evidence without writing."
@@ -4351,7 +4773,14 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
                 "limit": { "type": "integer", "minimum": 1 }
             }
         }),
-        "unpin_get_control_status" | "unpin_list_catalog" => json!({
+        "unpin_get_control_status" => json!({
+            "type": "object",
+            "properties": {
+                "operationId": non_empty_string_schema()
+            },
+            "additionalProperties": false
+        }),
+        "unpin_list_catalog" => json!({
             "type": "object",
             "properties": {},
             "additionalProperties": false
@@ -4392,6 +4821,8 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
         "unpin_apply_hook_trust" => control_hook_trust_schema(&provider_ids, true),
         "unpin_plan_profile_policy" => control_profile_schema(&provider_ids, false),
         "unpin_apply_profile_policy" => control_profile_schema(&provider_ids, true),
+        "unpin_plan_profile_provider" => control_profile_provider_schema(&provider_ids, false),
+        "unpin_apply_profile_provider" => control_profile_provider_schema(&provider_ids, true),
         "unpin_get_capability_locks" => json!({
             "type": "object",
             "properties": {
@@ -4496,6 +4927,43 @@ fn control_profile_schema(provider_ids: &[&str], apply: bool) -> Value {
             "mode": string_enum(&["native", "gateway"]),
             "scope": string_enum(&["global", "repository", "workspace"]),
             "provider": string_enum(provider_ids),
+            "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
+            "planFingerprint": non_empty_string_schema()
+        },
+        "additionalProperties": false
+    })
+}
+
+fn control_profile_provider_schema(provider_ids: &[&str], apply: bool) -> Value {
+    let mut required = vec![json!("profileId"), json!("mode"), json!("providerReach")];
+    if apply {
+        required.push(json!("operationId"));
+        required.push(json!("planFingerprint"));
+    }
+    json!({
+        "type": "object",
+        "required": required,
+        "properties": {
+            "profileId": non_empty_string_schema(),
+            "mode": string_enum(&["native", "gateway"]),
+            "scope": string_enum(&["global", "repository", "workspace"]),
+            "provider": string_enum(provider_ids),
+            "providerReach": {
+                "oneOf": [
+                    { "type": "string", "enum": ["all", "all-providers", "omitted"] },
+                    {
+                        "type": "object",
+                        "required": ["mode", "provider"],
+                        "properties": {
+                            "mode": { "type": "string", "enum": ["selected", "selected-provider"] },
+                            "provider": string_enum(provider_ids),
+                            "provenance": { "type": "string" }
+                        },
+                        "additionalProperties": false
+                    }
+                ]
+            },
+            "operationId": non_empty_string_schema(),
             "confirm": { "type": "boolean", "description": "Compatibility field only; never authorizes MCP mutation." },
             "planFingerprint": non_empty_string_schema()
         },
@@ -4632,6 +5100,8 @@ fn tool_annotations(name: &str) -> Value {
         | "unpin_validate_profile"
         | "unpin_plan_profile_policy"
         | "unpin_apply_profile_policy"
+        | "unpin_plan_profile_provider"
+        | "unpin_apply_profile_provider"
         | "unpin_get_capability_locks"
         | "unpin_plan_capability_lock"
         | "unpin_apply_capability_lock"

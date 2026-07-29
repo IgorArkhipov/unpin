@@ -3813,7 +3813,7 @@ fn toggle_plans_skill_disable_json_dry_run() {
     assert_eq!(value["providerReach"]["selected"]["provider"], "claude");
     assert_eq!(
         value["providerReach"]["selected"]["provenance"],
-        "exact-individual-target"
+        "explicit-input"
     );
     assert_eq!(
         value["providerCoverage"]["entries"]
@@ -5455,6 +5455,8 @@ fn mcp_once_lists_stable_tool_surface() {
             "unpin_validate_profile",
             "unpin_plan_profile_policy",
             "unpin_apply_profile_policy",
+            "unpin_plan_profile_provider",
+            "unpin_apply_profile_provider",
             "unpin_get_capability_locks",
             "unpin_plan_capability_lock",
             "unpin_apply_capability_lock",

@@ -2724,6 +2724,195 @@ fn control_descriptors_accept_profile_ids_and_profile_bound_hook_listing() {
 }
 
 #[test]
+fn profile_provider_mcp_schema_and_reach_authority_are_bound() {
+    let context = context();
+    let plan = tool_descriptor(&context, "unpin_plan_profile_provider");
+    assert_eq!(
+        required_input_fields(&plan),
+        vec!["profileId", "mode", "providerReach"]
+    );
+    assert_eq!(plan["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        tool_descriptor(&context, "unpin_apply_profile_provider")["inputSchema"]["required"],
+        json!([
+            "profileId",
+            "mode",
+            "providerReach",
+            "operationId",
+            "planFingerprint"
+        ])
+    );
+
+    let pinned = context_for_provider(ProviderId::Codex);
+    let pinned_plan = tool_descriptor(&pinned, "unpin_plan_profile_provider");
+    assert_eq!(
+        pinned_plan["inputSchema"]["properties"]["providerReach"]["oneOf"][1]["required"],
+        json!(["mode"]),
+        "a pinned connection supplies selected-provider authority"
+    );
+}
+
+#[test]
+fn profile_provider_mcp_rejects_unbound_or_widened_reach() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let context = context_with_roots(fixture_copy.path(), &app_state_root);
+    let definition = ProfileDefinition {
+        version: PROFILE_DEFINITION_VERSION,
+        id: "mcp-provider-reach".to_string(),
+        display_name: "MCP provider reach".to_string(),
+        description: None,
+        members: Vec::new(),
+        provider_members: std::collections::BTreeMap::new(),
+        supported_providers: [ProviderId::Codex].into_iter().collect(),
+    };
+    ProfileStore::new(&context.app_state_root)
+        .save_global_definition(
+            &definition,
+            None,
+            OwnerGeneration::new("mcp-profile-provider-reach", 1).expect("owner"),
+        )
+        .expect("save profile");
+
+    let omitted = call_tool_error(
+        &context,
+        "unpin_plan_profile_provider",
+        json!({"profileId": definition.id, "mode": "native"}),
+    );
+    assert!(omitted.contains("selected provider"), "{omitted}");
+
+    let mut pinned = context_with_roots(fixture_copy.path(), &app_state_root);
+    pinned.provider_scope = McpProviderScope::Provider(ProviderId::Codex);
+    let widened = call_tool_error(
+        &pinned,
+        "unpin_plan_profile_provider",
+        json!({
+            "profileId": "mcp-provider-reach",
+            "mode": "native",
+            "providerReach": "all"
+        }),
+    );
+    assert!(widened.contains("widen"), "{widened}");
+
+    let conflicting = call_tool_error(
+        &pinned,
+        "unpin_plan_profile_provider",
+        json!({
+            "profileId": "mcp-provider-reach",
+            "mode": "native",
+            "providerReach": {"mode": "selected", "provider": "claude"}
+        }),
+    );
+    assert!(conflicting.contains("conflicts with"), "{conflicting}");
+}
+
+#[test]
+fn profile_provider_mcp_handoff_binds_operation_and_fingerprint() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let context = context_with_roots(fixture_copy.path(), &app_state_root);
+    let definition = ProfileDefinition {
+        version: PROFILE_DEFINITION_VERSION,
+        id: "mcp-profile-provider".to_string(),
+        display_name: "MCP profile provider".to_string(),
+        description: None,
+        members: Vec::new(),
+        provider_members: std::collections::BTreeMap::new(),
+        supported_providers: [ProviderId::Claude, ProviderId::Codex]
+            .into_iter()
+            .collect(),
+    };
+    ProfileStore::new(&context.app_state_root)
+        .save_global_definition(
+            &definition,
+            None,
+            OwnerGeneration::new("mcp-profile-provider", 1).expect("owner"),
+        )
+        .expect("save profile");
+
+    let arguments = json!({
+        "profileId": definition.id,
+        "mode": "gateway",
+        "scope": "global",
+        "providerReach": "all"
+    });
+    let planned = call_tool(&context, "unpin_plan_profile_provider", arguments.clone());
+    assert_eq!(planned["schemaVersion"], 2);
+    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["operation"]["schemaVersion"], 2);
+    assert_eq!(planned["operation"]["operationKind"], "apply-profile");
+    assert_eq!(
+        planned["operation"]["providerReach"],
+        planned["providerReach"]
+    );
+    assert_eq!(
+        planned["operation"]["providerCoverage"],
+        planned["providerCoverage"]
+    );
+    assert_eq!(planned["plan"]["coverage"], planned["providerCoverage"]);
+    assert_eq!(planned["targets"].as_array().expect("targets").len(), 2);
+    let operation_id = planned["operationId"].as_str().expect("operation id");
+    let fingerprint = planned["planFingerprint"].as_str().expect("fingerprint");
+    assert_eq!(operation_id, format!("profile-provider-{fingerprint}"));
+
+    let mut wrong_operation = arguments.as_object().expect("arguments").clone();
+    wrong_operation.insert("operationId".to_string(), json!("profile-provider-wrong"));
+    wrong_operation.insert("planFingerprint".to_string(), json!(fingerprint));
+    let error = call_tool_error(
+        &context,
+        "unpin_apply_profile_provider",
+        serde_json::Value::Object(wrong_operation),
+    );
+    assert!(error.contains("operation id does not match"), "{error}");
+
+    let mut apply = arguments.as_object().expect("arguments").clone();
+    apply.insert("operationId".to_string(), json!(operation_id));
+    apply.insert("planFingerprint".to_string(), json!(fingerprint));
+    let handoff = call_tool(
+        &context,
+        "unpin_apply_profile_provider",
+        serde_json::Value::Object(apply),
+    );
+    assert_eq!(handoff["status"], "human-action-required");
+    assert_eq!(handoff["operationId"], operation_id);
+    assert_eq!(handoff["planFingerprint"], fingerprint);
+    assert_eq!(handoff["operation"]["operationId"], operation_id);
+    assert_eq!(handoff["operation"]["planFingerprint"], fingerprint);
+    assert_eq!(handoff["operation"]["expectedLifecycle"], "applied");
+    assert!(!app_state.path().join("policies").exists());
+}
+
+#[test]
+fn control_status_operation_id_is_optional_and_non_disclosing_without_journal() {
+    let context = context();
+    let ordinary = call_tool(&context, "unpin_get_control_status", json!({}));
+    assert_eq!(ordinary["status"], "ok");
+    let filtered = call_tool(
+        &context,
+        "unpin_get_control_status",
+        json!({"operationId": "missing-operation"}),
+    );
+    assert_eq!(filtered["status"], "ok");
+    assert!(
+        filtered["control"]["operations"]
+            .as_array()
+            .expect("operations")
+            .iter()
+            .all(|operation| operation.get("reachAware").is_none())
+    );
+    let error = call_tool_error(
+        &context,
+        "unpin_get_control_status",
+        json!({"operationId": ""}),
+    );
+    assert!(error.contains("non-empty string"), "{error}");
+}
+
+#[test]
 fn bulk_apply_descriptor_requires_review_fields() {
     let context = context();
 

@@ -382,6 +382,64 @@ pub fn project_reach_aware_operations(
     Ok(projections)
 }
 
+/// Attach one authorized reach-aware projection to a generic control status.
+///
+/// The generic control response is a schema-v1 contract and intentionally
+/// remains unchanged when no operation id is requested.  A caller that has a
+/// specific operation id may opt into the schema-v2 nested projection, but
+/// only after the journal's principal, audience, and transfer capability have
+/// been authenticated.  Authorization failures and missing records are
+/// indistinguishable from an empty result so an operation id cannot be used
+/// to probe another connection's journals.
+pub fn attach_reach_aware_status_for_operation(
+    control: &mut ControlStatus,
+    journals: &[TransitionJournal],
+    operation_id: Option<&str>,
+    authorization: &ReachAwareStatusAuthorization,
+    authority_key: &SessionAuthorityKey,
+) -> Result<(), ControlStatusError> {
+    let Some(operation_id) = operation_id else {
+        return Ok(());
+    };
+    if operation_id.is_empty() || operation_id.chars().any(char::is_control) {
+        return Err(ControlStatusError::ReachAwareAuthorization(
+            "operation id is invalid".to_string(),
+        ));
+    }
+
+    let filter = ReachAwareStatusFilter {
+        operation_id: Some(operation_id.to_string()),
+        ..ReachAwareStatusFilter::default()
+    };
+    let projections =
+        project_reach_aware_operations(journals, &filter, authorization, authority_key)?;
+    if projections.len() > 1 {
+        return Err(ControlStatusError::ReachAwareRecord(
+            "multiple authorized reach-aware records match operation id".to_string(),
+        ));
+    }
+    let Some(projection) = projections.into_iter().next() else {
+        // Do not disclose whether the operation is absent, legacy, or outside
+        // the caller's authenticated connection boundary.
+        return Ok(());
+    };
+
+    let Some(operation) = control
+        .operations
+        .iter_mut()
+        .find(|operation| operation.operation_id == projection.operation_id)
+    else {
+        // The status builder and journal store normally use the same
+        // workspace filter.  Treat a mismatch as non-disclosing rather than
+        // returning a second operation lookup oracle.
+        return Ok(());
+    };
+    operation.recovery_required = operation.recovery_required
+        || projection.lifecycle == ProviderReachLifecycle::RecoveryRequired;
+    operation.reach_aware = Some(projection);
+    Ok(())
+}
+
 fn authorize_reach_aware_status(
     journal: &TransitionJournal,
     envelope: &ReachAwareControlOperationEnvelope,

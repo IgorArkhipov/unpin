@@ -140,6 +140,11 @@ this command in the host's MCP configuration instead of running it by hand.
 Replace `zed` with the agent host (`claude`, `codex`, `cursor`, or `opencode`).
 The provider pin is a hard boundary for every MCP tool. Use `--provider all`
 only when the connection intentionally administers every supported provider.
+Reach-aware item, bulk, inventory-group, and named-profile mutations use
+schema-v2 plans with an explicit `Selected provider` or `All providers` reach.
+Review the returned provider coverage and preserve the exact operation ID and
+plan fingerprint through the CLI/TUI handoff and status lookup; partial,
+blocked/no-targets, and recovery-required results remain distinct.
 
 The [MCP setup guide](docs/MCP.md) has copy-ready configuration for Codex,
 Claude Code, Cursor, OpenCode, and Zed; explains Pi's native-MCP limitation;
