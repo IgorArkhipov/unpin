@@ -25,6 +25,7 @@ const LEASE_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-lease-v2\0";
 const LAUNCH_CONTROL_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-launch-control-v1\0";
 const INVENTORY_GROUP_AUTHENTICATION_PURPOSE: &[u8] =
     b"unpin-inventory-group-session-authority-v1\0";
+const REACH_AWARE_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-reach-aware-operation-v2\0";
 
 #[derive(Clone)]
 pub struct SessionAuthorityKey([u8; SECRET_BYTES]);
@@ -67,6 +68,16 @@ impl SessionAuthorityKey {
 
     pub(crate) fn verify_inventory_group(&self, payload: &[u8], tag: &str) -> Result<(), String> {
         self.verify(INVENTORY_GROUP_AUTHENTICATION_PURPOSE, payload, tag)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn authenticate_reach_aware(&self, payload: &[u8]) -> Result<String, String> {
+        self.authenticate(REACH_AWARE_AUTHENTICATION_PURPOSE, payload)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn verify_reach_aware(&self, payload: &[u8], tag: &str) -> Result<(), String> {
+        self.verify(REACH_AWARE_AUTHENTICATION_PURPOSE, payload, tag)
             .map_err(|error| error.to_string())
     }
 

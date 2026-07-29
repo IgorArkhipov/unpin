@@ -486,6 +486,7 @@ fn hook_trust_is_profile_bound_and_visible_as_stored_decision() {
         description: None,
         members: vec![hook_capability_id],
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let compiled = compile_profile(&definition, &catalog, ProfileSourceScope::Global)
         .expect("compile profile");
@@ -894,6 +895,7 @@ fn detached_live_profile_apply_fails_before_mutation() {
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     ProfileStore::new(&state)
         .save_global_definition(
@@ -986,6 +988,7 @@ fn fixture_credentials_cannot_authorize_non_temporary_profile_scope() {
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     ProfileStore::new(&state)
         .save_global_definition(
@@ -1061,6 +1064,7 @@ fn profile_list_and_apply_use_reviewed_next_session_policy_plan() {
         description: Some("Profile surface test".to_string()),
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     ProfileStore::new(&state)
         .save_global_definition(
@@ -1679,6 +1683,7 @@ while [ ! -f "$release" ]; do sleep 0.02; done
                     description: None,
                     members: Vec::new(),
                     provider_members: Default::default(),
+                    supported_providers: Default::default(),
                 },
                 &Catalog::default(),
                 ProfileSourceScope::Workspace,
@@ -2383,6 +2388,8 @@ fn list_discovers_explicit_live_style_roots_without_fixture_root() {
         .arg("list")
         .args(["--home-root"])
         .arg(home_root.path())
+        .args(["--codex-root"])
+        .arg(home_root.path().join(".codex"))
         .args(["--project-root"])
         .arg(project_root.path())
         .args(["--cursor-root"])
@@ -2796,6 +2803,8 @@ fn snapshot_discovers_explicit_live_style_roots_without_fixture_root() {
         .arg("snapshot")
         .args(["--home-root"])
         .arg(home_root.path())
+        .args(["--codex-root"])
+        .arg(home_root.path().join(".codex"))
         .args(["--project-root"])
         .arg(project_root.path())
         .args(["--cursor-root"])
@@ -2882,13 +2891,13 @@ fn toggle_plans_skill_disable_human_dry_run() {
         .arg(app_state.path())
         .args([
             "--provider",
-            "claude",
+            "pi",
             "--kind",
             "skill",
             "--layer",
             "project",
             "--id",
-            "claude:project:skill:example-claude-skill",
+            "pi:project:skill:example-pi-project-skill",
         ])
         .output()
         .expect("toggle output");
@@ -2898,13 +2907,48 @@ fn toggle_plans_skill_disable_human_dry_run() {
 
     assert!(stdout.contains("status: dry-run"));
     assert!(stdout.contains("targetEnabled: false"));
-    assert!(stdout.contains("claude:project:skill:example-claude-skill"));
+    assert!(stdout.contains("pi:project:skill:example-pi-project-skill"));
     assert!(stdout.contains("rename path"));
-    assert!(stdout.contains("/vault/claude/project/skill/"));
+    assert!(stdout.contains("/vault/pi/project/skill/"));
     assert!(stdout.contains("affectedTargets:"));
     assert!(stdout.contains("no writes were performed"));
     assert!(!stdout.contains("target enabled:"));
     assert!(!stdout.contains("affected targets:"));
+    assert!(!app_state.path().join("vault").exists());
+}
+
+#[test]
+fn toggle_blocks_shared_skill_outside_selected_provider_reach() {
+    let app_state = TempDir::new().expect("temp app state");
+
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["toggle", "--fixture-root"])
+        .arg(fixtures_root())
+        .args(["--app-state-root"])
+        .arg(app_state.path())
+        .args([
+            "--provider",
+            "claude",
+            "--kind",
+            "skill",
+            "--layer",
+            "project",
+            "--id",
+            "claude:project:skill:example-claude-skill",
+            "--json",
+        ])
+        .output()
+        .expect("toggle output");
+
+    assert_eq!(output.status.code(), Some(1));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("toggle stdout is json");
+    assert_eq!(value["status"], "blocked");
+    assert_eq!(
+        value["reason"],
+        "native toggle blocked: shared-source-crosses-provider-reach"
+    );
     assert!(!app_state.path().join("vault").exists());
 }
 
@@ -3783,13 +3827,13 @@ fn toggle_plans_skill_disable_json_dry_run() {
         .arg(app_state.path())
         .args([
             "--provider",
-            "claude",
+            "pi",
             "--kind",
             "skill",
             "--layer",
             "project",
             "--id",
-            "claude:project:skill:example-claude-skill",
+            "pi:project:skill:example-pi-project-skill",
             "--json",
         ])
         .output()
@@ -3802,11 +3846,24 @@ fn toggle_plans_skill_disable_json_dry_run() {
 
     let value: serde_json::Value =
         serde_json::from_slice(&output.stdout).expect("toggle stdout is json");
+    assert_eq!(value["statusVersion"], 2);
     assert_eq!(value["status"], "dry-run");
     assert_eq!(value["targetEnabled"], false);
+    assert_eq!(value["providerReach"]["selected"]["provider"], "pi");
+    assert_eq!(
+        value["providerReach"]["selected"]["provenance"],
+        "explicit-input"
+    );
+    assert_eq!(
+        value["providerCoverage"]["entries"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(
         value["selection"]["id"],
-        "claude:project:skill:example-claude-skill"
+        "pi:project:skill:example-pi-project-skill"
     );
     assert_eq!(value["operations"][0]["type"], "renamePath");
     assert!(
@@ -3822,6 +3879,124 @@ fn toggle_plans_skill_disable_json_dry_run() {
     assert!(value.get("backupId").is_none());
     assert!(value.get("reason").is_none());
     assert!(!app_state.path().join("vault").exists());
+}
+
+#[test]
+fn bulk_handoff_apply_and_status_preserve_reviewed_reach() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let fixture_root = fs::canonicalize(fixture_copy.path()).expect("canonical fixture copy root");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    let item_id = "codex:global:skill:admin/example-codex-admin-skill";
+
+    let omitted_reach = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "plan", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args([
+            "--provider",
+            "codex",
+            "--id",
+            item_id,
+            "--disable",
+            "--json",
+        ])
+        .output()
+        .expect("bulk plan without reach");
+    assert_eq!(omitted_reach.status.code(), Some(3));
+    let omitted: serde_json::Value =
+        serde_json::from_slice(&omitted_reach.stdout).expect("omitted reach JSON");
+    assert_eq!(omitted["status"], "blocked");
+    assert!(
+        omitted["reason"]
+            .as_str()
+            .expect("omitted reach reason")
+            .contains("selected provider")
+    );
+
+    let handoff = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "handoff", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args([
+            "--provider",
+            "codex",
+            "--selected-provider",
+            "codex",
+            "--reach",
+            "selected",
+            "--id",
+            item_id,
+            "--disable",
+            "--json",
+        ])
+        .output()
+        .expect("bulk handoff");
+    assert!(
+        handoff.status.success(),
+        "bulk handoff should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value =
+        serde_json::from_slice(&handoff.stdout).expect("bulk handoff JSON");
+    assert_eq!(handoff["statusVersion"], 2);
+    assert_eq!(handoff["providerReach"]["selected"]["provider"], "codex");
+    assert_eq!(
+        handoff["providerReach"]["selected"]["provenance"],
+        "explicit-input"
+    );
+    let operation_id = handoff["operationId"].as_str().expect("bulk operation id");
+    let fingerprint = handoff["planFingerprint"]
+        .as_str()
+        .expect("bulk plan fingerprint");
+    assert_eq!(handoff["handoff"]["operationId"], operation_id);
+    assert_eq!(handoff["handoff"]["planFingerprint"], fingerprint);
+
+    let applied = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "apply", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id])
+        .args(["--plan-fingerprint", fingerprint, "--confirm", "--json"])
+        .output()
+        .expect("bulk apply");
+    assert!(
+        applied.status.success(),
+        "bulk apply should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: serde_json::Value =
+        serde_json::from_slice(&applied.stdout).expect("bulk apply JSON");
+    assert_eq!(applied["statusVersion"], 2);
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["operationId"], operation_id);
+    assert_eq!(applied["planFingerprint"], fingerprint);
+
+    let status = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["bulk", "status", "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id, "--json"])
+        .output()
+        .expect("bulk status");
+    assert!(status.status.success());
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("bulk status JSON");
+    assert_eq!(status["statusVersion"], 2);
+    assert_eq!(status["status"], "applied");
+    assert_eq!(status["operationId"], operation_id);
+    assert_eq!(status["result"]["lifecycle"], "applied");
 }
 
 #[test]
@@ -3885,11 +4060,11 @@ fn toggle_apply_moves_skill_and_reports_backup_id() {
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let original_skill = fixture_copy
         .path()
-        .join("claude")
+        .join("pi")
         .join("project")
-        .join(".claude")
+        .join(".pi")
         .join("skills")
-        .join("example-claude-skill")
+        .join("example-pi-project-skill")
         .join("SKILL.md");
     assert!(original_skill.exists());
 
@@ -3901,13 +4076,13 @@ fn toggle_apply_moves_skill_and_reports_backup_id() {
             .arg(app_state.path())
             .args([
                 "--provider",
-                "claude",
+                "pi",
                 "--kind",
                 "skill",
                 "--layer",
                 "project",
                 "--id",
-                "claude:project:skill:example-claude-skill",
+                "pi:project:skill:example-pi-project-skill",
             ]);
     });
 
@@ -3938,7 +4113,7 @@ fn toggle_apply_moves_skill_and_reports_backup_id() {
         app_state
             .path()
             .join("vault")
-            .join("claude")
+            .join("pi")
             .join("project")
             .join("skill"),
     )
@@ -4843,11 +5018,11 @@ fn restore_restores_skill_backup_created_by_toggle_apply() {
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let original_skill = fixture_copy
         .path()
-        .join("claude")
+        .join("pi")
         .join("project")
-        .join(".claude")
+        .join(".pi")
         .join("skills")
-        .join("example-claude-skill")
+        .join("example-pi-project-skill")
         .join("SKILL.md");
 
     let apply = run_reviewed_toggle(false, |command| {
@@ -4858,13 +5033,13 @@ fn restore_restores_skill_backup_created_by_toggle_apply() {
             .arg(app_state.path())
             .args([
                 "--provider",
-                "claude",
+                "pi",
                 "--kind",
                 "skill",
                 "--layer",
                 "project",
                 "--id",
-                "claude:project:skill:example-claude-skill",
+                "pi:project:skill:example-pi-project-skill",
             ]);
     });
     assert!(apply.status.success(), "toggle apply should succeed");
@@ -4899,7 +5074,7 @@ fn restore_restores_skill_backup_created_by_toggle_apply() {
     let vault_skill_root = app_state
         .path()
         .join("vault")
-        .join("claude")
+        .join("pi")
         .join("project")
         .join("skill");
     assert!(
@@ -4923,11 +5098,11 @@ fn restore_renders_json_with_string_targets() {
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let original_skill = fixture_copy
         .path()
-        .join("claude")
+        .join("pi")
         .join("project")
-        .join(".claude")
+        .join(".pi")
         .join("skills")
-        .join("example-claude-skill")
+        .join("example-pi-project-skill")
         .join("SKILL.md");
 
     let apply = run_reviewed_toggle(false, |command| {
@@ -4938,13 +5113,13 @@ fn restore_renders_json_with_string_targets() {
             .arg(app_state.path())
             .args([
                 "--provider",
-                "claude",
+                "pi",
                 "--kind",
                 "skill",
                 "--layer",
                 "project",
                 "--id",
-                "claude:project:skill:example-claude-skill",
+                "pi:project:skill:example-pi-project-skill",
             ]);
     });
     assert!(apply.status.success(), "toggle apply should succeed");
@@ -5011,11 +5186,11 @@ fn restore_uses_user_config_app_state_when_app_state_arg_is_omitted() {
     );
     let original_skill = fixture_copy
         .path()
-        .join("claude")
+        .join("pi")
         .join("project")
-        .join(".claude")
+        .join(".pi")
         .join("skills")
-        .join("example-claude-skill")
+        .join("example-pi-project-skill")
         .join("SKILL.md");
 
     let apply = run_reviewed_toggle(false, |command| {
@@ -5026,13 +5201,13 @@ fn restore_uses_user_config_app_state_when_app_state_arg_is_omitted() {
             .arg(&app_state)
             .args([
                 "--provider",
-                "claude",
+                "pi",
                 "--kind",
                 "skill",
                 "--layer",
                 "project",
                 "--id",
-                "claude:project:skill:example-claude-skill",
+                "pi:project:skill:example-pi-project-skill",
             ]);
     });
     assert!(apply.status.success(), "toggle apply should succeed");
@@ -5077,7 +5252,7 @@ fn mcp_restore_plan_fingerprint_is_accepted_by_cli_apply() {
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let original_skill = fixture_copy
         .path()
-        .join("claude/project/.claude/skills/example-claude-skill/SKILL.md");
+        .join("pi/project/.pi/skills/example-pi-project-skill/SKILL.md");
     let disabled = run_reviewed_toggle(false, |command| {
         command
             .args(["--fixture-root"])
@@ -5086,13 +5261,13 @@ fn mcp_restore_plan_fingerprint_is_accepted_by_cli_apply() {
             .arg(app_state.path())
             .args([
                 "--provider",
-                "claude",
+                "pi",
                 "--kind",
                 "skill",
                 "--layer",
                 "project",
                 "--id",
-                "claude:project:skill:example-claude-skill",
+                "pi:project:skill:example-pi-project-skill",
             ]);
     });
     assert!(disabled.status.success(), "toggle should create backup");
@@ -5319,6 +5494,8 @@ fn mcp_once_lists_stable_tool_surface() {
             "unpin_validate_profile",
             "unpin_plan_profile_policy",
             "unpin_apply_profile_policy",
+            "unpin_plan_profile_provider",
+            "unpin_apply_profile_provider",
             "unpin_get_capability_locks",
             "unpin_plan_capability_lock",
             "unpin_apply_capability_lock",
@@ -5463,10 +5640,10 @@ fn mcp_once_plans_single_skill_toggle() {
         "params": {
             "name": "unpin_plan_toggle_item",
             "arguments": {
-                "provider": "claude",
+                "provider": "pi",
                 "kind": "skill",
                 "layer": "project",
-                "id": "claude:project:skill:example-claude-skill",
+                "id": "pi:project:skill:example-pi-project-skill",
                 "targetEnabled": false
             }
         }
@@ -5492,7 +5669,7 @@ fn mcp_once_plans_single_skill_toggle() {
     assert_eq!(body["result"]["structuredContent"]["status"], "planned");
     assert_eq!(
         body["result"]["structuredContent"]["selection"]["id"],
-        "claude:project:skill:example-claude-skill"
+        "pi:project:skill:example-pi-project-skill"
     );
     assert!(body["result"]["structuredContent"].get("writes").is_none());
     assert!(!app_state.path().join("vault").exists());
@@ -5505,7 +5682,7 @@ fn mcp_toggle_plan_fingerprint_is_accepted_by_cli_apply() {
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let skill = fixture_copy
         .path()
-        .join("claude/project/.claude/skills/example-claude-skill/SKILL.md");
+        .join("pi/project/.pi/skills/example-pi-project-skill/SKILL.md");
     let request = line_request(serde_json::json!({
         "jsonrpc": "2.0",
         "id": "toggle-plan",
@@ -5513,10 +5690,10 @@ fn mcp_toggle_plan_fingerprint_is_accepted_by_cli_apply() {
         "params": {
             "name": "unpin_plan_toggle_item",
             "arguments": {
-                "provider": "claude",
+                "provider": "pi",
                 "kind": "skill",
                 "layer": "project",
-                "id": "claude:project:skill:example-claude-skill",
+                "id": "pi:project:skill:example-pi-project-skill",
                 "targetEnabled": false
             }
         }
@@ -5550,13 +5727,13 @@ fn mcp_toggle_plan_fingerprint_is_accepted_by_cli_apply() {
         .arg(app_state.path())
         .args([
             "--provider",
-            "claude",
+            "pi",
             "--kind",
             "skill",
             "--layer",
             "project",
             "--id",
-            "claude:project:skill:example-claude-skill",
+            "pi:project:skill:example-pi-project-skill",
             "--apply",
             "--confirm",
             "--plan-fingerprint",

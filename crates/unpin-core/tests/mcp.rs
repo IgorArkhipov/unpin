@@ -29,7 +29,7 @@ use unpin_core::{
         UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME, UNPIN_MCP_TOOL_NAMES, handle_mcp_request,
         handle_stdio_request_once, handle_stdio_requests,
     },
-    mutation::{BackupAuthenticationKey, authenticate_legacy_backup},
+    mutation::{BackupAuthenticationKey, BulkToggleController, authenticate_legacy_backup},
     profiles::{
         CapabilityLockSnapshot, PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope,
         ProfileStore, compile_profile,
@@ -418,6 +418,7 @@ fn validates_inline_profile_without_materializing_state() {
         description: None,
         members: vec![capability_id.clone()],
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
 
     let validated = call_tool(
@@ -553,7 +554,7 @@ fn stdio_loop_skips_all_idless_message_responses() {
 }
 
 #[test]
-fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
+fn plans_bulk_toggle_items_with_fingerprint_and_separate_no_op_items() {
     let planned = call_tool(
         &context(),
         "unpin_plan_toggle_items",
@@ -562,7 +563,12 @@ fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
                 "providers": ["claude"],
                 "kinds": ["plugin"]
             },
-            "targetEnabled": false
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            },
+            "acknowledgeWholeInventory": true
         }),
     );
 
@@ -611,7 +617,7 @@ fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
             .as_array()
             .expect("perItemPlans")
             .len(),
-        actionable.len()
+        planned["includedCount"].as_u64().expect("included count") as usize
     );
     assert_eq!(planned["warnings"], json!([]));
     assert!(
@@ -651,18 +657,16 @@ fn plans_bulk_toggle_items_with_fingerprint_and_blocked_items() {
             )
     );
     assert!(
+        planned["noOpItems"]
+            .as_array()
+            .expect("noOpItems")
+            .iter()
+            .any(|entry| entry["id"] == "claude:project:tool:settings-local:local-shell")
+    );
+    assert!(
         planned["blockedItems"]
             .as_array()
-            .expect("blockedItems")
-            .iter()
-            .any(
-                |entry| entry["item"]["id"] == "claude:project:tool:settings-local:local-shell"
-                    && entry["reasonCode"] == "already-in-desired-state"
-                    && entry["message"]
-                        .as_str()
-                        .expect("blocked message")
-                        .contains("already")
-            )
+            .is_some_and(Vec::is_empty)
     );
 }
 
@@ -683,6 +687,121 @@ fn rejects_malformed_bulk_selector_fields() {
     assert_eq!(
         response["reason"],
         "selector.providers must be an array of strings"
+    );
+}
+
+#[test]
+fn bulk_preflight_rejects_missing_reach_and_provider_only_selectors() {
+    let missing_reach = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "ids": ["claude:global:tool:settings:safe-shell"]
+            },
+            "targetEnabled": false
+        }),
+    );
+    assert_eq!(missing_reach["status"], "blocked");
+    assert_eq!(missing_reach["reasonCode"], "bulk-plan-invalid");
+    assert!(
+        missing_reach["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("selected provider"))
+    );
+
+    let provider_only = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "providers": ["claude"]
+            },
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            },
+            "allowEmptySelection": true
+        }),
+    );
+    assert_eq!(provider_only["status"], "blocked");
+    assert_eq!(
+        provider_only["reasonCode"],
+        "selector-requires-non-provider-criterion"
+    );
+
+    let malformed_reach = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "ids": ["claude:global:tool:settings:safe-shell"]
+            },
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude",
+                "unexpected": true
+            }
+        }),
+    );
+    assert_eq!(malformed_reach["status"], "blocked");
+    assert_eq!(
+        malformed_reach["reason"],
+        "providerReach has unsupported fields"
+    );
+    let spoofed_provenance = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "ids": ["claude:global:tool:settings:safe-shell"]
+            },
+            "targetEnabled": false,
+            "maxItems": 1,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude",
+                "provenance": "pinned-mcp-boundary"
+            }
+        }),
+    );
+    assert_eq!(spoofed_provenance["status"], "blocked");
+    assert_eq!(
+        spoofed_provenance["reason"],
+        "providerReach has unsupported fields"
+    );
+}
+
+#[test]
+fn bulk_whole_inventory_acknowledgement_precedes_reach_filtering() {
+    let response = call_tool(
+        &context(),
+        "unpin_plan_toggle_items",
+        json!({
+            "selector": {
+                "kinds": ["skill"]
+            },
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            }
+        }),
+    );
+
+    assert_eq!(response["status"], "blocked");
+    assert_eq!(
+        response["reasonCode"],
+        "whole-inventory-acknowledgement-required"
+    );
+    assert_eq!(response["acknowledgementRequired"], true);
+    assert!(
+        response["resolvedCounts"]
+            .as_array()
+            .is_some_and(|counts| counts.iter().any(|count| count["provider"] != "claude")),
+        "counts come from the complete matched set before selected-provider filtering"
     );
 }
 
@@ -727,10 +846,10 @@ fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_writing() {
     context.backup_authentication_key = None;
     context.authentication.backup_authentication = McpCredentialReadiness::missing();
     let arguments = json!({
-        "provider": "claude",
+        "provider": "pi",
         "kind": "skill",
         "layer": "project",
-        "id": "claude:project:skill:example-claude-skill",
+        "id": "pi:project:skill:example-pi-project-skill",
         "targetEnabled": false
     });
 
@@ -861,6 +980,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
             "group": "personal:brainstorming",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": "all",
         }),
     );
     assert_eq!(preview["status"], "preview");
@@ -1028,6 +1148,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
                 "group": qualified_name,
                 "targetEnabled": target_enabled,
                 "maxMembers": 10,
+                "providerReach": "all",
             }),
         );
         assert_eq!(result["status"], expected_status);
@@ -1046,6 +1167,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
             "group": "personal:brainstorming",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": "all",
         }),
     );
     assert_eq!(actionable["status"], "actionable");
@@ -1148,6 +1270,7 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
             "group": "personal:brainstorming",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": "all",
         }),
     );
     let plan: unpin_core::groups::GroupTogglePlan =
@@ -1428,6 +1551,7 @@ fn inventory_group_mcp_ambiguity_returns_structured_qualified_candidates() {
                 "group": "collision",
                 "targetEnabled": false,
                 "maxMembers": 10,
+                "providerReach": "all",
             }),
         ),
     ] {
@@ -1441,7 +1565,7 @@ fn inventory_group_mcp_ambiguity_returns_structured_qualified_candidates() {
 }
 
 #[test]
-fn provider_scoped_mcp_redacts_mixed_provider_groups_and_blocks_planning() {
+fn provider_scoped_mcp_redacts_mixed_provider_groups_and_plans_subset() {
     let temp = TempDir::new().expect("temporary provider-scoped group root");
     let root = fs::canonicalize(temp.path()).expect("canonical provider-scoped group root");
     let fixture_root = root.join("fixtures");
@@ -1492,36 +1616,78 @@ fn provider_scoped_mcp_redacts_mixed_provider_groups_and_blocks_planning() {
         .iter()
         .find(|group| group["qualifiedName"] == "personal:mixed-providers")
         .expect("mixed-provider group");
-    assert_eq!(group["contextCompatible"], false);
-    for redacted_field in ["members", "providerCoverage", "counts", "state", "fresh"] {
-        assert!(
-            group.get(redacted_field).is_none(),
-            "context-mismatch group exposed {redacted_field}"
-        );
-    }
+    assert_eq!(group["contextCompatible"], true);
+    assert_eq!(
+        group["members"].as_array().expect("scoped members").len(),
+        1
+    );
+    assert_eq!(group["members"][0]["identity"]["provider"], json!("codex"));
+    assert_eq!(
+        group["counts"]
+            .as_object()
+            .expect("scoped counts")
+            .values()
+            .map(|count| count.as_u64().expect("count"))
+            .sum::<u64>(),
+        1,
+        "aggregate state must not include excluded-provider members"
+    );
+    assert_eq!(group["providerCoverage"], json!(["codex"]));
 
     let shown = call_tool(
         &context,
         "unpin_get_inventory_group",
         json!({"group": "personal:mixed-providers"}),
     );
-    assert_eq!(shown["status"], "context-mismatch");
-    for redacted_field in ["members", "providerCoverage", "counts", "state", "fresh"] {
-        assert!(
-            shown["group"].get(redacted_field).is_none(),
-            "context-mismatch group exposed {redacted_field}"
-        );
-    }
-    let error = call_tool_error(
+    assert_eq!(shown["status"], "ok");
+    assert_eq!(
+        shown["group"]["members"]
+            .as_array()
+            .expect("scoped members")
+            .len(),
+        1
+    );
+    assert_eq!(
+        shown["group"]["counts"]
+            .as_object()
+            .expect("scoped counts")
+            .values()
+            .map(|count| count.as_u64().expect("count"))
+            .sum::<u64>(),
+        1,
+        "detail state must not include excluded-provider members"
+    );
+    assert_eq!(shown["group"]["providerCoverage"], json!(["codex"]));
+    let plan = call_tool(
         &context,
         "unpin_plan_inventory_group",
         json!({
             "group": "personal:mixed-providers",
             "targetEnabled": false,
             "maxMembers": 10,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "codex"
+            }
         }),
     );
-    assert!(error.contains("context"), "{error}");
+    assert_ne!(plan["status"], "blocked");
+    assert_eq!(
+        plan["plan"]["providerReach"]["selected"]["provider"],
+        "codex"
+    );
+    assert_eq!(
+        plan["plan"]["members"]
+            .as_array()
+            .expect("scoped plan members")
+            .len(),
+        1
+    );
+    let encoded = serde_json::to_string(&plan).expect("scoped plan JSON");
+    assert!(
+        !encoded.contains("claude:"),
+        "excluded identity leaked: {encoded}"
+    );
     assert!(!app_state_root.join("backups").exists());
 }
 
@@ -1562,7 +1728,11 @@ fn bulk_apply_requires_fingerprint_and_max_items_but_not_boolean_confirmation() 
             "kinds": ["plugin"],
             "ids": ["claude:global:tool:settings:safe-shell"]
         },
-        "targetEnabled": false
+        "targetEnabled": false,
+        "providerReach": {
+            "mode": "selected",
+            "provider": "claude"
+        }
     });
 
     let unconfirmed = call_tool(&context(), "unpin_apply_toggle_items", selector.clone());
@@ -1626,7 +1796,8 @@ fn bulk_plan_blocks_empty_selection_unless_explicitly_allowed() {
             "selector": {
                 "ids": ["missing-item"]
             },
-            "targetEnabled": false
+            "targetEnabled": false,
+            "providerReach": "all"
         }),
     );
 
@@ -1641,6 +1812,7 @@ fn bulk_plan_blocks_empty_selection_unless_explicitly_allowed() {
                 "ids": ["missing-item"]
             },
             "targetEnabled": false,
+            "providerReach": "all",
             "allowEmptySelection": true
         }),
     );
@@ -1666,6 +1838,7 @@ fn bulk_plan_blocks_empty_selection_unless_explicitly_allowed() {
                 "ids": ["missing-item"]
             },
             "targetEnabled": false,
+            "providerReach": "all",
             "allowEmptySelection": true,
             "requireConfirmation": true,
             "planFingerprint": allowed["planFingerprint"],
@@ -1702,6 +1875,10 @@ fn bulk_apply_blocks_fingerprint_mismatch_without_writes() {
                 "ids": ["claude:global:tool:settings:safe-shell"]
             },
             "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "claude"
+            },
             "requireConfirmation": true,
             "planFingerprint": "sha256:mismatch",
             "maxItems": 1
@@ -1751,9 +1928,17 @@ fn bulk_apply_with_matching_fingerprint_returns_handoff_without_writes() {
             "kinds": ["plugin"],
             "ids": ["claude:global:tool:settings:safe-shell"]
         },
-        "targetEnabled": false
+        "targetEnabled": false,
+        "providerReach": {
+            "mode": "selected",
+            "provider": "claude"
+        }
     });
     let planned = call_tool(&context, "unpin_plan_toggle_items", request.clone());
+    let operation_id = planned["operationId"]
+        .as_str()
+        .expect("operation id")
+        .to_string();
     let fingerprint = planned["planFingerprint"]
         .as_str()
         .expect("plan fingerprint")
@@ -1770,12 +1955,56 @@ fn bulk_apply_with_matching_fingerprint_returns_handoff_without_writes() {
     );
 
     assert_eq!(applied["status"], "human-action-required");
-    assert_eq!(applied["operationKind"], "toggle-items");
+    assert_eq!(applied["schemaVersion"], 2);
+    assert_eq!(applied["operationId"], operation_id);
     assert_eq!(applied["planFingerprint"], fingerprint);
-    assert_eq!(applied["contractVariant"], "legacy-bulk-handoff");
-    assert_eq!(applied["legacyBulkHandoff"], true);
-    assert!(applied.get("controlContractVersion").is_none());
-    assert!(applied.get("operation").is_none());
+    assert_eq!(applied["handoff"]["operationId"], operation_id);
+    assert_eq!(applied["handoff"]["planFingerprint"], fingerprint);
+    assert_eq!(applied["operationV2"]["schemaVersion"], 2);
+    assert_eq!(applied["operationV2"]["family"], "bulk-toggle");
+    assert_eq!(applied["operationV2"]["operationId"], operation_id);
+    assert_eq!(applied["operationV2"]["planFingerprint"], fingerprint);
+    assert!(applied["operationV2"].get("roots").is_some());
+    assert!(applied["operationV2"].get("principal").is_some());
+    assert!(applied["operationV2"].get("payloadReference").is_some());
+    assert!(applied["operationV2"].get("authenticationTag").is_some());
+    assert!(applied.get("legacyBulkHandoff").is_none());
+    let loaded = BulkToggleController::new(&context.app_state_root)
+        .load_handoff(&operation_id)
+        .expect("MCP handoff is loadable by the CLI controller");
+    assert_eq!(loaded.operation_id, operation_id);
+    assert_eq!(loaded.plan_fingerprint, fingerprint);
+
+    let status = call_tool(
+        &context,
+        "unpin_get_control_status",
+        json!({"operationId": operation_id}),
+    );
+    let operations = status["control"]["operations"]
+        .as_array()
+        .expect("filtered operations");
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0]["operationId"], operation_id);
+    assert_eq!(operations[0]["reachAware"]["schemaVersion"], 2);
+
+    let mut pinned = context.clone();
+    pinned.provider_scope = McpProviderScope::Provider(ProviderId::Claude);
+    let pinned_status = call_tool(
+        &pinned,
+        "unpin_get_control_status",
+        json!({"operationId": operation_id}),
+    );
+    let pinned_operations = pinned_status["control"]["operations"]
+        .as_array()
+        .expect("pinned operations");
+    assert_eq!(pinned_operations.len(), 1);
+    assert!(
+        pinned_operations[0]["reachAware"]["providerCoverage"]["entries"]
+            .as_array()
+            .expect("pinned provider coverage")
+            .iter()
+            .all(|entry| entry["provider"] == "claude")
+    );
     assert!(settings_plugin_enabled(&settings_path, "safe-shell"));
     assert!(!app_state.path().join("backups").exists());
 }
@@ -1866,6 +2095,7 @@ fn profile_proposal_tool_is_read_only_metadata_routing_with_human_handoff() {
         description: Some("review changes for correctness and security".to_string()),
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     fs::write(
         profile_directory.join("review.json"),
@@ -1912,6 +2142,7 @@ fn session_launch_plan_returns_exact_argv_handoff_without_writes_or_authority() 
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let profile_directory = unpin_core::config::get_workspace_profiles_dir(&context.project_root);
     fs::create_dir_all(&profile_directory).expect("workspace profile directory");
@@ -2107,6 +2338,7 @@ fn control_mcp_reuses_profile_gateway_and_hook_models_with_human_handoff() {
         description: None,
         members: Vec::new(),
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let store = ProfileStore::new(&app_state_root);
     store
@@ -2344,6 +2576,7 @@ fn hook_trust_mcp_hands_off_and_list_hooks_reports_profile_bound_decision() {
         description: None,
         members: vec![capability_id.clone()],
         provider_members: std::collections::BTreeMap::new(),
+        supported_providers: std::collections::BTreeSet::new(),
     };
     let revision = compile_profile(&definition, &catalog, ProfileSourceScope::Global)
         .expect("compile hook profile");
@@ -2557,6 +2790,201 @@ fn control_descriptors_accept_profile_ids_and_profile_bound_hook_listing() {
             .get("profileDigest")
             .is_some()
     );
+}
+
+#[test]
+fn profile_provider_mcp_schema_and_reach_authority_are_bound() {
+    let context = context();
+    let plan = tool_descriptor(&context, "unpin_plan_profile_provider");
+    assert_eq!(
+        required_input_fields(&plan),
+        vec!["profileId", "mode", "providerReach"]
+    );
+    assert_eq!(plan["annotations"]["readOnlyHint"], true);
+    assert_eq!(
+        tool_descriptor(&context, "unpin_apply_profile_provider")["inputSchema"]["required"],
+        json!([
+            "profileId",
+            "mode",
+            "providerReach",
+            "operationId",
+            "planFingerprint"
+        ])
+    );
+
+    let pinned = context_for_provider(ProviderId::Codex);
+    let pinned_plan = tool_descriptor(&pinned, "unpin_plan_profile_provider");
+    assert_eq!(
+        pinned_plan["inputSchema"]["properties"]["providerReach"]["oneOf"][1]["required"],
+        json!(["mode"]),
+        "a pinned connection supplies selected-provider authority"
+    );
+}
+
+#[test]
+fn profile_provider_mcp_rejects_unbound_or_widened_reach() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let context = context_with_roots(fixture_copy.path(), &app_state_root);
+    let definition = ProfileDefinition {
+        version: PROFILE_DEFINITION_VERSION,
+        id: "mcp-provider-reach".to_string(),
+        display_name: "MCP provider reach".to_string(),
+        description: None,
+        members: Vec::new(),
+        provider_members: std::collections::BTreeMap::new(),
+        supported_providers: [ProviderId::Codex].into_iter().collect(),
+    };
+    ProfileStore::new(&context.app_state_root)
+        .save_global_definition(
+            &definition,
+            None,
+            OwnerGeneration::new("mcp-profile-provider-reach", 1).expect("owner"),
+        )
+        .expect("save profile");
+
+    let omitted = call_tool_error(
+        &context,
+        "unpin_plan_profile_provider",
+        json!({"profileId": definition.id, "mode": "native"}),
+    );
+    assert!(omitted.contains("selected provider"), "{omitted}");
+
+    let mut pinned = context_with_roots(fixture_copy.path(), &app_state_root);
+    pinned.provider_scope = McpProviderScope::Provider(ProviderId::Codex);
+    let widened = call_tool_error(
+        &pinned,
+        "unpin_plan_profile_provider",
+        json!({
+            "profileId": "mcp-provider-reach",
+            "mode": "native",
+            "providerReach": "all"
+        }),
+    );
+    assert!(widened.contains("widen"), "{widened}");
+
+    let conflicting = call_tool_error(
+        &pinned,
+        "unpin_plan_profile_provider",
+        json!({
+            "profileId": "mcp-provider-reach",
+            "mode": "native",
+            "providerReach": {"mode": "selected", "provider": "claude"}
+        }),
+    );
+    assert!(conflicting.contains("conflicts with"), "{conflicting}");
+}
+
+#[test]
+fn profile_provider_mcp_handoff_binds_operation_and_fingerprint() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let context = context_with_roots(fixture_copy.path(), &app_state_root);
+    let definition = ProfileDefinition {
+        version: PROFILE_DEFINITION_VERSION,
+        id: "mcp-profile-provider".to_string(),
+        display_name: "MCP profile provider".to_string(),
+        description: None,
+        members: Vec::new(),
+        provider_members: std::collections::BTreeMap::new(),
+        supported_providers: [ProviderId::Claude, ProviderId::Codex]
+            .into_iter()
+            .collect(),
+    };
+    ProfileStore::new(&context.app_state_root)
+        .save_global_definition(
+            &definition,
+            None,
+            OwnerGeneration::new("mcp-profile-provider", 1).expect("owner"),
+        )
+        .expect("save profile");
+
+    let arguments = json!({
+        "profileId": definition.id,
+        "mode": "gateway",
+        "scope": "global",
+        "providerReach": "all"
+    });
+    let planned = call_tool(&context, "unpin_plan_profile_provider", arguments.clone());
+    assert_eq!(planned["schemaVersion"], 2);
+    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["operation"]["schemaVersion"], 2);
+    assert_eq!(planned["operation"]["operationKind"], "apply-profile");
+    assert_eq!(
+        planned["operation"]["providerReach"],
+        planned["providerReach"]
+    );
+    assert_eq!(
+        planned["operation"]["providerCoverage"],
+        planned["providerCoverage"]
+    );
+    assert_eq!(planned["plan"]["coverage"], planned["providerCoverage"]);
+    let targets = planned["targets"].as_array().expect("targets");
+    assert_eq!(targets.len(), 2);
+    assert!(targets.iter().all(|target| {
+        target["localPresence"].is_string()
+            && target["genericProfileInheritedBefore"].is_boolean()
+            && target["genericPolicyEffect"].is_string()
+            && target["futureActivation"].is_boolean()
+    }));
+    let operation_id = planned["operationId"].as_str().expect("operation id");
+    let fingerprint = planned["planFingerprint"].as_str().expect("fingerprint");
+    assert_eq!(operation_id, format!("profile-provider-{fingerprint}"));
+
+    let mut wrong_operation = arguments.as_object().expect("arguments").clone();
+    wrong_operation.insert("operationId".to_string(), json!("profile-provider-wrong"));
+    wrong_operation.insert("planFingerprint".to_string(), json!(fingerprint));
+    let error = call_tool_error(
+        &context,
+        "unpin_apply_profile_provider",
+        serde_json::Value::Object(wrong_operation),
+    );
+    assert!(error.contains("operation id does not match"), "{error}");
+
+    let mut apply = arguments.as_object().expect("arguments").clone();
+    apply.insert("operationId".to_string(), json!(operation_id));
+    apply.insert("planFingerprint".to_string(), json!(fingerprint));
+    let handoff = call_tool(
+        &context,
+        "unpin_apply_profile_provider",
+        serde_json::Value::Object(apply),
+    );
+    assert_eq!(handoff["status"], "human-action-required");
+    assert_eq!(handoff["operationId"], operation_id);
+    assert_eq!(handoff["planFingerprint"], fingerprint);
+    assert_eq!(handoff["operation"]["operationId"], operation_id);
+    assert_eq!(handoff["operation"]["planFingerprint"], fingerprint);
+    assert_eq!(handoff["operation"]["expectedLifecycle"], "applied");
+    assert!(!app_state.path().join("policies").exists());
+}
+
+#[test]
+fn control_status_operation_id_is_optional_and_non_disclosing_without_journal() {
+    let context = context();
+    let ordinary = call_tool(&context, "unpin_get_control_status", json!({}));
+    assert_eq!(ordinary["status"], "ok");
+    let filtered = call_tool(
+        &context,
+        "unpin_get_control_status",
+        json!({"operationId": "missing-operation"}),
+    );
+    assert_eq!(filtered["status"], "ok");
+    assert!(
+        filtered["control"]["operations"]
+            .as_array()
+            .expect("operations")
+            .is_empty()
+    );
+    let error = call_tool_error(
+        &context,
+        "unpin_get_control_status",
+        json!({"operationId": ""}),
+    );
+    assert!(error.contains("non-empty string"), "{error}");
 }
 
 #[test]
@@ -2823,15 +3251,15 @@ fn legacy_apply_request_gets_versioned_non_mutating_migration_response() {
     copy_dir_all(&fixtures_root(), fixture_copy.path());
     let target = fixture_copy
         .path()
-        .join("claude/project/.claude/skills/example-claude-skill/SKILL.md");
+        .join("pi/project/.pi/skills/example-pi-project-skill/SKILL.md");
     let result = call_tool(
         &context_with_roots(fixture_copy.path(), app_state.path()),
         "unpin_apply_toggle_item",
         json!({
-            "provider": "claude",
+            "provider": "pi",
             "kind": "skill",
             "layer": "project",
-            "id": "claude:project:skill:example-claude-skill",
+            "id": "pi:project:skill:example-pi-project-skill",
             "targetEnabled": false,
             "requireConfirmation": true,
             "confirm": true
@@ -3085,7 +3513,6 @@ fn plans_project_codex_configured_mcp_native_toggle_over_mcp() {
         &context(),
         "unpin_plan_toggle_item",
         json!({
-            "provider": "codex",
             "kind": "mcp",
             "layer": "project",
             "id": "codex:project:configured-mcp:project-docs",
@@ -3098,12 +3525,53 @@ fn plans_project_codex_configured_mcp_native_toggle_over_mcp() {
     assert_eq!(planned["selection"]["layer"], "project");
     assert_eq!(planned["selection"]["enabled"], false);
     assert_eq!(planned["targetEnabled"], true);
+    assert_eq!(planned["providerReach"]["selected"]["provider"], "codex");
+    assert_eq!(
+        planned["providerReach"]["selected"]["provenance"],
+        "exact-individual-target"
+    );
+    assert_eq!(planned["coverage"]["entries"][0]["provider"], "codex");
+    assert_eq!(planned["coverage"]["entries"][0]["included"], true);
     assert_eq!(planned["operations"][0]["type"], "replaceFile");
     assert!(
         planned["operations"][0]["path"]
             .as_str()
             .expect("config path")
             .ends_with("codex/project/.codex/config.toml")
+    );
+}
+
+#[test]
+fn individual_toggle_rejects_selected_provider_conflict_before_native_planning() {
+    let app_state = TempDir::new().expect("temp app state");
+    let mut context = context();
+    context.app_state_root = app_state.path().to_path_buf();
+    let response = call_tool(
+        &context,
+        "unpin_plan_toggle_item",
+        json!({
+            "kind": "mcp",
+            "layer": "global",
+            "id": "zed:global:configured-mcp:github",
+            "targetEnabled": false,
+            "providerReach": {
+                "mode": "selected",
+                "provider": "codex"
+            }
+        }),
+    );
+
+    assert_eq!(response["status"], "blocked");
+    assert!(
+        response["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("codex")
+                && reason.contains("zed")
+                && reason.contains("exact target"))
+    );
+    assert!(
+        !app_state.path().join("journals").exists(),
+        "provider conflict rejects before native transition planning"
     );
 }
 
@@ -3214,24 +3682,27 @@ fn control_plane_configured_mcp_is_blocked_in_bulk_plan() {
     );
     let context = context_with_roots(fixture_copy.path(), app_state.path());
 
-    let planned = call_tool(
-        &context,
-        "unpin_plan_toggle_items",
-        json!({
-            "selector": {
-                "providers": ["claude"],
-                "categories": ["configured-mcp"],
-                "layers": ["project"],
-                "ids": [
-                    "claude:project:configured-mcp:unpin",
-                    "claude:project:configured-mcp:github"
-                ]
-            },
-            "targetEnabled": false
-        }),
-    );
+    let request = json!({
+        "selector": {
+            "providers": ["claude"],
+            "categories": ["configured-mcp"],
+            "layers": ["project"],
+            "ids": [
+                "claude:project:configured-mcp:unpin",
+                "claude:project:configured-mcp:github"
+            ]
+        },
+        "targetEnabled": false,
+        "providerReach": {
+            "mode": "selected",
+            "provider": "claude"
+        },
+        "acknowledgeWholeInventory": true
+    });
+    let planned = call_tool(&context, "unpin_plan_toggle_items", request.clone());
 
-    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["status"], "blocked");
+    assert_eq!(planned["lifecycle"], "blocked");
     assert_eq!(planned["matchedCount"], 2);
     assert_eq!(planned["actionableCount"], 1);
     assert_eq!(planned["blockedCount"], 1);
@@ -3253,6 +3724,24 @@ fn control_plane_configured_mcp_is_blocked_in_bulk_plan() {
             .as_str()
             .expect("fingerprint")
             .starts_with("sha256:")
+    );
+
+    let mut apply = request.as_object().expect("bulk request object").clone();
+    apply.insert(
+        "planFingerprint".to_string(),
+        planned["planFingerprint"].clone(),
+    );
+    apply.insert("maxItems".to_string(), json!(2));
+    let applied = call_tool(
+        &context,
+        "unpin_apply_toggle_items",
+        serde_json::Value::Object(apply),
+    );
+    assert_eq!(applied["status"], "blocked");
+    assert_eq!(applied["lifecycle"], "blocked");
+    assert_eq!(
+        applied["blockedItems"][0]["reasonCode"],
+        "control-plane-protected"
     );
 }
 
@@ -3959,18 +4448,18 @@ fn plans_single_skill_and_hands_off_apply_without_writing() {
     let context = context_with_roots(fixture_copy.path(), app_state.path());
     let original_skill = fixture_copy
         .path()
-        .join("claude")
+        .join("pi")
         .join("project")
-        .join(".claude")
+        .join(".pi")
         .join("skills")
-        .join("example-claude-skill")
+        .join("example-pi-project-skill")
         .join("SKILL.md");
 
     let selector = json!({
-        "provider": "claude",
+        "provider": "pi",
         "kind": "skill",
         "layer": "project",
-        "id": "claude:project:skill:example-claude-skill",
+        "id": "pi:project:skill:example-pi-project-skill",
         "targetEnabled": false
     });
 

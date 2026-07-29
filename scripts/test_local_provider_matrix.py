@@ -22,11 +22,113 @@ from run_local_provider_matrix import (
     QUALITY_GATE_TIMEOUT_SECONDS,
     is_repository_tmp_path,
     live_inventory_exclusion_reason,
+    live_item_has_cross_provider_shared_source,
     live_plan_state_paths,
 )
 
 
 class LiveInventoryFilterTests(unittest.TestCase):
+    def test_live_shared_source_requires_matching_source_and_state_paths(self) -> None:
+        target = {
+            "provider": "claude",
+            "kind": "skill",
+            "sourcePath": "/shared/skill/SKILL.md",
+            "statePath": "/shared/skill",
+        }
+        coupled = {
+            **target,
+            "provider": "opencode",
+        }
+        distinct_state = {
+            **target,
+            "provider": "cursor",
+            "statePath": "/cursor/config.json",
+        }
+
+        self.assertTrue(
+            live_item_has_cross_provider_shared_source(target, [target, coupled])
+        )
+        self.assertFalse(
+            live_item_has_cross_provider_shared_source(target, [target, distinct_state])
+        )
+        self.assertFalse(
+            live_item_has_cross_provider_shared_source(
+                {**target, "kind": "mcp"}, [target, coupled]
+            )
+        )
+
+    def test_shared_source_contract_ignores_distinct_mutable_state_paths(self) -> None:
+        target = {
+            "provider": "codex",
+            "kind": "skill",
+            "id": "codex:global:skill:shared",
+            "sourcePath": "/fixtures/shared/SKILL.md",
+            "statePath": "/fixtures/codex/global/config.toml",
+            "enabled": True,
+        }
+        other_provider_view = {
+            **target,
+            "provider": "zed",
+            "id": "zed:global:skill:shared",
+            "statePath": "/fixtures/shared",
+        }
+        with mock.patch.object(
+            matrix_cases,
+            "read_full_inventory",
+            return_value={"items": [target, other_provider_view]},
+        ):
+            contract = matrix_cases.shared_source_contract(
+                Path("/test/unpin"),
+                Path("/test/fixtures"),
+                Path("/test/state"),
+                target,
+            )
+
+        self.assertIsNone(contract)
+
+    def test_shared_source_assertion_checks_counterpart_state(self) -> None:
+        contract = {
+            "sourcePath": "/fixtures/shared/SKILL.md",
+            "statePath": "/fixtures/shared",
+            "targetId": "claude:global:skill:shared",
+            "counterpartStates": {"opencode:global:skill:shared": True},
+        }
+        counterpart = {
+            "provider": "opencode",
+            "id": "opencode:global:skill:shared",
+            "sourcePath": contract["sourcePath"],
+            "statePath": contract["statePath"],
+            "enabled": True,
+        }
+
+        with mock.patch.object(
+            matrix_cases, "read_full_inventory", return_value={"items": [counterpart]}
+        ):
+            matrix_cases.assert_shared_source_state(
+                Path("/test/unpin"),
+                Path("/test/fixtures"),
+                Path("/test/state"),
+                contract,
+                True,
+                "shared-source",
+            )
+
+        counterpart["enabled"] = False
+        with (
+            mock.patch.object(
+                matrix_cases, "read_full_inventory", return_value={"items": [counterpart]}
+            ),
+            self.assertRaises(MatrixFailure),
+        ):
+            matrix_cases.assert_shared_source_state(
+                Path("/test/unpin"),
+                Path("/test/fixtures"),
+                Path("/test/state"),
+                contract,
+                True,
+                "shared-source",
+            )
+
     def test_matrix_inventory_group_identity_is_explicit_and_bounded(self) -> None:
         item = {
             "provider": "codex",

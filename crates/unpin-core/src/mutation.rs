@@ -23,7 +23,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::approval::ControlAuthorization;
 use crate::clock::{current_timestamp, unix_nanos_id};
 use crate::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, ProviderId,
@@ -46,6 +45,9 @@ use crate::transitions::{
     TransitionJournalStore, TransitionLifecycle, TransitionPlan,
     journal::{JournalError, MAX_AUTHORIZATION_DECISION_HISTORY_ENTRIES},
 };
+use crate::{
+    approval::ControlAuthorization, control_operation::ReachAwareControlOperationEnvelopeBuilder,
+};
 
 mod restore_control;
 pub use restore_control::*;
@@ -54,6 +56,9 @@ pub(crate) mod group_control;
 
 mod toggle_control;
 pub use toggle_control::*;
+
+mod bulk_control;
+pub use bulk_control::*;
 
 mod backup_authentication;
 
@@ -98,7 +103,7 @@ pub struct TogglePlanRequest {
 }
 
 #[derive(Debug, Clone)]
-struct TogglePlanInput {
+pub(crate) struct TogglePlanInput {
     app_state_root: PathBuf,
     item: DiscoveryItem,
     apply: bool,
@@ -140,6 +145,13 @@ pub struct ToggleResult {
     pub backup_id: Option<String>,
     pub reason: Option<String>,
     pub writes: Option<String>,
+    /// Reach-aware projections are additive so legacy mutation callers remain
+    /// source-compatible. Native and bulk controllers always populate these
+    /// fields; older direct mutation helpers leave them absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_reach: Option<crate::provider_reach::ProviderReach>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage: Option<crate::provider_reach::ProviderReachCoverage>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -256,7 +268,7 @@ fn plan_toggle_dispatch(input: TogglePlanInput) -> ToggleResult {
 
     let backup_authentication_key = input.backup_authentication_key.as_ref();
 
-    if is_supported_codex_skill(&input.item) && !input.item.is_shared_skill_source() {
+    if input.item.uses_codex_skill_config_state() {
         if input.apply {
             return apply_codex_skill_toggle(
                 input.app_state_root,
@@ -453,7 +465,7 @@ fn is_live_provider_config_state_path(item: &DiscoveryItem) -> bool {
         && (matches!(
             item.category,
             DiscoveryCategory::PluginConfig | DiscoveryCategory::ConfiguredMcp
-        ) || (is_supported_codex_skill(item) && !item.is_shared_skill_source()))
+        ) || item.uses_codex_skill_config_state())
 }
 
 fn validate_mutation_plan_targets(plan: ToggleResult) -> ToggleResult {
@@ -598,6 +610,24 @@ fn apply_authorized_toggle_transaction(
         authorization,
         reviewed_preview,
         crate::transitions::TransitionRecoveryPolicy::ResumeSafe,
+        None,
+    )
+}
+
+pub(crate) fn apply_authorized_toggle_transaction_reach_aware(
+    input: TogglePlanInput,
+    transition: &TransitionPlan,
+    authorization: &ControlAuthorization,
+    reviewed_preview: &ToggleResult,
+    envelope_builder: ReachAwareControlOperationEnvelopeBuilder,
+) -> ToggleResult {
+    apply_authorized_toggle_transaction_with_policy(
+        input,
+        transition,
+        authorization,
+        reviewed_preview,
+        crate::transitions::TransitionRecoveryPolicy::ResumeSafe,
+        Some(envelope_builder),
     )
 }
 
@@ -607,6 +637,7 @@ fn apply_authorized_toggle_transaction_with_policy(
     authorization: &ControlAuthorization,
     reviewed_preview: &ToggleResult,
     recovery_policy: crate::transitions::TransitionRecoveryPolicy,
+    mut reach_builder: Option<ReachAwareControlOperationEnvelopeBuilder>,
 ) -> ToggleResult {
     let app_state_root = input.app_state_root.clone();
     let journal_app_state_root = canonical_existing_root(&app_state_root);
@@ -634,6 +665,7 @@ fn apply_authorized_toggle_transaction_with_policy(
             );
         }
     };
+    let reach_authority_key = session_authority_key.clone();
     let session_manager =
         SessionManager::with_authority_key(&journal_app_state_root, session_authority_key);
     let _session_conflict_guard =
@@ -702,13 +734,18 @@ fn apply_authorized_toggle_transaction_with_policy(
         }
     }
 
-    let dry_run = plan_toggle_inner(TogglePlanInput {
+    let mut dry_run = plan_toggle_inner(TogglePlanInput {
         app_state_root: input.app_state_root.clone(),
         item: input.item.clone(),
         apply: false,
         backup_authentication_key: None,
         session_authority_key: None,
     });
+    // Reach and coverage are reviewed-plan metadata. Reattach them to the
+    // freshly derived native preview before drift comparison; native mutation
+    // dispatch itself remains provider-specific and unchanged.
+    dry_run.provider_reach = reviewed_preview.provider_reach;
+    dry_run.coverage = reviewed_preview.coverage.clone();
     if dry_run.status != ToggleStatus::DryRun {
         if existing_handle.as_ref().is_some_and(|handle| {
             matches!(
@@ -754,6 +791,13 @@ fn apply_authorized_toggle_transaction_with_policy(
             Err(error) => return blocked_result_from_plan(dry_run, error.to_string()),
         },
     };
+    if handle.journal.reach_aware.is_none()
+        && let Some(builder) = reach_builder.take()
+        && let Err(error) =
+            store.attach_reach_aware_builder(&mut handle, builder, &reach_authority_key)
+    {
+        return blocked_result_from_plan(dry_run, error.to_string());
+    }
     if handle.journal.lifecycle.is_terminal() {
         return cached_native_toggle_result(
             &app_state_root,
@@ -1176,6 +1220,8 @@ mod checkpoint_recovery_tests {
             backup_id: Some(backup_id),
             reason: None,
             writes: Some("writes were performed".to_string()),
+            provider_reach: None,
+            coverage: None,
         }
     }
 
@@ -1535,6 +1581,8 @@ fn plan_codex_skill_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -2355,6 +2403,8 @@ fn plan_directory_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> Toggle
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -2775,6 +2825,8 @@ fn plan_path_file_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> Toggle
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3133,6 +3185,8 @@ fn plan_claude_plugin_config_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3305,6 +3359,8 @@ fn plan_claude_all_project_mcp_servers_toggle(item: DiscoveryItem) -> ToggleResu
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3504,6 +3560,8 @@ fn plan_claude_configured_mcp_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3775,6 +3833,8 @@ fn plan_codex_toml_table_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -3865,6 +3925,8 @@ fn plan_disabled_codex_configured_mcp_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -4371,6 +4433,8 @@ fn plan_json_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem)
             backup_id: None,
             reason: None,
             writes: Some("no writes were performed".to_string()),
+            provider_reach: None,
+            coverage: None,
         };
     }
 
@@ -4411,6 +4475,8 @@ fn plan_json_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem)
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -4492,6 +4558,8 @@ fn plan_disabled_json_configured_mcp_vault_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -4588,6 +4656,8 @@ fn plan_cursor_workspace_configured_mcp_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -5464,6 +5534,8 @@ fn plan_opencode_configured_mcp_toggle(item: DiscoveryItem) -> ToggleResult {
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -5685,6 +5757,8 @@ fn plan_pi_package_extension_toggle(app_state_root: PathBuf, item: DiscoveryItem
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -6126,6 +6200,8 @@ fn plan_opencode_plugin_config_toggle(
             backup_id: None,
             reason: None,
             writes: Some("no writes were performed".to_string()),
+            provider_reach: None,
+            coverage: None,
         };
     }
 
@@ -6183,6 +6259,8 @@ fn plan_opencode_plugin_config_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -6605,6 +6683,8 @@ fn plan_zed_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem) 
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -6674,6 +6754,8 @@ fn plan_disabled_zed_configured_mcp_vault_toggle(
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -7063,6 +7145,8 @@ fn blocked(item: DiscoveryItem, reason: impl Into<String>) -> ToggleResult {
         backup_id: None,
         reason: Some(reason.into()),
         writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
     }
 }
 
@@ -8510,10 +8594,6 @@ fn path_string(path: PathBuf) -> String {
 
 fn is_supported_codex_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Codex && item.category == DiscoveryCategory::ConfiguredMcp
-}
-
-fn is_supported_codex_skill(item: &DiscoveryItem) -> bool {
-    item.provider == ProviderId::Codex && item.category == DiscoveryCategory::Skill
 }
 
 fn is_supported_pi_file_skill(item: &DiscoveryItem) -> bool {

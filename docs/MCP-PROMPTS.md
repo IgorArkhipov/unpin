@@ -64,6 +64,82 @@ the change was applied until the CLI or TUI completion and subsequent
 rediscovery prove it.
 ```
 
+## Reach-aware operation template (schema v2)
+
+Use this checklist for every item, bulk, inventory-group, and named-profile
+operation. It keeps mutation reach separate from both MCP connection scope
+and list visibility:
+
+```text
+Before planning, confirm the MCP connection providerScope and current
+inventory. Treat providerScope as a hard connection boundary; a plan may
+narrow it but never widen it.
+
+Choose exactly one mutation reach:
+- All providers, with explicit cross-provider intent; or
+- Selected provider, naming the provider and reporting authority provenance.
+
+For an exact item, preserve exact-individual-target provenance. For other
+selected-provider operations, report whether authority came from explicit
+input, TUI control, or a pinned MCP boundary. Do not infer authority from a
+provider/list filter.
+
+Call the family-specific plan tool first. Show providerReach, provenance,
+included and excluded providerCoverage entries with reasons, actionable and
+blocked targets, target state, activation/lifecycle, revisions, and the exact
+plan fingerprint. For bulk plans, use a non-provider selector criterion and
+set acknowledgeWholeInventory only after I explicitly approve a whole-
+inventory operation. Treat an empty selection as blocked unless I explicitly
+allow the reviewed empty selection.
+
+Stop for review. If I approve, request only the structured MCP-to-CLI/TUI
+handoff and preserve its exact operationId and planFingerprint. Do not
+reconstruct a selector, change visible filters, or apply a different plan.
+Approval and transfer artifacts are short-lived, audience/session/workspace
+bound, and single-use. Never expose signing material or extend expiry.
+
+After the handoff, poll status by the same operationId after any host or CLI
+restart, then rediscover affected providers. Treat applied and no-op as
+success; keep partial distinct from blocked/no-targets; and stop for manual
+repair or authenticated restore on recovery-required. Any fingerprint,
+reach/provenance, root, revision, inventory, or pre-state drift is a rejection
+that requires fresh discovery and a fresh plan.
+
+These reach-aware projections are schema-v2 (schema version 2). Preserve
+unrelated schema-v1 inventory, discovery, restore, policy, gateway, session,
+and hook contracts; do not require v2 fields in those responses.
+```
+
+### Family-specific reach prompts
+
+Use the smallest family prompt that matches the requested change. Each one
+must still include the common template above.
+
+```text
+Item: plan exactly one writable provider item. Confirm provider, kind, layer,
+and exact item ID. Use selected-provider reach only for that provider unless I
+explicitly request all-provider reach; report exact-individual-target or the
+explicit authority provenance returned by the plan. Request a handoff only
+after I review the complete target and coverage evidence.
+
+Bulk: plan only the reviewed ID/kind/category/layer/enabled selector and
+desired target state. Require an explicit max-items bound. If the selector
+covers every item of a provider, stop and ask whether I acknowledge the whole
+inventory. Preserve the returned operationId/fingerprint for the bulk CLI
+handoff, apply, and status commands.
+
+Group: resolve the qualified personal/repository group and revision, then plan
+with selected-provider or all-provider reach. Show every member, provider
+coverage entry, cohort, blocked reason, and lifecycle before requesting the
+CLI/TUI handoff. A changed group definition or inventory is drift.
+
+Named profile: validate the compiled profile and catalog revision, then plan
+through the ProfileProviderOperationController with selected-provider or
+all-provider reach. Show Create/Replace/AlreadyMatches targets, provider
+coverage, next-session activation, and fingerprint. Do not substitute the
+legacy generic policy/lock operation for a named provider operation.
+```
+
 ## Audit the current project setup
 
 Use this before changing anything:

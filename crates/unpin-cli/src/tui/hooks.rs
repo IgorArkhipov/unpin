@@ -394,6 +394,7 @@ mod tests {
                 description: None,
                 members: vec![capability.id.clone()],
                 provider_members: BTreeMap::new(),
+                supported_providers: std::collections::BTreeSet::new(),
             },
             &catalog,
             ProfileSourceScope::Workspace,

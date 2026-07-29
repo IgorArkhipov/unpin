@@ -83,6 +83,26 @@ def live_plan_state_paths(item: dict[str, Any]) -> list[Path]:
     )
 
 
+def live_item_has_cross_provider_shared_source(
+    item: dict[str, Any], inventory: list[dict[str, Any]]
+) -> bool:
+    if item.get("kind") != "skill":
+        return False
+
+    source_path = item.get("sourcePath")
+    state_path = item.get("statePath")
+    provider = item.get("provider")
+    if not all(isinstance(value, str) for value in (source_path, state_path, provider)):
+        return False
+
+    return any(
+        counterpart.get("provider") != provider
+        and counterpart.get("sourcePath") == source_path
+        and counterpart.get("statePath") == state_path
+        for counterpart in inventory
+    )
+
+
 def inventory_item_paths(item: dict[str, Any]) -> list[Path]:
     return [
         Path(value).expanduser().resolve()
@@ -139,6 +159,7 @@ def sanitized_live_plan(
         )
     return {
         "status": planned.get("status"),
+        "reason": planned.get("reason"),
         "writes": planned.get("writes"),
         "targetEnabled": planned.get("targetEnabled"),
         "selection": {
@@ -248,7 +269,12 @@ def capture_live_inventory(
                 "--json",
             ]
         )
-        planned = parse_json_output(run_command(command).stdout)
+        planned = parse_json_output(run_command(command, check=False).stdout)
+        blocked_for_shared_source = (
+            planned.get("status") == "blocked"
+            and planned.get("reason")
+            == "native toggle blocked: shared-source-crosses-provider-reach"
+        )
         plan_selection = planned.get("selection") or {}
         semantic_plan_valid = (
             planned.get("status") in {"dry-run", "planned"}
@@ -306,6 +332,47 @@ def capture_live_inventory(
             and backup_directory_absent
             and not unknown_targets
         )
+        if blocked_for_shared_source:
+            if not live_item_has_cross_provider_shared_source(selected, items):
+                raise MatrixFailure(
+                    "live shared-source block did not have a physically coupled "
+                    f"cross-provider view for {scenario['slug']}"
+                )
+            if not unchanged:
+                raise MatrixFailure(
+                    f"live shared-source block changed state for {scenario['slug']}; "
+                    f"provider digests unchanged: {provider_digests_unchanged}; "
+                    f"changed path classes: {changed_path_classes}; "
+                    f"backup directory absent: {backup_directory_absent}; "
+                    f"unknown target classes: {unknown_target_classes}"
+                )
+            provider_state_unchanged = provider_state_unchanged and unchanged
+            write_json(
+                artifact_root / "raw/live-plans" / f"{scenario['slug']}.json",
+                sanitized_live_plan(
+                    planned, artifact_root=artifact_root, home_root=home_root
+                ),
+            )
+            cell.update(
+                {
+                    "status": "blocked-shared-source",
+                    "reason": planned["reason"],
+                    "stateUnchanged": unchanged,
+                    "checkedPathCount": len(state_paths),
+                    "selectedPathClasses": sorted(
+                        {
+                            path_class(
+                                path,
+                                artifact_root=artifact_root,
+                                home_root=home_root,
+                            )
+                            for path in state_paths
+                        }
+                    ),
+                }
+            )
+            plans.append(cell)
+            continue
         if not semantic_plan_valid or not unchanged:
             raise MatrixFailure(
                 f"live dry run failed safety check for {scenario['slug']}; "
@@ -511,7 +578,9 @@ def capture_static_surfaces(binary: Path, artifact_root: Path) -> dict[str, Any]
     return results
 
 
-def state_label(value: bool) -> str:
+def state_label(value: bool | None) -> str:
+    if value is None:
+        return "guarded"
     return "enabled" if value else "disabled"
 
 
@@ -677,11 +746,11 @@ def render_report(
                         surface=html.escape(result["surface"]),
                         layer=result["layer"],
                         kind=result["kind"],
-                        initial=state_label(states["initial"]),
-                        first=state_label(states["afterFirstToggle"]),
-                        second=state_label(states["afterSecondToggle"]),
-                        restore=state_label(states["afterRestoreSecond"]),
-                        final=state_label(states["final"]),
+                        initial=state_label(states.get("initial")),
+                        first=state_label(states.get("afterFirstToggle")),
+                        second=state_label(states.get("afterSecondToggle")),
+                        restore=state_label(states.get("afterRestoreSecond")),
+                        final=state_label(states.get("final")),
                     )
                 )
         provider_sections.append(

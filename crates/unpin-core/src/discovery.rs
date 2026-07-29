@@ -95,7 +95,7 @@ impl DiscoveryRoots {
             opencode_project: root.join("opencode").join("project"),
             shared_global: root.join("shared").join("global"),
             shared_project: root.join("shared").join("project"),
-            zed_global: root.join("zed").join("global"),
+            zed_global: root.join("zed").join("global").join(".config").join("zed"),
             zed_project: root.join("zed").join("project"),
             scan_project_scopes: false,
             app_state_root: None,
@@ -127,7 +127,7 @@ impl DiscoveryRoots {
             opencode_project: project_root.to_path_buf(),
             shared_global: home_root.to_path_buf(),
             shared_project: project_root.to_path_buf(),
-            zed_global: home_root.to_path_buf(),
+            zed_global: home_root.join(".config").join("zed"),
             zed_project: project_root.to_path_buf(),
             scan_project_scopes: true,
             app_state_root: None,
@@ -282,6 +282,15 @@ impl DiscoveryItem {
                 })
             }
         }
+    }
+
+    #[must_use]
+    pub fn uses_codex_skill_config_state(&self) -> bool {
+        self.provider == ProviderId::Codex
+            && self.category == DiscoveryCategory::Skill
+            && Path::new(&self.state_path)
+                .file_name()
+                .is_some_and(|name| name == "config.toml")
     }
 
     #[must_use]
@@ -920,11 +929,6 @@ pub(crate) fn discover_codex(
         items,
         warnings,
     )?;
-    warn_ignored_codex_shared_skill_config_states(
-        &items[skill_item_start..],
-        &skill_config_states,
-        warnings,
-    );
     let global_agent_root = roots.codex_global.join("agents");
     let live_agent_ids = discover_agent_files(
         &global_agent_root,
@@ -1077,43 +1081,13 @@ fn apply_codex_skill_config_states(
 ) {
     let state_path = path_string(config_path);
     for item in items {
-        if item.provider != ProviderId::Codex
-            || item.category != DiscoveryCategory::Skill
-            || item.is_shared_skill_source()
-        {
+        if item.provider != ProviderId::Codex || item.category != DiscoveryCategory::Skill {
             continue;
         }
 
         item.enabled = states.get(&item.source_path).copied().unwrap_or(true);
         item.mutability = DiscoveryMutability::ReadWrite;
         item.state_path.clone_from(&state_path);
-    }
-}
-
-fn warn_ignored_codex_shared_skill_config_states(
-    items: &[DiscoveryItem],
-    states: &BTreeMap<String, bool>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) {
-    let mut warned_paths = BTreeSet::new();
-    for item in items {
-        if item.provider != ProviderId::Codex
-            || !item.is_shared_skill_source()
-            || !states.contains_key(&item.source_path)
-            || !warned_paths.insert(item.source_path.clone())
-        {
-            continue;
-        }
-
-        warnings.push(DiscoveryWarning {
-            provider: ProviderId::Codex,
-            layer: Some(item.layer),
-            code: "shared-skill-native-config-ignored".to_string(),
-            message: format!(
-                "Codex skills.config entry for shared skill {} is ignored; remove the native entry because Unpin vault state controls every provider loading this source",
-                item.source_path
-            ),
-        });
     }
 }
 
@@ -2494,11 +2468,7 @@ pub(crate) fn discover_zed(
         ProviderId::Zed,
         DiscoveryLayer::Global,
         &[(
-            roots
-                .zed_global
-                .join(".config")
-                .join("zed")
-                .join("AGENTS.md"),
+            roots.zed_global.join("AGENTS.md"),
             "zed:global:setting:agents-md",
             "AGENTS.md",
         )],
@@ -2515,11 +2485,7 @@ pub(crate) fn discover_zed(
         items,
     );
 
-    let global_settings_path = roots
-        .zed_global
-        .join(".config")
-        .join("zed")
-        .join("settings.json");
+    let global_settings_path = roots.zed_global.join("settings.json");
     let live_zed_global_mcp_ids = discover_zed_settings(
         &global_settings_path,
         DiscoveryLayer::Global,

@@ -1,4 +1,7 @@
-use std::{fmt, path::PathBuf};
+use std::{
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -91,7 +94,41 @@ impl PolicyStore {
             .map_err(Into::into)
     }
 
+    #[must_use]
+    pub(crate) fn app_state_root(&self) -> &Path {
+        &self.app_state_root
+    }
+
+    pub(crate) fn resource_path(&self, target: &PolicyTarget) -> Result<PathBuf, PolicyStoreError> {
+        target.validate()?;
+        Ok(match target {
+            PolicyTarget::Global => get_global_policy_path(&self.app_state_root),
+            PolicyTarget::Repository { repository_key } => {
+                get_repository_policy_path(&self.app_state_root, repository_key)
+            }
+            PolicyTarget::Workspace {
+                repository_key,
+                workspace_key,
+            } => {
+                get_workspace_policy_state_path(&self.app_state_root, repository_key, workspace_key)
+            }
+        })
+    }
+
     pub fn save(
+        &self,
+        target: &PolicyTarget,
+        policy: &ScopePolicy,
+        expected: Option<&StateRevision>,
+        owner: OwnerGeneration,
+    ) -> Result<StateRevision, PolicyStoreError> {
+        self.compare_and_swap_scope_policy(target, policy, expected, owner)
+    }
+
+    /// Atomically replaces one complete scope policy. Provider-target profile
+    /// operations use this boundary once for the entire declared provider set;
+    /// they never commit provider overrides one at a time.
+    pub fn compare_and_swap_scope_policy(
         &self,
         target: &PolicyTarget,
         policy: &ScopePolicy,
@@ -147,20 +184,10 @@ impl PolicyStore {
     }
 
     fn store(&self, target: &PolicyTarget) -> Result<AtomicJsonStore, PolicyStoreError> {
-        target.validate()?;
-        let path = match target {
-            PolicyTarget::Global => get_global_policy_path(&self.app_state_root),
-            PolicyTarget::Repository { repository_key } => {
-                get_repository_policy_path(&self.app_state_root, repository_key)
-            }
-            PolicyTarget::Workspace {
-                repository_key,
-                workspace_key,
-            } => {
-                get_workspace_policy_state_path(&self.app_state_root, repository_key, workspace_key)
-            }
-        };
-        Ok(AtomicJsonStore::new(path, POLICY_STATE_SCHEMA_VERSION))
+        Ok(AtomicJsonStore::new(
+            self.resource_path(target)?,
+            POLICY_STATE_SCHEMA_VERSION,
+        ))
     }
 }
 

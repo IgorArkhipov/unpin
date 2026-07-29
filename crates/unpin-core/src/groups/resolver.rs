@@ -239,7 +239,7 @@ impl GroupResolver {
     ) -> GroupMemberObservation {
         if identities
             .iter()
-            .any(|identity| !self.context.admits_member(identity))
+            .any(|identity| !self.context.admits_layer(identity))
         {
             return GroupMemberObservation {
                 state: GroupState::Mixed,
@@ -275,7 +275,7 @@ impl GroupResolver {
                 .definition
                 .members
                 .iter()
-                .any(|member| !self.context.admits_member(member))
+                .any(|member| !self.context.admits_layer(member))
         {
             return GroupDefinitionView::redacted(record);
         }
@@ -574,7 +574,7 @@ fn toggle_eligibility(
     context: &GroupAccessContext,
     item: &DiscoveryItem,
 ) -> (bool, Option<GroupMemberReason>) {
-    if !context.admits_member(
+    if !context.admits_layer(
         &GroupMemberIdentity::try_from(item).expect("discovered item identity is bounded"),
     ) {
         return (false, Some(GroupMemberReason::ContextScopeConflict));

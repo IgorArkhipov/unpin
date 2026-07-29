@@ -19,6 +19,10 @@ use crate::{
         CONTROL_PLANE_PROTECTED_REASON, NativeToggleController, NativeTogglePlan,
         is_control_plane_protected_disable,
     },
+    provider_reach::{
+        IncludedTargetOutcome, ProviderCoverageEntry, ProviderReach, ProviderReachCoverage,
+        ProviderReachError, ProviderReachLifecycle, ProviderReachRequest, classify_lifecycle,
+    },
     transitions::{
         EffectActivation, EffectAuthority, TransitionContext, TransitionEffect,
         TransitionEffectKind, TransitionKind, TransitionPlan, TransitionPlanError,
@@ -67,6 +71,7 @@ pub enum GroupMemberPlanOutcome {
     AlreadyCorrect,
     Blocked,
     Missing,
+    OutOfProviderReach,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -123,6 +128,9 @@ pub struct GroupTogglePlan {
     pub target: GroupTargetState,
     pub max_members: usize,
     pub total_members: usize,
+    pub provider_reach: ProviderReach,
+    pub provider_coverage: ProviderReachCoverage,
+    pub lifecycle: ProviderReachLifecycle,
     pub definition_view: GroupDefinitionView,
     pub members: Vec<GroupMemberPlan>,
     pub resources: Vec<GroupResourcePlan>,
@@ -156,6 +164,34 @@ impl GroupTogglePlan {
             || self.definition_view.qualified_name != self.qualified_name
             || self.definition_view.scope != self.scope
             || self.definition_view.revision != self.group_revision
+            || self.provider_coverage.entries().iter().any(|entry| {
+                entry.included != self.provider_reach.allows(entry.provider)
+                    || (!entry.included
+                        && entry.reason
+                            != Some(crate::provider_reach::ProviderReachReason::OutOfProviderReach))
+            })
+            || self.provider_coverage.entries
+                != ProviderReachCoverage::new(
+                    self.members
+                        .iter()
+                        .map(|member| {
+                            if self.provider_reach.allows(member.identity.provider) {
+                                ProviderCoverageEntry::included(
+                                    member.identity.provider,
+                                    member.identity.id.clone(),
+                                )
+                            } else {
+                                ProviderCoverageEntry::excluded(
+                                    member.identity.provider,
+                                    member.identity.id.clone(),
+                                )
+                            }
+                        })
+                        .collect(),
+                )
+                .entries
+            || self.lifecycle != planned_reach_lifecycle(self)
+            || self.disposition != expected_group_disposition(self)
             || self
                 .cohorts
                 .iter()
@@ -197,7 +233,8 @@ impl GroupTogglePlan {
             }
             GroupMemberPlanOutcome::AlreadyCorrect
             | GroupMemberPlanOutcome::Blocked
-            | GroupMemberPlanOutcome::Missing => {
+            | GroupMemberPlanOutcome::Missing
+            | GroupMemberPlanOutcome::OutOfProviderReach => {
                 member.item_plan_fingerprint.is_some() || member.child_operation_id.is_some()
             }
         }) {
@@ -282,7 +319,38 @@ impl GroupPlanner {
         max_members: usize,
         mode: GroupPlanMode,
     ) -> Result<GroupTogglePlan, GroupPlanError> {
-        self.plan_with_operation_id(reference, target, max_members, mode, None)
+        self.plan_with_reach(reference, target, max_members, mode, ProviderReach::All)
+    }
+
+    /// Plan a group against an already validated provider reach.
+    pub fn plan_with_reach(
+        &self,
+        reference: &GroupRef,
+        target: GroupTargetState,
+        max_members: usize,
+        mode: GroupPlanMode,
+        provider_reach: ProviderReach,
+    ) -> Result<GroupTogglePlan, GroupPlanError> {
+        self.plan_with_operation_id(reference, target, max_members, mode, provider_reach, None)
+    }
+
+    /// Validate provider authority before discovery, then plan the group.
+    pub fn plan_with_provider_reach_request(
+        &self,
+        reference: &GroupRef,
+        target: GroupTargetState,
+        max_members: usize,
+        mode: GroupPlanMode,
+        request: ProviderReachRequest,
+    ) -> Result<GroupTogglePlan, GroupPlanError> {
+        let preflight = request
+            .validate_before_discovery()
+            .map_err(GroupPlanError::ProviderReach)?;
+        let provider_reach = preflight
+            .reconcile_exact_target(None)
+            .map_err(GroupPlanError::ProviderReach)?
+            .reach;
+        self.plan_with_reach(reference, target, max_members, mode, provider_reach)
     }
 
     pub(crate) fn revalidate(
@@ -300,6 +368,7 @@ impl GroupPlanner {
             reviewed.target,
             reviewed.max_members,
             reviewed.mode,
+            reviewed.provider_reach,
             reviewed.operation_id.clone(),
         )?;
         plan.response_id.clone_from(&reviewed.response_id);
@@ -320,6 +389,7 @@ impl GroupPlanner {
         target: GroupTargetState,
         max_members: usize,
         mode: GroupPlanMode,
+        provider_reach: ProviderReach,
         fixed_operation_id: Option<String>,
     ) -> Result<GroupTogglePlan, GroupPlanError> {
         if max_members == 0 || max_members > MAX_GROUP_MEMBERS {
@@ -364,8 +434,36 @@ impl GroupPlanner {
         let native = NativeToggleController::new(self.resolver.context().app_state_root());
         let planning_journals = native.planning_journals();
         let requested_enabled = target.enabled();
+        let provider_coverage = ProviderReachCoverage::new(
+            record
+                .definition
+                .members
+                .iter()
+                .map(|identity| {
+                    if provider_reach.allows(identity.provider) {
+                        ProviderCoverageEntry::included(identity.provider, identity.id.clone())
+                    } else {
+                        ProviderCoverageEntry::excluded(identity.provider, identity.id.clone())
+                    }
+                })
+                .collect(),
+        );
         let mut members = Vec::with_capacity(record.definition.members.len());
         for identity in &record.definition.members {
+            if !provider_reach.allows(identity.provider) {
+                members.push(GroupMemberPlan {
+                    identity: identity.clone(),
+                    current_enabled: None,
+                    requested_enabled,
+                    outcome: GroupMemberPlanOutcome::OutOfProviderReach,
+                    reason: Some("out-of-provider-reach".to_string()),
+                    item_plan_fingerprint: None,
+                    child_operation_id: None,
+                    affected_resources: Vec::new(),
+                    native_plan: None,
+                });
+                continue;
+            }
             let matches = index.get(identity).map(Vec::as_slice).unwrap_or_default();
             let mut member = match matches {
                 [] => blocked_member(
@@ -439,6 +537,15 @@ impl GroupPlanner {
                 member.child_operation_id = None;
                 member.native_plan = None;
             }
+            if member.outcome == GroupMemberPlanOutcome::Changed
+                && shared_source_crosses_provider_reach(matches[0], &provider_reach, &source_views)
+            {
+                member.outcome = GroupMemberPlanOutcome::Blocked;
+                member.reason = Some("shared-source-crosses-provider-reach".to_string());
+                member.item_plan_fingerprint = None;
+                member.child_operation_id = None;
+                member.native_plan = None;
+            }
             members.push(member);
         }
 
@@ -453,13 +560,23 @@ impl GroupPlanner {
                 GroupMemberPlanOutcome::Blocked | GroupMemberPlanOutcome::Missing
             )
         });
-        let disposition = if !actionable && exceptional {
+        let included_count = members
+            .iter()
+            .filter(|member| member.outcome != GroupMemberPlanOutcome::OutOfProviderReach)
+            .count();
+        let reach_exclusions = provider_coverage
+            .excluded()
+            .any(ProviderCoverageEntry::is_reach_exclusion);
+        let disposition = if exceptional || (included_count == 0 && reach_exclusions) {
             GroupPlanDisposition::Blocked
-        } else if !actionable {
+        } else if !actionable && !reach_exclusions {
             GroupPlanDisposition::NoOp
         } else if mode == GroupPlanMode::PreviewOnly {
             GroupPlanDisposition::Preview
         } else {
+            // A selected-provider subset with no writes still needs a durable
+            // handoff so the excluded members are reported as `partial` rather
+            // than being mistaken for an ordinary no-op.
             GroupPlanDisposition::Actionable
         };
         let response_id = secure_random_identifier("group-response", 16)
@@ -497,6 +614,9 @@ impl GroupPlanner {
             target,
             max_members,
             total_members: members.len(),
+            provider_reach,
+            provider_coverage: provider_coverage.clone(),
+            lifecycle: planned_reach_lifecycle_parts(&members, &provider_coverage),
             definition_view: view,
             members,
             resources,
@@ -584,9 +704,83 @@ pub(crate) fn shared_source_has_unlisted_view(
     source_views: &BTreeMap<String, BTreeSet<GroupMemberIdentity>>,
 ) -> bool {
     item.is_shared_skill_source()
+        && !item.uses_codex_skill_config_state()
         && source_views
             .get(item.source_path.as_str())
             .is_some_and(|views| views.iter().any(|identity| !selected.contains(identity)))
+}
+
+pub(crate) fn shared_source_crosses_provider_reach(
+    item: &DiscoveryItem,
+    provider_reach: &ProviderReach,
+    source_views: &BTreeMap<String, BTreeSet<GroupMemberIdentity>>,
+) -> bool {
+    item.is_shared_skill_source()
+        && !item.uses_codex_skill_config_state()
+        && source_views
+            .get(item.source_path.as_str())
+            .is_some_and(|views| {
+                views
+                    .iter()
+                    .any(|identity| !provider_reach.allows(identity.provider))
+            })
+}
+
+fn planned_reach_lifecycle(plan: &GroupTogglePlan) -> ProviderReachLifecycle {
+    planned_reach_lifecycle_parts(&plan.members, &plan.provider_coverage)
+}
+
+fn expected_group_disposition(plan: &GroupTogglePlan) -> GroupPlanDisposition {
+    let has_blocker = plan.members.iter().any(|member| {
+        matches!(
+            member.outcome,
+            GroupMemberPlanOutcome::Blocked | GroupMemberPlanOutcome::Missing
+        )
+    });
+    let actionable = plan
+        .members
+        .iter()
+        .any(|member| member.outcome == GroupMemberPlanOutcome::Changed);
+    let included_count = plan
+        .members
+        .iter()
+        .filter(|member| member.outcome != GroupMemberPlanOutcome::OutOfProviderReach)
+        .count();
+    let has_reach_exclusions = plan
+        .provider_coverage
+        .excluded()
+        .any(ProviderCoverageEntry::is_reach_exclusion);
+    if has_blocker || (included_count == 0 && has_reach_exclusions) {
+        GroupPlanDisposition::Blocked
+    } else if !actionable && !has_reach_exclusions {
+        GroupPlanDisposition::NoOp
+    } else if plan.mode == GroupPlanMode::PreviewOnly {
+        GroupPlanDisposition::Preview
+    } else {
+        GroupPlanDisposition::Actionable
+    }
+}
+
+fn planned_reach_lifecycle_parts(
+    members: &[GroupMemberPlan],
+    coverage: &ProviderReachCoverage,
+) -> ProviderReachLifecycle {
+    let included_outcomes = members
+        .iter()
+        .filter_map(|member| match member.outcome {
+            GroupMemberPlanOutcome::Changed => Some(IncludedTargetOutcome::Applied),
+            GroupMemberPlanOutcome::AlreadyCorrect => Some(IncludedTargetOutcome::NoOp),
+            GroupMemberPlanOutcome::Blocked | GroupMemberPlanOutcome::Missing => {
+                Some(IncludedTargetOutcome::Blocked)
+            }
+            GroupMemberPlanOutcome::OutOfProviderReach => None,
+        })
+        .collect();
+    classify_lifecycle(&crate::provider_reach::LifecycleEvidence {
+        included_outcomes,
+        coverage: coverage.clone(),
+        writes_started: false,
+    })
 }
 
 fn build_resources(
@@ -717,15 +911,34 @@ fn build_parent_transition(
     repository_key: &str,
     workspace_key: &str,
 ) -> Result<TransitionPlan, TransitionPlanError> {
-    TransitionPlan::new(
-        operation_id,
-        TransitionKind::InventoryGroupApply,
-        TransitionContext {
-            repository_key: repository_key.to_string(),
-            workspace_key: workspace_key.to_string(),
-            session_id: None,
-            profile_digest: None,
-        },
+    let effects = if resources.is_empty() {
+        // TransitionPlan requires at least one effect. For an actionable
+        // selected-provider plan whose included members are already correct,
+        // retain a deterministic terminal selection effect so the reviewed
+        // partial outcome has a durable operation/journal without inventing a
+        // provider write target.
+        let pre_fingerprint = encode_lower_hex(&Sha256::digest(
+            format!("inventory-group-terminal-pre\0{operation_id}").as_bytes(),
+        ));
+        let post_fingerprint = encode_lower_hex(&Sha256::digest(
+            format!("inventory-group-terminal-post\0{operation_id}").as_bytes(),
+        ));
+        let resource_digest = encode_lower_hex(&Sha256::digest(
+            format!("inventory-group-terminal-resource\0{operation_id}").as_bytes(),
+        ));
+        vec![TransitionEffect {
+            effect_id: "inventory-group-selection-effect".to_string(),
+            kind: TransitionEffectKind::ReplaceProviderConfig,
+            resource_id: format!("inventory-group-selection-{}", &resource_digest[..24]),
+            target_type: "inventory-group-selection".to_string(),
+            summary: "Record one reviewed inventory group selection".to_string(),
+            authority: EffectAuthority::UserManaged,
+            activation: EffectActivation::RestartRequired,
+            expected_pre_fingerprint: Some(pre_fingerprint),
+            expected_post_fingerprint: Some(post_fingerprint),
+            provider_views: Vec::new(),
+        }]
+    } else {
         resources
             .iter()
             .map(|resource| TransitionEffect {
@@ -740,7 +953,18 @@ fn build_parent_transition(
                 expected_post_fingerprint: Some(resource.expected_post_fingerprint.clone()),
                 provider_views: resource.provider_views.clone(),
             })
-            .collect(),
+            .collect()
+    };
+    TransitionPlan::new(
+        operation_id,
+        TransitionKind::InventoryGroupApply,
+        TransitionContext {
+            repository_key: repository_key.to_string(),
+            workspace_key: workspace_key.to_string(),
+            session_id: None,
+            profile_digest: None,
+        },
+        effects,
     )
 }
 
@@ -759,6 +983,9 @@ fn calculate_group_fingerprint(plan: &GroupTogglePlan) -> Result<String, GroupPl
         target: GroupTargetState,
         max_members: usize,
         total_members: usize,
+        provider_reach: ProviderReach,
+        provider_coverage: &'a ProviderReachCoverage,
+        lifecycle: ProviderReachLifecycle,
         definition_view: &'a GroupDefinitionView,
         members: &'a [GroupMemberPlan],
         resources: &'a [GroupResourcePlan],
@@ -777,6 +1004,9 @@ fn calculate_group_fingerprint(plan: &GroupTogglePlan) -> Result<String, GroupPl
         target: plan.target,
         max_members: plan.max_members,
         total_members: plan.total_members,
+        provider_reach: plan.provider_reach,
+        provider_coverage: &plan.provider_coverage,
+        lifecycle: plan.lifecycle,
         definition_view: &plan.definition_view,
         members: &plan.members,
         resources: &plan.resources,
@@ -791,6 +1021,7 @@ fn calculate_group_fingerprint(plan: &GroupTogglePlan) -> Result<String, GroupPl
 pub enum GroupPlanError {
     Resolve(GroupResolveError),
     Discovery(crate::discovery::DiscoveryError),
+    ProviderReach(ProviderReachError),
     Transition(TransitionPlanError),
     Validation(crate::groups::GroupValidationError),
     Approval(String),
@@ -816,6 +1047,12 @@ impl From<GroupResolveError> for GroupPlanError {
     }
 }
 
+impl From<ProviderReachError> for GroupPlanError {
+    fn from(error: ProviderReachError) -> Self {
+        Self::ProviderReach(error)
+    }
+}
+
 impl From<TransitionPlanError> for GroupPlanError {
     fn from(error: TransitionPlanError) -> Self {
         Self::Transition(error)
@@ -833,6 +1070,7 @@ impl fmt::Display for GroupPlanError {
         match self {
             Self::Resolve(error) => error.fmt(formatter),
             Self::Discovery(error) => write!(formatter, "group discovery failed: {error}"),
+            Self::ProviderReach(error) => error.fmt(formatter),
             Self::Transition(error) => error.fmt(formatter),
             Self::Validation(error) => error.fmt(formatter),
             Self::Approval(error) => write!(formatter, "group approval context failed: {error}"),
@@ -1075,6 +1313,164 @@ mod tests {
             &listed_item,
             &BTreeSet::from(
                 [GroupMemberIdentity::try_from(&listed_item).expect("listed identity")]
+            ),
+            &source_views,
+        ));
+
+        listed_item.provider = ProviderId::Codex;
+        listed_item.id = "codex:global:skill:listed".to_string();
+        listed_item.source_path = "/fixture/.agents/skills/listed/SKILL.md".to_string();
+        listed_item.state_path = "/fixture/.codex/config.toml".to_string();
+        let mut other_provider_item = listed_item.clone();
+        other_provider_item.provider = ProviderId::Cursor;
+        other_provider_item.id = "cursor:global:skill:@compat/agents/listed".to_string();
+        let inventory = vec![listed_item.clone(), other_provider_item];
+        let source_views = index_source_views(&inventory);
+
+        assert!(!shared_source_has_unlisted_view(
+            &listed_item,
+            &BTreeSet::from([GroupMemberIdentity::try_from(&listed_item).expect("Codex identity")]),
+            &source_views,
+        ));
+    }
+
+    #[test]
+    fn selected_provider_plans_subset_and_binds_reach_coverage() {
+        let root = TempDir::new().expect("tempdir");
+        let context = context(&root);
+        let personal = PersonalGroupStore::new(context.clone());
+        let repository = RepositoryGroupStore::new(context.clone());
+        let codex = identity(
+            "codex:global:skill:codex-only",
+            DiscoveryKind::Skill,
+            DiscoveryCategory::Skill,
+        );
+        let zed = GroupMemberIdentity::new(
+            ProviderId::Zed,
+            DiscoveryKind::Skill,
+            DiscoveryCategory::Skill,
+            DiscoveryLayer::Global,
+            "zed:global:skill:zed-only",
+        )
+        .expect("zed identity");
+        personal
+            .create(
+                &GroupDefinitionV1::new("mixed", vec![codex.clone(), zed.clone()])
+                    .expect("definition"),
+                OwnerGeneration::new("group-planner-test", 1).expect("owner"),
+            )
+            .expect("create group");
+        let mut codex_item = item(&codex, "codex");
+        codex_item.enabled = false;
+        codex_item.source_path = "/fixture/.agents/skills/codex-only/SKILL.md".to_string();
+        let mut zed_item = item(&zed, "zed");
+        zed_item.provider = ProviderId::Zed;
+        zed_item.source_path = "/fixture/.agents/skills/zed-only/SKILL.md".to_string();
+        let planner = GroupPlanner::new(GroupResolver::new(context, personal, repository))
+            .with_discovery_override(DiscoveryOutput {
+                items: vec![codex_item, zed_item],
+                warnings: Vec::new(),
+            });
+
+        let plan = planner
+            .plan_with_reach(
+                &GroupRef::qualified(GroupScope::Personal, "mixed").expect("reference"),
+                GroupTargetState::Disable,
+                4,
+                GroupPlanMode::TuiDirect,
+                ProviderReach::selected(
+                    ProviderId::Codex,
+                    crate::provider_reach::SelectedProviderProvenance::ExplicitInput,
+                ),
+            )
+            .expect("selected-provider plan");
+        assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
+        assert_eq!(plan.members.len(), 2);
+        assert_eq!(plan.total_members, 2);
+        assert_eq!(
+            plan.members[0].outcome,
+            GroupMemberPlanOutcome::AlreadyCorrect
+        );
+        assert_eq!(
+            plan.members[1].outcome,
+            GroupMemberPlanOutcome::OutOfProviderReach
+        );
+        assert_eq!(plan.members[1].current_enabled, None);
+        assert_eq!(
+            plan.members[1].reason.as_deref(),
+            Some("out-of-provider-reach")
+        );
+        assert_eq!(plan.provider_coverage.entries().len(), 2);
+        assert_eq!(plan.provider_coverage.excluded().count(), 1);
+        assert_eq!(plan.lifecycle, ProviderReachLifecycle::Partial);
+        plan.verify().expect("reach-bound plan verifies");
+    }
+
+    #[test]
+    fn all_members_outside_selected_provider_are_blocked_without_native_planning() {
+        let root = TempDir::new().expect("tempdir");
+        let context = context(&root);
+        let personal = PersonalGroupStore::new(context.clone());
+        let repository = RepositoryGroupStore::new(context.clone());
+        let zed = GroupMemberIdentity::new(
+            ProviderId::Zed,
+            DiscoveryKind::Skill,
+            DiscoveryCategory::Skill,
+            DiscoveryLayer::Global,
+            "zed:global:skill:zed-only",
+        )
+        .expect("zed identity");
+        personal
+            .create(
+                &GroupDefinitionV1::new("zed-only", vec![zed.clone()]).expect("definition"),
+                OwnerGeneration::new("group-planner-test", 1).expect("owner"),
+            )
+            .expect("create group");
+        let planner = GroupPlanner::new(GroupResolver::new(context, personal, repository))
+            .with_discovery_override(DiscoveryOutput::default());
+        let plan = planner
+            .plan_with_reach(
+                &GroupRef::qualified(GroupScope::Personal, "zed-only").expect("reference"),
+                GroupTargetState::Disable,
+                4,
+                GroupPlanMode::TuiDirect,
+                ProviderReach::selected(
+                    ProviderId::Codex,
+                    crate::provider_reach::SelectedProviderProvenance::ExplicitInput,
+                ),
+            )
+            .expect("all-excluded plan");
+        assert_eq!(plan.disposition, GroupPlanDisposition::Blocked);
+        assert_eq!(
+            plan.lifecycle,
+            ProviderReachLifecycle::NoTargetsInProviderReach
+        );
+        assert_eq!(
+            plan.members[0].outcome,
+            GroupMemberPlanOutcome::OutOfProviderReach
+        );
+        assert!(plan.members[0].native_plan.is_none());
+        plan.verify().expect("all-excluded plan verifies");
+    }
+
+    #[test]
+    fn shared_source_crossing_excluded_provider_is_blocked() {
+        let listed = identity(
+            "codex:global:skill:listed",
+            DiscoveryKind::Skill,
+            DiscoveryCategory::Skill,
+        );
+        let mut listed_item = item(&listed, "listed");
+        listed_item.source_path = "/fixture/.agents/skills/shared/SKILL.md".to_string();
+        let mut excluded = listed_item.clone();
+        excluded.provider = ProviderId::Zed;
+        excluded.id = "zed:global:skill:shared".to_string();
+        let source_views = index_source_views(&[listed_item.clone(), excluded]);
+        assert!(shared_source_crosses_provider_reach(
+            &listed_item,
+            &ProviderReach::selected(
+                ProviderId::Codex,
+                crate::provider_reach::SelectedProviderProvenance::ExplicitInput,
             ),
             &source_views,
         ));

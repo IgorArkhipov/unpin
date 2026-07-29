@@ -9,13 +9,17 @@ use rusqlite::Connection;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use unpin_core::{
-    control_operation::DurableControlError,
+    control_operation::{DurableControlError, ReachAwareRootBinding},
     discovery::{DiscoveryItem, DiscoveryMutability, DiscoveryRoots, ProviderId, discover_all},
     mutation::{
         BackupAuthenticationKey, BackupAuthenticationStatus, NativeToggleControlError,
         NativeToggleController, RestoreBackupInput, RestoreControlError, RestoreController,
         RestoreStatus, TogglePlanRequest, ToggleResult, ToggleStatus, authenticate_legacy_backup,
         load_backup_summaries_authenticated, plan_toggle as core_plan_toggle, restore_backup,
+    },
+    provider_reach::{
+        ConnectionBoundary, DerivedTargetKind, ProviderReach, ProviderReachError,
+        ProviderReachInput, ProviderReachRequest, SelectedProviderProvenance,
     },
     sessions::{
         BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
@@ -91,6 +95,61 @@ fn apply_audit_failure_preserves_recovery_evidence_after_directory_move() {
         !source_path.exists(),
         "the test must reach the post-mutation audit failure"
     );
+}
+
+#[test]
+fn reach_aware_native_wrapper_rejects_context_drift_before_writes() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
+        .expect("Codex skill");
+    let context = control_context("reach-aware-repository", "reach-aware-workspace");
+    let controller = NativeToggleController::with_session_authority_key(
+        &app_state_root,
+        session_authority_key(),
+    );
+    let plan = controller.plan(item, &context).expect("native toggle plan");
+    let authorization = control_authorization(
+        &app_state_root,
+        &plan
+            .approval_expectation(&context)
+            .expect("approval expectation"),
+        "reach-aware-context-drift",
+        2_000_000_000,
+    );
+    let provider_root = fixture_copy.path().join("codex").join("global");
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &app_state_root,
+        vec![(
+            ProviderId::Codex,
+            provider_root,
+            "fixture-codex".to_string(),
+        )],
+        "fixture",
+    )
+    .expect("trusted roots");
+    let result = controller.apply_with_reach_aware(
+        &plan,
+        authorization,
+        &control_context("drifted-repository", "reach-aware-workspace"),
+        backup_authentication_key(),
+        roots,
+        "unpin-test-audience",
+        100,
+        200,
+    );
+    assert!(matches!(
+        result,
+        Err(NativeToggleControlError::ContextMismatch)
+    ));
+    assert!(!app_state_root.join("transactions").exists());
+    assert!(!app_state_root.join("backups").exists());
 }
 
 fn sha256_hex(value: &[u8]) -> String {
@@ -1177,6 +1236,8 @@ fn exact_native_toggle_retry_verifies_authenticated_live_post_state() {
     let applied = controller
         .apply(&plan, authorization, &context, key.clone())
         .expect("native toggle apply");
+    assert_eq!(applied.provider_reach, Some(plan.provider_reach));
+    assert_eq!(applied.coverage.as_ref(), Some(&plan.coverage));
     let backup_id = applied.backup_id.clone().expect("native toggle backup");
     let committed = TransitionJournalStore::new(&app_state_root)
         .list()
@@ -1199,6 +1260,8 @@ fn exact_native_toggle_retry_verifies_authenticated_live_post_state() {
         .apply(&plan, exact_retry_authorization, &context, key.clone())
         .expect("verified exact native toggle retry");
     assert_eq!(exact_retry.status, ToggleStatus::Applied);
+    assert_eq!(exact_retry.provider_reach, Some(plan.provider_reach));
+    assert_eq!(exact_retry.coverage.as_ref(), Some(&plan.coverage));
     assert_eq!(exact_retry.backup_id.as_deref(), Some(backup_id.as_str()));
 
     let restored = restore_backup(RestoreBackupInput {
@@ -1410,6 +1473,114 @@ fn interrupted_native_toggle_with_provider_drift_requires_recovery() {
     assert_eq!(
         repaired.journal.terminal_code.as_deref(),
         Some("legacy-resume-state-diverged")
+    );
+}
+
+#[test]
+fn native_toggle_omitted_reach_uses_exact_target_provenance() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| {
+            item.provider == ProviderId::Codex && item.mutability == DiscoveryMutability::ReadWrite
+        })
+        .expect("Codex writable item");
+    let controller = NativeToggleController::new(app_state.path());
+    let plan = controller
+        .plan(item, &control_context("test-repository", "test-workspace"))
+        .expect("exact target plan");
+
+    assert_eq!(
+        plan.provider_reach,
+        ProviderReach::selected(
+            ProviderId::Codex,
+            SelectedProviderProvenance::ExactIndividualTarget,
+        )
+    );
+    assert_eq!(plan.preview.provider_reach, Some(plan.provider_reach));
+    assert_eq!(plan.coverage.entries.len(), 1);
+    assert!(plan.coverage.entries[0].included);
+}
+
+#[test]
+fn native_toggle_rejects_selected_provider_conflict_before_native_planning() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "zed:global:configured-mcp:github")
+        .expect("Zed configured MCP item");
+    let request = ProviderReachRequest::new(
+        ConnectionBoundary::All,
+        ProviderReachInput::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
+        DerivedTargetKind::Individual,
+    );
+    let error = NativeToggleController::new(app_state.path())
+        .plan_with_reach_request(
+            item,
+            &control_context("test-repository", "test-workspace"),
+            request,
+        )
+        .expect_err("selected Codex must reject exact Zed target");
+    assert!(matches!(
+        error,
+        NativeToggleControlError::ProviderReach(ProviderReachError::ExactTargetConflict {
+            selected: ProviderId::Codex,
+            target: ProviderId::Zed,
+        })
+    ));
+    assert!(
+        !app_state.path().join("journals").exists(),
+        "authority conflict must happen before native transition state"
+    );
+}
+
+#[test]
+fn native_toggle_blocks_shared_source_outside_selected_provider_reach() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let discovery = discover_all(&DiscoveryRoots::fixture_root(fixture_copy.path()))
+        .expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "claude:global:skill:example-claude-global-skill")
+        .cloned()
+        .expect("Claude shared skill");
+
+    let error = NativeToggleController::new(app_state.path())
+        .plan_with_reach_in_inventory(
+            item,
+            &discovery.items,
+            &control_context("test-repository", "test-workspace"),
+            ConnectionBoundary::All,
+            ProviderReachInput::selected(
+                ProviderId::Claude,
+                SelectedProviderProvenance::ExplicitInput,
+            ),
+            vec![unpin_core::provider_reach::SelectedProviderAuthority::new(
+                ProviderId::Claude,
+                SelectedProviderProvenance::ExplicitInput,
+            )],
+        )
+        .expect_err("shared source must block before native planning");
+
+    assert!(matches!(
+        error,
+        NativeToggleControlError::Blocked(reason)
+            if reason == "shared-source-crosses-provider-reach"
+    ));
+    assert!(
+        !app_state.path().join("journals").exists(),
+        "shared-source guard must run before transition state"
     );
 }
 
@@ -3287,6 +3458,96 @@ fn applies_codex_skill_native_config_toggle_without_moving_admin_source() {
 }
 
 #[test]
+fn applies_codex_shared_skill_toggle_without_moving_shared_source() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+    let config_path = fixture_copy.path().join("codex/global/config.toml");
+    let skill_path = fixture_copy
+        .path()
+        .join("shared/global/.agents/skills/example-shared-global-skill/SKILL.md");
+
+    let discovery = discover_all(&roots).expect("fixture discovery");
+    let item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:example-shared-global-skill")
+        .expect("Codex shared skill");
+    assert!(item.enabled);
+    assert_eq!(item.state_path, config_path.to_string_lossy());
+
+    let disable_plan = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: false,
+        backup_authentication_key: None,
+    });
+    assert_eq!(disable_plan.status, ToggleStatus::DryRun);
+    assert_eq!(disable_plan.operations[0].operation_type, "replaceFile");
+    assert!(
+        disable_plan
+            .operations
+            .iter()
+            .all(|operation| operation.operation_type != "renamePath")
+    );
+
+    let disabled_apply = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(disabled_apply.status, ToggleStatus::Applied);
+    assert!(skill_path.is_file(), "shared skill source remains in place");
+    assert!(!app_state.path().join("vault").exists());
+    let disabled_config = fs::read_to_string(&config_path).expect("disabled Codex config");
+    assert!(disabled_config.contains(&format!("path = {:?}", skill_path.to_string_lossy())));
+    assert!(disabled_config.contains("enabled = false"));
+    assert!(disabled_config.contains("[plugins.safe-shell]\nenabled = true"));
+    assert!(disabled_config.contains("[mcp_servers.github]"));
+    assert!(disabled_config.contains("[hooks.PreToolUse]\ncommand = \"echo\""));
+
+    let disabled_discovery = discover_all(&roots).expect("disabled discovery");
+    let disabled_item = disabled_discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:skill:example-shared-global-skill")
+        .expect("disabled Codex shared skill");
+    assert!(!disabled_item.enabled);
+    for item_id in [
+        "cursor:global:skill:@compat/agents/example-shared-global-skill",
+        "pi:global:skill:@compat/agents/example-shared-global-skill",
+        "opencode:global:skill:@compat/agents/example-shared-global-skill",
+        "zed:global:skill:example-shared-global-skill",
+    ] {
+        assert!(
+            disabled_discovery
+                .items
+                .iter()
+                .find(|item| item.id == item_id)
+                .is_some_and(|item| item.enabled),
+            "{item_id} remains enabled"
+        );
+    }
+
+    let enabled_apply = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: disabled_item.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(enabled_apply.status, ToggleStatus::Applied);
+    assert!(enabled_apply.target_enabled);
+    assert!(skill_path.is_file());
+    assert!(
+        fs::read_to_string(&config_path)
+            .expect("enabled Codex config")
+            .contains("enabled = true")
+    );
+}
+
+#[test]
 fn blocks_codex_skill_toggle_when_native_config_has_duplicate_paths() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
@@ -3856,14 +4117,6 @@ fn shared_skills_move_to_vault_and_restore_origin() {
         (
             "claude:project:skill:example-claude-skill",
             "claude/project/.claude/skills/example-claude-skill",
-        ),
-        (
-            "codex:global:skill:example-shared-global-skill",
-            "shared/global/.agents/skills/example-shared-global-skill",
-        ),
-        (
-            "codex:project:skill:example-shared-project-skill",
-            "shared/project/.agents/skills/example-shared-project-skill",
         ),
         (
             "cursor:global:skill:@compat/agents/example-shared-global-skill",

@@ -15,6 +15,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod mutation;
 pub mod profiles;
+pub mod provider_reach;
 pub mod providers;
 pub mod sessions;
 pub mod snapshots;

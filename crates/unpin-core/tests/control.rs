@@ -1,16 +1,36 @@
-use std::{collections::BTreeSet, fs, path::Path, process::Command};
+use std::{
+    collections::BTreeSet,
+    fs,
+    path::Path,
+    process::Command,
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 use tempfile::TempDir;
 use unpin_core::{
     approval::{ApprovalExpectation, ApprovalResourceBinding},
     bridges::HookCoverageStatus,
-    control::build_control_status,
+    control::{
+        CatalogControlSummary, ControlOperationStatus, ControlStatus,
+        ReachAwareStatusAuthorization, ReachAwareStatusFilter,
+        attach_reach_aware_status_for_operation, build_control_status,
+        project_reach_aware_operation_status, project_reach_aware_operations,
+    },
     control_operation::{
         CONTROL_OPERATION_ENVELOPE_SCHEMA_VERSION, ControlHumanAction, ControlOperationEnvelope,
-        ControlOperationLifecycle,
+        ControlOperationLifecycle, ControlResolvedContext, ReachAwareControlOperationEnvelope,
+        ReachAwareOperationFamily, ReachAwarePayloadReference, ReachAwareRootBinding,
+        ReachAwareTransferCapability,
     },
     discovery::{DiscoveryRoots, ProviderId, discover_all},
     profiles::{PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileStore},
+    provider_reach::{
+        ConnectionBoundary, ProviderReach, ProviderReachCoverage, ProviderReachLifecycle,
+        SelectedProviderAuthority, SelectedProviderProvenance,
+    },
     sessions::{
         BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
         PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
@@ -18,7 +38,8 @@ use unpin_core::{
     state::{atomic_json::OwnerGeneration, workspace::resolve_workspace_identity},
     transitions::{
         EffectActivation, EffectAuthority, TransitionContext, TransitionEffect,
-        TransitionEffectKind, TransitionJournalStore, TransitionKind, TransitionPlan,
+        TransitionEffectKind, TransitionJournalStore, TransitionKind, TransitionLifecycle,
+        TransitionPlan,
     },
 };
 
@@ -26,6 +47,15 @@ fn fixtures_root() -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
+}
+
+fn wall_clock_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock is after Unix epoch")
+        .as_secs()
+        .try_into()
+        .expect("Unix timestamp fits i64")
 }
 
 #[test]
@@ -75,6 +105,262 @@ fn control_operation_envelope_is_surface_neutral_and_deterministic() {
 }
 
 #[test]
+fn reach_aware_v2_envelope_binds_provider_material_without_changing_v1() {
+    let temp = TempDir::new().expect("temporary roots");
+    let state_root = temp.path().join("state");
+    let provider_root = temp.path().join("codex");
+    fs::create_dir(&state_root).expect("state root");
+    fs::create_dir(&provider_root).expect("provider root");
+    let key = SessionAuthorityKey::new([7; 32]);
+    let principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "session",
+        "scope",
+        ConnectionBoundary::All,
+        &key,
+    )
+    .expect("signed principal");
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &state_root,
+        vec![(
+            ProviderId::Codex,
+            provider_root,
+            "fixture-codex".to_string(),
+        )],
+        "fixture",
+    )
+    .expect("trusted roots");
+    let owner = OwnerGeneration::new("reach-aware-test", 1).expect("owner");
+    let revision = unpin_core::state::atomic_json::StateRevision {
+        sequence: 1,
+        fingerprint: "r".repeat(64),
+    };
+    let provider_reach = ProviderReach::selected(
+        ProviderId::Codex,
+        SelectedProviderProvenance::ExactIndividualTarget,
+    );
+    let envelope = ReachAwareControlOperationEnvelope::builder()
+        .family(ReachAwareOperationFamily::NativeToggle, 1)
+        .operation("native-operation", "native-toggle", "plan-fingerprint")
+        .context(ControlResolvedContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some("session".to_string()),
+            profile_digest: None,
+        })
+        .reach(
+            ConnectionBoundary::All,
+            provider_reach,
+            Some(SelectedProviderAuthority::new(
+                ProviderId::Codex,
+                SelectedProviderProvenance::ExactIndividualTarget,
+            )),
+            ProviderReachCoverage::new(Vec::new()),
+        )
+        .lifecycle(
+            ProviderReachLifecycle::Applied,
+            ProviderReachLifecycle::Applied,
+            EffectActivation::RestartRequired,
+        )
+        .trusted_roots(roots)
+        .authority(principal, "unpin-test-audience", 100, 200)
+        .journal_binding(owner, revision)
+        .payload_reference(ReachAwarePayloadReference {
+            family: ReachAwareOperationFamily::NativeToggle,
+            schema_version: 1,
+            reference: "native-operation".to_string(),
+            payload_digest: "p".repeat(64),
+        })
+        .build()
+        .expect("reach-aware envelope");
+    assert_eq!(envelope.schema_version, 2);
+    let fingerprint = envelope.fingerprint().expect("fingerprint");
+    assert_eq!(envelope.envelope_fingerprint, fingerprint);
+    let mut tampered = envelope.clone();
+    tampered.provider_reach = ProviderReach::All;
+    assert!(tampered.verify().is_err());
+    assert_eq!(CONTROL_OPERATION_ENVELOPE_SCHEMA_VERSION, 1);
+}
+
+#[test]
+fn reach_aware_roots_allow_policy_only_operations_without_provider_paths() {
+    let state = TempDir::new().expect("state");
+    let roots =
+        ReachAwareRootBinding::from_provider_paths(state.path(), Vec::new(), "policy-store-only")
+            .expect("policy-only roots");
+    roots.verify().expect("valid policy-only roots");
+    assert!(roots.provider_roots.is_empty());
+}
+
+#[test]
+fn reach_aware_v2_builder_is_fail_closed_without_authority_and_journal_binding() {
+    let error = ReachAwareControlOperationEnvelope::builder()
+        .family(ReachAwareOperationFamily::NativeToggle, 1)
+        .operation("native-operation", "native-toggle", "plan-fingerprint")
+        .build()
+        .expect_err("incomplete reach-aware records must not be constructible");
+    assert!(error.to_string().contains("context"));
+}
+
+#[test]
+fn reach_aware_v2_journal_attachment_binds_revision_and_redacts_provider_roots() {
+    let temp = TempDir::new().expect("temporary state root");
+    let state_root = temp.path().join("state");
+    let provider_root = temp.path().join("codex");
+    fs::create_dir(&state_root).expect("state root");
+    fs::create_dir(&provider_root).expect("provider root");
+    let state_root = fs::canonicalize(state_root).expect("canonical state root");
+    let provider_root = fs::canonicalize(provider_root).expect("canonical provider root");
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &state_root,
+        vec![(
+            ProviderId::Codex,
+            provider_root.clone(),
+            "fixture-codex".to_string(),
+        )],
+        "fixture",
+    )
+    .expect("trusted provider roots");
+    let key = SessionAuthorityKey::new([8; 32]);
+    let principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "session",
+        "scope",
+        ConnectionBoundary::All,
+        &key,
+    )
+    .expect("signed principal");
+    let plan = TransitionPlan::new(
+        "reach-aware-journal-operation",
+        TransitionKind::NativeToggle,
+        TransitionContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some("session".to_string()),
+            profile_digest: None,
+        },
+        vec![TransitionEffect {
+            effect_id: "effect".to_string(),
+            kind: TransitionEffectKind::ReplaceProviderConfig,
+            resource_id: "resource".to_string(),
+            target_type: "native-provider-state".to_string(),
+            summary: "toggle provider state".to_string(),
+            authority: EffectAuthority::UserManaged,
+            activation: EffectActivation::RestartRequired,
+            expected_pre_fingerprint: Some("a".repeat(64)),
+            expected_post_fingerprint: Some("b".repeat(64)),
+            provider_views: vec![ProviderId::Codex],
+        }],
+    )
+    .expect("transition plan");
+    let owner = OwnerGeneration::new("reach-aware-journal-test", 1).expect("owner");
+    let store = TransitionJournalStore::new(&state_root);
+    let mut handle = store
+        .create_or_attach(&plan, owner.clone())
+        .expect("create journal");
+    let issued_at_unix = wall_clock_unix();
+    let make_builder = || {
+        ReachAwareControlOperationEnvelope::builder()
+            .family(ReachAwareOperationFamily::NativeToggle, 1)
+            .operation(
+                plan.operation_id.clone(),
+                plan.kind.as_str(),
+                "c".repeat(64),
+            )
+            .context(ControlResolvedContext {
+                repository_key: "repository".to_string(),
+                workspace_key: "workspace".to_string(),
+                session_id: Some("session".to_string()),
+                profile_digest: None,
+            })
+            .reach(
+                ConnectionBoundary::All,
+                ProviderReach::selected(
+                    ProviderId::Codex,
+                    SelectedProviderProvenance::ExactIndividualTarget,
+                ),
+                Some(SelectedProviderAuthority::new(
+                    ProviderId::Codex,
+                    SelectedProviderProvenance::ExactIndividualTarget,
+                )),
+                ProviderReachCoverage::new(Vec::new()),
+            )
+            .lifecycle(
+                ProviderReachLifecycle::Applied,
+                ProviderReachLifecycle::Applied,
+                EffectActivation::RestartRequired,
+            )
+            .trusted_roots(roots.clone())
+            .authority(
+                principal.clone(),
+                "unpin-test-audience",
+                issued_at_unix,
+                issued_at_unix + 60,
+            )
+            .payload_reference(ReachAwarePayloadReference {
+                family: ReachAwareOperationFamily::NativeToggle,
+                schema_version: 1,
+                reference: plan.operation_id.clone(),
+                payload_digest: "c".repeat(64),
+            })
+    };
+    store
+        .attach_reach_aware_builder(&mut handle, make_builder(), &key)
+        .expect("attach v2 envelope");
+    let envelope = handle
+        .journal
+        .reach_aware
+        .clone()
+        .expect("attached envelope");
+    assert_eq!(envelope.owner, owner);
+    assert_eq!(envelope.revision.sequence, 1);
+    assert!(
+        store
+            .attach_reach_aware_builder(&mut handle, make_builder(), &key)
+            .is_ok(),
+        "a live persisted envelope may be reattached with the same authority"
+    );
+    let redacted = envelope.redacted();
+    let rendered = serde_json::to_string(&redacted).expect("redacted envelope");
+    assert!(!rendered.contains(provider_root.to_string_lossy().as_ref()));
+    let mut tampered = envelope.clone();
+    tampered.provider_reach = ProviderReach::All;
+    assert!(tampered.verify_authenticated(&key).is_err());
+    let mut tampered_roots = envelope.clone();
+    tampered_roots.roots.provider_roots[0].root = "/tmp/tampered".to_string();
+    assert!(tampered_roots.verify_authenticated(&key).is_err());
+    let mut unsigned_journal = store
+        .load(&plan, owner.clone())
+        .expect("reload attached journal");
+    unsigned_journal
+        .journal
+        .reach_aware
+        .as_mut()
+        .expect("attached envelope")
+        .authentication_tag
+        .clear();
+    assert!(store.save(&mut unsigned_journal).is_err());
+    let mut tampered_journal = store
+        .load(&plan, owner.clone())
+        .expect("reload attached journal");
+    tampered_journal
+        .journal
+        .reach_aware
+        .as_mut()
+        .expect("attached envelope")
+        .provider_reach = ProviderReach::All;
+    assert!(store.save(&mut tampered_journal).is_err());
+
+    handle
+        .journal
+        .record(TransitionLifecycle::Committed, "committed", None)
+        .expect("terminal journal");
+    store.save(&mut handle).expect("save terminal journal");
+    let mut terminal = store.load(&plan, owner).expect("reload terminal journal");
+    store
+        .attach_reach_aware_builder(&mut terminal, make_builder(), &key)
+        .expect("idempotent terminal attach");
+}
+
+#[test]
 fn control_status_is_shared_redacted_state_and_persistent_metadata_excludes_runtime() {
     let temp = TempDir::new().expect("temporary control root");
     let root = fs::canonicalize(temp.path()).expect("canonical control root");
@@ -96,6 +382,7 @@ fn control_status_is_shared_redacted_state_and_persistent_metadata_excludes_runt
                 description: None,
                 members: Vec::new(),
                 provider_members: std::collections::BTreeMap::new(),
+                supported_providers: std::collections::BTreeSet::new(),
             },
             None,
             OwnerGeneration::new("control-test", 1).unwrap(),
@@ -236,4 +523,1027 @@ fn control_status_filters_foreign_workspace_sessions_and_operations() {
     assert_eq!(status.sessions[0].workspace_key, identity.workspace_key);
     assert_eq!(status.operations.len(), 1);
     assert_eq!(status.operations[0].operation_id, "local-operation");
+}
+
+#[test]
+fn reach_aware_transfer_capability_rejects_invalid_contexts_and_is_consumed_once() {
+    let temp = TempDir::new().expect("temporary control root");
+    let state_root = fs::canonicalize(temp.path()).expect("canonical state root");
+    let provider_root = state_root.join("codex");
+    fs::create_dir(&provider_root).expect("provider root");
+    let authority_key = SessionAuthorityKey::new([0x71; 32]);
+    let issuer = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "issuer-session",
+        "issuer-scope",
+        ConnectionBoundary::All,
+        &authority_key,
+    )
+    .expect("issuer principal");
+    let recipient = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "recipient-session",
+        "recipient-scope",
+        ConnectionBoundary::pinned(ProviderId::Codex),
+        &authority_key,
+    )
+    .expect("recipient principal");
+    let wrong_boundary_recipient = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "recipient-session",
+        "recipient-scope",
+        ConnectionBoundary::All,
+        &authority_key,
+    )
+    .expect("wrong-boundary recipient principal");
+    let mut forged_recipient = recipient.clone();
+    forged_recipient.authentication_tag = "forged".to_string();
+    assert!(
+        ReachAwareTransferCapability::issue(
+            "forged-transfer",
+            "control-audience",
+            "scope-digest",
+            "transfer-operation",
+            &forged_recipient,
+            100,
+            200,
+            &authority_key,
+        )
+        .is_err(),
+        "capability issuance must authenticate the recipient principal"
+    );
+    let capability = ReachAwareTransferCapability::issue(
+        "transfer-1",
+        "control-audience",
+        "scope-digest",
+        "transfer-operation",
+        &recipient,
+        100,
+        200,
+        &authority_key,
+    )
+    .expect("signed capability");
+    capability
+        .validate_for(
+            "transfer-operation",
+            "control-audience",
+            "scope-digest",
+            &recipient,
+            150,
+            &authority_key,
+        )
+        .expect("valid capability");
+    assert!(
+        capability
+            .validate_for(
+                "transfer-operation",
+                "control-audience",
+                "scope-digest",
+                &wrong_boundary_recipient,
+                150,
+                &authority_key,
+            )
+            .is_err(),
+        "capability validation must bind the recipient connection boundary"
+    );
+    assert!(
+        capability
+            .validate_for(
+                "transfer-operation",
+                "control-audience",
+                "scope-digest",
+                &forged_recipient,
+                150,
+                &authority_key,
+            )
+            .is_err(),
+        "capability validation must authenticate the recipient principal"
+    );
+    assert!(
+        capability
+            .validate_for(
+                "wrong-operation",
+                "control-audience",
+                "scope-digest",
+                &recipient,
+                150,
+                &authority_key,
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .validate_for(
+                "transfer-operation",
+                "wrong-audience",
+                "scope-digest",
+                &recipient,
+                150,
+                &authority_key,
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .validate_for(
+                "transfer-operation",
+                "control-audience",
+                "wrong-scope",
+                &recipient,
+                150,
+                &authority_key,
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .validate_for(
+                "transfer-operation",
+                "control-audience",
+                "scope-digest",
+                &issuer,
+                150,
+                &authority_key,
+            )
+            .is_err()
+    );
+    assert!(
+        capability
+            .validate_for(
+                "transfer-operation",
+                "control-audience",
+                "scope-digest",
+                &recipient,
+                250,
+                &authority_key,
+            )
+            .is_err()
+    );
+    let transfer_issued_at_unix = wall_clock_unix();
+    let transfer_expires_at_unix = transfer_issued_at_unix + 60;
+    let capability = ReachAwareTransferCapability::issue(
+        "transfer-live",
+        "control-audience",
+        "scope-digest",
+        "transfer-operation",
+        &recipient,
+        transfer_issued_at_unix,
+        transfer_expires_at_unix,
+        &authority_key,
+    )
+    .expect("live signed capability");
+
+    let provider_root = fs::canonicalize(provider_root).expect("canonical provider root");
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &state_root,
+        vec![(ProviderId::Codex, provider_root, "fixture".to_string())],
+        "fixture",
+    )
+    .expect("trusted roots");
+    let plan = TransitionPlan::new(
+        "transfer-operation",
+        TransitionKind::NativeToggle,
+        TransitionContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some("issuer-session".to_string()),
+            profile_digest: None,
+        },
+        vec![TransitionEffect {
+            effect_id: "effect".to_string(),
+            kind: TransitionEffectKind::ReplaceProviderConfig,
+            resource_id: "resource".to_string(),
+            target_type: "native-provider-state".to_string(),
+            summary: "transfer test".to_string(),
+            authority: EffectAuthority::UserManaged,
+            activation: EffectActivation::RestartRequired,
+            expected_pre_fingerprint: Some("a".repeat(64)),
+            expected_post_fingerprint: Some("b".repeat(64)),
+            provider_views: vec![ProviderId::Codex],
+        }],
+    )
+    .expect("transition plan");
+    let owner = OwnerGeneration::new("transfer-owner", 1).expect("owner");
+    let revision = unpin_core::state::atomic_json::StateRevision {
+        sequence: 1,
+        fingerprint: "r".repeat(64),
+    };
+    let builder = ReachAwareControlOperationEnvelope::builder()
+        .family(ReachAwareOperationFamily::NativeToggle, 1)
+        .operation(
+            plan.operation_id.clone(),
+            plan.kind.as_str(),
+            "p".repeat(64),
+        )
+        .context(ControlResolvedContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some("issuer-session".to_string()),
+            profile_digest: None,
+        })
+        .reach(
+            ConnectionBoundary::All,
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
+            Some(SelectedProviderAuthority::new(
+                ProviderId::Codex,
+                SelectedProviderProvenance::ExplicitInput,
+            )),
+            ProviderReachCoverage::new(vec![
+                unpin_core::provider_reach::ProviderCoverageEntry::included(
+                    ProviderId::Codex,
+                    "codex-target",
+                ),
+                unpin_core::provider_reach::ProviderCoverageEntry::excluded(
+                    ProviderId::Zed,
+                    "zed-private-target",
+                ),
+            ]),
+        )
+        .lifecycle(
+            ProviderReachLifecycle::Partial,
+            ProviderReachLifecycle::Partial,
+            EffectActivation::RestartRequired,
+        )
+        .trusted_roots(roots)
+        .authority(
+            issuer,
+            "control-audience",
+            transfer_issued_at_unix,
+            transfer_expires_at_unix,
+        )
+        .journal_binding(owner.clone(), revision)
+        .payload_reference(ReachAwarePayloadReference {
+            family: ReachAwareOperationFamily::NativeToggle,
+            schema_version: 1,
+            reference: plan.operation_id.clone(),
+            payload_digest: "p".repeat(64),
+        })
+        .transfer_capability(Some(capability.clone()));
+    let store = TransitionJournalStore::new(&state_root);
+    let mut handle = store
+        .create_or_attach(&plan, owner)
+        .expect("create journal");
+    store
+        .attach_reach_aware_builder(&mut handle, builder, &authority_key)
+        .expect("attach envelope");
+    store
+        .consume_reach_aware_transfer_capability(
+            &mut handle,
+            &capability,
+            "control-audience",
+            "scope-digest",
+            &recipient,
+            transfer_issued_at_unix,
+            &authority_key,
+        )
+        .expect("first durable consumption");
+    let transferred_authorization = ReachAwareStatusAuthorization::new(
+        recipient.clone(),
+        "control-audience",
+        "scope-digest",
+        transfer_issued_at_unix,
+        None,
+    );
+    project_reach_aware_operation_status(
+        &handle.journal,
+        &transferred_authorization,
+        &authority_key,
+    )
+    .expect("consumed transfer establishes durable recipient status access");
+    let mut tampered_journal = handle.journal.clone();
+    tampered_journal
+        .consumed_transfer_capabilities
+        .get_mut(&capability.capability_id)
+        .expect("consumption receipt")
+        .authentication_tag = "forged".to_string();
+    assert!(
+        project_reach_aware_operation_status(
+            &tampered_journal,
+            &transferred_authorization,
+            &authority_key,
+        )
+        .is_err(),
+        "consumed capability adoption must be authenticated"
+    );
+    assert!(
+        project_reach_aware_operation_status(
+            &handle.journal,
+            &ReachAwareStatusAuthorization::new(
+                recipient.clone(),
+                "control-audience",
+                "wrong-scope",
+                150,
+                None,
+            ),
+            &authority_key,
+        )
+        .is_err()
+    );
+    assert!(
+        store
+            .consume_reach_aware_transfer_capability(
+                &mut handle,
+                &capability,
+                "control-audience",
+                "scope-digest",
+                &recipient,
+                150,
+                &authority_key,
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets() {
+    let temp = TempDir::new().expect("temporary control root");
+    let root = fs::canonicalize(temp.path()).expect("canonical root");
+    let provider_root = root.join("codex");
+    fs::create_dir(&provider_root).expect("provider root");
+    let authority_key = SessionAuthorityKey::new([0x72; 32]);
+    let principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "status-session",
+        "status-scope",
+        ConnectionBoundary::All,
+        &authority_key,
+    )
+    .expect("principal");
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        &root,
+        vec![(
+            ProviderId::Codex,
+            fs::canonicalize(provider_root).expect("canonical provider root"),
+            "fixture".to_string(),
+        )],
+        "fixture",
+    )
+    .expect("roots");
+    let plan = TransitionPlan::new(
+        "status-operation",
+        TransitionKind::NativeToggle,
+        TransitionContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some("status-session".to_string()),
+            profile_digest: None,
+        },
+        vec![TransitionEffect {
+            effect_id: "effect".to_string(),
+            kind: TransitionEffectKind::ReplaceProviderConfig,
+            resource_id: "resource".to_string(),
+            target_type: "native-provider-state".to_string(),
+            summary: "status test".to_string(),
+            authority: EffectAuthority::UserManaged,
+            activation: EffectActivation::RestartRequired,
+            expected_pre_fingerprint: None,
+            expected_post_fingerprint: Some("b".repeat(64)),
+            provider_views: vec![ProviderId::Codex],
+        }],
+    )
+    .expect("plan");
+    let pinned_principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "status-pinned-session",
+        "status-pinned-scope",
+        ConnectionBoundary::pinned(ProviderId::Codex),
+        &authority_key,
+    )
+    .expect("pinned principal");
+    let status_issued_at_unix = wall_clock_unix();
+    let status_expires_at_unix = status_issued_at_unix + 60;
+    let pinned_capability = ReachAwareTransferCapability::issue(
+        "status-transfer",
+        "control-audience",
+        "status-scope-digest",
+        &plan.operation_id,
+        &pinned_principal,
+        status_issued_at_unix,
+        status_expires_at_unix,
+        &authority_key,
+    )
+    .expect("status transfer capability");
+    let store = TransitionJournalStore::new(&root);
+    let mut handle = store
+        .create_or_attach(
+            &plan,
+            OwnerGeneration::new("status-owner", 1).expect("owner"),
+        )
+        .expect("journal");
+    let builder = ReachAwareControlOperationEnvelope::builder()
+        .family(ReachAwareOperationFamily::NativeToggle, 1)
+        .operation(
+            plan.operation_id.clone(),
+            plan.kind.as_str(),
+            "s".repeat(64),
+        )
+        .context(ControlResolvedContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some("status-session".to_string()),
+            profile_digest: None,
+        })
+        .reach(
+            ConnectionBoundary::All,
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::ExplicitInput),
+            Some(SelectedProviderAuthority::new(
+                ProviderId::Codex,
+                SelectedProviderProvenance::ExplicitInput,
+            )),
+            ProviderReachCoverage::new(vec![
+                unpin_core::provider_reach::ProviderCoverageEntry::included(
+                    ProviderId::Codex,
+                    "codex-visible-target",
+                ),
+                unpin_core::provider_reach::ProviderCoverageEntry::excluded(
+                    ProviderId::Zed,
+                    "zed-secret-path",
+                ),
+            ]),
+        )
+        .lifecycle(
+            ProviderReachLifecycle::Partial,
+            ProviderReachLifecycle::Partial,
+            EffectActivation::RestartRequired,
+        )
+        .trusted_roots(roots)
+        .authority(
+            principal.clone(),
+            "control-audience",
+            status_issued_at_unix,
+            status_expires_at_unix,
+        )
+        .payload_reference(ReachAwarePayloadReference {
+            family: ReachAwareOperationFamily::NativeToggle,
+            schema_version: 1,
+            reference: plan.operation_id.clone(),
+            payload_digest: "s".repeat(64),
+        })
+        .transfer_capability(Some(pinned_capability.clone()));
+    store
+        .attach_reach_aware_builder(&mut handle, builder, &authority_key)
+        .expect("attach envelope");
+    store
+        .consume_reach_aware_transfer_capability(
+            &mut handle,
+            &pinned_capability,
+            "control-audience",
+            "status-scope-digest",
+            &pinned_principal,
+            status_issued_at_unix,
+            &authority_key,
+        )
+        .expect("durably consume status transfer capability");
+    let journal = handle.journal.clone();
+    let authorization = ReachAwareStatusAuthorization::new(
+        pinned_principal,
+        "control-audience",
+        "status-scope-digest",
+        status_issued_at_unix,
+        Some(pinned_capability),
+    );
+    let projection = project_reach_aware_operation_status(&journal, &authorization, &authority_key)
+        .expect("authorized projection");
+    let repeated_projection =
+        project_reach_aware_operation_status(&journal, &authorization, &authority_key)
+            .expect("durable transfer supports repeat status reads");
+    assert_eq!(repeated_projection, projection);
+    let rendered = serde_json::to_string(&projection).expect("projection JSON");
+    assert!(rendered.contains("codex-visible-target"));
+    assert!(!rendered.contains("zed-secret-path"));
+    assert!(
+        projection
+            .excluded_provider_counts
+            .contains_key(&ProviderId::Zed)
+    );
+    let zed_unauthorized = {
+        let zed_principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+            "status-zed-session",
+            "status-zed-scope",
+            ConnectionBoundary::pinned(ProviderId::Zed),
+            &authority_key,
+        )
+        .expect("Zed principal");
+        project_reach_aware_operation_status(
+            &journal,
+            &ReachAwareStatusAuthorization::new(
+                zed_principal,
+                "control-audience",
+                "status-scope-digest",
+                150,
+                None,
+            ),
+            &authority_key,
+        )
+        .is_err()
+    };
+    assert!(
+        zed_unauthorized,
+        "pinned status cannot observe an operation selected for another provider"
+    );
+    let all_provider_projection = project_reach_aware_operation_status(
+        &journal,
+        &ReachAwareStatusAuthorization::new(
+            principal.clone(),
+            "control-audience",
+            "status-scope-digest",
+            150,
+            None,
+        ),
+        &authority_key,
+    )
+    .expect("all-provider projection");
+    assert!(
+        serde_json::to_string(&all_provider_projection)
+            .expect("all-provider projection JSON")
+            .contains("zed-secret-path")
+    );
+
+    let filter = ReachAwareStatusFilter {
+        operation_id: Some("status-operation".to_string()),
+        family: Some(ReachAwareOperationFamily::NativeToggle),
+        lifecycle: Some(ProviderReachLifecycle::RecoveryRequired),
+        provider: Some(ProviderId::Codex),
+    };
+    let projections = project_reach_aware_operations(
+        std::slice::from_ref(&journal),
+        &filter,
+        &authorization,
+        &authority_key,
+    )
+    .expect("filtered projections");
+    assert_eq!(projections.len(), 1);
+    let wrong_principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        "wrong-session",
+        "wrong-scope",
+        ConnectionBoundary::All,
+        &authority_key,
+    )
+    .expect("wrong principal");
+    let unauthorized = ReachAwareStatusAuthorization::new(
+        wrong_principal,
+        "control-audience",
+        "status-scope-digest",
+        150,
+        None,
+    );
+    assert!(project_reach_aware_operation_status(&journal, &unauthorized, &authority_key).is_err());
+    assert!(
+        project_reach_aware_operations(
+            std::slice::from_ref(&journal),
+            &ReachAwareStatusFilter {
+                operation_id: Some("status-operation".to_string()),
+                family: None,
+                lifecycle: None,
+                provider: Some(ProviderId::Zed),
+            },
+            &unauthorized,
+            &authority_key,
+        )
+        .expect("unauthorized list is non-disclosing")
+        .is_empty()
+    );
+
+    let mut control = ControlStatus {
+        schema_version: 1,
+        repository_key: journal.repository_key.clone(),
+        workspace_key: journal.workspace_key.clone(),
+        catalog: CatalogControlSummary::default(),
+        profiles: Vec::new(),
+        policies: Default::default(),
+        gateways: Vec::new(),
+        sessions: Vec::new(),
+        operations: vec![ControlOperationStatus {
+            operation_id: journal.operation_id.clone(),
+            operation_kind: journal.operation_kind.clone(),
+            lifecycle: journal.lifecycle,
+            effect_graph_digest: journal.effect_graph_digest.clone(),
+            authorization_recorded: true,
+            resources: Vec::new(),
+            terminal_code: journal.terminal_code.clone(),
+            recovery_required: false,
+            reach_aware: None,
+        }],
+        hooks: Vec::new(),
+    };
+    let before_unfiltered = control.clone();
+    attach_reach_aware_status_for_operation(
+        &mut control,
+        std::slice::from_ref(&journal),
+        None,
+        &authorization,
+        &authority_key,
+    )
+    .expect("empty operation filter preserves generic status");
+    assert_eq!(control, before_unfiltered);
+    attach_reach_aware_status_for_operation(
+        &mut control,
+        std::slice::from_ref(&journal),
+        Some("status-operation"),
+        &authorization,
+        &authority_key,
+    )
+    .expect("exact operation filter attaches authorized projection");
+    let attached = control.operations[0]
+        .reach_aware
+        .as_ref()
+        .expect("nested reach-aware status");
+    assert_eq!(attached.schema_version, 2);
+    assert_eq!(attached.lifecycle, ProviderReachLifecycle::RecoveryRequired);
+    assert!(control.operations[0].recovery_required);
+
+    // Terminal status is repeatable for the original authenticated principal and
+    // no longer needs a transfer capability on each read.
+    handle
+        .journal
+        .record(
+            TransitionLifecycle::Committed,
+            "status-test-committed",
+            None,
+        )
+        .expect("terminal journal transition");
+    store.save(&mut handle).expect("save terminal journal");
+    let terminal_journal = handle.journal.clone();
+    let terminal_authorization = ReachAwareStatusAuthorization::new(
+        principal,
+        "control-audience",
+        "status-scope-digest",
+        150,
+        None,
+    );
+    let terminal_projection = project_reach_aware_operation_status(
+        &terminal_journal,
+        &terminal_authorization,
+        &authority_key,
+    )
+    .expect("same-principal terminal status");
+    let repeated_terminal_projection = project_reach_aware_operation_status(
+        &terminal_journal,
+        &terminal_authorization,
+        &authority_key,
+    )
+    .expect("repeat same-principal terminal status");
+    assert_eq!(repeated_terminal_projection, terminal_projection);
+    assert_eq!(
+        terminal_projection.lifecycle,
+        ProviderReachLifecycle::Partial
+    );
+
+    let mut unauthorized_control = control.clone();
+    unauthorized_control.operations[0].reach_aware = None;
+    attach_reach_aware_status_for_operation(
+        &mut unauthorized_control,
+        std::slice::from_ref(&journal),
+        Some("status-operation"),
+        &unauthorized,
+        &authority_key,
+    )
+    .expect("unauthorized exact operation remains non-disclosing");
+    assert!(unauthorized_control.operations[0].reach_aware.is_none());
+    let ambiguity = attach_reach_aware_status_for_operation(
+        &mut control,
+        &[journal.clone(), journal.clone()],
+        Some("status-operation"),
+        &authorization,
+        &authority_key,
+    )
+    .expect_err("duplicate authorized operation ids must fail closed");
+    assert!(ambiguity.to_string().contains("multiple authorized"));
+}
+
+#[test]
+fn reach_aware_status_attachment_preserves_canonical_lifecycle_states() {
+    let temp = TempDir::new().expect("temporary status root");
+    let root = fs::canonicalize(temp.path()).expect("canonical status root");
+    let authority_key = SessionAuthorityKey::new([0x74; 32]);
+
+    for (suffix, lifecycle) in [
+        ("applied", ProviderReachLifecycle::Applied),
+        ("partial", ProviderReachLifecycle::Partial),
+        ("blocked", ProviderReachLifecycle::Blocked),
+        ("recovery", ProviderReachLifecycle::RecoveryRequired),
+    ] {
+        let operation_id = format!("status-{suffix}");
+        let store = TransitionJournalStore::new(&root);
+        let journal = create_reach_aware_status_journal(
+            &store,
+            &root,
+            &authority_key,
+            &operation_id,
+            lifecycle,
+        );
+        let principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+            format!("{operation_id}-session"),
+            format!("{operation_id}-scope"),
+            ConnectionBoundary::All,
+            &authority_key,
+        )
+        .expect("status principal");
+        let authorization =
+            ReachAwareStatusAuthorization::new(principal, "control-audience", "", 500, None);
+        let mut control = ControlStatus {
+            schema_version: 1,
+            repository_key: journal.repository_key.clone(),
+            workspace_key: journal.workspace_key.clone(),
+            catalog: CatalogControlSummary::default(),
+            profiles: Vec::new(),
+            policies: Default::default(),
+            gateways: Vec::new(),
+            sessions: Vec::new(),
+            operations: vec![ControlOperationStatus {
+                operation_id: journal.operation_id.clone(),
+                operation_kind: journal.operation_kind.clone(),
+                lifecycle: journal.lifecycle,
+                effect_graph_digest: journal.effect_graph_digest.clone(),
+                authorization_recorded: true,
+                resources: Vec::new(),
+                terminal_code: journal.terminal_code.clone(),
+                recovery_required: false,
+                reach_aware: None,
+            }],
+            hooks: Vec::new(),
+        };
+
+        attach_reach_aware_status_for_operation(
+            &mut control,
+            std::slice::from_ref(&journal),
+            Some(&operation_id),
+            &authorization,
+            &authority_key,
+        )
+        .expect("authorized lifecycle attachment");
+        let attached = control.operations[0]
+            .reach_aware
+            .as_ref()
+            .expect("attached lifecycle");
+        assert_eq!(attached.lifecycle, lifecycle);
+        assert_eq!(
+            control.operations[0].recovery_required,
+            lifecycle == ProviderReachLifecycle::RecoveryRequired
+        );
+    }
+}
+
+#[test]
+fn reach_aware_gc_retains_live_records_removes_expired_records_and_keeps_v1_readable() {
+    let temp = TempDir::new().expect("temporary state root");
+    let root = fs::canonicalize(temp.path()).expect("canonical root");
+    let store = TransitionJournalStore::new(&root);
+    let legacy_plan = TransitionPlan::new(
+        "legacy-operation",
+        TransitionKind::ApplyProfile,
+        TransitionContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: None,
+            profile_digest: None,
+        },
+        vec![TransitionEffect {
+            effect_id: "legacy-effect".to_string(),
+            kind: TransitionEffectKind::PublishView,
+            resource_id: "legacy-resource".to_string(),
+            target_type: "profile-policy".to_string(),
+            summary: "legacy".to_string(),
+            authority: EffectAuthority::UserManaged,
+            activation: EffectActivation::Live,
+            expected_pre_fingerprint: None,
+            expected_post_fingerprint: Some("b".repeat(64)),
+            provider_views: Vec::new(),
+        }],
+    )
+    .expect("legacy plan");
+    store
+        .create_or_attach(
+            &legacy_plan,
+            OwnerGeneration::new("legacy-owner", 1).expect("owner"),
+        )
+        .expect("legacy journal");
+    let authority_key = SessionAuthorityKey::new([0x73; 32]);
+    create_reach_aware_gc_journal(
+        &store,
+        &root,
+        &authority_key,
+        "expired-committed",
+        200,
+        TransitionLifecycle::Committed,
+    );
+    create_reach_aware_gc_journal(
+        &store,
+        &root,
+        &authority_key,
+        "expired-applying",
+        200,
+        TransitionLifecycle::Applying,
+    );
+    create_reach_aware_gc_journal(
+        &store,
+        &root,
+        &authority_key,
+        "expired-needs-repair",
+        200,
+        TransitionLifecycle::NeedsRepair,
+    );
+    create_reach_aware_gc_journal(
+        &store,
+        &root,
+        &authority_key,
+        "fresh-committed",
+        995,
+        TransitionLifecycle::Committed,
+    );
+    let report = store.gc_reach_aware(1_000, 10).expect("reach-aware GC");
+    assert_eq!(report.scanned, 4);
+    assert_eq!(report.removed, 1);
+    assert_eq!(report.retained, 3);
+    assert_eq!(report.legacy_records, 1);
+    assert_eq!(
+        report.removed_operation_ids,
+        vec!["expired-committed".to_string()]
+    );
+    let operation_ids = store
+        .list()
+        .expect("journals")
+        .into_iter()
+        .map(|journal| journal.operation_id)
+        .collect::<BTreeSet<_>>();
+    assert!(!operation_ids.contains("expired-committed"));
+    for retained in [
+        "legacy-operation",
+        "expired-applying",
+        "expired-needs-repair",
+        "fresh-committed",
+    ] {
+        assert!(operation_ids.contains(retained), "{retained} is retained");
+    }
+
+    #[cfg(unix)]
+    {
+        let transaction_root = root.join("transactions");
+        let mode = fs::metadata(&transaction_root)
+            .expect("private transaction directory")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
+        let journal_path = fs::read_dir(transaction_root)
+            .expect("transaction entries")
+            .next()
+            .expect("legacy journal entry")
+            .expect("journal directory entry")
+            .path();
+        assert_eq!(
+            fs::metadata(journal_path)
+                .expect("private journal")
+                .permissions()
+                .mode()
+                & 0o077,
+            0
+        );
+    }
+}
+
+fn create_reach_aware_gc_journal(
+    store: &TransitionJournalStore,
+    root: &Path,
+    authority_key: &SessionAuthorityKey,
+    operation_id: &str,
+    expires_at_unix: i64,
+    lifecycle: TransitionLifecycle,
+) {
+    create_reach_aware_journal(
+        store,
+        root,
+        authority_key,
+        operation_id,
+        expires_at_unix,
+        ProviderReachLifecycle::Applied,
+        lifecycle,
+    );
+}
+
+fn create_reach_aware_status_journal(
+    store: &TransitionJournalStore,
+    root: &Path,
+    authority_key: &SessionAuthorityKey,
+    operation_id: &str,
+    lifecycle: ProviderReachLifecycle,
+) -> unpin_core::transitions::TransitionJournal {
+    create_reach_aware_journal(
+        store,
+        root,
+        authority_key,
+        operation_id,
+        1_000,
+        lifecycle,
+        TransitionLifecycle::Committed,
+    );
+    store
+        .list()
+        .expect("status journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == operation_id)
+        .expect("created status journal")
+}
+
+fn create_reach_aware_journal(
+    store: &TransitionJournalStore,
+    root: &Path,
+    authority_key: &SessionAuthorityKey,
+    operation_id: &str,
+    _expires_at_unix: i64,
+    reach_lifecycle: ProviderReachLifecycle,
+    lifecycle: TransitionLifecycle,
+) {
+    let provider_root = root.join(format!("{operation_id}-provider"));
+    fs::create_dir(&provider_root).expect("provider root");
+    let roots = ReachAwareRootBinding::from_provider_paths(
+        root,
+        vec![(ProviderId::Codex, provider_root, "fixture".to_string())],
+        "fixture",
+    )
+    .expect("trusted roots");
+    let plan = TransitionPlan::new(
+        operation_id,
+        TransitionKind::NativeToggle,
+        TransitionContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some(format!("{operation_id}-session")),
+            profile_digest: None,
+        },
+        vec![TransitionEffect {
+            effect_id: format!("{operation_id}-effect"),
+            kind: TransitionEffectKind::ReplaceProviderConfig,
+            resource_id: format!("{operation_id}-resource"),
+            target_type: "native-provider-state".to_string(),
+            summary: "reach-aware GC test".to_string(),
+            authority: EffectAuthority::UserManaged,
+            activation: EffectActivation::RestartRequired,
+            expected_pre_fingerprint: Some("a".repeat(64)),
+            expected_post_fingerprint: Some("b".repeat(64)),
+            provider_views: vec![ProviderId::Codex],
+        }],
+    )
+    .expect("transition plan");
+    let principal = unpin_core::control_operation::ReachAwarePrincipal::sign(
+        format!("{operation_id}-session"),
+        format!("{operation_id}-scope"),
+        ConnectionBoundary::All,
+        authority_key,
+    )
+    .expect("principal");
+    let builder = ReachAwareControlOperationEnvelope::builder()
+        .family(ReachAwareOperationFamily::NativeToggle, 1)
+        .operation(
+            operation_id,
+            TransitionKind::NativeToggle.as_str(),
+            "g".repeat(64),
+        )
+        .context(ControlResolvedContext {
+            repository_key: "repository".to_string(),
+            workspace_key: "workspace".to_string(),
+            session_id: Some(format!("{operation_id}-session")),
+            profile_digest: None,
+        })
+        .reach(
+            ConnectionBoundary::All,
+            ProviderReach::All,
+            None,
+            ProviderReachCoverage::new(vec![
+                unpin_core::provider_reach::ProviderCoverageEntry::included(
+                    ProviderId::Codex,
+                    format!("{operation_id}-target"),
+                ),
+            ]),
+        )
+        .lifecycle(
+            reach_lifecycle,
+            reach_lifecycle,
+            EffectActivation::RestartRequired,
+        )
+        .trusted_roots(roots)
+        .authority(principal, "control-audience", 100, _expires_at_unix)
+        .payload_reference(ReachAwarePayloadReference {
+            family: ReachAwareOperationFamily::NativeToggle,
+            schema_version: 1,
+            reference: operation_id.to_string(),
+            payload_digest: "g".repeat(64),
+        });
+    let owner = OwnerGeneration::new(format!("{operation_id}-owner"), 1).expect("owner");
+    let mut handle = store
+        .create_or_attach(&plan, owner.clone())
+        .expect("create journal");
+    let mut envelope = builder
+        .journal_binding(
+            owner,
+            unpin_core::state::atomic_json::StateRevision {
+                sequence: 1,
+                fingerprint: "g".repeat(64),
+            },
+        )
+        .build()
+        .expect("build reach-aware envelope");
+    envelope
+        .seal(authority_key)
+        .expect("seal reach-aware envelope");
+    handle.journal.reach_aware = Some(envelope);
+    handle
+        .journal
+        .record(lifecycle, lifecycle.as_str(), None)
+        .expect("record lifecycle");
+    store.save(&mut handle).expect("save lifecycle");
 }

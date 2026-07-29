@@ -7,20 +7,28 @@ use unpin_core::{
     catalog::{CapabilityId, Catalog},
     control_operation::{
         ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
-        DurableControlError,
+        DurableControlError, ReachAwarePrincipal, ReachAwareRootBinding,
     },
-    discovery::{DiscoveryRoots, discover_all},
+    discovery::{DiscoveryOutput, discover_all},
     profiles::{
         CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, GatewaySelection,
-        PolicyApplyStatus, PolicyChange, PolicyControlError, PolicyStore, PolicyTarget,
-        ProfileDefinition, ProfileDefinitionEntry, ProfilePolicyController, ProfileReference,
+        PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyApplyStatus, PolicyChange, PolicyControlError,
+        PolicyStore, PolicyTarget, ProfileDefinition, ProfileDefinitionEntry,
+        ProfilePolicyController, ProfileProviderOperationController, ProfileProviderOperationError,
+        ProfileProviderOperationStatus, ProfileProviderReachAwareApplyContext, ProfileReference,
         ProfileSelection, ProfileSourceScope, ProfileStore, capability_lock_enforcement,
-        compile_profile, propose_profile, resolve_effective_gateway,
+        compile_profile, profile_reach_scope_digest, propose_profile, resolve_effective_gateway,
+    },
+    provider_reach::{
+        ConnectionBoundary, DerivedTargetKind, ProviderReachRequest, SelectedProviderAuthority,
+        SelectedProviderProvenance,
     },
     providers::ProviderId,
     state::atomic_json::OwnerGeneration,
+    state::workspace::WorkspaceIdentity,
 };
 
+use super::ProviderReachArg;
 use crate::{
     DiscoveryRootArgs, command_error_exit, credentials, parse_provider_id, resolve_config,
     resolve_discovery_roots_with_config, unix_now,
@@ -75,6 +83,10 @@ pub(crate) enum ProfileCommands {
         /// Provider-specific override. Omit for generic scope policy.
         #[arg(long)]
         provider: Option<String>,
+        /// Reach-aware provider targeting. Omit to preserve the legacy generic
+        /// profile/gateway policy workflow.
+        #[arg(long, alias = "provider-reach", value_enum)]
+        reach: Option<ProviderReachArg>,
         /// Persistent scope receiving selection.
         #[arg(long, value_enum, default_value_t = PolicyScopeArg::Workspace)]
         scope: PolicyScopeArg,
@@ -182,6 +194,7 @@ pub(crate) fn run(command: ProfileCommands) -> ExitCode {
             options,
             id,
             provider,
+            reach,
             scope,
             mode,
             apply,
@@ -191,6 +204,7 @@ pub(crate) fn run(command: ProfileCommands) -> ExitCode {
             options,
             &id,
             provider.as_deref(),
+            reach,
             scope,
             mode,
             apply,
@@ -693,6 +707,7 @@ fn apply_profile(
     options: ProfileRootOptions,
     id: &str,
     provider: Option<&str>,
+    reach: Option<ProviderReachArg>,
     scope: PolicyScopeArg,
     mode: ProfileModeArg,
     apply: bool,
@@ -715,10 +730,11 @@ fn apply_profile(
         Ok(None) => return command_error_exit(options.json, "failed", "profile not found"),
         Err(error) => return command_error_exit(options.json, "failed", &error),
     };
-    let compiled = match compile_current(&options, &config, &entry.definition, entry.scope) {
-        Ok(compiled) => compiled,
-        Err(error) => return command_error_exit(options.json, "failed", &error),
-    };
+    let (compiled, discovery) =
+        match compile_current_with_discovery(&options, &config, &entry.definition, entry.scope) {
+            Ok(compiled) => compiled,
+            Err(error) => return command_error_exit(options.json, "failed", &error),
+        };
     let identity = match config.workspace_identity() {
         Ok(identity) => identity,
         Err(error) => return command_error_exit(options.json, "failed", &error.to_string()),
@@ -738,6 +754,23 @@ fn apply_profile(
             }
         }
     };
+    if let Some(reach) = reach {
+        return apply_profile_with_reach(
+            &options,
+            &config,
+            &store,
+            &compiled,
+            &discovery,
+            &identity,
+            target,
+            provider,
+            reach,
+            mode,
+            apply,
+            confirm,
+            reviewed_fingerprint,
+        );
+    }
     let controller = ProfilePolicyController::new(&config.app_state_root);
     let change = PolicyChange {
         profile: Some(ProfileSelection::Profile {
@@ -866,6 +899,304 @@ fn apply_profile(
     ExitCode::SUCCESS
 }
 
+#[allow(clippy::too_many_arguments)]
+fn apply_profile_with_reach(
+    options: &ProfileRootOptions,
+    config: &unpin_core::config::UnpinConfig,
+    store: &ProfileStore,
+    compiled: &unpin_core::profiles::CompiledProfileRevision,
+    discovery: &DiscoveryOutput,
+    identity: &WorkspaceIdentity,
+    target: PolicyTarget,
+    provider: Option<ProviderId>,
+    reach: ProviderReachArg,
+    mode: ProfileModeArg,
+    apply: bool,
+    confirm: bool,
+    reviewed_fingerprint: Option<&str>,
+) -> ExitCode {
+    let reach_input = match reach.input(provider) {
+        Ok(reach) => reach,
+        Err(error) => return crate::command_error_exit_code(options.json, "blocked", &error, 3),
+    };
+    let mut reach_request = ProviderReachRequest::new(
+        ConnectionBoundary::All,
+        reach_input,
+        DerivedTargetKind::Profile,
+    );
+    if let Some(provider) = provider {
+        reach_request = reach_request.with_authority(SelectedProviderAuthority::new(
+            provider,
+            SelectedProviderProvenance::ExplicitInput,
+        ));
+    }
+    let provider_reach = match reach_request
+        .validate_before_discovery()
+        .and_then(|preflight| preflight.reconcile_exact_target(None))
+    {
+        Ok(resolution) => resolution.reach,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
+    };
+    let controller = ProfileProviderOperationController::new(&config.app_state_root);
+    let plan = match controller.plan_with_gateway_and_discovery(
+        &target,
+        compiled,
+        provider_reach,
+        match mode {
+            ProfileModeArg::Native => GatewaySelection::Native,
+            ProfileModeArg::Gateway => GatewaySelection::Gateway,
+        },
+        discovery,
+    ) {
+        Ok(plan) => plan,
+        Err(error) => {
+            return crate::command_error_exit_code(
+                options.json,
+                profile_provider_error_status(&error),
+                &error.to_string(),
+                profile_provider_error_exit(&error),
+            );
+        }
+    };
+    if !apply {
+        if options.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&json!({
+                    "statusVersion": 2,
+                    "status": if plan.no_op { "no-op" } else { "planned" },
+                    "operationId": plan.operation_id,
+                    "planFingerprint": plan.plan_fingerprint,
+                    "providerReach": plan.provider_reach,
+                    "providerCoverage": plan.coverage,
+                    "activation": plan.activation,
+                    "targets": plan.targets,
+                    "humanAction": {
+                        "code": "confirm-and-apply",
+                        "guidance": "Review provider reach, provenance, coverage, target classifications, activation, and fingerprint before apply."
+                    },
+                    "plan": plan,
+                }))
+                .expect("reach-aware profile plan JSON")
+            );
+        } else {
+            println!(
+                "profile {} reach={:?} targets={} activation={:?} fingerprint={}",
+                compiled.profile_id,
+                plan.provider_reach,
+                plan.targets.len(),
+                plan.activation,
+                plan.plan_fingerprint
+            );
+            for target in &plan.targets {
+                println!(
+                    "  {} classification={} presence={:?} inherited-before={:?} effect={:?} future-activation={:?} activation={:?}",
+                    target.provider.as_str(),
+                    target.classification.as_str(),
+                    target.local_presence,
+                    target.generic_profile_inherited_before,
+                    target.generic_policy_effect,
+                    target.future_activation,
+                    target.activation
+                );
+            }
+        }
+        return ExitCode::SUCCESS;
+    }
+    if !confirm {
+        return crate::command_error_exit_code(options.json, "blocked", "confirmation-required", 3);
+    }
+    if reviewed_fingerprint != Some(plan.plan_fingerprint.as_str()) {
+        return crate::command_error_exit_code(
+            options.json,
+            "blocked",
+            "plan-fingerprint-mismatch",
+            3,
+        );
+    }
+    let fixture_mode = options.roots.fixture_root.is_some();
+    if let Err(error) = unpin_core::fixture::require_fixture_write_sandbox(
+        fixture_mode,
+        [
+            config.app_state_root.as_path(),
+            config.project_root.as_path(),
+        ],
+    ) {
+        return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+    }
+    let session_key =
+        match credentials::resolve_session_authority_key(fixture_mode, &config.app_state_root) {
+            Ok(Some(key)) => key,
+            Ok(None) => {
+                return crate::command_error_exit_code(
+                    options.json,
+                    "blocked",
+                    "session authority key missing; run `unpin auth session init`",
+                    3,
+                );
+            }
+            Err(error) => {
+                return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+            }
+        };
+    let approval_context =
+        match ControlApprovalContext::new(&identity.repository_key, &identity.workspace_key) {
+            Ok(context) => context,
+            Err(error) => {
+                return crate::command_error_exit_code(
+                    options.json,
+                    "blocked",
+                    &error.to_string(),
+                    3,
+                );
+            }
+        };
+    let session_id = plan.operation_id.clone();
+    let expectation = match plan.approval_expectation(&approval_context, &session_id) {
+        Ok(expectation) => expectation,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
+    };
+    let roots = match ReachAwareRootBinding::from_provider_paths(
+        &config.app_state_root,
+        Vec::new(),
+        "unpin-cli-profile-provider",
+    ) {
+        Ok(roots) => roots,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+        }
+    };
+    // The CLI does not accept caller metadata as identity. The reviewed
+    // operation id and scope digest are signed with the locally resolved
+    // session authority key, yielding an operation-specific trusted principal
+    // without minting an ad-hoc lease.
+    let principal = match sign_reviewed_profile_principal(&plan, &expectation, &session_key) {
+        Ok(principal) => principal,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+        }
+    };
+    let now_unix = unix_now();
+    let durable = ProfileProviderReachAwareApplyContext {
+        approval_context: approval_context.clone(),
+        roots,
+        principal,
+        audience: PROFILE_PROVIDER_APPROVAL_AUDIENCE.to_string(),
+        issued_at_unix: now_unix,
+        expires_at_unix: now_unix + 3600,
+        now_unix,
+    };
+    let authorization = match credentials::authorize_reviewed_control_decision(
+        fixture_mode,
+        &config.app_state_root,
+        &expectation,
+        &plan.plan_fingerprint,
+        reviewed_fingerprint,
+        "unpin-cli-profile-provider-approval",
+        now_unix,
+    ) {
+        Ok(authorization) => authorization,
+        Err(error) => {
+            return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+        }
+    };
+    if let Err(error) = store.materialize_revision(
+        compiled,
+        OwnerGeneration::new("unpin-cli-profile-provider", 1).expect("static owner is valid"),
+    ) {
+        return crate::command_error_exit_code(options.json, "blocked", &error.to_string(), 3);
+    }
+    let result = match ProfileProviderOperationController::new(&config.app_state_root)
+        .with_session_authority_key(session_key)
+        .apply_with_reach_aware(&plan, authorization, durable, "unpin-cli-profile-provider")
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return crate::command_error_exit_code(
+                options.json,
+                profile_provider_error_status(&error),
+                &error.to_string(),
+                profile_provider_error_exit(&error),
+            );
+        }
+    };
+    let status = match result.status {
+        ProfileProviderOperationStatus::Applied => "applied",
+        ProfileProviderOperationStatus::NoOp => "no-op",
+        ProfileProviderOperationStatus::Blocked => "blocked",
+        ProfileProviderOperationStatus::RecoveryRequired => "recovery-required",
+    };
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "statusVersion": 2,
+                "status": status,
+                "operationId": plan.operation_id,
+                "planFingerprint": plan.plan_fingerprint,
+                "providerReach": plan.provider_reach,
+                "providerCoverage": plan.coverage,
+                "activation": plan.activation,
+                "result": result,
+            }))
+            .expect("reach-aware profile apply JSON")
+        );
+    } else {
+        println!(
+            "profile {} {status}; reach={:?} activation={:?}",
+            compiled.profile_id, plan.provider_reach, plan.activation
+        );
+    }
+    ExitCode::from(match result.status {
+        ProfileProviderOperationStatus::Applied | ProfileProviderOperationStatus::NoOp => 0,
+        ProfileProviderOperationStatus::Blocked => 3,
+        ProfileProviderOperationStatus::RecoveryRequired => 4,
+    })
+}
+
+fn sign_reviewed_profile_principal(
+    plan: &unpin_core::profiles::ProfileProviderOperationPlan,
+    expectation: &unpin_core::approval::ApprovalExpectation,
+    session_key: &unpin_core::sessions::SessionAuthorityKey,
+) -> Result<ReachAwarePrincipal, String> {
+    // The operation id and scope digest come from the reviewed plan and its
+    // approval expectation; no command-line caller metadata is interpreted as
+    // identity. The local credential signature is the trusted boundary.
+    ReachAwarePrincipal::sign(
+        plan.operation_id.clone(),
+        profile_reach_scope_digest(expectation, &plan.operation_id),
+        ConnectionBoundary::All,
+        session_key,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn profile_provider_error_status(error: &ProfileProviderOperationError) -> &'static str {
+    if matches!(
+        error,
+        ProfileProviderOperationError::RecoveryRequired { .. }
+    ) {
+        "recovery-required"
+    } else {
+        "blocked"
+    }
+}
+
+fn profile_provider_error_exit(error: &ProfileProviderOperationError) -> u8 {
+    if matches!(
+        error,
+        ProfileProviderOperationError::RecoveryRequired { .. }
+    ) {
+        4
+    } else {
+        3
+    }
+}
+
 fn context(
     options: &ProfileRootOptions,
 ) -> Result<(unpin_core::config::UnpinConfig, ProfileStore), String> {
@@ -909,19 +1240,29 @@ fn compile_current(
     definition: &ProfileDefinition,
     source_scope: ProfileSourceScope,
 ) -> Result<unpin_core::profiles::CompiledProfileRevision, String> {
-    let roots = resolve_discovery_roots_with_config(&options.roots, config)?
-        .with_app_state_root(&config.app_state_root);
-    compile_from_roots(&roots, definition, source_scope)
+    compile_current_with_discovery(options, config, definition, source_scope)
+        .map(|(compiled, _)| compiled)
 }
 
-fn compile_from_roots(
-    roots: &DiscoveryRoots,
+fn compile_current_with_discovery(
+    options: &ProfileRootOptions,
+    config: &unpin_core::config::UnpinConfig,
     definition: &ProfileDefinition,
     source_scope: ProfileSourceScope,
-) -> Result<unpin_core::profiles::CompiledProfileRevision, String> {
-    let discovery = discover_all(roots).map_err(|error| error.to_string())?;
+) -> Result<
+    (
+        unpin_core::profiles::CompiledProfileRevision,
+        DiscoveryOutput,
+    ),
+    String,
+> {
+    let roots = resolve_discovery_roots_with_config(&options.roots, config)?
+        .with_app_state_root(&config.app_state_root);
+    let discovery = discover_all(&roots).map_err(|error| error.to_string())?;
     let catalog = Catalog::from_discovery(&discovery).map_err(|error| error.to_string())?;
-    compile_profile(definition, &catalog, source_scope).map_err(|error| error.to_string())
+    let compiled =
+        compile_profile(definition, &catalog, source_scope).map_err(|error| error.to_string())?;
+    Ok((compiled, discovery))
 }
 
 fn render_profiles(json_output: bool, profiles: &[ProfileDefinitionEntry]) -> ExitCode {
@@ -1009,5 +1350,60 @@ mod recovery_status_tests {
         ));
 
         assert_eq!(policy_control_error_status(&error), "recovery-required");
+    }
+}
+
+#[cfg(test)]
+mod profile_principal_tests {
+    use std::collections::BTreeSet;
+
+    use super::*;
+    use unpin_core::{
+        discovery::DiscoveryOutput,
+        profiles::{
+            PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileProviderOperationController,
+            ProfileSourceScope,
+        },
+        provider_reach::ProviderReach,
+        providers::ProviderId,
+        sessions::SessionAuthorityKey,
+    };
+
+    #[test]
+    fn reviewed_profile_principal_rejects_caller_metadata_tampering() {
+        let temp = tempfile::TempDir::new().expect("principal test root");
+        let state_root = std::fs::canonicalize(temp.path()).expect("canonical principal root");
+        let catalog = Catalog::from_discovery(&DiscoveryOutput::default()).expect("empty catalog");
+        let definition = ProfileDefinition {
+            version: PROFILE_DEFINITION_VERSION,
+            id: "principal-review".to_string(),
+            display_name: "Principal review".to_string(),
+            description: None,
+            members: Vec::new(),
+            provider_members: std::collections::BTreeMap::new(),
+            supported_providers: BTreeSet::from([ProviderId::Codex]),
+        };
+        let compiled =
+            compile_profile(&definition, &catalog, ProfileSourceScope::Global).expect("profile");
+        let controller = ProfileProviderOperationController::new(&state_root);
+        let plan = controller
+            .plan(&PolicyTarget::Global, &compiled, ProviderReach::all())
+            .expect("provider plan");
+        let context = ControlApprovalContext::new("principal-repo", "principal-workspace")
+            .expect("approval context");
+        let expectation = plan
+            .approval_expectation(&context, &plan.operation_id)
+            .expect("expectation");
+        let key = SessionAuthorityKey::new([0x7a; 32]);
+        let principal =
+            sign_reviewed_profile_principal(&plan, &expectation, &key).expect("signed principal");
+        principal.verify(&key).expect("principal verifies");
+
+        let mut tampered = principal;
+        tampered.connection_scope_id = "caller-supplied-scope".to_string();
+        assert!(
+            tampered.verify(&key).is_err(),
+            "caller metadata must not replace the signed scope"
+        );
     }
 }

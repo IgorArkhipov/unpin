@@ -1,10 +1,21 @@
-use std::{collections::BTreeSet, fmt, fs, io, path::PathBuf};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt, fs, io,
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
     config::get_transition_journal_path,
+    control_operation::{
+        ReachAwareCapabilityConsumption, ReachAwareControlOperationEnvelope,
+        ReachAwareControlOperationEnvelopeBuilder, ReachAwareEnvelopeError, ReachAwarePrincipal,
+        ReachAwareTransferCapability,
+    },
+    sessions::SessionAuthorityKey,
     state::atomic_json::{
         AtomicJsonStore, OwnerGeneration, StateError, StateRevision, StateSnapshot,
     },
@@ -114,6 +125,15 @@ pub struct TransitionJournal {
     pub audit: Vec<JournalEvent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub terminal_code: Option<String>,
+    /// Optional schema-v2 reach envelope. Missing means this is an existing
+    /// schema-v1 operation and remains dual-readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reach_aware: Option<ReachAwareControlOperationEnvelope>,
+    /// Durable capability consumption ledger.  This is intentionally kept on
+    /// the journal document so the one-use transition is protected by the
+    /// same CAS and lock as lifecycle changes.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub consumed_transfer_capabilities: BTreeMap<String, ReachAwareCapabilityConsumption>,
 }
 
 impl TransitionJournal {
@@ -148,6 +168,8 @@ impl TransitionJournal {
             effects,
             audit: Vec::new(),
             terminal_code: None,
+            reach_aware: None,
+            consumed_transfer_capabilities: BTreeMap::new(),
         };
         journal.record(TransitionLifecycle::Planned, "planned", None)?;
         Ok(journal)
@@ -306,6 +328,260 @@ impl TransitionJournalStore {
         }
     }
 
+    pub fn create_or_attach_reach_aware(
+        &self,
+        plan: &TransitionPlan,
+        owner: OwnerGeneration,
+        builder: ReachAwareControlOperationEnvelopeBuilder,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<JournalHandle, JournalError> {
+        let mut handle = self.create_or_attach(plan, owner)?;
+        self.attach_reach_aware_builder(&mut handle, builder, authority_key)?;
+        Ok(handle)
+    }
+
+    fn attach_reach_aware_authenticated(
+        &self,
+        handle: &mut JournalHandle,
+        envelope: ReachAwareControlOperationEnvelope,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), JournalError> {
+        envelope
+            .verify_authenticated(authority_key)
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        if envelope.operation_id != handle.journal.operation_id
+            || envelope.operation_kind != handle.journal.operation_kind
+            || envelope.context.repository_key != handle.journal.repository_key
+            || envelope.context.workspace_key != handle.journal.workspace_key
+        {
+            return Err(JournalError::OperationConflict);
+        }
+        match &handle.journal.reach_aware {
+            Some(existing) if existing != &envelope => Err(JournalError::OperationConflict),
+            Some(_) => Ok(()),
+            None if envelope.owner != handle.owner || envelope.revision != handle.revision => {
+                Err(JournalError::OperationConflict)
+            }
+            None => {
+                handle.journal.reach_aware = Some(envelope);
+                self.save(handle)
+            }
+        }
+    }
+
+    pub fn attach_reach_aware_builder(
+        &self,
+        handle: &mut JournalHandle,
+        builder: ReachAwareControlOperationEnvelopeBuilder,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), JournalError> {
+        let now_unix = unix_now()?;
+        self.attach_reach_aware_builder_at(handle, builder, authority_key, now_unix)
+    }
+
+    /// Attach a reach-aware envelope using an explicitly supplied Unix clock.
+    ///
+    /// Production callers should use [`Self::attach_reach_aware_builder`],
+    /// which samples the system clock. The `_at` form keeps journal tests and
+    /// deterministic recovery simulations independent of wall-clock time.
+    pub(crate) fn attach_reach_aware_builder_at(
+        &self,
+        handle: &mut JournalHandle,
+        builder: ReachAwareControlOperationEnvelopeBuilder,
+        authority_key: &SessionAuthorityKey,
+        now_unix: i64,
+    ) -> Result<(), JournalError> {
+        if let Some(existing) = &handle.journal.reach_aware {
+            existing
+                .verify_authenticated(authority_key)
+                .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+            // Build a candidate using the current CAS binding solely to
+            // compare immutable authority fields.  Lifecycle/recovery evidence
+            // changes as the operation progresses, and the journal revision
+            // advances on every checkpoint, so those fields are deliberately
+            // excluded by `same_authority_binding`.
+            let candidate = builder
+                .journal_binding(handle.owner.clone(), handle.revision.clone())
+                .build()
+                .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+            // The persisted envelope owns the authority window. Reusing an
+            // operation after wall-clock expiry is rejected even when a caller
+            // replays the original issued/expiry timestamps.
+            if !handle.journal.lifecycle.is_terminal() && existing.is_expired_at(now_unix) {
+                return Err(JournalError::ReachAwareEnvelope(
+                    "reach-aware envelope has expired".to_string(),
+                ));
+            }
+            if !existing.same_authority_binding(&candidate) {
+                return Err(JournalError::OperationConflict);
+            }
+            return Ok(());
+        }
+        let mut envelope = builder
+            .journal_binding(handle.owner.clone(), handle.revision.clone())
+            .build()
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        if !handle.journal.lifecycle.is_terminal() && envelope.is_expired_at(now_unix) {
+            return Err(JournalError::ReachAwareEnvelope(
+                "reach-aware envelope has expired".to_string(),
+            ));
+        }
+        envelope
+            .seal(authority_key)
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        self.attach_reach_aware_authenticated(handle, envelope, authority_key)
+    }
+
+    /// Consume a transfer capability exactly once under the transition
+    /// journal's lock and compare-and-swap revision.  The capability's
+    /// serialized `consumed` bit is deliberately ignored as state: replay is
+    /// decided only by the durable journal ledger.
+    #[allow(clippy::too_many_arguments)]
+    pub fn consume_reach_aware_transfer_capability(
+        &self,
+        handle: &mut JournalHandle,
+        capability: &ReachAwareTransferCapability,
+        audience: &str,
+        scope_digest: &str,
+        principal: &ReachAwarePrincipal,
+        now_unix: i64,
+        authority_key: &SessionAuthorityKey,
+    ) -> Result<(), JournalError> {
+        let envelope = handle
+            .journal
+            .reach_aware
+            .as_ref()
+            .ok_or_else(|| JournalError::ReachAwareEnvelope("missing reach-aware envelope".into()))?
+            .clone();
+        envelope
+            .verify_authenticated(authority_key)
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        let bound_capability = envelope.transfer_capability.as_ref().ok_or_else(|| {
+            JournalError::ReachAwareEnvelope("missing transfer capability".into())
+        })?;
+        if bound_capability != capability {
+            return Err(JournalError::OperationConflict);
+        }
+        capability
+            .validate_for(
+                &envelope.operation_id,
+                audience,
+                scope_digest,
+                principal,
+                now_unix,
+                authority_key,
+            )
+            .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        if handle
+            .journal
+            .consumed_transfer_capabilities
+            .contains_key(&capability.capability_id)
+        {
+            return Err(JournalError::ReachAwareEnvelope(
+                ReachAwareEnvelopeError::CapabilityUnavailable.to_string(),
+            ));
+        }
+        if handle.journal.lifecycle.is_terminal() {
+            return Err(JournalError::TerminalMutation);
+        }
+        let consumption = ReachAwareCapabilityConsumption::record(
+            capability,
+            &envelope.operation_id,
+            audience,
+            scope_digest,
+            principal,
+            now_unix,
+            authority_key,
+        )
+        .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+        handle
+            .journal
+            .consumed_transfer_capabilities
+            .insert(capability.capability_id.clone(), consumption);
+        handle.journal.record(
+            TransitionLifecycle::Applying,
+            "transfer-capability-consumed",
+            None,
+        )?;
+        self.save(handle)
+    }
+
+    /// Remove only expired terminal reach-aware records.  Legacy schema-v1
+    /// journals and active/recovery records are retained for resume and
+    /// backward-readable status.
+    pub fn gc_reach_aware(
+        &self,
+        now_unix: i64,
+        retention_seconds: i64,
+    ) -> Result<ReachAwareGcReport, JournalError> {
+        if retention_seconds < 0 {
+            return Err(JournalError::InvalidRetention);
+        }
+        let transaction_root = self.app_state_root.join("transactions");
+        let metadata = match fs::symlink_metadata(&transaction_root) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(ReachAwareGcReport::default());
+            }
+            Err(error) => return Err(JournalError::Io(transaction_root, error.to_string())),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(JournalError::UnsafeJournalDirectory(transaction_root));
+        }
+        let mut paths = fs::read_dir(&transaction_root)
+            .map_err(|error| JournalError::Io(transaction_root.clone(), error.to_string()))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| JournalError::Io(transaction_root.clone(), error.to_string()))?
+            .into_iter()
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+                    && !path
+                        .file_name()
+                        .is_some_and(|name| name.to_string_lossy().starts_with('.'))
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        let mut report = ReachAwareGcReport::default();
+        for path in paths {
+            let store = AtomicJsonStore::new(&path, TRANSITION_JOURNAL_SCHEMA_VERSION);
+            let snapshot = store
+                .load::<TransitionJournal>()?
+                .ok_or(JournalError::JournalDisappeared)?;
+            let journal = snapshot.value;
+            journal.verify_audit_chain()?;
+            if journal.reach_aware.is_none() {
+                report.legacy_records += 1;
+                continue;
+            }
+            report.scanned += 1;
+            let envelope = journal
+                .reach_aware
+                .as_ref()
+                .expect("reach-aware record was checked above");
+            let expired = now_unix
+                >= envelope
+                    .expires_at_unix
+                    .checked_add(retention_seconds)
+                    .ok_or(JournalError::InvalidRetention)?;
+            let safely_collectable = matches!(
+                journal.lifecycle,
+                TransitionLifecycle::Committed | TransitionLifecycle::RolledBack
+            );
+            if expired && safely_collectable {
+                store.remove_if_revision(&snapshot.revision)?;
+                report.removed += 1;
+                report
+                    .removed_operation_ids
+                    .push(envelope.operation_id.clone());
+            } else {
+                report.retained += 1;
+            }
+        }
+        Ok(report)
+    }
+
     pub fn load(
         &self,
         plan: &TransitionPlan,
@@ -321,6 +597,19 @@ impl TransitionJournalStore {
 
     pub fn save(&self, handle: &mut JournalHandle) -> Result<(), JournalError> {
         handle.journal.verify_audit_chain()?;
+        if let Some(envelope) = &handle.journal.reach_aware {
+            envelope
+                .verify()
+                .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?;
+            if envelope.authentication_tag.is_empty()
+                || envelope.authority_key_id.is_empty()
+                || envelope.principal.authentication_tag.is_empty()
+            {
+                return Err(JournalError::ReachAwareEnvelope(
+                    "reach-aware envelope is not sealed".to_string(),
+                ));
+            }
+        }
         let revision = self.store(&handle.journal.operation_id).compare_and_swap(
             Some(&handle.revision),
             handle.owner.clone(),
@@ -440,6 +729,15 @@ impl TransitionJournalStore {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReachAwareGcReport {
+    pub scanned: usize,
+    pub removed: usize,
+    pub retained: usize,
+    pub legacy_records: usize,
+    pub removed_operation_ids: Vec<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct JournalHandle {
     pub journal: TransitionJournal,
@@ -504,6 +802,16 @@ fn validate_event_code(code: &str) -> Result<(), JournalError> {
     }
 }
 
+fn unix_now() -> Result<i64, JournalError> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| JournalError::ReachAwareEnvelope(error.to_string()))?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| {
+        JournalError::ReachAwareEnvelope("system clock value overflowed Unix timestamp".to_string())
+    })
+}
+
 #[derive(Debug)]
 pub enum JournalError {
     InvalidPlan(String),
@@ -515,8 +823,10 @@ pub enum JournalError {
     TerminalMutation,
     UnsafeJournalDirectory(PathBuf),
     JournalPathMismatch,
+    InvalidRetention,
     Io(PathBuf, String),
     State(StateError),
+    ReachAwareEnvelope(String),
 }
 
 impl From<StateError> for JournalError {
@@ -549,8 +859,14 @@ impl fmt::Display for JournalError {
             Self::JournalPathMismatch => {
                 formatter.write_str("transition journal path does not match its operation id")
             }
+            Self::InvalidRetention => {
+                formatter.write_str("reach-aware retention must be non-negative")
+            }
             Self::Io(path, message) => write!(formatter, "{}: {message}", path.display()),
             Self::State(error) => error.fmt(formatter),
+            Self::ReachAwareEnvelope(message) => {
+                write!(formatter, "invalid reach-aware envelope: {message}")
+            }
         }
     }
 }

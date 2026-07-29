@@ -23,6 +23,7 @@ pub enum TransitionKind {
     TrustHook,
     Recover,
     NativeToggle,
+    BulkToggle,
     InventoryGroupApply,
 }
 
@@ -40,6 +41,7 @@ impl TransitionKind {
             Self::TrustHook => "trust-hook",
             Self::Recover => "recover",
             Self::NativeToggle => "native-toggle",
+            Self::BulkToggle => "bulk-toggle",
             Self::InventoryGroupApply => "inventory-group-apply",
         }
     }

@@ -733,6 +733,7 @@ fn authenticated_gateway_catalog_uses_withdrawn_canonical_skill_body() {
             description: None,
             members: vec![record.id.clone()],
             provider_members: Default::default(),
+            supported_providers: Default::default(),
         },
         &catalog,
         ProfileSourceScope::Workspace,

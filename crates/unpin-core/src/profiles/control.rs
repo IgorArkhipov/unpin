@@ -16,10 +16,13 @@ use crate::{
     },
     profiles::{
         CapabilityLockState, GatewaySelection, PolicyResolutionError, PolicySnapshot, PolicyStore,
-        PolicyStoreError, PolicyTarget, ProfileRevisionSet, ProfileSelection, ProfileStore,
+        PolicyStoreError, PolicyTarget, ProfileProviderOperationController,
+        ProfileProviderOperationError, ProfileProviderOperationPlan,
+        ProfileProviderOperationResult, ProfileRevisionSet, ProfileSelection, ProfileStore,
         ProfileStoreError, ProviderPolicy, ResolutionPolicies, ScopePolicy,
         resolve_effective_policy,
     },
+    provider_reach::ProviderReach,
     providers::ProviderId,
     sessions::{SessionAuthorityKey, SessionManager},
     state::atomic_json::{OwnerGeneration, StateError, StateRevision},
@@ -258,6 +261,41 @@ impl ProfilePolicyController {
             activation,
             plan_fingerprint,
         })
+    }
+
+    /// Plan an explicit provider-target operation for a named compiled profile.
+    /// This is deliberately separate from [`Self::plan`], whose optional
+    /// provider remains the legacy generic-policy contract.
+    pub fn plan_provider_operation(
+        &self,
+        target: &PolicyTarget,
+        revision: &crate::profiles::CompiledProfileRevision,
+        provider_reach: ProviderReach,
+    ) -> Result<ProfileProviderOperationPlan, ProfileProviderOperationError> {
+        ProfileProviderOperationController::with_policy_store(self.policies.clone()).plan(
+            target,
+            revision,
+            provider_reach,
+        )
+    }
+
+    pub fn apply_provider_operation(
+        &self,
+        plan: &ProfileProviderOperationPlan,
+        actor_id: &str,
+    ) -> Result<ProfileProviderOperationResult, ProfileProviderOperationError> {
+        ProfileProviderOperationController::with_policy_store(self.policies.clone())
+            .apply(plan, actor_id)
+    }
+
+    pub fn restore_provider_operation(
+        &self,
+        plan: &ProfileProviderOperationPlan,
+        applied: &ProfileProviderOperationResult,
+        actor_id: &str,
+    ) -> Result<StateRevision, ProfileProviderOperationError> {
+        ProfileProviderOperationController::with_policy_store(self.policies.clone())
+            .restore(plan, applied, actor_id)
     }
 
     pub fn apply(

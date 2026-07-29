@@ -2335,6 +2335,7 @@ mod tests {
                 description: None,
                 members,
                 provider_members: BTreeMap::new(),
+                supported_providers: std::collections::BTreeSet::new(),
             },
             &catalog,
             ProfileSourceScope::Session,

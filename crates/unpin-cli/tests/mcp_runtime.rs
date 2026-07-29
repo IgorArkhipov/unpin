@@ -33,13 +33,15 @@ use unpin_core::{
         ListChangeSupport, UpstreamIdentity, UpstreamToolDescriptor, UpstreamToolRegistration,
     },
     profiles::{
-        PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope, compile_profile,
+        PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope, ProfileStore,
+        compile_profile,
     },
     providers::ProviderId,
     sessions::{
         BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
         PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
     },
+    state::atomic_json::OwnerGeneration,
 };
 
 fn fixtures_root() -> String {
@@ -120,6 +122,7 @@ fn skill_gateway(temp: &TempDir) -> Arc<unpin_core::gateway::GatewayService> {
             description: None,
             members: vec![capability_id],
             provider_members: BTreeMap::new(),
+            supported_providers: std::collections::BTreeSet::new(),
         },
         &catalog,
         ProfileSourceScope::Session,
@@ -258,6 +261,7 @@ fn tool_gateway(
             description: None,
             members: vec![capability_id],
             provider_members: BTreeMap::new(),
+            supported_providers: std::collections::BTreeSet::new(),
         },
         &catalog,
         ProfileSourceScope::Session,
@@ -543,6 +547,74 @@ async fn stdio_pool_calls_real_child_mcp_server() {
         Some("ok")
     );
     assert_ne!(result.is_error, Some(true));
+}
+
+#[tokio::test]
+async fn stdio_pool_preserves_pinned_profile_reach_rejection() {
+    let state = TempDir::new().expect("temporary state");
+    let state_root = fs::canonicalize(state.path()).expect("canonical temporary state");
+    let definition = ProfileDefinition {
+        version: PROFILE_DEFINITION_VERSION,
+        id: "runtime-provider-reach".to_string(),
+        display_name: "Runtime provider reach".to_string(),
+        description: None,
+        members: Vec::new(),
+        provider_members: BTreeMap::new(),
+        supported_providers: BTreeSet::from([ProviderId::Codex]),
+    };
+    ProfileStore::new(&state_root)
+        .save_global_definition(
+            &definition,
+            None,
+            OwnerGeneration::new("runtime-provider-reach", 1).expect("owner"),
+        )
+        .expect("save runtime profile");
+
+    let home = state.path().join("home");
+    fs::create_dir_all(&home).expect("fixture home");
+    let identity = UpstreamIdentity::stdio(
+        "unpin-fixture-codex",
+        env!("CARGO_BIN_EXE_unpin"),
+        vec![
+            "mcp".to_string(),
+            "--home-root".to_string(),
+            home.to_string_lossy().into_owned(),
+            "--fixture-root".to_string(),
+            fixtures_root(),
+            "--app-state-root".to_string(),
+            state_root.to_string_lossy().into_owned(),
+            "--provider".to_string(),
+            "codex".to_string(),
+        ],
+    )
+    .expect("stdio identity");
+
+    let result = McpUpstreamPool::default()
+        .call(
+            &identity,
+            None,
+            None,
+            "unpin_plan_profile_provider",
+            serde_json::from_value(serde_json::json!({
+                "profileId": definition.id,
+                "mode": "native",
+                "providerReach": "all"
+            }))
+            .expect("profile provider arguments"),
+            GatewayRuntimeTimeouts {
+                connect: Duration::from_secs(15),
+                call: Duration::from_secs(15),
+            },
+        )
+        .await;
+
+    // rmcp surfaces a server-side JSON-RPC tool error as a failed call rather
+    // than a `CallToolResult`; the runtime must preserve that fail-closed
+    // boundary instead of treating the rejected reach as success.
+    assert!(matches!(
+        result,
+        Err(GatewayRuntimeError::UpstreamCallFailed)
+    ));
 }
 
 #[tokio::test]
