@@ -8,12 +8,13 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     approval::{ApprovalExpectation, ControlApprovalContext},
-    discovery::{DiscoveryItem, ProviderId, discover_all},
+    discovery::{DiscoveryCategory, DiscoveryItem, ProviderId, discover_all},
     encode_lower_hex,
     groups::resolver::index_discovery,
     groups::{
-        GroupDefinitionView, GroupMemberIdentity, GroupRef, GroupResolveError, GroupResolver,
-        GroupRevision, GroupScope, GroupSessionError, MAX_GROUP_MEMBERS, secure_random_identifier,
+        GroupDefinitionView, GroupDiscoveryIndex, GroupMemberIdentity, GroupRef, GroupResolveError,
+        GroupResolver, GroupRevision, GroupScope, GroupSessionError, MAX_GROUP_MEMBERS,
+        secure_random_identifier,
     },
     mutation::{
         CONTROL_PLANE_PROTECTED_REASON, NativeToggleController, NativeTogglePlan,
@@ -99,10 +100,20 @@ pub struct GroupResourcePlan {
     pub resource_id: String,
     pub target_type: String,
     pub member_indices: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub preserved_members: Vec<GroupPreservedMemberProof>,
     pub expected_pre_fingerprint: String,
     pub expected_post_fingerprint: String,
     pub provider_views: Vec<ProviderId>,
     pub activation: EffectActivation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GroupPreservedMemberProof {
+    pub member_index: usize,
+    pub source_fingerprint: String,
+    pub current_enabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -549,7 +560,7 @@ impl GroupPlanner {
             members.push(member);
         }
 
-        let resources = build_resources(&mut members)?;
+        let resources = reconcile_shared_resource_members(&mut members, &index)?;
         let cohorts = build_cohorts(&members, &resources);
         let actionable = members
             .iter()
@@ -567,18 +578,19 @@ impl GroupPlanner {
         let reach_exclusions = provider_coverage
             .excluded()
             .any(ProviderCoverageEntry::is_reach_exclusion);
-        let disposition = if exceptional || (included_count == 0 && reach_exclusions) {
-            GroupPlanDisposition::Blocked
-        } else if !actionable && !reach_exclusions {
-            GroupPlanDisposition::NoOp
-        } else if mode == GroupPlanMode::PreviewOnly {
-            GroupPlanDisposition::Preview
-        } else {
-            // A selected-provider subset with no writes still needs a durable
-            // handoff so the excluded members are reported as `partial` rather
-            // than being mistaken for an ordinary no-op.
-            GroupPlanDisposition::Actionable
-        };
+        let disposition =
+            if (!actionable && exceptional) || (included_count == 0 && reach_exclusions) {
+                GroupPlanDisposition::Blocked
+            } else if !actionable && !reach_exclusions {
+                GroupPlanDisposition::NoOp
+            } else if mode == GroupPlanMode::PreviewOnly {
+                GroupPlanDisposition::Preview
+            } else {
+                // A selected-provider subset with no writes still needs a durable
+                // handoff so the excluded members are reported as `partial` rather
+                // than being mistaken for an ordinary no-op.
+                GroupPlanDisposition::Actionable
+            };
         let response_id = secure_random_identifier("group-response", 16)
             .map_err(|error| GroupPlanError::IdentifierGeneration(error.to_string()))?;
         let operation_id = if disposition == GroupPlanDisposition::Actionable {
@@ -750,7 +762,7 @@ fn expected_group_disposition(plan: &GroupTogglePlan) -> GroupPlanDisposition {
         .provider_coverage
         .excluded()
         .any(ProviderCoverageEntry::is_reach_exclusion);
-    if has_blocker || (included_count == 0 && has_reach_exclusions) {
+    if (!actionable && has_blocker) || (included_count == 0 && has_reach_exclusions) {
         GroupPlanDisposition::Blocked
     } else if !actionable && !has_reach_exclusions {
         GroupPlanDisposition::NoOp
@@ -765,6 +777,18 @@ fn planned_reach_lifecycle_parts(
     members: &[GroupMemberPlan],
     coverage: &ProviderReachCoverage,
 ) -> ProviderReachLifecycle {
+    let actionable = members
+        .iter()
+        .any(|member| member.outcome == GroupMemberPlanOutcome::Changed);
+    let exceptional = members.iter().any(|member| {
+        matches!(
+            member.outcome,
+            GroupMemberPlanOutcome::Blocked | GroupMemberPlanOutcome::Missing
+        )
+    });
+    if actionable && exceptional {
+        return ProviderReachLifecycle::Partial;
+    }
     let included_outcomes = members
         .iter()
         .filter_map(|member| match member.outcome {
@@ -783,6 +807,227 @@ fn planned_reach_lifecycle_parts(
     })
 }
 
+const BLOCKED_MEMBER_SHARED_RESOURCE_REASON: &str = "blocked-member-shared-resource";
+
+#[derive(Debug)]
+struct SharedResourceAssociation {
+    resource_id: String,
+    member_index: usize,
+    provider: ProviderId,
+    proof: GroupPreservedMemberProof,
+}
+
+fn reconcile_shared_resource_members(
+    members: &mut [GroupMemberPlan],
+    index: &GroupDiscoveryIndex<'_>,
+) -> Result<Vec<GroupResourcePlan>, GroupPlanError> {
+    loop {
+        let mut resources = build_resources(members)?;
+        let (associations, unsafe_resources) =
+            classify_blocked_shared_resources(members, &resources, index);
+        if unsafe_resources.is_empty() {
+            attach_preserved_members(members, &mut resources, associations);
+            refresh_resource_fingerprints(&mut resources, members)?;
+            return Ok(resources);
+        }
+
+        let blocked_component_members = connected_actionable_members(&resources, &unsafe_resources);
+        if blocked_component_members.is_empty() {
+            return Err(GroupPlanError::InvalidPlan);
+        }
+        for member_index in blocked_component_members {
+            let member = &mut members[member_index];
+            member.outcome = GroupMemberPlanOutcome::Blocked;
+            member.reason = Some(BLOCKED_MEMBER_SHARED_RESOURCE_REASON.to_string());
+            member.item_plan_fingerprint = None;
+            member.child_operation_id = None;
+            member.affected_resources.clear();
+            member.native_plan = None;
+        }
+    }
+}
+
+fn classify_blocked_shared_resources(
+    members: &[GroupMemberPlan],
+    resources: &[GroupResourcePlan],
+    index: &GroupDiscoveryIndex<'_>,
+) -> (Vec<SharedResourceAssociation>, BTreeSet<String>) {
+    let mut associations = BTreeMap::new();
+    let mut unsafe_resources = BTreeSet::new();
+    for (blocked_index, blocked_member) in members
+        .iter()
+        .enumerate()
+        .filter(|(_, member)| member.outcome == GroupMemberPlanOutcome::Blocked)
+    {
+        let matches = index
+            .get(&blocked_member.identity)
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        for resource in resources {
+            for actionable_index in &resource.member_indices {
+                let Some(native) = members[*actionable_index].native_plan.as_ref() else {
+                    continue;
+                };
+                for target in native.preview.affected_targets.iter().filter(|target| {
+                    group_resource_id(&target.target_type, &target.path) == resource.resource_id
+                }) {
+                    let sharing = matches
+                        .iter()
+                        .copied()
+                        .filter(|item| item_shares_mutation_target(item, target))
+                        .collect::<Vec<_>>();
+                    if sharing.is_empty() {
+                        continue;
+                    }
+                    let safe_item = (matches.len() == 1 && sharing.len() == 1)
+                        .then_some(sharing[0])
+                        .filter(|blocked_item| {
+                            composition_preserves_blocked_member(
+                                blocked_member,
+                                blocked_item,
+                                &native.preview.selection,
+                                target,
+                            )
+                        });
+                    let Some(blocked_item) = safe_item else {
+                        unsafe_resources.insert(resource.resource_id.clone());
+                        continue;
+                    };
+                    associations.insert(
+                        (resource.resource_id.clone(), blocked_index),
+                        SharedResourceAssociation {
+                            resource_id: resource.resource_id.clone(),
+                            member_index: blocked_index,
+                            provider: blocked_item.provider,
+                            proof: GroupPreservedMemberProof {
+                                member_index: blocked_index,
+                                source_fingerprint: blocked_item
+                                    .source_fingerprint
+                                    .clone()
+                                    .expect("composition proof requires a source fingerprint"),
+                                current_enabled: blocked_item.enabled,
+                            },
+                        },
+                    );
+                }
+            }
+        }
+    }
+    associations.retain(|(resource_id, _), _| !unsafe_resources.contains(resource_id));
+    (associations.into_values().collect(), unsafe_resources)
+}
+
+fn item_shares_mutation_target(
+    item: &DiscoveryItem,
+    target: &crate::mutation::MutationTarget,
+) -> bool {
+    item.state_path == target.path || item.source_path == target.path
+}
+
+fn composition_preserves_blocked_member(
+    blocked_member: &GroupMemberPlan,
+    blocked_item: &DiscoveryItem,
+    actionable_item: &DiscoveryItem,
+    target: &crate::mutation::MutationTarget,
+) -> bool {
+    blocked_member.reason.as_deref() == Some(CONTROL_PLANE_PROTECTED_REASON)
+        && blocked_item.source_fingerprint.is_some()
+        && blocked_item.provider == ProviderId::Codex
+        && blocked_item.category == DiscoveryCategory::ConfiguredMcp
+        && actionable_item.uses_codex_skill_config_state()
+        && target.target_type == "statePath"
+        && actionable_item.state_path == target.path
+        && blocked_item.state_path == target.path
+}
+
+fn connected_actionable_members(
+    resources: &[GroupResourcePlan],
+    unsafe_resources: &BTreeSet<String>,
+) -> BTreeSet<usize> {
+    let mut connected = resources
+        .iter()
+        .filter(|resource| unsafe_resources.contains(&resource.resource_id))
+        .flat_map(|resource| resource.member_indices.iter().copied())
+        .collect::<BTreeSet<_>>();
+    loop {
+        let before = connected.len();
+        for resource in resources {
+            if resource
+                .member_indices
+                .iter()
+                .any(|member_index| connected.contains(member_index))
+            {
+                connected.extend(resource.member_indices.iter().copied());
+            }
+        }
+        if connected.len() == before {
+            return connected;
+        }
+    }
+}
+
+fn attach_preserved_members(
+    members: &mut [GroupMemberPlan],
+    resources: &mut [GroupResourcePlan],
+    associations: Vec<SharedResourceAssociation>,
+) {
+    for association in associations {
+        let resource = resources
+            .iter_mut()
+            .find(|resource| resource.resource_id == association.resource_id)
+            .expect("association references a planned resource");
+        resource.member_indices.push(association.member_index);
+        resource.member_indices.sort_unstable();
+        resource.member_indices.dedup();
+        resource.provider_views.push(association.provider);
+        resource.provider_views.sort_unstable();
+        resource.provider_views.dedup();
+        resource.preserved_members.push(association.proof);
+        resource
+            .preserved_members
+            .sort_by_key(|proof| proof.member_index);
+        resource
+            .preserved_members
+            .dedup_by_key(|proof| proof.member_index);
+        members[association.member_index]
+            .affected_resources
+            .push(resource.resource_id.clone());
+        members[association.member_index].affected_resources.sort();
+        members[association.member_index].affected_resources.dedup();
+    }
+}
+
+fn refresh_resource_fingerprints(
+    resources: &mut [GroupResourcePlan],
+    members: &[GroupMemberPlan],
+) -> Result<(), GroupPlanError> {
+    for resource in resources {
+        if resource.preserved_members.is_empty() {
+            continue;
+        }
+        let mut plans = resource
+            .member_indices
+            .iter()
+            .filter_map(|member_index| {
+                members[*member_index]
+                    .native_plan
+                    .as_ref()
+                    .map(|native| native.plan_fingerprint.clone())
+            })
+            .collect::<Vec<_>>();
+        plans.sort();
+        let encoded = serde_json::to_vec(&(plans, &resource.preserved_members))
+            .map_err(|error| GroupPlanError::Serialization(error.to_string()))?;
+        resource.expected_pre_fingerprint = encode_lower_hex(&Sha256::digest(
+            [b"group-resource-pre-v1\0".as_slice(), encoded.as_slice()].concat(),
+        ));
+        resource.expected_post_fingerprint = encode_lower_hex(&Sha256::digest(
+            [b"group-resource-post-v1\0".as_slice(), encoded.as_slice()].concat(),
+        ));
+    }
+    Ok(())
+}
+
 fn build_resources(
     members: &mut [GroupMemberPlan],
 ) -> Result<Vec<GroupResourcePlan>, GroupPlanError> {
@@ -795,21 +1040,16 @@ fn build_resources(
         activation: Option<EffectActivation>,
     }
     let mut resources = BTreeMap::<String, ResourceAccumulator>::new();
+    for member in members.iter_mut() {
+        member.affected_resources.clear();
+    }
     for (member_index, member) in members.iter_mut().enumerate() {
         let Some(native) = member.native_plan.as_ref() else {
             continue;
         };
         let mut member_resources = Vec::new();
         for target in &native.preview.affected_targets {
-            let mut hasher = Sha256::new();
-            hasher.update(b"unpin-group-resource-v1\0");
-            hasher.update(target.target_type.as_bytes());
-            hasher.update([0]);
-            hasher.update(target.path.as_bytes());
-            let resource_id = format!(
-                "group-resource-{}",
-                &encode_lower_hex(&hasher.finalize())[..32]
-            );
+            let resource_id = group_resource_id(&target.target_type, &target.path);
             member_resources.push(resource_id.clone());
             let entry = resources.entry(resource_id).or_default();
             entry.target_type.clone_from(&target.target_type);
@@ -840,6 +1080,7 @@ fn build_resources(
                 resource_id,
                 target_type: entry.target_type,
                 member_indices: entry.member_indices.into_iter().collect(),
+                preserved_members: Vec::new(),
                 expected_pre_fingerprint,
                 expected_post_fingerprint,
                 provider_views: entry.providers.into_iter().collect(),
@@ -849,6 +1090,18 @@ fn build_resources(
             })
         })
         .collect()
+}
+
+fn group_resource_id(target_type: &str, path: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"unpin-group-resource-v1\0");
+    hasher.update(target_type.as_bytes());
+    hasher.update([0]);
+    hasher.update(path.as_bytes());
+    format!(
+        "group-resource-{}",
+        &encode_lower_hex(&hasher.finalize())[..32]
+    )
 }
 
 fn max_activation(current: Option<EffectActivation>, next: EffectActivation) -> EffectActivation {
@@ -883,7 +1136,7 @@ fn build_cohorts(
             {
                 if component_resources.insert(resource.resource_id.clone()) {
                     for adjacent in &resource.member_indices {
-                        if actionable.contains(adjacent) && !component_members.contains(adjacent) {
+                        if !component_members.contains(adjacent) {
                             queue.push_back(*adjacent);
                         }
                     }
