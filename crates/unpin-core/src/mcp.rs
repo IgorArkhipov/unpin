@@ -44,8 +44,8 @@ use crate::profiles::{
     PolicyMaintenanceController, PolicyStore, PolicyTarget, ProfileDefinition,
     ProfilePolicyController, ProfileProviderOperationController,
     ProfileProviderReachAwareApplyContext, ProfileReference, ProfileSelection, ProfileSourceScope,
-    ProfileStore, capability_lock_enforcement, compile_profile, profile_reach_scope_digest,
-    propose_profile, resolve_effective_gateway,
+    ProfileStore, UnmanagedPolicyStatus, capability_lock_enforcement, compile_profile,
+    profile_reach_scope_digest, propose_profile, resolve_effective_gateway,
 };
 use crate::provider_reach::{
     ConnectionBoundary, DerivedTargetKind, ProviderReachInput, ProviderReachLifecycle,
@@ -1634,9 +1634,9 @@ fn get_policy_maintenance_status(context: &McpContext, arguments: &Value) -> Res
         }
         (None, None) => {
             let identity = resolve_workspace_identity(&context.project_root)
-                .map_err(|error| error.to_string())?;
+                .map_err(|_| "workspace identity is unavailable".to_string())?;
             PolicyTarget::workspace(identity.repository_key, identity.workspace_key)
-                .map_err(|error| error.to_string())?
+                .map_err(|_| "workspace identity is invalid".to_string())?
         }
         _ => {
             return Err("repositoryKey and workspaceKey must be supplied together".to_string());
@@ -1664,8 +1664,8 @@ fn get_policy_maintenance_status(context: &McpContext, arguments: &Value) -> Res
         Err(error) => {
             return Ok(json!({
                 "status": "blocked",
-                "reason": "policy-maintenance-verification-failed",
-                "message": error.to_string(),
+                "reason": error.public_code(),
+                "message": error.public_message(),
                 "target": target,
                 "humanAction": {
                     "code": "inspect-policy-maintenance",
@@ -1675,16 +1675,43 @@ fn get_policy_maintenance_status(context: &McpContext, arguments: &Value) -> Res
         }
     };
     let Some(status) = status else {
-        return Ok(json!({
-            "status": "unmanaged",
-            "target": target,
-            "humanAction": {
+        let unmanaged = match controller.unmanaged_status(&target) {
+            Ok(unmanaged) => unmanaged,
+            Err(error) => {
+                return Ok(json!({
+                    "status": "blocked",
+                    "reason": error.public_code(),
+                    "message": error.public_message(),
+                    "target": target,
+                    "humanAction": {
+                        "code": "inspect-policy-maintenance",
+                        "guidance": "Run `unpin profile policy status --json` and inspect local state."
+                    }
+                }));
+            }
+        };
+        let human_action = match unmanaged {
+            UnmanagedPolicyStatus::MigrationAvailable => json!({
                 "code": "review-policy-migration",
                 "guidance": "Run `unpin profile policy migrate --json`, review the plan, then apply it through the CLI with exact confirmation."
-            }
+            }),
+            UnmanagedPolicyStatus::ExistingPolicy => json!({
+                "code": "inspect-existing-policy",
+                "guidance": "A workspace policy already exists without a maintenance record; inspect it before choosing an explicit adoption or replacement path."
+            }),
+            UnmanagedPolicyStatus::MigrationUnavailable => json!({
+                "code": "inspect-migration-source",
+                "guidance": "No safe fixed-source migration is currently available; inspect the workspace policy source."
+            }),
+        };
+        return Ok(json!({
+            "status": "unmanaged",
+            "unmanagedState": unmanaged,
+            "target": target,
+            "humanAction": human_action
         }));
     };
-    let human_action = status.allowed_actions.first().map(|action| {
+    let human_actions = status.allowed_actions.iter().map(|action| {
         let PolicyTarget::Workspace {
             repository_key,
             workspace_key,
@@ -1708,11 +1735,13 @@ fn get_policy_maintenance_status(context: &McpContext, arguments: &Value) -> Res
             "code": format!("review-policy-{action}"),
             "guidance": guidance
         })
-    });
+    }).collect::<Vec<_>>();
+    let human_action = human_actions.first().cloned();
     Ok(json!({
         "status": "managed",
         "maintenance": status,
         "humanAction": human_action,
+        "humanActions": human_actions,
         "mutationsAvailable": false
     }))
 }

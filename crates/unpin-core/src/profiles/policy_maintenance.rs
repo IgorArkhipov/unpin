@@ -7,12 +7,20 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    approval::{
+        ApprovalExpectation, ApprovalResourceBinding, CONTROL_APPROVAL_AUDIENCE,
+        CONTROL_APPROVAL_ISSUER, ControlApprovalContext, ControlAuthorization,
+        ControlOperationKind, approval_binding_digest,
+    },
     config::get_workspace_policy_path,
-    encode_lower_hex,
+    encode_lower_hex, is_lower_hex_digest,
     mutation::BackupAuthenticationKey,
     profiles::{PolicyStore, PolicyStoreError, PolicyTarget, ScopePolicy},
     state::{
-        atomic_json::{AtomicJsonStore, OwnerGeneration, StateError, StateRevision, StateSnapshot},
+        atomic_json::{
+            AtomicJsonStore, OwnerGeneration, StateError, StateResourceLock, StateRevision,
+            StateSnapshot,
+        },
         workspace::{WorkspacePhysicalEvidence, capture_workspace_physical_evidence},
     },
 };
@@ -124,6 +132,37 @@ pub struct PolicyMaintenancePlan {
     pub plan_fingerprint: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "action", rename_all = "kebab-case")]
+pub enum PublicPolicyMaintenanceAction {
+    Migrate {
+        target: PolicyTarget,
+        policy: ScopePolicy,
+    },
+    Reattach {
+        from_target: PolicyTarget,
+        to_target: PolicyTarget,
+    },
+    Discard {
+        target: PolicyTarget,
+    },
+    Cleanup {
+        target: PolicyTarget,
+    },
+    Restore {
+        backup_id: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PublicPolicyMaintenancePlan {
+    pub schema_version: u32,
+    pub operation_id: String,
+    pub action: PublicPolicyMaintenanceAction,
+    pub plan_fingerprint: String,
+}
+
 impl PolicyMaintenancePlan {
     pub fn verify(&self) -> Result<(), PolicyMaintenanceError> {
         if self.schema_version != POLICY_MAINTENANCE_PLAN_SCHEMA_VERSION
@@ -139,6 +178,132 @@ impl PolicyMaintenancePlan {
             return Err(PolicyMaintenanceError::PlanFingerprintMismatch);
         }
         Ok(())
+    }
+
+    pub fn public_view(&self) -> Result<PublicPolicyMaintenancePlan, PolicyMaintenanceError> {
+        self.verify()?;
+        let action = match &self.action {
+            PolicyMaintenanceAction::Migrate {
+                workspace, policy, ..
+            } => PublicPolicyMaintenanceAction::Migrate {
+                target: PolicyTarget::workspace(
+                    workspace.repository_key.clone(),
+                    workspace.workspace_key.clone(),
+                )?,
+                policy: policy.clone(),
+            },
+            PolicyMaintenanceAction::Reattach {
+                from_target,
+                to_target,
+                ..
+            } => PublicPolicyMaintenanceAction::Reattach {
+                from_target: from_target.clone(),
+                to_target: to_target.clone(),
+            },
+            PolicyMaintenanceAction::Discard { target } => PublicPolicyMaintenanceAction::Discard {
+                target: target.clone(),
+            },
+            PolicyMaintenanceAction::Cleanup { target } => PublicPolicyMaintenanceAction::Cleanup {
+                target: target.clone(),
+            },
+            PolicyMaintenanceAction::Restore { backup_id } => {
+                PublicPolicyMaintenanceAction::Restore {
+                    backup_id: backup_id.clone(),
+                }
+            }
+        };
+        Ok(PublicPolicyMaintenancePlan {
+            schema_version: self.schema_version,
+            operation_id: self.operation_id.clone(),
+            action,
+            plan_fingerprint: self.plan_fingerprint.clone(),
+        })
+    }
+
+    pub fn approval_expectation(
+        &self,
+        context: &ControlApprovalContext,
+    ) -> Result<ApprovalExpectation, PolicyMaintenanceError> {
+        self.verify()?;
+        self.approval_expectation_verified(context)
+    }
+
+    fn approval_expectation_verified(
+        &self,
+        context: &ControlApprovalContext,
+    ) -> Result<ApprovalExpectation, PolicyMaintenanceError> {
+        let mut resources = Vec::new();
+        let mut push_target = |target: &PolicyTarget,
+                               policy_revision: Option<&StateRevision>,
+                               record_revision: Option<&StateRevision>|
+         -> Result<(), PolicyMaintenanceError> {
+            let record_resource_id = record_id(target)?;
+            resources.push(ApprovalResourceBinding {
+                resource_id: format!("{record_resource_id}-policy"),
+                pre_state_fingerprint: policy_revision
+                    .map(|revision| approval_binding_digest(&revision.fingerprint)),
+            });
+            resources.push(ApprovalResourceBinding {
+                resource_id: record_resource_id,
+                pre_state_fingerprint: record_revision
+                    .map(|revision| approval_binding_digest(&revision.fingerprint)),
+            });
+            Ok(())
+        };
+        match &self.action {
+            PolicyMaintenanceAction::Migrate { workspace, .. } => {
+                let target = PolicyTarget::workspace(
+                    workspace.repository_key.clone(),
+                    workspace.workspace_key.clone(),
+                )?;
+                push_target(
+                    &target,
+                    self.expected_policy_revision.as_ref(),
+                    self.expected_record_revision.as_ref(),
+                )?;
+            }
+            PolicyMaintenanceAction::Reattach {
+                from_target,
+                to_target,
+                ..
+            } => {
+                push_target(
+                    from_target,
+                    self.expected_policy_revision.as_ref(),
+                    self.expected_record_revision.as_ref(),
+                )?;
+                push_target(to_target, None, None)?;
+            }
+            PolicyMaintenanceAction::Discard { target }
+            | PolicyMaintenanceAction::Cleanup { target } => {
+                push_target(
+                    target,
+                    self.expected_policy_revision.as_ref(),
+                    self.expected_record_revision.as_ref(),
+                )?;
+            }
+            PolicyMaintenanceAction::Restore { backup_id } => {
+                resources.push(ApprovalResourceBinding {
+                    resource_id: backup_id.clone(),
+                    pre_state_fingerprint: self
+                        .expected_record_revision
+                        .as_ref()
+                        .map(|revision| approval_binding_digest(&revision.fingerprint)),
+                });
+            }
+        }
+        Ok(ApprovalExpectation {
+            issuer: CONTROL_APPROVAL_ISSUER.to_string(),
+            audience: CONTROL_APPROVAL_AUDIENCE.to_string(),
+            operation_id: self.operation_id.clone(),
+            operation_kind: ControlOperationKind::PolicyMaintenance.as_str().to_string(),
+            effect_graph_digest: self.plan_fingerprint.clone(),
+            repository_key: context.repository_key().to_string(),
+            workspace_key: context.workspace_key().to_string(),
+            session_id: None,
+            profile_digest: None,
+            resources,
+        })
     }
 }
 
@@ -175,6 +340,14 @@ pub struct PolicyMaintenanceStatus {
     pub allowed_actions: Vec<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum UnmanagedPolicyStatus {
+    MigrationAvailable,
+    ExistingPolicy,
+    MigrationUnavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PolicyMaintenanceOutcome {
@@ -190,9 +363,29 @@ pub struct ProtectedPolicyChange<T> {
     pub backup_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PolicyBackupHandoff {
+    pub backup_id: String,
+    pub restore_command: String,
+}
+
+impl PolicyBackupHandoff {
+    pub fn from_backup_id(backup_id: impl Into<String>) -> Result<Self, PolicyMaintenanceError> {
+        let backup_id = backup_id.into();
+        if !is_policy_backup_id(&backup_id) {
+            return Err(PolicyMaintenanceError::InvalidBackup);
+        }
+        Ok(Self {
+            restore_command: format!("unpin profile policy restore --backup-id {backup_id}"),
+            backup_id,
+        })
+    }
+}
+
 #[derive(Debug)]
 pub enum ProtectedPolicyChangeError<E> {
-    Apply(E),
+    Apply { error: E, backup_id: String },
     Maintenance(PolicyMaintenanceError),
 }
 
@@ -250,6 +443,11 @@ impl PolicyMaintenanceController {
             project_root: project_root.into(),
             authentication_key,
         }
+    }
+
+    fn acquire_operation_lock(&self) -> Result<StateResourceLock, PolicyMaintenanceError> {
+        StateResourceLock::acquire(self.app_state_root.join("policy-maintenance-operation"))
+            .map_err(Into::into)
     }
 
     pub fn plan_migration(&self) -> Result<PolicyMaintenancePlan, PolicyMaintenanceError> {
@@ -432,6 +630,33 @@ impl PolicyMaintenanceController {
         }))
     }
 
+    pub fn unmanaged_status(
+        &self,
+        target: &PolicyTarget,
+    ) -> Result<UnmanagedPolicyStatus, PolicyMaintenanceError> {
+        if self.load_record_snapshot(target)?.is_some() {
+            return Err(PolicyMaintenanceError::InvalidLifecycle);
+        }
+        if self.policies.load(target)?.is_some() {
+            return Ok(UnmanagedPolicyStatus::ExistingPolicy);
+        }
+        match self.plan_migration() {
+            Ok(PolicyMaintenancePlan {
+                action: PolicyMaintenanceAction::Migrate { workspace, .. },
+                ..
+            }) => {
+                let migration_target =
+                    PolicyTarget::workspace(workspace.repository_key, workspace.workspace_key)?;
+                Ok(if &migration_target == target {
+                    UnmanagedPolicyStatus::MigrationAvailable
+                } else {
+                    UnmanagedPolicyStatus::MigrationUnavailable
+                })
+            }
+            Ok(_) | Err(_) => Ok(UnmanagedPolicyStatus::MigrationUnavailable),
+        }
+    }
+
     pub fn load_backup(
         &self,
         backup_id: &str,
@@ -443,16 +668,19 @@ impl PolicyMaintenanceController {
     pub fn apply(
         &self,
         reviewed: &PolicyMaintenancePlan,
+        authorization: ControlAuthorization,
+        context: &ControlApprovalContext,
         approval: &PolicyMaintenanceApproval,
         owner: OwnerGeneration,
     ) -> Result<PolicyMaintenanceOutcome, PolicyMaintenanceError> {
         reviewed.verify()?;
-        validate_approval(reviewed, approval)?;
+        validate_approval(reviewed, &authorization, context, approval)?;
+        let _operation_lock = self.acquire_operation_lock()?;
         let current = self.replan(reviewed)?;
         if &current != reviewed {
             return Err(PolicyMaintenanceError::PlanDrift);
         }
-        match &reviewed.action {
+        let result = match &reviewed.action {
             PolicyMaintenanceAction::Migrate {
                 source_path,
                 source_fingerprint,
@@ -462,7 +690,7 @@ impl PolicyMaintenanceController {
             } => self.apply_migration(
                 reviewed,
                 approval,
-                owner,
+                owner.clone(),
                 source_path,
                 source_fingerprint,
                 source_identity,
@@ -473,32 +701,66 @@ impl PolicyMaintenanceController {
                 from_target,
                 to_target,
                 workspace,
-            } => self.apply_reattach(reviewed, approval, owner, from_target, to_target, workspace),
+            } => self.apply_reattach(
+                reviewed,
+                approval,
+                owner.clone(),
+                from_target,
+                to_target,
+                workspace,
+            ),
             PolicyMaintenanceAction::Discard { target } => {
-                self.apply_discard(reviewed, approval, owner, target)
+                self.apply_discard(reviewed, approval, owner.clone(), target)
             }
             PolicyMaintenanceAction::Cleanup { target } => {
-                self.apply_cleanup(reviewed, approval, owner, target)
+                self.apply_cleanup(reviewed, approval, owner.clone(), target)
             }
             PolicyMaintenanceAction::Restore { backup_id } => {
-                self.apply_restore(reviewed, approval, owner, backup_id)
+                self.apply_restore(reviewed, approval, owner.clone(), backup_id)
             }
+        };
+        match result {
+            Ok(outcome) => Ok(outcome),
+            Err(error) => self.recover_failed_apply(reviewed, approval, owner, error),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn protect_policy_change<T, E>(
         &self,
         target: &PolicyTarget,
         operation_id: &str,
         reviewed_plan_fingerprint: &str,
+        approval_expectation: &ApprovalExpectation,
         approval: &PolicyMaintenanceApproval,
+        authorization: ControlAuthorization,
         owner: OwnerGeneration,
-        apply: impl FnOnce() -> Result<T, E>,
+        apply: impl FnOnce(ControlAuthorization) -> Result<T, E>,
     ) -> Result<ProtectedPolicyChange<T>, ProtectedPolicyChangeError<E>> {
-        validate_external_approval(reviewed_plan_fingerprint, approval)
+        authorization
+            .assert_matches(approval_expectation)
+            .map_err(|_| PolicyMaintenanceError::ApprovalRejected)
             .map_err(ProtectedPolicyChangeError::Maintenance)?;
+        validate_external_approval(
+            reviewed_plan_fingerprint,
+            authorization.decision_digest(),
+            approval,
+        )
+        .map_err(ProtectedPolicyChangeError::Maintenance)?;
         validate_component("operation id", operation_id)
             .map_err(ProtectedPolicyChangeError::Maintenance)?;
+        let _operation_lock = self
+            .acquire_operation_lock()
+            .map_err(ProtectedPolicyChangeError::Maintenance)?;
+        if self
+            .load_record_snapshot(target)
+            .map_err(ProtectedPolicyChangeError::Maintenance)?
+            .is_some_and(|record| record.value.lifecycle != PolicyMaintenanceLifecycle::Active)
+        {
+            return Err(ProtectedPolicyChangeError::Maintenance(
+                PolicyMaintenanceError::InvalidLifecycle,
+            ));
+        }
         let mut entries = vec![
             self.backup_entry(target)
                 .map_err(ProtectedPolicyChangeError::Maintenance)?,
@@ -515,71 +777,81 @@ impl PolicyMaintenanceController {
                 owner.clone(),
             )
             .map_err(ProtectedPolicyChangeError::Maintenance)?;
-        let result = match apply() {
+        let result = match apply(authorization) {
             Ok(result) => result,
             Err(error) => {
                 let current_policy = self
                     .policies
                     .load(target)
                     .map_err(PolicyMaintenanceError::from)
+                    .map_err(|error| recovery_error(&backup_id, error))
                     .map_err(ProtectedPolicyChangeError::Maintenance)?;
                 let current_record = self
-                    .load_record_snapshot(target)
+                    .load_record_raw(target)
+                    .map_err(|error| recovery_error(&backup_id, error))
                     .map_err(ProtectedPolicyChangeError::Maintenance)?;
                 entries[0].post_policy_revision = current_policy.map(|snapshot| snapshot.revision);
                 entries[0].post_record_revision = current_record.map(|snapshot| snapshot.revision);
-                self.finalize_backup(
+                self.finalize_protected_backup(
                     &backup_id,
                     &backup_revision,
                     entries,
+                    approval,
+                    operation_id,
                     rollback_owner(&owner, "failed-change-backup")
+                        .map_err(|error| recovery_error(&backup_id, error))
                         .map_err(ProtectedPolicyChangeError::Maintenance)?,
                 )
                 .map_err(ProtectedPolicyChangeError::Maintenance)?;
-                return Err(ProtectedPolicyChangeError::Apply(error));
+                return Err(ProtectedPolicyChangeError::Apply { error, backup_id });
             }
         };
-        let current_policy = self
-            .policies
-            .load(target)
-            .map_err(PolicyMaintenanceError::from)
-            .map_err(ProtectedPolicyChangeError::Maintenance)?;
-        let mut post_record_revision = entries[0].prior_record_revision.clone();
-        if let Some(mut record) = entries[0].prior_record.clone() {
-            if record.lifecycle != PolicyMaintenanceLifecycle::Active {
-                return Err(ProtectedPolicyChangeError::Maintenance(
-                    PolicyMaintenanceError::InvalidLifecycle,
-                ));
-            }
-            let policy = current_policy.as_ref().ok_or_else(|| {
-                ProtectedPolicyChangeError::Maintenance(PolicyMaintenanceError::PolicyNotFound)
-            })?;
-            record.active_policy_revision = Some(policy.revision.clone());
-            record.active_policy_fingerprint = Some(
-                policy_fingerprint(&policy.policy)
-                    .map_err(ProtectedPolicyChangeError::Maintenance)?,
-            );
-            record.review = approval.review();
-            record.last_operation_id = operation_id.to_string();
-            self.sign_record(&mut record)
-                .map_err(ProtectedPolicyChangeError::Maintenance)?;
-            post_record_revision = Some(
-                self.write_record(
+        let bookkeeping = (|| -> Result<(), PolicyMaintenanceError> {
+            let current_policy = self.policies.load(target)?;
+            let mut post_record_revision = entries[0].prior_record_revision.clone();
+            if let Some(mut record) = entries[0].prior_record.clone() {
+                if record.lifecycle != PolicyMaintenanceLifecycle::Active {
+                    return Err(PolicyMaintenanceError::InvalidLifecycle);
+                }
+                let policy = current_policy
+                    .as_ref()
+                    .ok_or(PolicyMaintenanceError::PolicyNotFound)?;
+                record.active_policy_revision = Some(policy.revision.clone());
+                record.active_policy_fingerprint = Some(policy_fingerprint(&policy.policy)?);
+                record.review = approval.review();
+                record.last_operation_id = operation_id.to_string();
+                self.sign_record(&mut record)?;
+                post_record_revision = Some(self.write_record(
                     &record,
                     entries[0].prior_record_revision.as_ref(),
-                    rollback_owner(&owner, "protected-change-record")
-                        .map_err(ProtectedPolicyChangeError::Maintenance)?,
-                )
-                .map_err(ProtectedPolicyChangeError::Maintenance)?,
-            );
+                    rollback_owner(&owner, "protected-change-record")?,
+                )?);
+            }
+            entries[0].post_policy_revision = current_policy.map(|snapshot| snapshot.revision);
+            entries[0].post_record_revision = post_record_revision;
+            Ok(())
+        })();
+        if let Err(error) = bookkeeping {
+            return Err(ProtectedPolicyChangeError::Maintenance(
+                self.recover_protected_post_apply(
+                    &backup_id,
+                    &backup_revision,
+                    &entries,
+                    approval,
+                    operation_id,
+                    &owner,
+                    error,
+                ),
+            ));
         }
-        entries[0].post_policy_revision = current_policy.map(|snapshot| snapshot.revision);
-        entries[0].post_record_revision = post_record_revision;
-        self.finalize_backup(
+        self.finalize_protected_backup(
             &backup_id,
             &backup_revision,
             entries,
+            approval,
+            operation_id,
             rollback_owner(&owner, "protected-change-backup")
+                .map_err(|error| recovery_error(&backup_id, error))
                 .map_err(ProtectedPolicyChangeError::Maintenance)?,
         )
         .map_err(ProtectedPolicyChangeError::Maintenance)?;
@@ -618,6 +890,16 @@ impl PolicyMaintenanceController {
             workspace.workspace_key.clone(),
         )?;
         let mut entries = vec![self.backup_entry(&target)?];
+        let current_source = read_legacy_policy(&self.project_root)?;
+        let current_workspace = capture_workspace_physical_evidence(&self.project_root)?;
+        if current_source.path != source_path
+            || current_source.fingerprint != source_fingerprint
+            || current_source.identity != source_identity
+            || current_source.policy != *policy
+            || current_workspace != *workspace
+        {
+            return Err(PolicyMaintenanceError::SourceDrift);
+        }
         let (backup_revision, backup_id) =
             self.write_backup(plan, approval, &entries, owner.clone())?;
         let policy_revision = self.policies.save(&target, policy, None, owner.clone())?;
@@ -651,19 +933,27 @@ impl PolicyMaintenanceController {
                         rollback_owner(&owner, "migration-policy")?,
                     )
                     .map_err(|rollback| {
-                        PolicyMaintenanceError::RecoveryRequired(format!(
-                            "{error}; policy rollback failed: {rollback}"
-                        ))
+                        recovery_required(format!("{error}; policy rollback failed: {rollback}"))
                     })?;
                 return Err(error);
             }
         };
         entries[0].post_policy_revision = Some(policy_revision);
         entries[0].post_record_revision = Some(record_revision);
+        let current_source = read_legacy_policy(&self.project_root)?;
+        let current_workspace = capture_workspace_physical_evidence(&self.project_root)?;
+        if current_source.path != source_path
+            || current_source.fingerprint != source_fingerprint
+            || current_source.identity != source_identity
+            || current_source.policy != *policy
+            || current_workspace != *workspace
+        {
+            return Err(PolicyMaintenanceError::SourceDrift);
+        }
         self.finalize_backup(
             &backup_id,
             &backup_revision,
-            entries,
+            &entries,
             rollback_owner(&owner, "migration-backup")?,
         )?;
         Ok(PolicyMaintenanceOutcome {
@@ -690,6 +980,14 @@ impl PolicyMaintenanceController {
         let old_record = self
             .load_record_snapshot(from_target)?
             .ok_or(PolicyMaintenanceError::RecordNotFound)?;
+        ensure_revision(
+            Some(&old_policy.revision),
+            plan.expected_policy_revision.as_ref(),
+        )?;
+        ensure_revision(
+            Some(&old_record.revision),
+            plan.expected_record_revision.as_ref(),
+        )?;
         let mut entries = vec![
             self.backup_entry(from_target)?,
             self.backup_entry(to_target)?,
@@ -729,7 +1027,7 @@ impl PolicyMaintenanceController {
                         rollback_owner(&owner, "reattach-new-policy")?,
                     )
                     .map_err(|rollback| {
-                        PolicyMaintenanceError::RecoveryRequired(format!(
+                        recovery_required(format!(
                             "{error}; new-policy rollback failed: {rollback}"
                         ))
                     })?;
@@ -779,12 +1077,12 @@ impl PolicyMaintenanceController {
                     &owner,
                 );
                 if let Err(rollback) = restored {
-                    return Err(PolicyMaintenanceError::RecoveryRequired(format!(
+                    return Err(recovery_required(format!(
                         "{error}; old-policy rollback failed: {rollback}"
                     )));
                 }
                 if let Err(rollback) = new_rollback {
-                    return Err(PolicyMaintenanceError::RecoveryRequired(format!(
+                    return Err(recovery_required(format!(
                         "{error}; new-target rollback failed: {rollback}"
                     )));
                 }
@@ -798,7 +1096,7 @@ impl PolicyMaintenanceController {
         self.finalize_backup(
             &backup_id,
             &backup_revision,
-            entries,
+            &entries,
             rollback_owner(&owner, "reattach-backup")?,
         )?;
         Ok(PolicyMaintenanceOutcome {
@@ -823,6 +1121,14 @@ impl PolicyMaintenanceController {
         let record = self
             .load_record_snapshot(target)?
             .ok_or(PolicyMaintenanceError::RecordNotFound)?;
+        ensure_revision(
+            Some(&policy.revision),
+            plan.expected_policy_revision.as_ref(),
+        )?;
+        ensure_revision(
+            Some(&record.revision),
+            plan.expected_record_revision.as_ref(),
+        )?;
         let mut entries = vec![self.backup_entry(target)?];
         let (backup_revision, backup_id) =
             self.write_backup(plan, approval, &entries, owner.clone())?;
@@ -849,9 +1155,7 @@ impl PolicyMaintenanceController {
                         rollback_owner(&owner, "discard-policy")?,
                     )
                     .map_err(|rollback| {
-                        PolicyMaintenanceError::RecoveryRequired(format!(
-                            "{error}; discard rollback failed: {rollback}"
-                        ))
+                        recovery_required(format!("{error}; discard rollback failed: {rollback}"))
                     })?;
                 return Err(error);
             }
@@ -861,7 +1165,7 @@ impl PolicyMaintenanceController {
         self.finalize_backup(
             &backup_id,
             &backup_revision,
-            entries,
+            &entries,
             rollback_owner(&owner, "discard-backup")?,
         )?;
         Ok(PolicyMaintenanceOutcome {
@@ -882,6 +1186,10 @@ impl PolicyMaintenanceController {
         let record = self
             .load_record_snapshot(target)?
             .ok_or(PolicyMaintenanceError::RecordNotFound)?;
+        ensure_revision(
+            Some(&record.revision),
+            plan.expected_record_revision.as_ref(),
+        )?;
         let mut entries = vec![self.backup_entry(target)?];
         let (backup_revision, backup_id) =
             self.write_backup(plan, approval, &entries, owner.clone())?;
@@ -892,7 +1200,7 @@ impl PolicyMaintenanceController {
         self.finalize_backup(
             &backup_id,
             &backup_revision,
-            entries,
+            &entries,
             rollback_owner(&owner, "cleanup-backup")?,
         )?;
         Ok(PolicyMaintenanceOutcome {
@@ -943,7 +1251,7 @@ impl PolicyMaintenanceController {
         self.finalize_backup(
             &restore_backup_id,
             &restore_backup_revision,
-            rollback_entries,
+            &rollback_entries,
             rollback_owner(&owner, "restore-backup")?,
         )?;
         let lifecycle = source
@@ -1048,26 +1356,274 @@ impl PolicyMaintenanceController {
         Ok(revision)
     }
 
+    fn finalize_protected_backup(
+        &self,
+        backup_id: &str,
+        backup_revision: &StateRevision,
+        entries: Vec<PolicyBackupEntry>,
+        approval: &PolicyMaintenanceApproval,
+        operation_id: &str,
+        owner: OwnerGeneration,
+    ) -> Result<(), PolicyMaintenanceError> {
+        match self.finalize_backup(backup_id, backup_revision, &entries, owner.clone()) {
+            Ok(_) => Ok(()),
+            Err(finalize_error) => {
+                match self.compensate_entries(&entries, approval, operation_id, &owner) {
+                    Ok(()) => {
+                        self.backup_store(backup_id)
+                            .map_err(|store_error| recovery_error(backup_id, store_error))?
+                            .remove_if_revision(backup_revision)
+                            .map_err(|error| {
+                                recovery_required(format!(
+                                    "backup={backup_id}; compensation-complete; cleanup={}",
+                                    PolicyMaintenanceError::from(error).public_code()
+                                ))
+                            })?;
+                        Err(finalize_error)
+                    }
+                    Err(compensation_error) => {
+                        let latest_entries = self
+                            .capture_post_revisions(&entries)
+                            .map_err(|capture_error| recovery_error(backup_id, capture_error))?;
+                        let finalized = self.finalize_backup(
+                            backup_id,
+                            backup_revision,
+                            &latest_entries,
+                            rollback_owner(&owner, "protected-change-recovery-backup")
+                                .map_err(|owner_error| recovery_error(backup_id, owner_error))?,
+                        );
+                        Err(recovery_required(format!(
+                            "backup={backup_id}; finalize={}; compensation={}; backup={}",
+                            finalize_error.public_code(),
+                            compensation_error.public_code(),
+                            if finalized.is_ok() {
+                                "finalized"
+                            } else {
+                                "incomplete"
+                            }
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn recover_protected_post_apply(
+        &self,
+        backup_id: &str,
+        backup_revision: &StateRevision,
+        entries: &[PolicyBackupEntry],
+        approval: &PolicyMaintenanceApproval,
+        operation_id: &str,
+        owner: &OwnerGeneration,
+        error: PolicyMaintenanceError,
+    ) -> PolicyMaintenanceError {
+        let current_entries = match self.capture_post_revisions(entries) {
+            Ok(entries) => entries,
+            Err(capture_error) => {
+                return recovery_required(format!(
+                    "backup={backup_id}; cause={}; capture={}",
+                    error.public_code(),
+                    capture_error.public_code()
+                ));
+            }
+        };
+        let recovery_owner = match rollback_owner(owner, "protected-change-recovery") {
+            Ok(owner) => owner,
+            Err(owner_error) => {
+                return recovery_required(format!(
+                    "backup={backup_id}; cause={}; owner={}",
+                    error.public_code(),
+                    owner_error.public_code()
+                ));
+            }
+        };
+        match self.finalize_protected_backup(
+            backup_id,
+            backup_revision,
+            current_entries,
+            approval,
+            operation_id,
+            recovery_owner,
+        ) {
+            Ok(()) => recovery_required(format!(
+                "backup={backup_id}; cause={}; backup=finalized",
+                error.public_code()
+            )),
+            Err(recovery @ PolicyMaintenanceError::RecoveryRequired { .. }) => recovery,
+            Err(_) => error,
+        }
+    }
+
+    fn recover_failed_apply(
+        &self,
+        plan: &PolicyMaintenancePlan,
+        approval: &PolicyMaintenanceApproval,
+        owner: OwnerGeneration,
+        error: PolicyMaintenanceError,
+    ) -> Result<PolicyMaintenanceOutcome, PolicyMaintenanceError> {
+        let backup_id = format!("policy-backup-{}", &plan.plan_fingerprint[..32]);
+        let Some(snapshot) = self
+            .load_backup_snapshot(&backup_id)
+            .map_err(|load_error| recovery_error(&backup_id, load_error))?
+        else {
+            return Err(error);
+        };
+        if snapshot.value.finalized {
+            return Err(recovery_required(format!(
+                "backup={backup_id}; cause={}; backup=finalized",
+                error.public_code()
+            )));
+        }
+        let entries = self
+            .capture_post_revisions(&snapshot.value.entries)
+            .map_err(|capture_error| recovery_error(&backup_id, capture_error))?;
+        let unchanged = entries.iter().all(|entry| {
+            entry.prior_policy_revision == entry.post_policy_revision
+                && entry.prior_record_revision == entry.post_record_revision
+        });
+        if unchanged {
+            self.backup_store(&backup_id)
+                .map_err(|store_error| recovery_error(&backup_id, store_error))?
+                .remove_if_revision(&snapshot.revision)
+                .map_err(|cleanup_error| {
+                    recovery_required(format!(
+                        "backup={backup_id}; state=unchanged; cleanup={}",
+                        PolicyMaintenanceError::from(cleanup_error).public_code()
+                    ))
+                })?;
+            return Err(error);
+        }
+        match self.compensate_entries(&entries, approval, &plan.operation_id, &owner) {
+            Ok(()) => {
+                self.backup_store(&backup_id)
+                    .map_err(|store_error| recovery_error(&backup_id, store_error))?
+                    .remove_if_revision(&snapshot.revision)
+                    .map_err(|remove_error| {
+                        recovery_required(format!(
+                            "backup={backup_id}; compensation-complete; cleanup={}",
+                            PolicyMaintenanceError::from(remove_error).public_code()
+                        ))
+                    })?;
+                Err(error)
+            }
+            Err(compensation_error) => {
+                let latest_entries = self
+                    .capture_post_revisions(&snapshot.value.entries)
+                    .map_err(|capture_error| recovery_error(&backup_id, capture_error))?;
+                let finalized = self.finalize_backup(
+                    &backup_id,
+                    &snapshot.revision,
+                    &latest_entries,
+                    rollback_owner(&owner, "failed-apply-recovery-backup")
+                        .map_err(|owner_error| recovery_error(&backup_id, owner_error))?,
+                );
+                Err(recovery_required(format!(
+                    "backup={backup_id}; cause={}; compensation={}; backup={}",
+                    error.public_code(),
+                    compensation_error.public_code(),
+                    if finalized.is_ok() {
+                        "finalized"
+                    } else {
+                        "incomplete"
+                    }
+                )))
+            }
+        }
+    }
+
+    fn capture_post_revisions(
+        &self,
+        entries: &[PolicyBackupEntry],
+    ) -> Result<Vec<PolicyBackupEntry>, PolicyMaintenanceError> {
+        entries
+            .iter()
+            .cloned()
+            .map(|mut entry| {
+                entry.post_policy_revision = self
+                    .policies
+                    .load(&entry.target)?
+                    .map(|snapshot| snapshot.revision);
+                entry.post_record_revision = self
+                    .load_record_raw(&entry.target)?
+                    .map(|snapshot| snapshot.revision);
+                Ok(entry)
+            })
+            .collect()
+    }
+
+    fn compensate_entries(
+        &self,
+        entries: &[PolicyBackupEntry],
+        approval: &PolicyMaintenanceApproval,
+        operation_id: &str,
+        owner: &OwnerGeneration,
+    ) -> Result<(), PolicyMaintenanceError> {
+        for (index, entry) in entries.iter().enumerate() {
+            let restored_policy_revision = if entry.prior_policy_revision
+                == entry.post_policy_revision
+            {
+                entry.prior_policy_revision.clone()
+            } else {
+                let policy_owner = rollback_owner(owner, &format!("compensate-policy-{index}"))?;
+                self.restore_policy_entry(entry, policy_owner)?
+            };
+            if entry.prior_record_revision != entry.post_record_revision {
+                let record_owner = rollback_owner(owner, &format!("compensate-record-{index}"))?;
+                self.restore_record_entry(
+                    entry,
+                    restored_policy_revision.as_ref(),
+                    approval,
+                    operation_id,
+                    record_owner,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     fn finalize_backup(
         &self,
         backup_id: &str,
         expected: &StateRevision,
-        entries: Vec<PolicyBackupEntry>,
+        entries: &[PolicyBackupEntry],
         owner: OwnerGeneration,
     ) -> Result<StateRevision, PolicyMaintenanceError> {
         let snapshot = self
             .load_backup_snapshot(backup_id)?
             .ok_or(PolicyMaintenanceError::BackupNotFound)?;
-        if &snapshot.revision != expected || snapshot.value.finalized {
+        if &snapshot.revision != expected {
             return Err(PolicyMaintenanceError::BackupDrift);
         }
+        if snapshot.value.finalized {
+            return if snapshot.value.entries.as_slice() == entries {
+                Ok(snapshot.revision)
+            } else {
+                Err(PolicyMaintenanceError::BackupDrift)
+            };
+        }
         let mut backup = snapshot.value;
-        backup.entries = entries;
+        backup.entries = entries.to_vec();
         backup.finalized = true;
         self.sign_backup(&mut backup)?;
-        self.backup_store(backup_id)?
+        match self
+            .backup_store(backup_id)?
             .compare_and_swap(Some(expected), owner, &backup)
-            .map_err(Into::into)
+        {
+            Ok(revision) => Ok(revision),
+            Err(error) => {
+                let observed = self.load_backup_snapshot(backup_id)?;
+                if let Some(observed) = observed
+                    && observed.value.finalized
+                    && observed.value.entries.as_slice() == entries
+                {
+                    Ok(observed.revision)
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
     }
 
     fn rollback_new_target(
@@ -1132,44 +1688,58 @@ impl PolicyMaintenanceController {
             entry.post_record_revision.as_ref(),
         )?;
         match (current, entry.prior_record.as_ref()) {
-            (Some(current), Some(prior)) => {
-                let mut restored = prior.clone();
-                restored.review = approval.review();
-                restored.last_operation_id = operation_id.to_string();
-                if restored.lifecycle == PolicyMaintenanceLifecycle::Active {
-                    restored.active_policy_revision = restored_policy_revision.cloned();
-                    restored.active_policy_fingerprint = entry
-                        .prior_policy
-                        .as_ref()
-                        .map(policy_fingerprint)
-                        .transpose()?;
-                }
-                self.sign_record(&mut restored)?;
-                self.write_record(&restored, Some(&current.revision), owner)
-                    .map(Some)
-            }
+            (Some(current), Some(prior)) => self.write_restored_record(
+                entry,
+                prior,
+                restored_policy_revision,
+                approval,
+                operation_id,
+                Some(&current.revision),
+                owner,
+            ),
             (Some(current), None) => {
                 self.record_store(&entry.target)?
                     .remove_if_revision(&current.revision)?;
                 Ok(None)
             }
-            (None, Some(prior)) => {
-                let mut restored = prior.clone();
-                restored.review = approval.review();
-                restored.last_operation_id = operation_id.to_string();
-                if restored.lifecycle == PolicyMaintenanceLifecycle::Active {
-                    restored.active_policy_revision = restored_policy_revision.cloned();
-                    restored.active_policy_fingerprint = entry
-                        .prior_policy
-                        .as_ref()
-                        .map(policy_fingerprint)
-                        .transpose()?;
-                }
-                self.sign_record(&mut restored)?;
-                self.write_record(&restored, None, owner).map(Some)
-            }
+            (None, Some(prior)) => self.write_restored_record(
+                entry,
+                prior,
+                restored_policy_revision,
+                approval,
+                operation_id,
+                None,
+                owner,
+            ),
             (None, None) => Ok(None),
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_restored_record(
+        &self,
+        entry: &PolicyBackupEntry,
+        prior: &PolicyMaintenanceRecord,
+        restored_policy_revision: Option<&StateRevision>,
+        approval: &PolicyMaintenanceApproval,
+        operation_id: &str,
+        expected_revision: Option<&StateRevision>,
+        owner: OwnerGeneration,
+    ) -> Result<Option<StateRevision>, PolicyMaintenanceError> {
+        let mut restored = prior.clone();
+        restored.review = approval.review();
+        restored.last_operation_id = operation_id.to_string();
+        if restored.lifecycle == PolicyMaintenanceLifecycle::Active {
+            restored.active_policy_revision = restored_policy_revision.cloned();
+            restored.active_policy_fingerprint = entry
+                .prior_policy
+                .as_ref()
+                .map(policy_fingerprint)
+                .transpose()?;
+        }
+        self.sign_record(&mut restored)?;
+        self.write_record(&restored, expected_revision, owner)
+            .map(Some)
     }
 
     fn sign_record(
@@ -1472,15 +2042,8 @@ fn seal_plan(
         expected_record_revision,
         plan_fingerprint: String::new(),
     };
-    let fingerprint = calculate_plan_fingerprint(&plan)?;
-    plan.operation_id = format!("policy-maintenance-{}", &fingerprint[..32]);
     plan.plan_fingerprint = calculate_plan_fingerprint(&plan)?;
     plan.operation_id = format!("policy-maintenance-{}", &plan.plan_fingerprint[..32]);
-    let final_fingerprint = calculate_plan_fingerprint(&plan)?;
-    if final_fingerprint != plan.plan_fingerprint {
-        plan.plan_fingerprint = final_fingerprint;
-        plan.operation_id = format!("policy-maintenance-{}", &plan.plan_fingerprint[..32]);
-    }
     Ok(plan)
 }
 
@@ -1503,48 +2066,47 @@ fn calculate_plan_fingerprint(
 
 fn validate_approval(
     plan: &PolicyMaintenancePlan,
+    authorization: &ControlAuthorization,
+    context: &ControlApprovalContext,
     approval: &PolicyMaintenanceApproval,
 ) -> Result<(), PolicyMaintenanceError> {
-    if !approval.confirmed
-        || approval.plan_fingerprint != plan.plan_fingerprint
-        || approval.actor_id.trim().is_empty()
-        || approval.actor_id.len() > 512
-        || approval.decision_digest.len() != 64
-        || !approval
-            .decision_digest
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    let expectation = plan.approval_expectation_verified(context)?;
+    authorization
+        .assert_matches(&expectation)
+        .map_err(|_| PolicyMaintenanceError::ApprovalRejected)?;
+    if approval.plan_fingerprint != plan.plan_fingerprint
+        || approval.decision_digest != authorization.decision_digest()
     {
         return Err(PolicyMaintenanceError::ApprovalRejected);
     }
-    Ok(())
+    validate_approval_fields(approval)
 }
 
 fn validate_external_approval(
     reviewed_plan_fingerprint: &str,
+    authorization_decision_digest: &str,
     approval: &PolicyMaintenanceApproval,
 ) -> Result<(), PolicyMaintenanceError> {
     if reviewed_plan_fingerprint.len() != 64
         || approval.plan_fingerprint != reviewed_plan_fingerprint
-        || !approval.confirmed
-        || approval.actor_id.trim().is_empty()
-        || approval.decision_digest.len() != 64
+        || approval.decision_digest != authorization_decision_digest
     {
         return Err(PolicyMaintenanceError::ApprovalRejected);
     }
-    validate_approval(
-        &PolicyMaintenancePlan {
-            schema_version: POLICY_MAINTENANCE_PLAN_SCHEMA_VERSION,
-            operation_id: "external-policy-change".to_string(),
-            action: PolicyMaintenanceAction::Restore {
-                backup_id: "external".to_string(),
-            },
-            expected_policy_revision: None,
-            expected_record_revision: None,
-            plan_fingerprint: reviewed_plan_fingerprint.to_string(),
-        },
-        approval,
-    )
+    validate_approval_fields(approval)
+}
+
+fn validate_approval_fields(
+    approval: &PolicyMaintenanceApproval,
+) -> Result<(), PolicyMaintenanceError> {
+    if !approval.confirmed
+        || approval.actor_id.trim().is_empty()
+        || approval.actor_id.len() > 512
+        || !is_lower_hex_digest(&approval.decision_digest)
+    {
+        return Err(PolicyMaintenanceError::ApprovalRejected);
+    }
+    Ok(())
 }
 
 fn ensure_revision(
@@ -1628,6 +2190,20 @@ fn rollback_owner(
     .map_err(Into::into)
 }
 
+fn recovery_error(backup_id: &str, error: PolicyMaintenanceError) -> PolicyMaintenanceError {
+    recovery_required(format!("backup={backup_id}; cause={}", error.public_code()))
+}
+
+fn recovery_required(detail: impl Into<String>) -> PolicyMaintenanceError {
+    let detail = detail.into();
+    let backup_id = detail
+        .strip_prefix("backup=")
+        .and_then(|remainder| remainder.split(';').next())
+        .filter(|backup_id| is_policy_backup_id(backup_id))
+        .map(str::to_owned);
+    PolicyMaintenanceError::RecoveryRequired { detail, backup_id }
+}
+
 fn io_error(path: &Path, error: io::Error) -> PolicyMaintenanceError {
     PolicyMaintenanceError::Io {
         path: path.to_path_buf(),
@@ -1640,7 +2216,10 @@ pub enum PolicyMaintenanceError {
     Policy(PolicyStoreError),
     State(StateError),
     Workspace(crate::state::workspace::WorkspaceIdentityError),
-    Io { path: PathBuf, message: String },
+    Io {
+        path: PathBuf,
+        message: String,
+    },
     Serialization(String),
     InvalidSourceJson(String),
     SourceMetadata(String),
@@ -1665,8 +2244,122 @@ pub enum PolicyMaintenanceError {
     InvalidLifecycle,
     WorkspaceStillAttached,
     ReattachNotProven,
-    InvalidComponent { label: &'static str },
-    RecoveryRequired(String),
+    InvalidComponent {
+        label: &'static str,
+    },
+    RecoveryRequired {
+        detail: String,
+        backup_id: Option<String>,
+    },
+}
+
+impl PolicyMaintenanceError {
+    #[must_use]
+    pub const fn public_code(&self) -> &'static str {
+        match self {
+            Self::InvalidSource => "unsafe-migration-source",
+            Self::SourceDrift => "migration-source-drift",
+            Self::DestinationExists => "policy-destination-exists",
+            Self::RecordNotFound => "maintenance-record-not-found",
+            Self::PolicyNotFound => "managed-policy-not-found",
+            Self::BackupNotFound => "policy-backup-not-found",
+            Self::BackupAlreadyExists => "policy-backup-already-exists",
+            Self::BackupIncomplete => "policy-backup-incomplete",
+            Self::BackupDrift => "policy-backup-drift",
+            Self::InvalidPlan => "invalid-policy-maintenance-plan",
+            Self::PlanFingerprintMismatch => "plan-fingerprint-mismatch",
+            Self::PlanDrift => "policy-maintenance-plan-drift",
+            Self::ApprovalRejected => "policy-maintenance-approval-rejected",
+            Self::InvalidRecord => "invalid-policy-maintenance-record",
+            Self::InvalidBackup => "invalid-policy-maintenance-backup",
+            Self::AuthenticationFailed => "policy-maintenance-authentication-failed",
+            Self::RecordPolicyDrift => "policy-maintenance-record-drift",
+            Self::InvalidLifecycle => "invalid-policy-maintenance-lifecycle",
+            Self::WorkspaceStillAttached => "workspace-policy-still-attached",
+            Self::ReattachNotProven => "workspace-reattach-not-proven",
+            Self::InvalidComponent { .. } => "invalid-policy-maintenance-component",
+            Self::RecoveryRequired { .. } => "policy-maintenance-recovery-required",
+            Self::Policy(_)
+            | Self::State(_)
+            | Self::Workspace(_)
+            | Self::Io { .. }
+            | Self::Serialization(_)
+            | Self::InvalidSourceJson(_)
+            | Self::SourceMetadata(_)
+            | Self::AuthenticationKey(_) => "policy-maintenance-unavailable",
+        }
+    }
+
+    #[must_use]
+    pub const fn public_message(&self) -> &'static str {
+        match self {
+            Self::InvalidSource => "The workspace policy source is unsafe.",
+            Self::SourceDrift => "The workspace policy source changed after review.",
+            Self::DestinationExists => "A workspace policy already exists at the destination.",
+            Self::RecordNotFound => "The workspace policy maintenance record was not found.",
+            Self::PolicyNotFound => "The managed workspace policy was not found.",
+            Self::BackupNotFound => "The requested policy backup was not found.",
+            Self::BackupAlreadyExists => "A backup for this reviewed operation already exists.",
+            Self::BackupIncomplete => "The requested policy backup is incomplete.",
+            Self::BackupDrift => "The policy backup changed after review.",
+            Self::InvalidPlan => "The policy maintenance plan is invalid.",
+            Self::PlanFingerprintMismatch => "The policy maintenance plan fingerprint is invalid.",
+            Self::PlanDrift => "Policy maintenance state changed after review.",
+            Self::ApprovalRejected => "Authenticated policy maintenance approval was rejected.",
+            Self::InvalidRecord => "The workspace policy maintenance record is invalid.",
+            Self::InvalidBackup => "The policy maintenance backup is invalid.",
+            Self::AuthenticationFailed => "Policy maintenance authentication failed.",
+            Self::RecordPolicyDrift => {
+                "The maintenance record no longer matches the workspace policy."
+            }
+            Self::InvalidLifecycle => "The requested policy maintenance action is not allowed now.",
+            Self::WorkspaceStillAttached => "The workspace policy is still attached.",
+            Self::ReattachNotProven => "The current workspace does not prove a safe reattachment.",
+            Self::InvalidComponent { .. } => "A policy maintenance identifier is invalid.",
+            Self::RecoveryRequired { .. } => {
+                "Policy maintenance stopped after a state change; authenticated recovery is required."
+            }
+            Self::Policy(_)
+            | Self::State(_)
+            | Self::Workspace(_)
+            | Self::Io { .. }
+            | Self::Serialization(_)
+            | Self::InvalidSourceJson(_)
+            | Self::SourceMetadata(_)
+            | Self::AuthenticationKey(_) => {
+                "Policy maintenance could not complete safely. Inspect local state and retry."
+            }
+        }
+    }
+
+    #[must_use]
+    pub const fn requires_recovery(&self) -> bool {
+        matches!(self, Self::RecoveryRequired { .. })
+    }
+
+    #[must_use]
+    pub fn recovery_backup_id(&self) -> Option<&str> {
+        let Self::RecoveryRequired { backup_id, .. } = self else {
+            return None;
+        };
+        backup_id.as_deref()
+    }
+
+    #[must_use]
+    pub fn recovery_handoff(&self) -> Option<PolicyBackupHandoff> {
+        self.recovery_backup_id()
+            .and_then(|backup_id| PolicyBackupHandoff::from_backup_id(backup_id).ok())
+    }
+}
+
+fn is_policy_backup_id(backup_id: &str) -> bool {
+    let Some(suffix) = backup_id.strip_prefix("policy-backup-") else {
+        return false;
+    };
+    suffix.len() == 32
+        && suffix
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 impl fmt::Display for PolicyMaintenanceError {
@@ -1742,8 +2435,8 @@ impl fmt::Display for PolicyMaintenanceError {
                 "workspace reattachment requires reliable proof of the same physical checkout",
             ),
             Self::InvalidComponent { label } => write!(formatter, "invalid {label}"),
-            Self::RecoveryRequired(message) => {
-                write!(formatter, "policy maintenance recovery required: {message}")
+            Self::RecoveryRequired { detail, .. } => {
+                write!(formatter, "policy maintenance recovery required: {detail}")
             }
         }
     }

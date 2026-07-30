@@ -318,7 +318,7 @@ impl GroupPlanner {
     }
 
     #[cfg(test)]
-    fn with_discovery_override(mut self, discovery: crate::discovery::DiscoveryOutput) -> Self {
+    pub fn with_discovery_override(mut self, discovery: crate::discovery::DiscoveryOutput) -> Self {
         self.discovery_override = Some(discovery);
         self
     }

@@ -31,8 +31,8 @@ use unpin_core::{
     },
     mutation::{BackupAuthenticationKey, BulkToggleController, authenticate_legacy_backup},
     profiles::{
-        CapabilityLockSnapshot, PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope,
-        ProfileStore, compile_profile,
+        CapabilityLockSnapshot, PROFILE_DEFINITION_VERSION, PolicyStore, PolicyTarget,
+        ProfileDefinition, ProfileSourceScope, ProfileStore, ScopePolicy, compile_profile,
     },
     sessions::SessionAuthorityKey,
     state::{
@@ -885,7 +885,26 @@ fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_writing() {
 
 #[test]
 fn policy_maintenance_status_is_read_only_and_returns_cli_handoff() {
-    let context = context();
+    let temp = TempDir::new().expect("temporary policy MCP root");
+    let root = fs::canonicalize(temp.path()).expect("canonical policy MCP root");
+    let fixture_root = root.join("fixtures");
+    let app_state_root = root.join("state");
+    let project_root = root.join("project");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(project_root.join(".unpin")).expect("workspace policy directory");
+    let git = std::process::Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&project_root)
+        .output()
+        .expect("git init");
+    assert!(git.status.success());
+    fs::write(
+        project_root.join(".unpin").join("policy.json"),
+        serde_json::to_vec_pretty(&ScopePolicy::default()).expect("serialize policy"),
+    )
+    .expect("write workspace policy");
+    let mut context = context_with_roots(&fixture_root, &app_state_root);
+    context.project_root = project_root;
     let descriptor = tool_descriptor(&context, "unpin_get_policy_maintenance_status");
     assert_eq!(descriptor["annotations"]["readOnlyHint"], true);
 
@@ -898,6 +917,43 @@ fn policy_maintenance_status_is_read_only_and_returns_cli_handoff() {
             .expect("CLI guidance")
             .contains("unpin profile policy migrate")
     );
+    assert!(
+        !status
+            .to_string()
+            .contains(&context.project_root.display().to_string())
+    );
+
+    context.backup_authentication_key = None;
+    context.authentication.backup_authentication = McpCredentialReadiness::missing();
+    let blocked = call_tool(&context, "unpin_get_policy_maintenance_status", json!({}));
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(blocked["reason"], "backup-authentication-key-missing");
+    assert_eq!(
+        blocked["humanAction"]["code"],
+        "initialize-backup-authentication"
+    );
+}
+
+#[test]
+fn policy_maintenance_existing_unmanaged_policy_has_no_migration_handoff() {
+    let context = context();
+    let identity = resolve_workspace_identity(&context.project_root).expect("workspace identity");
+    let target = PolicyTarget::workspace(identity.repository_key, identity.workspace_key)
+        .expect("workspace target");
+    PolicyStore::new(&context.app_state_root)
+        .save(
+            &target,
+            &ScopePolicy::default(),
+            None,
+            OwnerGeneration::new("mcp-unmanaged-policy", 1).expect("owner"),
+        )
+        .expect("seed unmanaged policy");
+
+    let status = call_tool(&context, "unpin_get_policy_maintenance_status", json!({}));
+    assert_eq!(status["status"], "unmanaged");
+    assert_eq!(status["unmanagedState"], "existing-policy");
+    assert_eq!(status["humanAction"]["code"], "inspect-existing-policy");
+    assert!(!status.to_string().contains("review-policy-migration"));
 }
 
 #[test]

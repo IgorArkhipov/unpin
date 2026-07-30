@@ -7,17 +7,18 @@ use unpin_core::{
     catalog::{CapabilityId, Catalog},
     control_operation::{
         ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle,
-        DurableControlError, ReachAwarePrincipal, ReachAwareRootBinding,
+        ReachAwarePrincipal, ReachAwareRootBinding,
     },
     discovery::{DiscoveryOutput, discover_all},
     profiles::{
         CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, GatewaySelection,
-        PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyApplyStatus, PolicyChange, PolicyControlError,
-        PolicyMaintenanceApproval, PolicyMaintenanceController, PolicyMaintenancePlan, PolicyStore,
-        PolicyTarget, ProfileDefinition, ProfileDefinitionEntry, ProfilePolicyController,
-        ProfileProviderOperationController, ProfileProviderOperationError,
-        ProfileProviderOperationStatus, ProfileProviderReachAwareApplyContext, ProfileReference,
-        ProfileSelection, ProfileSourceScope, ProfileStore, ProtectedPolicyChangeError,
+        PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyApplyStatus, PolicyBackupHandoff, PolicyChange,
+        PolicyMaintenanceApproval, PolicyMaintenanceController, PolicyMaintenanceError,
+        PolicyMaintenancePlan, PolicyStore, PolicyTarget, ProfileDefinition,
+        ProfileDefinitionEntry, ProfilePolicyController, ProfileProviderOperationController,
+        ProfileProviderOperationError, ProfileProviderOperationStatus,
+        ProfileProviderReachAwareApplyContext, ProfileReference, ProfileSelection,
+        ProfileSourceScope, ProfileStore, ProtectedPolicyChangeError, UnmanagedPolicyStatus,
         capability_lock_enforcement, compile_profile, profile_reach_scope_digest, propose_profile,
         resolve_effective_gateway,
     },
@@ -32,8 +33,8 @@ use unpin_core::{
 
 use super::ProviderReachArg;
 use crate::{
-    DiscoveryRootArgs, command_error_exit, credentials, parse_provider_id, resolve_config,
-    resolve_discovery_roots_with_config, unix_now,
+    DiscoveryRootArgs, command_error_exit, command_error_exit_code, credentials, parse_provider_id,
+    resolve_config, resolve_discovery_roots_with_config, unix_now,
 };
 
 #[derive(Debug, Subcommand)]
@@ -414,23 +415,40 @@ fn policy_maintenance_status(
     let candidate = candidate_current.then_some(config.project_root.as_path());
     let status = match controller.status(&target, candidate) {
         Ok(status) => status,
-        Err(error) => return command_error_exit(options.json, "blocked", &error.to_string()),
+        Err(error) => return policy_maintenance_error_exit(options.json, &error),
+    };
+    let unmanaged = if status.is_none() {
+        match controller.unmanaged_status(&target) {
+            Ok(status) => Some(status),
+            Err(error) => return policy_maintenance_error_exit(options.json, &error),
+        }
+    } else {
+        None
     };
     if options.json {
+        let human_action = match unmanaged {
+            Some(UnmanagedPolicyStatus::MigrationAvailable) => Some(json!({
+                "code": "review-migration",
+                "guidance": "Run `unpin profile policy migrate` to review the fixed workspace source."
+            })),
+            Some(UnmanagedPolicyStatus::ExistingPolicy) => Some(json!({
+                "code": "inspect-existing-policy",
+                "guidance": "A workspace policy already exists without a maintenance record; inspect it before choosing an explicit adoption or replacement path."
+            })),
+            Some(UnmanagedPolicyStatus::MigrationUnavailable) => Some(json!({
+                "code": "inspect-migration-source",
+                "guidance": "No safe fixed-source migration is currently available; inspect the workspace policy source."
+            })),
+            None => None,
+        };
         println!(
             "{}",
             serde_json::to_string_pretty(&json!({
                 "status": if status.is_some() { "managed" } else { "unmanaged" },
                 "target": target,
                 "maintenance": status,
-                "humanAction": if status.is_none() {
-                    Some(json!({
-                        "code": "review-migration",
-                        "guidance": "Run `unpin profile policy migrate` to review the fixed workspace source."
-                    }))
-                } else {
-                    None
-                },
+                "unmanagedState": unmanaged,
+                "humanAction": human_action,
             }))
             .expect("policy maintenance status JSON")
         );
@@ -446,8 +464,14 @@ fn policy_maintenance_status(
                 status.allowed_actions.join(",")
             }
         );
-    } else {
+    } else if unmanaged == Some(UnmanagedPolicyStatus::MigrationAvailable) {
         println!("workspace policy is unmanaged; review `unpin profile policy migrate`");
+    } else if unmanaged == Some(UnmanagedPolicyStatus::ExistingPolicy) {
+        println!(
+            "workspace policy exists without a maintenance record; inspect it before adoption or replacement"
+        );
+    } else {
+        println!("workspace policy is unmanaged; no safe fixed-source migration is available");
     }
     ExitCode::SUCCESS
 }
@@ -488,17 +512,21 @@ fn run_policy_maintenance_mutation(
     };
     let plan = match planner(&controller) {
         Ok(plan) => plan,
-        Err(error) => {
-            return command_error_exit(mutation.options.json, "blocked", &error.to_string());
-        }
+        Err(error) => return policy_maintenance_error_exit(mutation.options.json, &error),
     };
     if !mutation.apply {
         if mutation.options.json {
+            let public_plan = match plan.public_view() {
+                Ok(public_plan) => public_plan,
+                Err(error) => {
+                    return policy_maintenance_error_exit(mutation.options.json, &error);
+                }
+            };
             println!(
                 "{}",
                 serde_json::to_string_pretty(&json!({
                     "status": "planned",
-                    "plan": plan,
+                    "plan": public_plan,
                     "humanAction": {
                         "code": "confirm-and-apply",
                         "guidance": "Re-run with --apply --confirm and this plan fingerprint."
@@ -507,9 +535,15 @@ fn run_policy_maintenance_mutation(
                 .expect("policy maintenance plan JSON")
             );
         } else {
+            let public = match plan.public_view() {
+                Ok(public) => public,
+                Err(error) => return policy_maintenance_error_exit(false, &error),
+            };
+            let action = serde_json::to_string(&public.action)
+                .expect("public policy maintenance action serializes");
             println!(
-                "policy maintenance planned operation={} fingerprint={}",
-                plan.operation_id, plan.plan_fingerprint
+                "policy maintenance planned action={action} operation={} fingerprint={}",
+                public.operation_id, public.plan_fingerprint
             );
         }
         return ExitCode::SUCCESS;
@@ -533,14 +567,63 @@ fn run_policy_maintenance_mutation(
     ) {
         return command_error_exit(mutation.options.json, "blocked", &error);
     }
-    let approval = policy_maintenance_approval(&plan.plan_fingerprint);
+    let identity = match config.workspace_identity() {
+        Ok(identity) => identity,
+        Err(_) => {
+            return command_error_exit(
+                mutation.options.json,
+                "blocked",
+                "workspace-identity-unavailable",
+            );
+        }
+    };
+    let approval_context =
+        match ControlApprovalContext::new(identity.repository_key, identity.workspace_key) {
+            Ok(context) => context,
+            Err(_) => {
+                return command_error_exit(
+                    mutation.options.json,
+                    "blocked",
+                    "approval-context-invalid",
+                );
+            }
+        };
+    let expectation = match plan.approval_expectation(&approval_context) {
+        Ok(expectation) => expectation,
+        Err(error) => return policy_maintenance_error_exit(mutation.options.json, &error),
+    };
+    let reviewed_at = unix_now();
+    let authorization = match credentials::authorize_reviewed_control_decision(
+        mutation.options.roots.fixture_root.is_some(),
+        &config.app_state_root,
+        &expectation,
+        &plan.plan_fingerprint,
+        mutation.plan_fingerprint.as_deref(),
+        "unpin-cli-policy-maintenance-approval",
+        reviewed_at,
+    ) {
+        Ok(authorization) => authorization,
+        Err(_) => {
+            return command_error_exit(
+                mutation.options.json,
+                "blocked",
+                "authenticated-approval-required",
+            );
+        }
+    };
+    let approval = PolicyMaintenanceApproval {
+        confirmed: true,
+        plan_fingerprint: plan.plan_fingerprint.clone(),
+        actor_id: "unpin-cli-policy-maintenance".to_string(),
+        reviewed_at_unix: u64::try_from(reviewed_at).unwrap_or_default(),
+        decision_digest: authorization.decision_digest().to_string(),
+    };
     let owner = OwnerGeneration::new(format!("unpin-cli-{}", plan.operation_id), 1)
         .expect("derived policy maintenance owner is valid");
-    let outcome = match controller.apply(&plan, &approval, owner) {
+    let outcome = match controller.apply(&plan, authorization, &approval_context, &approval, owner)
+    {
         Ok(outcome) => outcome,
-        Err(error) => {
-            return command_error_exit(mutation.options.json, "blocked", &error.to_string());
-        }
+        Err(error) => return policy_maintenance_error_exit(mutation.options.json, &error),
     };
     if mutation.options.json {
         println!(
@@ -567,13 +650,12 @@ fn policy_maintenance_controller(
 ) -> Result<PolicyMaintenanceController, String> {
     let fixture_mode = options.roots.fixture_root.is_some();
     let key =
-        match credentials::resolve_backup_authentication_key(fixture_mode, &config.app_state_root)?
+        match credentials::resolve_backup_authentication_key(fixture_mode, &config.app_state_root)
+            .map_err(|_| "backup-authentication-unavailable".to_string())?
         {
             Some(key) => key,
             None => {
-                return Err(
-                    "backup authentication key missing; run `unpin auth backup init`".to_string(),
-                );
+                return Err("backup-authentication-key-missing".to_string());
             }
         };
     Ok(PolicyMaintenanceController::new(
@@ -583,13 +665,88 @@ fn policy_maintenance_controller(
     ))
 }
 
-fn policy_maintenance_approval(plan_fingerprint: &str) -> PolicyMaintenanceApproval {
+fn policy_maintenance_error_exit(json_output: bool, error: &PolicyMaintenanceError) -> ExitCode {
+    if error.requires_recovery() {
+        return protected_policy_change_error_exit(json_output, error);
+    }
+    let (status, reason, code) = policy_maintenance_error_contract(error);
+    command_error_exit_code(json_output, status, reason, code)
+}
+
+fn policy_maintenance_error_contract(
+    error: &PolicyMaintenanceError,
+) -> (&'static str, &'static str, u8) {
+    if error.requires_recovery() {
+        ("recovery-required", error.public_code(), 4)
+    } else {
+        ("blocked", error.public_code(), 1)
+    }
+}
+
+fn policy_backup_handoff(backup_id: &str) -> PolicyBackupHandoff {
+    PolicyBackupHandoff::from_backup_id(backup_id)
+        .expect("protected policy backups use validated recovery identifiers")
+}
+
+fn protected_policy_change_error_exit(
+    json_output: bool,
+    error: &PolicyMaintenanceError,
+) -> ExitCode {
+    let Some(backup_id) = error.recovery_backup_id() else {
+        return command_error_exit_code(json_output, "recovery-required", error.public_code(), 4);
+    };
+
+    let handoff = policy_backup_handoff(backup_id);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "recovery-required",
+                "reason": error.public_code(),
+                "recovery": handoff,
+            }))
+            .expect("protected policy recovery JSON")
+        );
+    } else {
+        eprintln!(
+            "recovery backup={}; restore with `{}`",
+            handoff.backup_id, handoff.restore_command
+        );
+    }
+    ExitCode::from(4)
+}
+
+fn protected_apply_error_exit(json_output: bool, backup_id: &str) -> ExitCode {
+    let handoff = policy_backup_handoff(backup_id);
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "recovery-required",
+                "reason": "protected-policy-change-apply-failed",
+                "recovery": handoff,
+            }))
+            .expect("protected policy apply recovery JSON")
+        );
+    } else {
+        eprintln!(
+            "recovery backup={}; restore with `{}`",
+            handoff.backup_id, handoff.restore_command
+        );
+    }
+    ExitCode::from(4)
+}
+
+fn policy_maintenance_approval(
+    plan_fingerprint: &str,
+    authorization_decision_digest: &str,
+) -> PolicyMaintenanceApproval {
     PolicyMaintenanceApproval {
         confirmed: true,
         plan_fingerprint: plan_fingerprint.to_string(),
         actor_id: "unpin-cli-policy-maintenance".to_string(),
         reviewed_at_unix: u64::try_from(unix_now()).unwrap_or_default(),
-        decision_digest: plan_fingerprint.to_string(),
+        decision_digest: authorization_decision_digest.to_string(),
     }
 }
 
@@ -725,18 +882,21 @@ fn change_capability_lock(
         Ok(controller) => controller,
         Err(error) => return command_error_exit(options.json, "blocked", &error),
     };
-    let maintenance_approval = policy_maintenance_approval(&plan.plan_fingerprint);
+    let maintenance_approval =
+        policy_maintenance_approval(&plan.plan_fingerprint, authorization.decision_digest());
     let protected = maintenance.protect_policy_change(
         &plan.target,
         &format!("capability-lock-{}", &plan.plan_fingerprint[..32]),
         &plan.plan_fingerprint,
+        &expectation,
         &maintenance_approval,
+        authorization,
         OwnerGeneration::new(
             format!("unpin-cli-capability-lock-{}", &plan.plan_fingerprint[..16]),
             1,
         )
         .expect("derived capability-lock backup owner is valid"),
-        || {
+        |authorization| {
             ProfilePolicyController::with_session_authority_key(
                 &config.app_state_root,
                 session_authority_key,
@@ -751,17 +911,14 @@ fn change_capability_lock(
     );
     let protected = match protected {
         Ok(protected) => protected,
-        Err(ProtectedPolicyChangeError::Apply(error)) => {
-            return command_error_exit(
-                options.json,
-                policy_control_error_status(&error),
-                &error.to_string(),
-            );
+        Err(ProtectedPolicyChangeError::Apply { backup_id, .. }) => {
+            return protected_apply_error_exit(options.json, &backup_id);
         }
         Err(ProtectedPolicyChangeError::Maintenance(error)) => {
-            return command_error_exit(options.json, "recovery-required", &error.to_string());
+            return protected_policy_change_error_exit(options.json, &error);
         }
     };
+    let capability_backup_id = protected.backup_id;
     let result = protected.result;
     if options.json {
         let operation = ControlOperationEnvelope::from_expectation(
@@ -784,12 +941,13 @@ fn change_capability_lock(
                 "status": "applied",
                 "operation": operation,
                 "result": result,
+                "policyBackup": policy_backup_handoff(&capability_backup_id),
             }))
             .expect("capability lock apply JSON")
         );
     } else {
         println!(
-            "global {} capability lock applied; activation=next-session-only",
+            "global {} capability lock applied; activation=next-session-only; policy backup={capability_backup_id}; restore=`unpin profile policy restore --backup-id {capability_backup_id}`",
             provider.as_str()
         );
     }
@@ -1236,18 +1394,21 @@ fn apply_profile(
         Ok(controller) => controller,
         Err(error) => return command_error_exit(options.json, "blocked", &error),
     };
-    let maintenance_approval = policy_maintenance_approval(&plan.plan_fingerprint);
+    let maintenance_approval =
+        policy_maintenance_approval(&plan.plan_fingerprint, authorization.decision_digest());
     let protected = maintenance.protect_policy_change(
         &plan.target,
         &format!("profile-apply-{}", &plan.plan_fingerprint[..32]),
         &plan.plan_fingerprint,
+        &expectation,
         &maintenance_approval,
+        authorization,
         OwnerGeneration::new(
             format!("unpin-cli-profile-backup-{}", &plan.plan_fingerprint[..16]),
             1,
         )
         .expect("derived profile backup owner is valid"),
-        || {
+        |authorization| {
             ProfilePolicyController::with_session_authority_key(
                 &config.app_state_root,
                 session_authority_key,
@@ -1257,15 +1418,11 @@ fn apply_profile(
     );
     let protected = match protected {
         Ok(protected) => protected,
-        Err(ProtectedPolicyChangeError::Apply(error)) => {
-            return command_error_exit(
-                options.json,
-                policy_control_error_status(&error),
-                &error.to_string(),
-            );
+        Err(ProtectedPolicyChangeError::Apply { backup_id, .. }) => {
+            return protected_apply_error_exit(options.json, &backup_id);
         }
         Err(ProtectedPolicyChangeError::Maintenance(error)) => {
-            return command_error_exit(options.json, "recovery-required", &error.to_string());
+            return protected_policy_change_error_exit(options.json, &error);
         }
     };
     let result = protected.result;
@@ -1291,13 +1448,14 @@ fn apply_profile(
                 "operation": operation,
                 "profile": compiled,
                 "result": result,
+                "policyBackup": policy_backup_handoff(&protected.backup_id),
             }))
             .expect("profile apply JSON")
         );
     } else {
         println!(
-            "profile {} selected; activation=next-session-only mode={:?}",
-            compiled.profile_id, mode
+            "profile {} selected; activation=next-session-only mode={:?}; policy backup={}; restore=`unpin profile policy restore --backup-id {}`",
+            compiled.profile_id, mode, protected.backup_id, protected.backup_id
         );
     }
     ExitCode::SUCCESS
@@ -1520,18 +1678,21 @@ fn apply_profile_with_reach(
             return crate::command_error_exit_code(options.json, "blocked", &error, 3);
         }
     };
-    let maintenance_approval = policy_maintenance_approval(&plan.plan_fingerprint);
+    let maintenance_approval =
+        policy_maintenance_approval(&plan.plan_fingerprint, authorization.decision_digest());
     let protected = maintenance.protect_policy_change(
         &plan.target,
         &plan.operation_id,
         &plan.plan_fingerprint,
+        &expectation,
         &maintenance_approval,
+        authorization,
         OwnerGeneration::new(
             format!("unpin-cli-profile-provider-backup-{}", plan.operation_id),
             1,
         )
         .expect("derived profile-provider backup owner is valid"),
-        || {
+        |authorization| {
             ProfileProviderOperationController::new(&config.app_state_root)
                 .with_session_authority_key(session_key)
                 .apply_with_reach_aware(&plan, authorization, durable, "unpin-cli-profile-provider")
@@ -1539,21 +1700,11 @@ fn apply_profile_with_reach(
     );
     let protected = match protected {
         Ok(protected) => protected,
-        Err(ProtectedPolicyChangeError::Apply(error)) => {
-            return crate::command_error_exit_code(
-                options.json,
-                profile_provider_error_status(&error),
-                &error.to_string(),
-                profile_provider_error_exit(&error),
-            );
+        Err(ProtectedPolicyChangeError::Apply { backup_id, .. }) => {
+            return protected_apply_error_exit(options.json, &backup_id);
         }
         Err(ProtectedPolicyChangeError::Maintenance(error)) => {
-            return crate::command_error_exit_code(
-                options.json,
-                "recovery-required",
-                &error.to_string(),
-                4,
-            );
+            return protected_policy_change_error_exit(options.json, &error);
         }
     };
     let result = protected.result;
@@ -1575,13 +1726,18 @@ fn apply_profile_with_reach(
                 "providerCoverage": plan.coverage,
                 "activation": plan.activation,
                 "result": result,
+                "policyBackup": policy_backup_handoff(&protected.backup_id),
             }))
             .expect("reach-aware profile apply JSON")
         );
     } else {
         println!(
-            "profile {} {status}; reach={:?} activation={:?}",
-            compiled.profile_id, plan.provider_reach, plan.activation
+            "profile {} {status}; reach={:?} activation={:?}; policy backup={}; restore=`unpin profile policy restore --backup-id {}`",
+            compiled.profile_id,
+            plan.provider_reach,
+            plan.activation,
+            protected.backup_id,
+            protected.backup_id
         );
     }
     ExitCode::from(match result.status {
@@ -1761,10 +1917,13 @@ fn render_profile_plan(
     ExitCode::SUCCESS
 }
 
-fn policy_control_error_status(error: &PolicyControlError) -> &'static str {
+#[cfg(test)]
+fn policy_control_error_status(error: &unpin_core::profiles::PolicyControlError) -> &'static str {
     if matches!(
         error,
-        PolicyControlError::Durable(DurableControlError::RecoveryRequired(_))
+        unpin_core::profiles::PolicyControlError::Durable(
+            unpin_core::control_operation::DurableControlError::RecoveryRequired(_)
+        )
     ) {
         "recovery-required"
     } else {
@@ -1775,6 +1934,7 @@ fn policy_control_error_status(error: &PolicyControlError) -> &'static str {
 #[cfg(test)]
 mod recovery_status_tests {
     use super::*;
+    use unpin_core::{control_operation::DurableControlError, profiles::PolicyControlError};
 
     #[test]
     fn profile_durable_recovery_has_distinct_machine_status() {
@@ -1783,6 +1943,23 @@ mod recovery_status_tests {
         ));
 
         assert_eq!(policy_control_error_status(&error), "recovery-required");
+    }
+
+    #[test]
+    fn policy_maintenance_recovery_has_distinct_status_and_exit_code() {
+        let error = PolicyMaintenanceError::RecoveryRequired {
+            detail: "policy-backup-test".to_string(),
+            backup_id: None,
+        };
+
+        assert_eq!(
+            policy_maintenance_error_contract(&error),
+            (
+                "recovery-required",
+                "policy-maintenance-recovery-required",
+                4,
+            )
+        );
     }
 }
 

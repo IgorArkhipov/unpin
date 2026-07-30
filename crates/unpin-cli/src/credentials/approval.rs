@@ -10,7 +10,7 @@ use unpin_core::{
         ApprovalExpectation, ApprovalIssuer, ApprovalKey, ApprovalReceipt, ApprovalReceiptClaims,
         ApprovalVerifier, ControlAuthorization, MAX_APPROVAL_LIFETIME_SECONDS, authorize_control,
     },
-    fixture::{FixtureCredentialPurpose, fixture_credential_key},
+    fixture::{FixtureCredentialPurpose, canonical_fixture_scope_path, fixture_credential_key},
     groups::GroupTogglePlan,
     state::atomic_json::OwnerGeneration,
 };
@@ -113,10 +113,7 @@ pub(crate) fn authorize_reviewed_control_decision(
     // symlink. Fixture mode uses synthetic state only, so bind nonce evidence
     // to its canonical physical root without weakening live-state checks.
     let canonical_fixture_root = if fixture_mode {
-        Some(
-            std::fs::canonicalize(app_state_root)
-                .map_err(|error| format!("fixture state root could not be resolved: {error}"))?,
-        )
+        Some(canonical_fixture_scope_path(app_state_root)?)
     } else {
         None
     };

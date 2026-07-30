@@ -589,6 +589,35 @@ impl GroupWorkflow {
                 "result: {:?} final={:?} observationFresh={} operation={}",
                 result.lifecycle, result.final_state, result.observation_fresh, result.operation_id,
             ));
+            if let Some(reason) = &result.observation_reason {
+                details.push(format!("observation: {reason}"));
+            }
+            for member in &result.members {
+                details.push(format!(
+                    "member result: {} status={:?} cohort={} failure={} backup={} reason={}",
+                    member.identity.id,
+                    member.status,
+                    member.cohort_id.as_deref().unwrap_or("none"),
+                    member
+                        .failure_mode
+                        .as_ref()
+                        .map_or_else(|| "none".to_string(), |failure| format!("{failure:?}")),
+                    member.backup_id.as_deref().unwrap_or("none"),
+                    member.reason.as_deref().unwrap_or("none"),
+                ));
+            }
+            if !result.backup_ids.is_empty() {
+                details.push(format!("recovery backups: {}", result.backup_ids.join(","),));
+            }
+            if matches!(
+                result.lifecycle,
+                GroupOperationLifecycle::Partial | GroupOperationLifecycle::RecoveryRequired
+            ) {
+                details.push(format!(
+                    "recovery: inspect `unpin group operation-show {} --json` before retrying or restoring",
+                    result.operation_id
+                ));
+            }
         }
         if let Some(error) = &self.last_error {
             details.push(format!("error: {error}"));
@@ -1821,6 +1850,18 @@ mod tests {
             }
         ));
         assert_eq!(workflow.phase, WorkflowPhase::Partial);
+        let details = workflow.details();
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("member result:"))
+        );
+        assert!(details.iter().any(|detail| detail.contains("backup=")));
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("unpin group operation-show"))
+        );
     }
 
     #[test]

@@ -1196,11 +1196,25 @@ fn profile_list_and_apply_use_reviewed_next_session_policy_plan() {
 fn capability_lock_cli_uses_global_provider_plan_and_reports_pinned_revision() {
     let temp = TempDir::new().expect("temporary capability lock root");
     let root = fs::canonicalize(temp.path()).expect("canonical capability lock root");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("private capability lock root");
+    }
     let project = root.join("project");
     let state = root.join("state");
     let fixtures = fixtures_root();
     fs::create_dir(&project).expect("project directory");
     fs::create_dir(&state).expect("state directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(&state, fs::Permissions::from_mode(0o700))
+            .expect("private capability lock state");
+    }
     run_git(&project, &["init", "-q"]);
 
     let common = [
@@ -5950,6 +5964,15 @@ fn profile_policy_cli_plans_applies_and_reports_authenticated_migration() {
             .arg(&app_state_root)
             .arg("--json");
     };
+    let configure_text = |command: &mut assert_cmd::Command| {
+        command
+            .arg("--fixture-root")
+            .arg(&fixture_root)
+            .arg("--project-root")
+            .arg(&project_root)
+            .arg("--app-state-root")
+            .arg(&app_state_root);
+    };
 
     let mut planned = Command::cargo_bin("unpin").expect("unpin binary");
     planned.args(["profile", "policy", "migrate"]);
@@ -5960,9 +5983,31 @@ fn profile_policy_cli_plans_applies_and_reports_authenticated_migration() {
         "{}",
         String::from_utf8_lossy(&planned.stderr)
     );
+    let planned_text =
+        String::from_utf8(planned.stdout.clone()).expect("migration plan output is utf8");
+    assert!(!planned_text.contains(&project_root.to_string_lossy().to_string()));
     let planned: serde_json::Value =
         serde_json::from_slice(&planned.stdout).expect("migration plan JSON");
     assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["plan"]["action"]["action"], "migrate");
+    assert!(planned["plan"]["action"]["policy"].is_object());
+    assert!(planned["plan"].get("sourcePath").is_none());
+    assert!(planned["plan"].get("workspace").is_none());
+
+    let mut text_planned = Command::cargo_bin("unpin").expect("unpin binary");
+    text_planned.args(["profile", "policy", "migrate"]);
+    configure_text(&mut text_planned);
+    let text_planned = text_planned.output().expect("text migration plan output");
+    assert!(
+        text_planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&text_planned.stderr)
+    );
+    let text_planned = String::from_utf8(text_planned.stdout).expect("text migration plan is utf8");
+    assert!(text_planned.contains("\"action\":\"migrate\""));
+    assert!(text_planned.contains("operation="));
+    assert!(!text_planned.contains(&project_root.to_string_lossy().to_string()));
+
     let fingerprint = planned["plan"]["planFingerprint"]
         .as_str()
         .expect("plan fingerprint");
@@ -5976,8 +6021,9 @@ fn profile_policy_cli_plans_applies_and_reports_authenticated_migration() {
     let applied = applied.output().expect("migration apply output");
     assert!(
         applied.status.success(),
-        "{}",
-        String::from_utf8_lossy(&applied.stderr)
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr),
     );
     let applied: serde_json::Value =
         serde_json::from_slice(&applied.stdout).expect("migration apply JSON");
@@ -5998,4 +6044,62 @@ fn profile_policy_cli_plans_applies_and_reports_authenticated_migration() {
     assert_eq!(status["status"], "managed");
     assert_eq!(status["maintenance"]["classification"], "attached");
     assert_eq!(status["maintenance"]["lifecycle"]["state"], "active");
+}
+
+#[cfg(unix)]
+#[test]
+fn profile_policy_cli_does_not_offer_migration_for_existing_unmanaged_policy() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_root = fs::canonicalize(temp.path()).expect("canonical fixture root");
+    let project_root = fixture_root.join("project");
+    let app_state_root = fixture_root.join("state");
+    fs::create_dir_all(project_root.join(".unpin")).expect("workspace policy directory");
+    let git = Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&project_root)
+        .output()
+        .expect("git init");
+    assert!(git.status.success());
+    fs::write(
+        project_root.join(".unpin").join("policy.json"),
+        serde_json::to_vec_pretty(&unpin_core::profiles::ScopePolicy::default())
+            .expect("serialize workspace policy"),
+    )
+    .expect("write workspace policy");
+    let identity = resolve_workspace_identity(&project_root).expect("workspace identity");
+    let target = PolicyTarget::workspace(identity.repository_key, identity.workspace_key)
+        .expect("workspace target");
+    PolicyStore::new(&app_state_root)
+        .save(
+            &target,
+            &unpin_core::profiles::ScopePolicy::default(),
+            None,
+            OwnerGeneration::new("cli-unmanaged-policy", 1).expect("owner"),
+        )
+        .expect("seed unmanaged destination policy");
+
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["profile", "policy", "status"])
+        .arg("--fixture-root")
+        .arg(&fixture_root)
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--app-state-root")
+        .arg(&app_state_root)
+        .arg("--json")
+        .output()
+        .expect("policy status output");
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("policy status JSON");
+    assert_eq!(status["status"], "unmanaged");
+    assert_eq!(status["unmanagedState"], "existing-policy");
+    assert_eq!(status["humanAction"]["code"], "inspect-existing-policy");
+    assert!(!status.to_string().contains("review-migration"));
 }
