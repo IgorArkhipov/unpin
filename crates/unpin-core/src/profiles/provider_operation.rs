@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     approval::{
-        ApprovalError, ApprovalExpectation, CONTROL_APPROVAL_ISSUER, ControlApprovalContext,
-        ControlAuthorization,
+        ApprovalError, ApprovalExpectation, ApprovalResourceBinding, CONTROL_APPROVAL_ISSUER,
+        ControlApprovalContext, ControlAuthorization, approval_binding_digest,
     },
     control_operation::{
         ControlResolvedContext, ReachAwareControlOperationEnvelope, ReachAwareOperationFamily,
@@ -43,7 +43,7 @@ use crate::{
 
 use super::{
     CompiledProfileRevision, GatewaySelection, PolicyStore, PolicyStoreError, PolicyTarget,
-    ProfileReference, ProfileSelection, ProviderPolicy, ScopePolicy,
+    ProfileReference, ProfileSelection, ProviderPolicy, ScopePolicy, policy_resource_id,
 };
 
 pub const PROFILE_PROVIDER_OPERATION_SCHEMA_VERSION: u32 = 2;
@@ -219,6 +219,14 @@ impl ProfileProviderOperationPlan {
         let mut expectation = profile_transition_plan(self, context, session_id)?
             .approval_expectation(CONTROL_APPROVAL_ISSUER, PROFILE_PROVIDER_APPROVAL_AUDIENCE);
         expectation.effect_graph_digest = self.plan_fingerprint.clone();
+        expectation.resources.push(ApprovalResourceBinding {
+            resource_id: policy_resource_id(&self.target)
+                .map_err(|_| ProfileProviderOperationError::InvalidPlan)?,
+            pre_state_fingerprint: self
+                .expected_revision
+                .as_ref()
+                .map(|revision| approval_binding_digest(&revision.fingerprint)),
+        });
         Ok(expectation)
     }
 }

@@ -10,15 +10,17 @@ use std::{
 use tempfile::TempDir;
 use unpin_core::{
     approval::{
-        ApprovalExpectation, ApprovalIssuer, ApprovalKey, ApprovalReceiptClaims, ApprovalVerifier,
-        ControlApprovalContext, ControlAuthorization, authorize_control,
+        ApprovalExpectation, ApprovalIssuer, ApprovalKey, ApprovalReceiptClaims,
+        ApprovalResourceBinding, ApprovalVerifier, CONTROL_APPROVAL_AUDIENCE,
+        CONTROL_APPROVAL_ISSUER, ControlApprovalContext, ControlAuthorization,
+        ControlOperationKind, authorize_control,
     },
     mutation::BackupAuthenticationKey,
     profiles::{
         GatewaySelection, PolicyMaintenanceAction, PolicyMaintenanceApproval,
         PolicyMaintenanceController, PolicyMaintenanceError, PolicyMaintenanceLifecycle,
         PolicyStore, PolicyTarget, ProtectedPolicyChangeError, PublicPolicyMaintenanceAction,
-        ScopePolicy, UnmanagedPolicyStatus, WorkspacePolicyClassification,
+        ScopePolicy, UnmanagedPolicyStatus, WorkspacePolicyClassification, policy_resource_id,
     },
     state::atomic_json::OwnerGeneration,
 };
@@ -68,19 +70,62 @@ fn approval(plan_fingerprint: &str) -> PolicyMaintenanceApproval {
 }
 
 fn external_authorization(
-    controller: &PolicyMaintenanceController,
     app_state_root: &Path,
-    repository: &Path,
+    target: &PolicyTarget,
+    reviewed_plan_fingerprint: &str,
     marker: u64,
 ) -> (ControlAuthorization, ApprovalExpectation) {
-    write_legacy_policy(repository, &ScopePolicy::default());
-    let plan = controller
-        .plan_migration()
-        .expect("external authorization plan");
-    let (authorization, context, _) = authorization(app_state_root, &plan, marker);
-    let expectation = plan
-        .approval_expectation(&context)
-        .expect("external authorization expectation");
+    let expectation = ApprovalExpectation {
+        issuer: CONTROL_APPROVAL_ISSUER.to_string(),
+        audience: CONTROL_APPROVAL_AUDIENCE.to_string(),
+        operation_id: format!("profile-change-{marker}"),
+        operation_kind: ControlOperationKind::ProfilePolicy.as_str().to_string(),
+        effect_graph_digest: reviewed_plan_fingerprint.to_string(),
+        repository_key: "repository".to_string(),
+        workspace_key: "workspace".to_string(),
+        session_id: None,
+        profile_digest: None,
+        resources: vec![ApprovalResourceBinding {
+            resource_id: policy_resource_id(target).expect("policy target resource"),
+            pre_state_fingerprint: None,
+        }],
+    };
+    let key = ApprovalKey::new([0x6a; 32]);
+    let issuer = ApprovalIssuer::new(
+        key.clone(),
+        expectation.issuer.clone(),
+        expectation.audience.clone(),
+    )
+    .expect("approval issuer");
+    let receipt = issuer
+        .issue(ApprovalReceiptClaims {
+            version: 1,
+            receipt_id: format!("policy-maintenance-external-receipt-{marker}"),
+            nonce: format!("policy-maintenance-external-nonce-{marker}"),
+            issuer: String::new(),
+            audience: String::new(),
+            operation_id: expectation.operation_id.clone(),
+            operation_kind: expectation.operation_kind.clone(),
+            effect_graph_digest: expectation.effect_graph_digest.clone(),
+            repository_key: expectation.repository_key.clone(),
+            workspace_key: expectation.workspace_key.clone(),
+            session_id: expectation.session_id.clone(),
+            profile_digest: expectation.profile_digest.clone(),
+            resources: expectation.resources.clone(),
+            issued_at_unix: 1_785_370_000,
+            expires_at_unix: 1_785_370_060,
+        })
+        .expect("approval receipt");
+    let authorization = authorize_control(
+        app_state_root,
+        &receipt,
+        &ApprovalVerifier::new(key),
+        &expectation,
+        1_785_370_000,
+        OwnerGeneration::new(format!("policy-maintenance-external-approval-{marker}"), 1)
+            .expect("approval owner"),
+    )
+    .expect("control authorization");
     (authorization, expectation)
 }
 
@@ -319,6 +364,23 @@ fn unmanaged_existing_policy_does_not_advertise_migration() {
             .expect_err("existing destination must not be migrated"),
         PolicyMaintenanceError::DestinationExists
     ));
+}
+
+#[test]
+fn unmanaged_status_propagates_workspace_errors() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    fs::create_dir_all(&repository).expect("repository directory");
+    write_legacy_policy(&repository, &ScopePolicy::default());
+    fs::write(repository.join(".git"), "gitdir: missing\n").expect("invalid gitdir marker");
+
+    let error = controller(&app_state, &repository)
+        .unmanaged_status(&PolicyTarget::Global)
+        .expect_err("workspace failure must remain actionable");
+
+    assert!(matches!(error, PolicyMaintenanceError::Workspace(_)));
 }
 
 #[cfg(unix)]
@@ -613,7 +675,7 @@ fn generic_policy_change_gets_authenticated_prechange_backup_and_reviewed_restor
     let reviewed_fingerprint = "cd".repeat(32);
     let controller = controller(&app_state, &repository);
     let (authorization, expectation) =
-        external_authorization(&controller, &app_state, &repository, 20);
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 20);
     let protected = controller
         .protect_policy_change(
             &target,
@@ -670,7 +732,7 @@ fn protected_change_rejects_authorization_bound_to_another_operation() {
     let reviewed_fingerprint = "ac".repeat(32);
     let controller = controller(&app_state, &repository);
     let (authorization, mut expectation) =
-        external_authorization(&controller, &app_state, &repository, 21);
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 21);
     expectation.operation_id = "profile-policy-other-operation".to_string();
     let called = Cell::new(false);
 
@@ -689,6 +751,46 @@ fn protected_change_rejects_authorization_bound_to_another_operation() {
             },
         )
         .expect_err("foreign authorization must not protect this change");
+
+    assert!(!called.get());
+    assert!(matches!(
+        error,
+        ProtectedPolicyChangeError::Maintenance(PolicyMaintenanceError::ApprovalRejected)
+    ));
+    assert!(!app_state.join("backups").join("policies").exists());
+}
+
+#[test]
+fn protected_change_rejects_authorization_bound_to_another_target() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    init_repository(&repository);
+    let target = PolicyTarget::Global;
+    let other_target =
+        PolicyTarget::workspace("other-repository", "other-workspace").expect("other target");
+    let reviewed_fingerprint = "ba".repeat(32);
+    let controller = controller(&app_state, &repository);
+    let (authorization, expectation) =
+        external_authorization(&app_state, &other_target, &reviewed_fingerprint, 22);
+    let called = Cell::new(false);
+
+    let error = controller
+        .protect_policy_change(
+            &target,
+            "profile-change",
+            &reviewed_fingerprint,
+            &expectation,
+            &external_approval(&reviewed_fingerprint, &authorization),
+            authorization,
+            owner(2),
+            |_authorization| {
+                called.set(true);
+                Ok::<(), ()>(())
+            },
+        )
+        .expect_err("foreign authorization must not protect this target");
 
     assert!(!called.get());
     assert!(matches!(
@@ -785,7 +887,7 @@ fn generic_protected_change_rejects_a_decision_digest_not_bound_to_authorization
     let reviewed_fingerprint = "34".repeat(32);
     let controller = controller(&app_state, &repository);
     let (authorization, expectation) =
-        external_authorization(&controller, &app_state, &repository, 25);
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 25);
     let called = Cell::new(false);
 
     let error = controller
@@ -836,7 +938,7 @@ fn protected_change_rejects_inactive_lifecycle_before_callback() {
     let called = Cell::new(false);
     let reviewed_fingerprint = "ef".repeat(32);
     let (authorization, expectation) =
-        external_authorization(&controller, &app_state, &moved_aside, 30);
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 30);
 
     let error = controller
         .protect_policy_change(
@@ -881,7 +983,7 @@ fn failed_protected_change_finalizes_backup_for_authenticated_restore() {
     let reviewed_fingerprint = "12".repeat(32);
     let controller = controller(&app_state, &repository);
     let (authorization, expectation) =
-        external_authorization(&controller, &app_state, &repository, 40);
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 40);
 
     let error = controller
         .protect_policy_change(
