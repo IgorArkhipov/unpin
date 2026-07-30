@@ -29,6 +29,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Workspace-policy maintenance binds reviewed plans, physical checkout
   evidence, current policy revisions, authenticated records, and restore
   backups before mutation.
+- Restore plans disclose and bind every overwritten policy and maintenance
+  record target, and protected changes with no observable failed residue can
+  be safely retried; interrupted partial changes remain restorable.
+
+### Compatibility
+
+- This beta adds the read-only `unpin_get_policy_maintenance_status` MCP tool
+  and policy-maintenance JSON contracts. Policy-maintenance plans use schema
+  version 2, so plans from earlier beta.5 prerelease builds must be replanned;
+  inventory-group definitions and approved-apply contracts remain compatible
+  with beta.4.
 
 ## [0.1.0-beta.4] - 2026-07-27
 

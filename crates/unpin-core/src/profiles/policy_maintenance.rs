@@ -29,7 +29,7 @@ use crate::{
     },
 };
 
-const POLICY_MAINTENANCE_PLAN_SCHEMA_VERSION: u32 = 1;
+const POLICY_MAINTENANCE_PLAN_SCHEMA_VERSION: u32 = 2;
 const POLICY_MAINTENANCE_RECORD_SCHEMA_VERSION: u32 = 1;
 const POLICY_MAINTENANCE_BACKUP_SCHEMA_VERSION: u32 = 1;
 const POLICY_MAINTENANCE_STATE_SCHEMA_VERSION: u32 = 1;
@@ -120,7 +120,18 @@ pub enum PolicyMaintenanceAction {
     },
     Restore {
         backup_id: String,
+        targets: Vec<PolicyRestoreTarget>,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PolicyRestoreTarget {
+    pub target: PolicyTarget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_policy_revision: Option<StateRevision>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_record_revision: Option<StateRevision>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -155,6 +166,7 @@ pub enum PublicPolicyMaintenanceAction {
     },
     Restore {
         backup_id: String,
+        targets: Vec<PolicyTarget>,
     },
 }
 
@@ -210,9 +222,10 @@ impl PolicyMaintenancePlan {
             PolicyMaintenanceAction::Cleanup { target } => PublicPolicyMaintenanceAction::Cleanup {
                 target: target.clone(),
             },
-            PolicyMaintenanceAction::Restore { backup_id } => {
+            PolicyMaintenanceAction::Restore { backup_id, targets } => {
                 PublicPolicyMaintenanceAction::Restore {
                     backup_id: backup_id.clone(),
+                    targets: targets.iter().map(|target| target.target.clone()).collect(),
                 }
             }
         };
@@ -286,7 +299,14 @@ impl PolicyMaintenancePlan {
                     self.expected_record_revision.as_ref(),
                 )?;
             }
-            PolicyMaintenanceAction::Restore { backup_id } => {
+            PolicyMaintenanceAction::Restore { backup_id, targets } => {
+                for target in targets {
+                    push_target(
+                        &target.target,
+                        target.expected_policy_revision.as_ref(),
+                        target.expected_record_revision.as_ref(),
+                    )?;
+                }
                 resources.push(ApprovalResourceBinding {
                     resource_id: backup_id.clone(),
                     pre_state_fingerprint: self
@@ -572,26 +592,39 @@ impl PolicyMaintenanceController {
         let snapshot = self
             .load_backup_snapshot(&backup_id)?
             .ok_or(PolicyMaintenanceError::BackupNotFound)?;
-        if !snapshot.value.finalized {
-            return Err(PolicyMaintenanceError::BackupIncomplete);
-        }
+        let mut targets = Vec::with_capacity(snapshot.value.entries.len());
         for entry in &snapshot.value.entries {
-            ensure_revision(
-                self.policies
-                    .load(&entry.target)?
-                    .as_ref()
-                    .map(|policy| &policy.revision),
-                entry.post_policy_revision.as_ref(),
-            )?;
-            ensure_revision(
-                self.load_record_snapshot(&entry.target)?
-                    .as_ref()
-                    .map(|record| &record.revision),
-                entry.post_record_revision.as_ref(),
-            )?;
+            let current_policy_revision = self
+                .policies
+                .load(&entry.target)?
+                .map(|policy| policy.revision);
+            let current_record_revision = self
+                .load_record_raw(&entry.target)?
+                .map(|record| record.revision);
+            let (expected_policy_revision, expected_record_revision) = if snapshot.value.finalized {
+                ensure_revision(
+                    current_policy_revision.as_ref(),
+                    entry.post_policy_revision.as_ref(),
+                )?;
+                ensure_revision(
+                    current_record_revision.as_ref(),
+                    entry.post_record_revision.as_ref(),
+                )?;
+                (
+                    entry.post_policy_revision.clone(),
+                    entry.post_record_revision.clone(),
+                )
+            } else {
+                (current_policy_revision, current_record_revision)
+            };
+            targets.push(PolicyRestoreTarget {
+                target: entry.target.clone(),
+                expected_policy_revision,
+                expected_record_revision,
+            });
         }
         seal_plan(
-            PolicyMaintenanceAction::Restore { backup_id },
+            PolicyMaintenanceAction::Restore { backup_id, targets },
             None,
             Some(snapshot.revision),
         )
@@ -727,7 +760,7 @@ impl PolicyMaintenanceController {
             PolicyMaintenanceAction::Cleanup { target } => {
                 self.apply_cleanup(reviewed, approval, owner.clone(), target)
             }
-            PolicyMaintenanceAction::Restore { backup_id } => {
+            PolicyMaintenanceAction::Restore { backup_id, .. } => {
                 self.apply_restore(reviewed, approval, owner.clone(), backup_id)
             }
         };
@@ -771,10 +804,28 @@ impl PolicyMaintenanceController {
         let _operation_lock = self
             .acquire_operation_lock()
             .map_err(ProtectedPolicyChangeError::Maintenance)?;
-        if self
-            .load_record_snapshot(target)
-            .map_err(ProtectedPolicyChangeError::Maintenance)?
-            .is_some_and(|record| record.value.lifecycle != PolicyMaintenanceLifecycle::Active)
+        let backup_id = external_backup_id(operation_id, reviewed_plan_fingerprint, target)
+            .map_err(ProtectedPolicyChangeError::Maintenance)?;
+        let record = match self.load_record_snapshot(target) {
+            Ok(record) => record,
+            Err(PolicyMaintenanceError::RecordPolicyDrift) => {
+                if self
+                    .load_backup_snapshot(&backup_id)
+                    .map_err(ProtectedPolicyChangeError::Maintenance)?
+                    .is_some()
+                {
+                    return Err(ProtectedPolicyChangeError::Maintenance(recovery_error(
+                        &backup_id,
+                        PolicyMaintenanceError::RecordPolicyDrift,
+                    )));
+                }
+                return Err(ProtectedPolicyChangeError::Maintenance(
+                    PolicyMaintenanceError::RecordPolicyDrift,
+                ));
+            }
+            Err(error) => return Err(ProtectedPolicyChangeError::Maintenance(error)),
+        };
+        if record.is_some_and(|record| record.value.lifecycle != PolicyMaintenanceLifecycle::Active)
         {
             return Err(ProtectedPolicyChangeError::Maintenance(
                 PolicyMaintenanceError::InvalidLifecycle,
@@ -784,18 +835,35 @@ impl PolicyMaintenanceController {
             self.backup_entry(target)
                 .map_err(ProtectedPolicyChangeError::Maintenance)?,
         ];
-        let backup_id = external_backup_id(operation_id, reviewed_plan_fingerprint, target)
-            .map_err(ProtectedPolicyChangeError::Maintenance)?;
-        let backup_revision = self
-            .write_named_backup(
-                &backup_id,
-                operation_id,
-                reviewed_plan_fingerprint,
-                approval,
-                &entries,
-                owner.clone(),
-            )
-            .map_err(ProtectedPolicyChangeError::Maintenance)?;
+        let (backup_revision, backup_owner) = match self.write_named_backup(
+            &backup_id,
+            operation_id,
+            reviewed_plan_fingerprint,
+            approval,
+            &entries,
+            owner.clone(),
+        ) {
+            Ok(revision) => (revision, owner.clone()),
+            Err(PolicyMaintenanceError::BackupAlreadyExists) => {
+                match self.resume_failed_protected_backup(
+                    &backup_id,
+                    operation_id,
+                    reviewed_plan_fingerprint,
+                    approval,
+                    &entries,
+                ) {
+                    Ok(resumed) => resumed,
+                    Err(PolicyMaintenanceError::BackupAlreadyExists) => {
+                        return Err(ProtectedPolicyChangeError::Maintenance(recovery_error(
+                            &backup_id,
+                            PolicyMaintenanceError::BackupAlreadyExists,
+                        )));
+                    }
+                    Err(error) => return Err(ProtectedPolicyChangeError::Maintenance(error)),
+                }
+            }
+            Err(error) => return Err(ProtectedPolicyChangeError::Maintenance(error)),
+        };
         let result = match apply(authorization) {
             Ok(result) => result,
             Err(error) => {
@@ -817,7 +885,7 @@ impl PolicyMaintenanceController {
                     entries,
                     approval,
                     operation_id,
-                    rollback_owner(&owner, "failed-change-backup")
+                    rollback_owner(&backup_owner, "failed-change-backup")
                         .map_err(|error| recovery_error(&backup_id, error))
                         .map_err(ProtectedPolicyChangeError::Maintenance)?,
                 )
@@ -843,7 +911,7 @@ impl PolicyMaintenanceController {
                 post_record_revision = Some(self.write_record(
                     &record,
                     entries[0].prior_record_revision.as_ref(),
-                    rollback_owner(&owner, "protected-change-record")?,
+                    rollback_owner(&backup_owner, "protected-change-record")?,
                 )?);
             }
             entries[0].post_policy_revision = current_policy.map(|snapshot| snapshot.revision);
@@ -858,7 +926,7 @@ impl PolicyMaintenanceController {
                     &entries,
                     approval,
                     operation_id,
-                    &owner,
+                    &backup_owner,
                     error,
                 ),
             ));
@@ -869,7 +937,7 @@ impl PolicyMaintenanceController {
             entries,
             approval,
             operation_id,
-            rollback_owner(&owner, "protected-change-backup")
+            rollback_owner(&backup_owner, "protected-change-backup")
                 .map_err(|error| recovery_error(&backup_id, error))
                 .map_err(ProtectedPolicyChangeError::Maintenance)?,
         )
@@ -888,7 +956,9 @@ impl PolicyMaintenanceController {
             }
             PolicyMaintenanceAction::Discard { target } => self.plan_discard(target.clone()),
             PolicyMaintenanceAction::Cleanup { target } => self.plan_cleanup(target.clone()),
-            PolicyMaintenanceAction::Restore { backup_id } => self.plan_restore(backup_id.clone()),
+            PolicyMaintenanceAction::Restore { backup_id, .. } => {
+                self.plan_restore(backup_id.clone())
+            }
         }
     }
 
@@ -1249,16 +1319,37 @@ impl PolicyMaintenanceController {
         let source = self
             .load_backup_snapshot(backup_id)?
             .ok_or(PolicyMaintenanceError::BackupNotFound)?;
-        let mut rollback_entries = source
+        let targets = match &plan.action {
+            PolicyMaintenanceAction::Restore { targets, .. } => targets,
+            _ => return Err(PolicyMaintenanceError::InvalidPlan),
+        };
+        if targets.len() != source.value.entries.len() {
+            return Err(PolicyMaintenanceError::InvalidPlan);
+        }
+        let restore_entries = source
             .value
             .entries
+            .iter()
+            .map(|entry| {
+                let target = targets
+                    .iter()
+                    .find(|target| target.target == entry.target)
+                    .ok_or(PolicyMaintenanceError::InvalidPlan)?;
+                Ok(PolicyBackupEntry {
+                    post_policy_revision: target.expected_policy_revision.clone(),
+                    post_record_revision: target.expected_record_revision.clone(),
+                    ..entry.clone()
+                })
+            })
+            .collect::<Result<Vec<_>, PolicyMaintenanceError>>()?;
+        let mut rollback_entries = restore_entries
             .iter()
             .map(|entry| self.backup_entry(&entry.target))
             .collect::<Result<Vec<_>, _>>()?;
         let (restore_backup_revision, restore_backup_id) =
             self.write_backup(plan, approval, &rollback_entries, owner.clone())?;
-        let mut affected_targets = Vec::with_capacity(source.value.entries.len());
-        for entry in &source.value.entries {
+        let mut affected_targets = Vec::with_capacity(restore_entries.len());
+        for entry in &restore_entries {
             let policy_revision =
                 self.restore_policy_entry(entry, rollback_owner(&owner, "restore-policy")?)?;
             let record_revision = self.restore_record_entry(
@@ -1282,9 +1373,7 @@ impl PolicyMaintenanceController {
             &rollback_entries,
             rollback_owner(&owner, "restore-backup")?,
         )?;
-        let lifecycle = source
-            .value
-            .entries
+        let lifecycle = restore_entries
             .iter()
             .find_map(|entry| {
                 entry
@@ -1322,7 +1411,7 @@ impl PolicyMaintenanceController {
         target: &PolicyTarget,
     ) -> Result<PolicyBackupEntry, PolicyMaintenanceError> {
         let policy = self.policies.load(target)?;
-        let record = self.load_record_snapshot(target)?;
+        let record = self.load_record_raw(target)?;
         Ok(PolicyBackupEntry {
             target: target.clone(),
             prior_policy: policy.as_ref().map(|snapshot| snapshot.policy.clone()),
@@ -1366,6 +1455,46 @@ impl PolicyMaintenanceController {
         if self.load_backup_snapshot(backup_id)?.is_some() {
             return Err(PolicyMaintenanceError::BackupAlreadyExists);
         }
+        let backup =
+            self.prepared_backup(backup_id, operation_id, plan_fingerprint, approval, entries)?;
+        let revision = self
+            .backup_store(backup_id)?
+            .compare_and_swap(None, owner, &backup)?;
+        Ok(revision)
+    }
+
+    fn resume_failed_protected_backup(
+        &self,
+        backup_id: &str,
+        operation_id: &str,
+        plan_fingerprint: &str,
+        approval: &PolicyMaintenanceApproval,
+        entries: &[PolicyBackupEntry],
+    ) -> Result<(StateRevision, OwnerGeneration), PolicyMaintenanceError> {
+        let existing = self
+            .load_backup_snapshot(backup_id)?
+            .ok_or(PolicyMaintenanceError::BackupAlreadyExists)?;
+        if !retryable_protected_backup(&existing.value, operation_id, plan_fingerprint, entries) {
+            return Err(PolicyMaintenanceError::BackupAlreadyExists);
+        }
+        let backup =
+            self.prepared_backup(backup_id, operation_id, plan_fingerprint, approval, entries)?;
+        let owner = successor_owner(&existing.owner)?;
+        let revision = self
+            .backup_store(backup_id)?
+            .compare_and_swap(Some(&existing.revision), owner.clone(), &backup)
+            .map_err(PolicyMaintenanceError::from)?;
+        Ok((revision, owner))
+    }
+
+    fn prepared_backup(
+        &self,
+        backup_id: &str,
+        operation_id: &str,
+        plan_fingerprint: &str,
+        approval: &PolicyMaintenanceApproval,
+        entries: &[PolicyBackupEntry],
+    ) -> Result<PolicyMaintenanceBackup, PolicyMaintenanceError> {
         let mut backup = PolicyMaintenanceBackup {
             schema_version: POLICY_MAINTENANCE_BACKUP_SCHEMA_VERSION,
             backup_id: backup_id.to_string(),
@@ -1378,10 +1507,7 @@ impl PolicyMaintenanceController {
             authentication_tag: String::new(),
         };
         self.sign_backup(&mut backup)?;
-        let revision = self
-            .backup_store(backup_id)?
-            .compare_and_swap(None, owner, &backup)?;
-        Ok(revision)
+        Ok(backup)
     }
 
     fn finalize_protected_backup(
@@ -1597,7 +1723,9 @@ impl PolicyMaintenanceController {
                 let policy_owner = rollback_owner(owner, &format!("compensate-policy-{index}"))?;
                 self.restore_policy_entry(entry, policy_owner)?
             };
-            if entry.prior_record_revision != entry.post_record_revision {
+            if entry.prior_record_revision != entry.post_record_revision
+                || restored_policy_revision != entry.prior_policy_revision
+            {
                 let record_owner = rollback_owner(owner, &format!("compensate-record-{index}"))?;
                 self.restore_record_entry(
                     entry,
@@ -1685,7 +1813,12 @@ impl PolicyMaintenanceController {
         match (current, entry.prior_policy.as_ref()) {
             (Some(current), Some(prior)) => self
                 .policies
-                .save(&entry.target, prior, Some(&current.revision), owner)
+                .save(
+                    &entry.target,
+                    prior,
+                    Some(&current.revision),
+                    successor_owner(&current.owner)?,
+                )
                 .map(Some)
                 .map_err(Into::into),
             (Some(current), None) => {
@@ -1850,6 +1983,11 @@ impl PolicyMaintenanceController {
         owner: OwnerGeneration,
     ) -> Result<StateRevision, PolicyMaintenanceError> {
         self.verify_record(&record.target, record)?;
+        let owner = self
+            .load_record_raw(&record.target)?
+            .map(|snapshot| successor_owner(&snapshot.owner))
+            .transpose()?
+            .unwrap_or(owner);
         self.record_store(&record.target)?
             .compare_and_swap(expected, owner, record)
             .map_err(Into::into)
@@ -2218,6 +2356,46 @@ fn rollback_owner(
     .map_err(Into::into)
 }
 
+fn successor_owner(owner: &OwnerGeneration) -> Result<OwnerGeneration, PolicyMaintenanceError> {
+    OwnerGeneration::new(owner.owner_id.clone(), owner.generation.saturating_add(1))
+        .map_err(Into::into)
+}
+
+fn retryable_protected_backup(
+    backup: &PolicyMaintenanceBackup,
+    operation_id: &str,
+    plan_fingerprint: &str,
+    entries: &[PolicyBackupEntry],
+) -> bool {
+    let no_residue = if backup.finalized {
+        backup.entries.iter().all(|entry| {
+            entry.post_policy_revision == entry.prior_policy_revision
+                && entry.post_record_revision == entry.prior_record_revision
+        })
+    } else {
+        backup.entries.iter().all(|entry| {
+            entry.post_policy_revision.is_none() && entry.post_record_revision.is_none()
+        })
+    };
+    no_residue
+        && backup.operation_id == operation_id
+        && backup.plan_fingerprint == plan_fingerprint
+        && backup.entries.len() == entries.len()
+        && backup
+            .entries
+            .iter()
+            .zip(entries)
+            .all(|(existing, current)| {
+                current.post_policy_revision.is_none()
+                    && current.post_record_revision.is_none()
+                    && existing.target == current.target
+                    && existing.prior_policy == current.prior_policy
+                    && existing.prior_policy_revision == current.prior_policy_revision
+                    && existing.prior_record == current.prior_record
+                    && existing.prior_record_revision == current.prior_record_revision
+            })
+}
+
 fn recovery_error(backup_id: &str, error: PolicyMaintenanceError) -> PolicyMaintenanceError {
     recovery_required_for_backup(backup_id, format!("cause={}", error.public_code()))
 }
@@ -2532,5 +2710,107 @@ impl From<StateError> for PolicyMaintenanceError {
 impl From<crate::state::workspace::WorkspaceIdentityError> for PolicyMaintenanceError {
     fn from(error: crate::state::workspace::WorkspaceIdentityError) -> Self {
         Self::Workspace(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use tempfile::TempDir;
+
+    use super::*;
+
+    fn owner(generation: u64) -> OwnerGeneration {
+        OwnerGeneration::new("policy-maintenance-unit-test", generation).expect("owner")
+    }
+
+    #[test]
+    fn compensation_rebinds_workspace_record_after_policy_rewrite() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let project_root = root.join("workspace");
+        let app_state_root = root.join("state");
+        fs::create_dir_all(&project_root).expect("workspace root");
+        let workspace =
+            capture_workspace_physical_evidence(&project_root).expect("workspace evidence");
+        let target = PolicyTarget::workspace(
+            workspace.repository_key.clone(),
+            workspace.workspace_key.clone(),
+        )
+        .expect("workspace target");
+        let controller = PolicyMaintenanceController::new(
+            &app_state_root,
+            &project_root,
+            BackupAuthenticationKey::new([0x71; 32]),
+        );
+        let policies = PolicyStore::new(&app_state_root);
+        let policy = ScopePolicy::default();
+        let initial_policy_revision = policies
+            .save(&target, &policy, None, owner(1))
+            .expect("seed policy");
+        let mut record = PolicyMaintenanceRecord {
+            schema_version: POLICY_MAINTENANCE_RECORD_SCHEMA_VERSION,
+            record_id: record_id(&target).expect("record id"),
+            target: target.clone(),
+            workspace,
+            provenance: PolicyMaintenanceProvenance::WorkspaceFileMigration {
+                source_path: project_root.join("policy.json"),
+                source_fingerprint: "a".repeat(64),
+                source_identity: "source".to_string(),
+            },
+            review: PolicyReviewEvidence {
+                actor_id: "test".to_string(),
+                reviewed_at_unix: 1,
+                decision_digest: "b".repeat(64),
+                plan_fingerprint: "c".repeat(64),
+            },
+            lifecycle: PolicyMaintenanceLifecycle::Active,
+            active_policy_revision: Some(initial_policy_revision.clone()),
+            active_policy_fingerprint: Some(policy_fingerprint(&policy).expect("policy digest")),
+            last_operation_id: "seed".to_string(),
+            authentication_key_id: String::new(),
+            authentication_tag: String::new(),
+        };
+        controller.sign_record(&mut record).expect("sign record");
+        let initial_record_revision = controller
+            .write_record(&record, None, owner(1))
+            .expect("seed record");
+        let mut entry = controller.backup_entry(&target).expect("backup entry");
+
+        let post_policy_revision = policies
+            .save(&target, &policy, Some(&initial_policy_revision), owner(2))
+            .expect("rewrite policy");
+        entry.post_policy_revision = Some(post_policy_revision);
+        entry.post_record_revision = Some(initial_record_revision);
+        let approval = PolicyMaintenanceApproval {
+            confirmed: true,
+            plan_fingerprint: "d".repeat(64),
+            actor_id: "test".to_string(),
+            reviewed_at_unix: 1,
+            decision_digest: "e".repeat(64),
+        };
+
+        controller
+            .compensate_entries(&[entry], &approval, "compensate", &owner(3))
+            .expect("compensate policy rewrite");
+
+        let policy = policies
+            .load(&target)
+            .expect("load restored policy")
+            .expect("restored policy");
+        let record = controller
+            .load_record_snapshot(&target)
+            .expect("record remains live-bound")
+            .expect("restored record");
+        assert_eq!(record.value.lifecycle, PolicyMaintenanceLifecycle::Active);
+        assert_eq!(
+            record.value.active_policy_revision,
+            Some(policy.revision.clone())
+        );
+        assert_eq!(
+            record.value.active_policy_fingerprint,
+            Some(policy_fingerprint(&policy.policy).expect("policy digest"))
+        );
     }
 }
