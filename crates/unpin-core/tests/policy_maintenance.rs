@@ -1,6 +1,7 @@
 use std::{
     cell::Cell,
     fs,
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Barrier},
@@ -55,8 +56,28 @@ fn owner(generation: u64) -> OwnerGeneration {
     OwnerGeneration::new("policy-maintenance-test", generation).expect("owner")
 }
 
+fn fresh_owner(operation: &str) -> OwnerGeneration {
+    OwnerGeneration::new(format!("policy-maintenance-{operation}"), 1).expect("fresh owner")
+}
+
 fn fixture_root(temp: &TempDir) -> PathBuf {
     fs::canonicalize(temp.path()).expect("canonical tempdir")
+}
+
+fn only_policy_backup_id(app_state_root: &Path) -> String {
+    fs::read_dir(app_state_root.join("backups").join("policies"))
+        .expect("backup directory")
+        .map(|entry| entry.expect("backup entry").path())
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .and_then(|path| {
+            path.file_stem()
+                .and_then(|stem| stem.to_str())
+                .map(str::to_owned)
+        })
+        .expect("policy backup")
 }
 
 fn approval(plan_fingerprint: &str) -> PolicyMaintenanceApproval {
@@ -202,6 +223,17 @@ fn apply_reviewed(
     controller.apply(plan, authorization, &context, &approval, owner(generation))
 }
 
+fn apply_reviewed_with_owner(
+    controller: &PolicyMaintenanceController,
+    app_state_root: &Path,
+    plan: &unpin_core::profiles::PolicyMaintenancePlan,
+    marker: u64,
+    owner: OwnerGeneration,
+) -> Result<unpin_core::profiles::PolicyMaintenanceOutcome, PolicyMaintenanceError> {
+    let (authorization, context, approval) = authorization(app_state_root, plan, marker);
+    controller.apply(plan, authorization, &context, &approval, owner)
+}
+
 fn controller(app_state_root: &Path, project_root: &Path) -> PolicyMaintenanceController {
     PolicyMaintenanceController::new(
         app_state_root,
@@ -280,6 +312,214 @@ fn fixed_source_migration_is_authenticated_reviewed_and_exactly_restorable() {
             .is_none()
     );
     assert!(source_path.exists());
+}
+
+#[test]
+fn sequential_maintenance_operations_accept_fresh_generation_one_owners() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    init_repository(&repository);
+    let policy = ScopePolicy::default();
+    write_legacy_policy(&repository, &policy);
+    let initial_controller = controller(&app_state, &repository);
+
+    let migration = initial_controller.plan_migration().expect("migration plan");
+    let target = migration_target(&migration);
+    apply_reviewed_with_owner(
+        &initial_controller,
+        &app_state,
+        &migration,
+        60,
+        fresh_owner("migration"),
+    )
+    .expect("migration with fresh owner");
+    let moved_aside = root.join("moved-aside");
+    fs::rename(&repository, &moved_aside).expect("move repository aside");
+    let controller = controller(&app_state, &moved_aside);
+
+    let discard = controller
+        .plan_discard(target.clone())
+        .expect("discard plan");
+    let discarded = apply_reviewed_with_owner(
+        &controller,
+        &app_state,
+        &discard,
+        61,
+        fresh_owner("discard"),
+    )
+    .expect("discard with fresh owner");
+
+    let restore = controller
+        .plan_restore(&discarded.backup_id)
+        .expect("restore plan");
+    apply_reviewed_with_owner(
+        &controller,
+        &app_state,
+        &restore,
+        62,
+        fresh_owner("restore"),
+    )
+    .expect("restore with fresh owner");
+
+    assert_eq!(
+        PolicyStore::new(&app_state)
+            .load(&target)
+            .expect("load restored policy")
+            .expect("restored policy")
+            .policy,
+        policy
+    );
+}
+
+#[test]
+fn protected_changes_advance_record_owner_from_existing_state() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    init_repository(&repository);
+    write_legacy_policy(&repository, &ScopePolicy::default());
+    let controller = controller(&app_state, &repository);
+
+    let migration = controller.plan_migration().expect("migration plan");
+    let target = migration_target(&migration);
+    apply_reviewed_with_owner(
+        &controller,
+        &app_state,
+        &migration,
+        63,
+        fresh_owner("protected-migration"),
+    )
+    .expect("migration with fresh owner");
+
+    for (operation_id, fingerprint, marker) in [
+        ("protected-owner-first", "51".repeat(32), 64),
+        ("protected-owner-second", "52".repeat(32), 65),
+    ] {
+        let (authorization, expectation) =
+            external_authorization(&app_state, &target, &fingerprint, marker);
+        controller
+            .protect_policy_change(
+                &target,
+                operation_id,
+                &fingerprint,
+                &expectation,
+                &external_approval(&fingerprint, &authorization),
+                authorization,
+                fresh_owner(operation_id),
+                |_authorization| Ok::<(), ()>(()),
+            )
+            .expect("protected change with fresh owner");
+    }
+}
+
+#[test]
+fn failed_workspace_protected_change_returns_a_recoverable_restore_handoff() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    init_repository(&repository);
+    let original = ScopePolicy::default();
+    write_legacy_policy(&repository, &original);
+    let controller = controller(&app_state, &repository);
+
+    let migration = controller.plan_migration().expect("migration plan");
+    let target = migration_target(&migration);
+    apply_reviewed_with_owner(
+        &controller,
+        &app_state,
+        &migration,
+        66,
+        fresh_owner("workspace-recovery-migration"),
+    )
+    .expect("migration");
+    let policies = PolicyStore::new(&app_state);
+    let before_change = policies
+        .load(&target)
+        .expect("load migrated policy")
+        .expect("migrated policy");
+    let changed = ScopePolicy {
+        gateway: GatewaySelection::Gateway,
+        ..ScopePolicy::default()
+    };
+    let fingerprint = "53".repeat(32);
+    let (authorization, expectation) =
+        external_authorization(&app_state, &target, &fingerprint, 67);
+    let backup_id = match controller
+        .protect_policy_change(
+            &target,
+            "workspace-protected-change",
+            &fingerprint,
+            &expectation,
+            &external_approval(&fingerprint, &authorization),
+            authorization,
+            fresh_owner("workspace-protected-change"),
+            |_authorization| {
+                policies
+                    .save(&target, &changed, Some(&before_change.revision), owner(2))
+                    .expect("rewrite policy");
+                Err::<(), _>("simulated apply failure")
+            },
+        )
+        .expect_err("failed change must preserve a restore backup")
+    {
+        ProtectedPolicyChangeError::Apply { backup_id, .. } => backup_id,
+        other => panic!("expected protected apply failure, got {other:?}"),
+    };
+
+    let (retry_authorization, retry_expectation) =
+        external_authorization(&app_state, &target, &fingerprint, 68);
+    let retry_error = controller
+        .protect_policy_change(
+            &target,
+            "workspace-protected-change",
+            &fingerprint,
+            &retry_expectation,
+            &external_approval(&fingerprint, &retry_authorization),
+            retry_authorization,
+            fresh_owner("workspace-protected-change-retry"),
+            |_authorization| Ok::<(), ()>(()),
+        )
+        .expect_err("drifted workspace record must require its known recovery backup");
+    assert!(matches!(
+        retry_error,
+        ProtectedPolicyChangeError::Maintenance(PolicyMaintenanceError::RecoveryRequired {
+            backup_id: Some(ref actual),
+            ..
+        }) if actual == &backup_id
+    ));
+
+    let restore = controller
+        .plan_restore(&backup_id)
+        .expect("restore plan for drifted workspace record");
+    apply_reviewed_with_owner(
+        &controller,
+        &app_state,
+        &restore,
+        69,
+        fresh_owner("workspace-protected-restore"),
+    )
+    .expect("restore drifted workspace record");
+
+    assert_eq!(
+        policies
+            .load(&target)
+            .expect("load restored policy")
+            .expect("restored policy")
+            .policy,
+        original
+    );
+    assert_eq!(
+        controller
+            .status(&target, None)
+            .expect("restored workspace status")
+            .expect("restored workspace record")
+            .lifecycle,
+        PolicyMaintenanceLifecycle::Active
+    );
 }
 
 #[test]
@@ -710,6 +950,33 @@ fn generic_policy_change_gets_authenticated_prechange_backup_and_reviewed_restor
     let restore = controller
         .plan_restore(&protected.backup_id)
         .expect("restore plan");
+    let public = restore.public_view().expect("public restore plan");
+    let PublicPolicyMaintenanceAction::Restore { backup_id, targets } = public.action else {
+        panic!("expected restore action");
+    };
+    assert_eq!(backup_id, protected.backup_id);
+    assert_eq!(targets, vec![target.clone()]);
+    let restore_context =
+        ControlApprovalContext::new("repository", "workspace").expect("restore context");
+    let restore_expectation = restore
+        .approval_expectation(&restore_context)
+        .expect("restore approval expectation");
+    assert_eq!(restore_expectation.resources.len(), 3);
+    assert!(
+        restore_expectation
+            .resources
+            .iter()
+            .any(|binding| binding.resource_id == protected.backup_id)
+    );
+    assert!(
+        restore_expectation
+            .resources
+            .iter()
+            .any(|binding| binding.resource_id.ends_with("-policy"))
+    );
+    assert!(restore_expectation.resources.iter().any(|binding| {
+        binding.resource_id != protected.backup_id && !binding.resource_id.ends_with("-policy")
+    }));
     apply_reviewed(&controller, &app_state, &restore, 3).expect("restore");
     assert_eq!(
         policies
@@ -718,6 +985,134 @@ fn generic_policy_change_gets_authenticated_prechange_backup_and_reviewed_restor
             .expect("restored policy")
             .policy,
         original
+    );
+}
+
+#[test]
+fn failed_protected_change_without_residue_can_be_retried() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    init_repository(&repository);
+    let target = PolicyTarget::Global;
+    let reviewed_fingerprint = "46".repeat(32);
+    let controller = controller(&app_state, &repository);
+    let (authorization, expectation) =
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 45);
+
+    let backup_id = match controller
+        .protect_policy_change(
+            &target,
+            "retryable-profile-change",
+            &reviewed_fingerprint,
+            &expectation,
+            &external_approval(&reviewed_fingerprint, &authorization),
+            authorization,
+            owner(2),
+            |_authorization| Err::<(), _>("simulated apply failure"),
+        )
+        .expect_err("failed apply must retain its backup")
+    {
+        ProtectedPolicyChangeError::Apply { backup_id, .. } => backup_id,
+        other => panic!("expected protected apply failure, got {other:?}"),
+    };
+    assert!(
+        controller
+            .load_backup(&backup_id)
+            .expect("load failed backup")
+            .expect("failed backup")
+            .finalized
+    );
+
+    let (retry_authorization, retry_expectation) =
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 46);
+    let called = Cell::new(false);
+    let retried = controller
+        .protect_policy_change(
+            &target,
+            "retryable-profile-change",
+            &reviewed_fingerprint,
+            &retry_expectation,
+            &external_approval(&reviewed_fingerprint, &retry_authorization),
+            retry_authorization,
+            owner(2),
+            |_authorization| {
+                called.set(true);
+                Ok::<(), &str>(())
+            },
+        )
+        .expect("retry without observable residue must proceed");
+
+    assert!(called.get());
+    assert_eq!(retried.backup_id, backup_id);
+    assert!(
+        controller
+            .load_backup(&retried.backup_id)
+            .expect("load retried backup")
+            .expect("retried backup")
+            .finalized
+    );
+}
+
+#[test]
+fn interrupted_protected_change_without_residue_can_be_retried() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    init_repository(&repository);
+    let target = PolicyTarget::Global;
+    let reviewed_fingerprint = "47".repeat(32);
+    let controller = controller(&app_state, &repository);
+
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        let (authorization, expectation) =
+            external_authorization(&app_state, &target, &reviewed_fingerprint, 47);
+        let _ = controller.protect_policy_change(
+            &target,
+            "interrupted-profile-change",
+            &reviewed_fingerprint,
+            &expectation,
+            &external_approval(&reviewed_fingerprint, &authorization),
+            authorization,
+            owner(2),
+            |_authorization| -> Result<(), ()> { panic!("simulated interruption") },
+        );
+    }));
+    assert!(interrupted.is_err());
+
+    let backup_id = only_policy_backup_id(&app_state);
+    assert!(
+        !controller
+            .load_backup(&backup_id)
+            .expect("load interrupted backup")
+            .expect("interrupted backup")
+            .finalized
+    );
+
+    let (retry_authorization, retry_expectation) =
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 48);
+    let retried = controller
+        .protect_policy_change(
+            &target,
+            "interrupted-profile-change",
+            &reviewed_fingerprint,
+            &retry_expectation,
+            &external_approval(&reviewed_fingerprint, &retry_authorization),
+            retry_authorization,
+            owner(2),
+            |_authorization| Ok::<(), ()>(()),
+        )
+        .expect("interrupted change without residue must retry");
+
+    assert_eq!(retried.backup_id, backup_id);
+    assert!(
+        controller
+            .load_backup(&retried.backup_id)
+            .expect("load retried backup")
+            .expect("retried backup")
+            .finalized
     );
 }
 
@@ -1028,10 +1423,134 @@ fn failed_protected_change_finalizes_backup_for_authenticated_restore() {
         .expect("failed-change backup");
     assert!(backup.finalized);
 
+    let (retry_authorization, retry_expectation) =
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 41);
+    let called = Cell::new(false);
+    let retry_error = controller
+        .protect_policy_change(
+            &target,
+            "failed-profile-change",
+            &reviewed_fingerprint,
+            &retry_expectation,
+            &external_approval(&reviewed_fingerprint, &retry_authorization),
+            retry_authorization,
+            owner(2),
+            |_authorization| {
+                called.set(true);
+                Ok::<(), &str>(())
+            },
+        )
+        .expect_err("partial failed change must require recovery before retry");
+    assert!(!called.get());
+    assert!(matches!(
+        retry_error,
+        ProtectedPolicyChangeError::Maintenance(PolicyMaintenanceError::RecoveryRequired {
+            backup_id: Some(ref actual),
+            ..
+        }) if actual == backup_id
+    ));
+
     let restore = controller
         .plan_restore(backup_id)
         .expect("authenticated restore plan");
     apply_reviewed(&controller, &app_state, &restore, 3).expect("restore");
+    assert_eq!(
+        policies
+            .load(&target)
+            .expect("load restored policy")
+            .expect("restored policy")
+            .policy,
+        original
+    );
+}
+
+#[test]
+fn interrupted_protected_change_with_residue_requires_recovery_and_is_restorable() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fixture_root(&temp);
+    let repository = root.join("repository");
+    let app_state = root.join("state");
+    init_repository(&repository);
+    let policies = PolicyStore::new(&app_state);
+    let target = PolicyTarget::Global;
+    let original = ScopePolicy::default();
+    let original_revision = policies
+        .save(&target, &original, None, owner(1))
+        .expect("seed policy");
+    let changed = ScopePolicy {
+        gateway: GatewaySelection::Gateway,
+        ..ScopePolicy::default()
+    };
+    let reviewed_fingerprint = "48".repeat(32);
+    let controller = controller(&app_state, &repository);
+
+    let interrupted = catch_unwind(AssertUnwindSafe(|| {
+        let (authorization, expectation) =
+            external_authorization(&app_state, &target, &reviewed_fingerprint, 49);
+        let _ = controller.protect_policy_change(
+            &target,
+            "interrupted-partial-profile-change",
+            &reviewed_fingerprint,
+            &expectation,
+            &external_approval(&reviewed_fingerprint, &authorization),
+            authorization,
+            owner(2),
+            |_authorization| -> Result<(), ()> {
+                policies
+                    .save(&target, &changed, Some(&original_revision), owner(2))
+                    .expect("partially apply policy change");
+                panic!("simulated interruption");
+            },
+        );
+    }));
+    assert!(interrupted.is_err());
+
+    let backup_id = only_policy_backup_id(&app_state);
+    assert!(
+        !controller
+            .load_backup(&backup_id)
+            .expect("load interrupted backup")
+            .expect("interrupted backup")
+            .finalized
+    );
+
+    let (retry_authorization, retry_expectation) =
+        external_authorization(&app_state, &target, &reviewed_fingerprint, 50);
+    let called = Cell::new(false);
+    let retry_error = controller
+        .protect_policy_change(
+            &target,
+            "interrupted-partial-profile-change",
+            &reviewed_fingerprint,
+            &retry_expectation,
+            &external_approval(&reviewed_fingerprint, &retry_authorization),
+            retry_authorization,
+            owner(2),
+            |_authorization| {
+                called.set(true);
+                Ok::<(), ()>(())
+            },
+        )
+        .expect_err("interrupted partial change must require recovery");
+    assert!(!called.get());
+    assert!(matches!(
+        retry_error,
+        ProtectedPolicyChangeError::Maintenance(PolicyMaintenanceError::RecoveryRequired {
+            backup_id: Some(ref actual),
+            ..
+        }) if actual == &backup_id
+    ));
+
+    let restore = controller
+        .plan_restore(&backup_id)
+        .expect("interrupted backup restore plan");
+    assert_eq!(
+        controller
+            .plan_restore(&backup_id)
+            .expect("stable interrupted backup restore plan"),
+        restore
+    );
+    apply_reviewed(&controller, &app_state, &restore, 3).expect("restore interrupted change");
     assert_eq!(
         policies
             .load(&target)
