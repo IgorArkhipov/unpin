@@ -529,3 +529,11 @@ Remember that default Unpin MCP may inspect and plan, but persistent writes
 require a human-action handoff completed through the Unpin CLI or TUI. Do not
 enable approved group apply during initial setup.
 ```
+
+### Policy-maintenance status
+
+`policy_maintenance_status` leaves `candidateCurrent` disabled by default, so
+an MCP query reports the authenticated target without implicitly comparing it
+to the current checkout. Set `candidateCurrent: true` when that comparison is
+intended. The interactive TUI always performs this comparison for its active
+workspace; the CLI exposes the same choice as `--candidate-current`.

@@ -150,6 +150,18 @@ impl GroupHarness {
             .expect("group plan")
     }
 
+    fn controller(&self) -> GroupController {
+        GroupController::new(
+            GroupPlanner::new(GroupResolver::new(
+                self.context.clone(),
+                PersonalGroupStore::new(self.context.clone()),
+                RepositoryGroupStore::new(self.context.clone()),
+            )),
+            self.backup_key.clone(),
+            SessionAuthorityKey::new([0x53; 32]),
+        )
+    }
+
     fn expectation(&self, plan: &unpin_core::groups::GroupTogglePlan) -> ApprovalExpectation {
         plan.approval_expectation(&control_context(
             self.context.repository_key(),
@@ -218,6 +230,28 @@ fn actionable_plans_allocate_distinct_high_entropy_operation_ids() {
     assert!(second_id.starts_with("inventory-group-"));
     assert!(first_id.len() >= "inventory-group-".len() + 48);
     assert!(second_id.len() >= "inventory-group-".len() + 48);
+}
+
+#[test]
+fn beta4_group_plans_without_preserved_members_remain_compatible() {
+    let harness = GroupHarness::new();
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    let serialized = serde_json::to_value(&plan).expect("serialize group plan");
+    assert!(
+        serialized["resources"]
+            .as_array()
+            .expect("resource plans")
+            .iter()
+            .all(|resource| resource.get("preservedMembers").is_none())
+    );
+
+    let restored: unpin_core::groups::GroupTogglePlan =
+        serde_json::from_value(serialized.clone()).expect("deserialize beta.4 plan");
+    assert_eq!(
+        serde_json::to_value(&restored).expect("serialize restored beta.4 plan"),
+        serialized
+    );
+    restored.verify().expect("verify beta.4 plan");
 }
 
 #[test]
@@ -909,6 +943,66 @@ fn shared_resource_members_apply_in_one_cohort_with_one_backup() {
             .expect("non-member after restore")
             .enabled,
         non_member.enabled
+    );
+}
+
+#[test]
+fn fresh_discovery_rejects_drift_before_group_apply() {
+    let harness = GroupHarness::new();
+    let discovery = discover_all(harness.context.discovery_roots()).expect("discovery before plan");
+    let cursor = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+        .map(GroupMemberIdentity::try_from)
+        .transpose()
+        .expect("Cursor MCP identity")
+        .expect("Cursor MCP fixture");
+    let personal = PersonalGroupStore::new(harness.context.clone());
+    let current = personal
+        .load("implementation")
+        .expect("load group")
+        .expect("implementation group");
+    let mut members = current.definition.members;
+    members.push(cursor.clone());
+    personal
+        .replace(
+            &GroupDefinitionV1::new("implementation", members).expect("expanded definition"),
+            Some(&current.revision),
+            OwnerGeneration::new("group-control-test", 2).expect("definition owner"),
+        )
+        .expect("expand definition");
+
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    assert_eq!(plan.cohorts.len(), 2);
+    fs::remove_file(&harness.first_skill_path).expect("remove planned Codex skill");
+
+    let expectation = harness.expectation(&plan);
+    let error = harness
+        .controller()
+        .apply(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-cohort-preflight",
+                NOW_UNIX,
+            ),
+        )
+        .expect_err("fresh discovery rejects changed group member");
+
+    assert!(matches!(
+        error,
+        unpin_core::groups::GroupControlError::PlanDrift
+    ));
+    assert!(
+        discover_all(harness.context.discovery_roots())
+            .expect("discovery after apply")
+            .items
+            .iter()
+            .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+            .expect("Cursor MCP after apply")
+            .enabled
     );
 }
 

@@ -350,7 +350,7 @@ impl GroupController {
                         },
                         &mut member_results,
                     ) {
-                        Ok(prepared) => prepared_cohorts.push(prepared),
+                        Ok(prepared) => prepared_cohorts.push((cohort, prepared)),
                         Err(reason) => {
                             preflight_failed = true;
                             mark_cohort_preflight_failed(cohort, &mut member_results, &reason);
@@ -367,7 +367,7 @@ impl GroupController {
             _ => unreachable!("discovery index exists for successful execution inputs"),
         }
 
-        if preflight_failed {
+        if preflight_failed && prepared_cohorts.is_empty() {
             let result = preflight_blocked_result(reviewed, member_results);
             operation.provider_reach_lifecycle = result.provider_reach_lifecycle;
             operation.terminalize(result.clone())?;
@@ -378,7 +378,7 @@ impl GroupController {
 
         drop(definition_lock);
         let mut provider_writes_marked = false;
-        for (cohort, prepared) in reviewed.cohorts.iter().zip(prepared_cohorts) {
+        for (cohort, prepared) in prepared_cohorts {
             if !provider_writes_marked && !prepared.members.is_empty() {
                 // Every included cohort has completed fresh preflight above.
                 // Persist the recovery boundary only when the first prepared
@@ -463,15 +463,8 @@ impl GroupController {
         }
 
         let lifecycle = roll_up(&member_results);
-        let provider_reach_lifecycle = if member_results.iter().any(|member| {
-            member.status == GroupApplyMemberStatus::Failed
-                || member.failure_mode
-                    == Some(crate::groups::GroupMemberFailureMode::RecoveryRequired)
-        }) {
-            ProviderReachLifecycle::RecoveryRequired
-        } else {
-            reviewed.lifecycle
-        };
+        let provider_reach_lifecycle =
+            provider_reach_lifecycle(&member_results, reviewed.lifecycle);
         let (final_state, observation_fresh, observation_reason) =
             self.observe_final_state(reviewed);
         let result = GroupApplyResult {
@@ -1576,6 +1569,19 @@ fn roll_up(members: &[GroupApplyMemberResult]) -> GroupOperationLifecycle {
     }
 }
 
+fn provider_reach_lifecycle(
+    members: &[GroupApplyMemberResult],
+    planned: ProviderReachLifecycle,
+) -> ProviderReachLifecycle {
+    if members.iter().any(|member| {
+        member.failure_mode == Some(crate::groups::GroupMemberFailureMode::RecoveryRequired)
+    }) {
+        ProviderReachLifecycle::RecoveryRequired
+    } else {
+        planned
+    }
+}
+
 fn mark_cohort_recovery_required(
     cohort: &GroupExecutionCohort,
     members: &mut [GroupApplyMemberResult],
@@ -1822,6 +1828,21 @@ mod tests {
             Some(crate::groups::GroupMemberFailureMode::RecoveryRequired)
         );
         assert_eq!(after_backup.backup_id.as_deref(), Some("backup-id"));
+    }
+
+    #[test]
+    fn preflight_failure_without_recovery_evidence_preserves_planned_reach_lifecycle() {
+        let changed = member_result(GroupApplyMemberStatus::Changed);
+        let mut preflight_failed = member_result(GroupApplyMemberStatus::Failed);
+        preflight_failed.reason = Some("cohort-blocked: fresh preflight failed".to_string());
+
+        assert_eq!(
+            provider_reach_lifecycle(
+                &[changed, preflight_failed],
+                ProviderReachLifecycle::Partial,
+            ),
+            ProviderReachLifecycle::Partial
+        );
     }
 
     #[test]

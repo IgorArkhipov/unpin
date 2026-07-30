@@ -12,8 +12,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Added
 
 - Authenticated workspace-policy migration, orphan classification, reattach,
-  discard, cleanup, and restore workflows through the CLI and TUI.
-- A read-only MCP policy-maintenance status tool with exact CLI handoffs.
+  discard, cleanup, and restore execution through the CLI.
+- TUI and read-only MCP policy-maintenance status surfaces lifecycle and
+  CLI-managed action state.
 
 ### Fixed
 
@@ -23,8 +24,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Security
 
 - Persistent profile and capability-lock changes now create authenticated
-  pre-change policy backups and preserve recovery-required outcomes when the
-  maintenance evidence cannot be completed.
+  pre-change policy backups; protected profile results and recovery-required
+  errors expose redacted restore handoffs when available.
 - Workspace-policy maintenance binds reviewed plans, physical checkout
   evidence, current policy revisions, authenticated records, and restore
   backups before mutation.

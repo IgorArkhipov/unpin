@@ -65,7 +65,12 @@ pub fn require_fixture_write_sandbox<'a>(
     Ok(())
 }
 
-fn canonical_fixture_scope_path(path: &Path) -> Result<PathBuf, String> {
+/// Resolves a fixture state root through its nearest existing ancestor.
+///
+/// Fixture callers may need a stable physical root before the state directory
+/// itself exists. This keeps credential and nonce paths consistent across
+/// aliases such as macOS `/var` and `/private/var`.
+pub fn canonical_fixture_scope_path(path: &Path) -> Result<PathBuf, String> {
     if !path.is_absolute() || path.components().any(|part| part == Component::ParentDir) {
         return Err(
             "fixture credential scope must be an absolute path without parent traversal"

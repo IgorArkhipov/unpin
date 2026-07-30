@@ -185,6 +185,7 @@ pub struct ApprovalExpectation {
 pub enum ControlOperationKind {
     ProfilePolicy,
     CapabilityPolicy,
+    PolicyMaintenance,
     GatewayWorkflow,
     SessionEnd,
     RestoreBackup,
@@ -227,6 +228,7 @@ impl ControlOperationKind {
         match self {
             Self::ProfilePolicy => "profile-policy",
             Self::CapabilityPolicy => "capability-policy",
+            Self::PolicyMaintenance => "policy-maintenance",
             Self::GatewayWorkflow => "gateway-workflow",
             Self::SessionEnd => "session-end",
             Self::RestoreBackup => "restore-backup",
