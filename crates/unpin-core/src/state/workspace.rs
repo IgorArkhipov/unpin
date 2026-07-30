@@ -3,6 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub type WorkspaceResult<T> = Result<T, WorkspaceIdentityError>;
@@ -15,6 +16,58 @@ pub struct WorkspaceIdentity {
     pub git_common_dir: Option<PathBuf>,
     pub git_worktree_dir: Option<PathBuf>,
     pub diagnostics: WorkspaceDiagnostics,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PhysicalDirectoryEvidence {
+    pub canonical_path: PathBuf,
+    pub incarnation_digest: String,
+    pub reliable: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkspacePhysicalEvidence {
+    pub repository_key: String,
+    pub workspace_key: String,
+    pub workspace_root: PhysicalDirectoryEvidence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_common_dir: Option<PhysicalDirectoryEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub git_worktree_dir: Option<PhysicalDirectoryEvidence>,
+}
+
+impl WorkspacePhysicalEvidence {
+    #[must_use]
+    pub fn is_reliable_git_workspace(&self) -> bool {
+        self.workspace_root.reliable
+            && self
+                .git_common_dir
+                .as_ref()
+                .is_some_and(|evidence| evidence.reliable)
+            && self
+                .git_worktree_dir
+                .as_ref()
+                .is_some_and(|evidence| evidence.reliable)
+    }
+
+    #[must_use]
+    pub fn same_physical_workspace(&self, other: &Self) -> bool {
+        self.is_reliable_git_workspace()
+            && other.is_reliable_git_workspace()
+            && self.workspace_root.incarnation_digest == other.workspace_root.incarnation_digest
+            && self
+                .git_common_dir
+                .as_ref()
+                .zip(other.git_common_dir.as_ref())
+                .is_some_and(|(left, right)| left.incarnation_digest == right.incarnation_digest)
+            && self
+                .git_worktree_dir
+                .as_ref()
+                .zip(other.git_worktree_dir.as_ref())
+                .is_some_and(|(left, right)| left.incarnation_digest == right.incarnation_digest)
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -130,6 +183,47 @@ pub fn resolve_workspace_identity(
         git_worktree_dir: Some(git_worktree_dir),
         diagnostics,
     })
+}
+
+pub fn capture_workspace_physical_evidence(
+    project_root: impl AsRef<Path>,
+) -> WorkspaceResult<WorkspacePhysicalEvidence> {
+    let identity = resolve_workspace_identity(project_root)?;
+    let workspace_root = directory_evidence(&identity.canonical_root)?;
+    let git_common_dir = identity
+        .git_common_dir
+        .as_deref()
+        .map(directory_evidence)
+        .transpose()?;
+    let git_worktree_dir = identity
+        .git_worktree_dir
+        .as_deref()
+        .map(directory_evidence)
+        .transpose()?;
+    Ok(WorkspacePhysicalEvidence {
+        repository_key: identity.repository_key,
+        workspace_key: identity.workspace_key,
+        workspace_root,
+        git_common_dir,
+        git_worktree_dir,
+    })
+}
+
+fn directory_evidence(path: &Path) -> WorkspaceResult<PhysicalDirectoryEvidence> {
+    let incarnation = filesystem_incarnation(path)?;
+    let reliable = !incarnation.is_degraded();
+    Ok(PhysicalDirectoryEvidence {
+        canonical_path: path.to_path_buf(),
+        incarnation_digest: incarnation_digest(&incarnation),
+        reliable,
+    })
+}
+
+fn incarnation_digest(incarnation: &FilesystemIncarnation) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"unpin-workspace-physical-incarnation-v1\0");
+    update_hasher_with_incarnation(&mut hasher, incarnation);
+    crate::encode_lower_hex(&hasher.finalize())
 }
 
 fn find_git_root(search_root: &Path) -> WorkspaceResult<Option<(PathBuf, PathBuf)>> {
