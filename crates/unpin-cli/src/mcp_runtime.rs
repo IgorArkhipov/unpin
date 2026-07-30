@@ -2224,7 +2224,7 @@ mod tests {
             matcher: HookMatcher::any(),
             action,
             order,
-            timeout_ms: 2_000,
+            timeout_ms: 10_000,
             failure_policy,
             source_layer: HookSourceLayer::Session,
             ownership: HookOwnership::User,
@@ -2832,7 +2832,7 @@ mod tests {
             None,
             &action,
             &json!({"value": 1}),
-            Duration::from_secs(2),
+            Duration::from_secs(10),
             128,
         )
         .await

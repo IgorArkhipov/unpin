@@ -15,7 +15,11 @@ use crate::{
     config::get_workspace_policy_path,
     encode_lower_hex, is_lower_hex_digest,
     mutation::BackupAuthenticationKey,
-    profiles::{PolicyStore, PolicyStoreError, PolicyTarget, ScopePolicy},
+    profiles::{
+        PolicyStore, PolicyStoreError, PolicyTarget, ScopePolicy, capability_lock_resource_id,
+        policy_resource_id,
+    },
+    providers::ProviderId,
     state::{
         atomic_json::{
             AtomicJsonStore, OwnerGeneration, StateError, StateResourceLock, StateRevision,
@@ -653,7 +657,15 @@ impl PolicyMaintenanceController {
                     UnmanagedPolicyStatus::MigrationUnavailable
                 })
             }
-            Ok(_) | Err(_) => Ok(UnmanagedPolicyStatus::MigrationUnavailable),
+            Ok(_)
+            | Err(PolicyMaintenanceError::InvalidSource)
+            | Err(PolicyMaintenanceError::InvalidSourceJson(_))
+            | Err(PolicyMaintenanceError::SourceMetadata(_))
+            | Err(PolicyMaintenanceError::Io {
+                kind: io::ErrorKind::NotFound,
+                ..
+            }) => Ok(UnmanagedPolicyStatus::MigrationUnavailable),
+            Err(error) => Err(error),
         }
     }
 
@@ -749,6 +761,13 @@ impl PolicyMaintenanceController {
         .map_err(ProtectedPolicyChangeError::Maintenance)?;
         validate_component("operation id", operation_id)
             .map_err(ProtectedPolicyChangeError::Maintenance)?;
+        if !approval_binds_protected_target(target, approval_expectation)
+            .map_err(ProtectedPolicyChangeError::Maintenance)?
+        {
+            return Err(ProtectedPolicyChangeError::Maintenance(
+                PolicyMaintenanceError::ApprovalRejected,
+            ));
+        }
         let _operation_lock = self
             .acquire_operation_lock()
             .map_err(ProtectedPolicyChangeError::Maintenance)?;
@@ -933,7 +952,10 @@ impl PolicyMaintenanceController {
                         rollback_owner(&owner, "migration-policy")?,
                     )
                     .map_err(|rollback| {
-                        recovery_required(format!("{error}; policy rollback failed: {rollback}"))
+                        recovery_required_for_backup(
+                            &backup_id,
+                            format!("{error}; policy rollback failed: {rollback}"),
+                        )
                     })?;
                 return Err(error);
             }
@@ -1027,9 +1049,10 @@ impl PolicyMaintenanceController {
                         rollback_owner(&owner, "reattach-new-policy")?,
                     )
                     .map_err(|rollback| {
-                        recovery_required(format!(
-                            "{error}; new-policy rollback failed: {rollback}"
-                        ))
+                        recovery_required_for_backup(
+                            &backup_id,
+                            format!("{error}; new-policy rollback failed: {rollback}"),
+                        )
                     })?;
                 return Err(error);
             }
@@ -1077,14 +1100,16 @@ impl PolicyMaintenanceController {
                     &owner,
                 );
                 if let Err(rollback) = restored {
-                    return Err(recovery_required(format!(
-                        "{error}; old-policy rollback failed: {rollback}"
-                    )));
+                    return Err(recovery_required_for_backup(
+                        &backup_id,
+                        format!("{error}; old-policy rollback failed: {rollback}"),
+                    ));
                 }
                 if let Err(rollback) = new_rollback {
-                    return Err(recovery_required(format!(
-                        "{error}; new-target rollback failed: {rollback}"
-                    )));
+                    return Err(recovery_required_for_backup(
+                        &backup_id,
+                        format!("{error}; new-target rollback failed: {rollback}"),
+                    ));
                 }
                 return Err(error);
             }
@@ -1155,7 +1180,10 @@ impl PolicyMaintenanceController {
                         rollback_owner(&owner, "discard-policy")?,
                     )
                     .map_err(|rollback| {
-                        recovery_required(format!("{error}; discard rollback failed: {rollback}"))
+                        recovery_required_for_backup(
+                            &backup_id,
+                            format!("{error}; discard rollback failed: {rollback}"),
+                        )
                     })?;
                 return Err(error);
             }
@@ -2191,7 +2219,7 @@ fn rollback_owner(
 }
 
 fn recovery_error(backup_id: &str, error: PolicyMaintenanceError) -> PolicyMaintenanceError {
-    recovery_required(format!("backup={backup_id}; cause={}", error.public_code()))
+    recovery_required_for_backup(backup_id, format!("cause={}", error.public_code()))
 }
 
 fn recovery_required(detail: impl Into<String>) -> PolicyMaintenanceError {
@@ -2201,13 +2229,57 @@ fn recovery_required(detail: impl Into<String>) -> PolicyMaintenanceError {
         .and_then(|remainder| remainder.split(';').next())
         .filter(|backup_id| is_policy_backup_id(backup_id))
         .map(str::to_owned);
+    recovery_required_with_backup_id(detail, backup_id)
+}
+
+fn recovery_required_for_backup(
+    backup_id: &str,
+    detail: impl Into<String>,
+) -> PolicyMaintenanceError {
+    let backup_id = is_policy_backup_id(backup_id).then(|| backup_id.to_string());
+    recovery_required_with_backup_id(detail.into(), backup_id)
+}
+
+fn recovery_required_with_backup_id(
+    detail: String,
+    backup_id: Option<String>,
+) -> PolicyMaintenanceError {
     PolicyMaintenanceError::RecoveryRequired { detail, backup_id }
 }
 
+fn approval_binds_protected_target(
+    target: &PolicyTarget,
+    approval_expectation: &ApprovalExpectation,
+) -> Result<bool, PolicyMaintenanceError> {
+    let target_resource_id =
+        policy_resource_id(target).map_err(|_| PolicyMaintenanceError::InvalidPlan)?;
+    if approval_expectation
+        .resources
+        .iter()
+        .any(|binding| binding.resource_id == target_resource_id)
+    {
+        return Ok(true);
+    }
+
+    if !matches!(target, PolicyTarget::Global) {
+        return Ok(false);
+    }
+
+    Ok(ProviderId::ALL.iter().copied().any(|provider| {
+        let resource_id = capability_lock_resource_id(provider);
+        approval_expectation
+            .resources
+            .iter()
+            .any(|binding| binding.resource_id == resource_id)
+    }))
+}
+
 fn io_error(path: &Path, error: io::Error) -> PolicyMaintenanceError {
+    let kind = error.kind();
     PolicyMaintenanceError::Io {
         path: path.to_path_buf(),
         message: error.to_string(),
+        kind,
     }
 }
 
@@ -2219,6 +2291,7 @@ pub enum PolicyMaintenanceError {
     Io {
         path: PathBuf,
         message: String,
+        kind: io::ErrorKind,
     },
     Serialization(String),
     InvalidSourceJson(String),
@@ -2368,7 +2441,7 @@ impl fmt::Display for PolicyMaintenanceError {
             Self::Policy(error) => error.fmt(formatter),
             Self::State(error) => error.fmt(formatter),
             Self::Workspace(error) => error.fmt(formatter),
-            Self::Io { path, message } => {
+            Self::Io { path, message, .. } => {
                 write!(
                     formatter,
                     "policy maintenance I/O failed at {}: {message}",
