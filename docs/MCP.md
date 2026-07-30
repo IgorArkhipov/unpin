@@ -12,6 +12,7 @@ An MCP-connected agent can:
 
 - inspect providers, skills, configured MCP servers, plugins, and backups;
 - list and inspect personal or repository inventory groups;
+- inspect authenticated workspace-policy binding and orphan classification;
 - check whether write prerequisites are ready;
 - prepare one-item, bounded bulk, or inventory-group plans;
 - return the exact plan fingerprint and affected resources for review.
@@ -31,6 +32,20 @@ as an additional boundary.
 
 MCP tool IDs use the `unpin_` prefix. Their titles, descriptions, and server
 identity use Unpin branding.
+
+### Workspace-policy maintenance status
+
+`unpin_get_policy_maintenance_status` is read-only. It reports whether the
+current or explicitly keyed workspace policy has an authenticated maintenance
+record, classifies its physical checkout binding, and returns the exact CLI
+handoff for migration, reattachment, discard, or cleanup. It never exposes a
+policy-maintenance mutation tool.
+
+Use `candidateCurrent=true` only when intentionally comparing a recorded
+workspace target with the MCP process's current checkout. Supply
+`repositoryKey` and `workspaceKey` together when inspecting a recorded target.
+If backup authentication is unavailable, initialize it with
+`unpin auth backup init`, restart the MCP session, and retry.
 
 ### Inventory-group MCP modes
 

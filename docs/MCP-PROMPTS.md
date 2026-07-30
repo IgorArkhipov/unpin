@@ -298,8 +298,11 @@ Desired capabilities:
 1. List the normalized Unpin catalog and resolve the exact capability ID for
    every requested capability. Show provider contribution fan-out and reject
    ambiguous names.
-2. Inspect existing profile and policy state. If PROFILE_ID already exists,
-   show and validate it before proposing changes.
+2. Inspect existing profile and policy state, including
+   `unpin_get_policy_maintenance_status`. If workspace policy is unmanaged or
+   orphaned, report its exact CLI maintenance handoff and do not claim that MCP
+   can migrate, reattach, discard, clean up, or restore it. If PROFILE_ID
+   already exists, show and validate it before proposing changes.
 3. Build a version 1 profile definition containing only the reviewed capability
    IDs. Profiles use replacement semantics, so explicitly report capabilities
    that the new definition would omit.

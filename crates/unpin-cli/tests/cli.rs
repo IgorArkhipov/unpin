@@ -5492,6 +5492,7 @@ fn mcp_once_lists_stable_tool_surface() {
             "unpin_restore_backup",
             "unpin_run_doctor",
             "unpin_get_control_status",
+            "unpin_get_policy_maintenance_status",
             "unpin_list_catalog",
             "unpin_list_hooks",
             "unpin_plan_catalog_adoption",
