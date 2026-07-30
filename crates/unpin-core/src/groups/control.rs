@@ -42,6 +42,8 @@ use crate::{
     },
 };
 
+const GROUP_EXECUTION_LOCK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Trusted inputs required to persist a schema-v2 reach-aware group apply.
 /// Roots and the signed principal are supplied by the verified caller; this
 /// controller never invents roots or derives identity from repository files.
@@ -2024,7 +2026,7 @@ fn acquire_operation_execution_lock(
         app_state_root
             .join("groups")
             .join(format!("group-execution-{operation_id}")),
-        Duration::from_secs(2),
+        GROUP_EXECUTION_LOCK_TIMEOUT,
     )
     .map_err(Into::into)
 }

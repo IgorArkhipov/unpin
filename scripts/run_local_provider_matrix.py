@@ -422,7 +422,10 @@ def capture_live_inventory(
 
 
 def run_quality_gates(
-    cargo: Path, binary: Path, artifact_root: Path
+    cargo: Path,
+    binary: Path,
+    artifact_root: Path,
+    timeout_seconds: float | None = QUALITY_GATE_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     python_sources = [
         Path(__file__).resolve(),
@@ -489,7 +492,7 @@ def run_quality_gates(
             process = run_command(
                 command,
                 check=False,
-                timeout_seconds=QUALITY_GATE_TIMEOUT_SECONDS,
+                timeout_seconds=timeout_seconds,
             )
         except MatrixCommandTimeout as error:
             duration = (dt.datetime.now(dt.timezone.utc) - started).total_seconds()
@@ -954,7 +957,12 @@ def main() -> int:
         verification = (
             {}
             if args.skip_quality_gates
-            else run_quality_gates(cargo, binary, artifact_root)
+            else run_quality_gates(
+                cargo,
+                binary,
+                artifact_root,
+                timeout_seconds=args.quality_gate_timeout_seconds,
+            )
         )
         summary = build_summary(
             artifact_root,
