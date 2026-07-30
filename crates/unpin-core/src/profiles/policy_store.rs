@@ -160,6 +160,16 @@ impl PolicyStore {
         }
     }
 
+    pub(crate) fn remove_if_revision(
+        &self,
+        target: &PolicyTarget,
+        expected: &StateRevision,
+    ) -> Result<(), PolicyStoreError> {
+        self.store(target)?
+            .remove_if_revision(expected)
+            .map_err(Into::into)
+    }
+
     pub fn load_resolution_policies(
         &self,
         repository_key: &str,
