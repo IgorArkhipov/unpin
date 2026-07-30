@@ -6,9 +6,10 @@ workflows.
 
 ## Distribution status and quick start
 
-Unpin `0.1.0-beta.4` adds reusable personal and repository inventory groups to
-the original beta foundation. Release artifacts are published only after
-required CI and provider evidence are complete. GitHub Releases then provides
+Unpin `0.1.0-beta.5` hardens reusable inventory-group execution and adds
+authenticated workspace-policy maintenance to the beta foundation. Release
+artifacts are published only after required CI and provider evidence are
+complete. GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
 GNU/Linux, together with CycloneDX SBOM attestations, SHA-256 checksums, and
 approved provider-matrix evidence. The binaries are not Apple-notarized or
@@ -19,7 +20,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.1.0-beta.4-TARGET.tar.gz \
+gh attestation verify unpin-v0.1.0-beta.5-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -27,7 +28,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.1.0-beta.4-TARGET
+cd unpin-v0.1.0-beta.5-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"
@@ -262,6 +263,16 @@ provider item identities.
 Native provider behavior remains default. Profiles are immutable allowlists resolved by replacement: session, workspace/worktree, repository, global, then native default. Provider-specific policy wins before generic policy at each scope. Global provider capability locks are applied after that selection: `hard-enabled` restores a capability omitted by a narrower profile, while `hard-disabled` removes it. Active sessions pin profile, lock, and exposure revisions, so another process, worktree, branch change, or later policy edit cannot mutate their capability set.
 
 Inspect locks with `unpin profile locks --provider codex --json`. Change one with a plan-first `unpin profile lock --provider codex --capability <id> --state hard-enabled|hard-disabled|clear --json`, then re-run with the emitted fingerprint plus `--apply --confirm`. Lock status includes repository/worktree identity, the effective gateway source, conservative enforcement quality, and `next-session-only` activation; native mode is never reported as strict when the provider cannot prove it.
+
+Workspace policy is machine-private. Inspect its authenticated binding with
+`unpin profile policy status --json`. Migrate the fixed local source
+`.unpin/policy.json` with `unpin profile policy migrate --json`, review the
+plan, then repeat it with `--apply --confirm --plan-fingerprint <fingerprint>`.
+Moved, deleted, or recreated worktrees are never silently rebound: status
+reports the classification and offers explicit `reattach`, `discard`, or
+`cleanup` plans. `restore` accepts only an authenticated policy backup ID.
+MCP can inspect this status and return the exact CLI handoff, but cannot mutate
+policy-maintenance state.
 
 Gateway lifecycle separates installation, routing, and detachment:
 

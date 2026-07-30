@@ -7,6 +7,28 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.5] - 2026-07-29
+
+### Added
+
+- Authenticated workspace-policy migration, orphan classification, reattach,
+  discard, cleanup, and restore workflows through the CLI and TUI.
+- A read-only MCP policy-maintenance status tool with exact CLI handoffs.
+
+### Fixed
+
+- Inventory-group best-effort apply now preserves blocked members and continues
+  independent cohorts after another cohort cannot be prepared or applied.
+
+### Security
+
+- Persistent profile and capability-lock changes now create authenticated
+  pre-change policy backups and preserve recovery-required outcomes when the
+  maintenance evidence cannot be completed.
+- Workspace-policy maintenance binds reviewed plans, physical checkout
+  evidence, current policy revisions, authenticated records, and restore
+  backups before mutation.
+
 ## [0.1.0-beta.4] - 2026-07-27
 
 ### Added
@@ -60,6 +82,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.4...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.5...HEAD
+[0.1.0-beta.5]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.3
