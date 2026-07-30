@@ -464,13 +464,9 @@ impl GroupController {
 
         let lifecycle = roll_up(&member_results);
         let provider_reach_lifecycle = if member_results.iter().any(|member| {
-            matches!(
-                member.status,
-                GroupApplyMemberStatus::Failed
-                    | GroupApplyMemberStatus::Blocked
-                    | GroupApplyMemberStatus::Missing
-            ) || member.failure_mode
-                == Some(crate::groups::GroupMemberFailureMode::RecoveryRequired)
+            member.status == GroupApplyMemberStatus::Failed
+                || member.failure_mode
+                    == Some(crate::groups::GroupMemberFailureMode::RecoveryRequired)
         }) {
             ProviderReachLifecycle::RecoveryRequired
         } else {
@@ -944,9 +940,16 @@ impl GroupController {
         context: &CohortApplyContext<'_, '_>,
         member_results: &mut [GroupApplyMemberResult],
     ) -> Result<PreparedCohort, String> {
+        self.verify_preserved_members(cohort, context.reviewed, context.discovery)?;
         let mut prepared = Vec::with_capacity(cohort.member_indices.len());
         for member_index in &cohort.member_indices {
             let planned = &context.reviewed.members[*member_index];
+            if planned.outcome == GroupMemberPlanOutcome::Blocked {
+                continue;
+            }
+            if planned.outcome != GroupMemberPlanOutcome::Changed {
+                return Err("execution cohort contains a non-actionable member".to_string());
+            }
             let native_plan = match self.fresh_native_plan(
                 &planned.identity,
                 &FreshNativePlanContext {
@@ -1075,6 +1078,87 @@ impl GroupController {
                 }
             }
         }
+        if provider_write_succeeded {
+            let post_discovery =
+                match discover_all(self.planner.resolver().context().discovery_roots()) {
+                    Ok(discovery) => discovery,
+                    Err(error) => {
+                        mark_cohort_recovery_required(
+                            cohort,
+                            member_results,
+                            &format!("blocked-member preservation could not be observed: {error}"),
+                        );
+                        return;
+                    }
+                };
+            let post_index = index_discovery(&post_discovery);
+            if let Err(reason) =
+                self.verify_preserved_members(cohort, context.reviewed, &post_index)
+            {
+                mark_cohort_recovery_required(cohort, member_results, &reason);
+            }
+        }
+    }
+
+    fn verify_preserved_members(
+        &self,
+        cohort: &GroupExecutionCohort,
+        reviewed: &GroupTogglePlan,
+        discovery: &GroupDiscoveryIndex<'_>,
+    ) -> Result<(), String> {
+        let mut preserved_indices = BTreeSet::new();
+        for resource_id in &cohort.resource_ids {
+            let resource = reviewed
+                .resources
+                .iter()
+                .find(|resource| &resource.resource_id == resource_id)
+                .ok_or_else(|| "execution cohort references an unknown resource".to_string())?;
+            for proof in &resource.preserved_members {
+                if !resource.member_indices.contains(&proof.member_index)
+                    || !cohort.member_indices.contains(&proof.member_index)
+                {
+                    return Err(
+                        "blocked-member preservation proof is outside its resource cohort"
+                            .to_string(),
+                    );
+                }
+                let planned = reviewed
+                    .members
+                    .get(proof.member_index)
+                    .ok_or_else(|| "blocked-member preservation index is invalid".to_string())?;
+                if planned.outcome != GroupMemberPlanOutcome::Blocked
+                    || !planned.affected_resources.contains(resource_id)
+                {
+                    return Err(
+                        "blocked-member preservation proof is not bound to the blocked member"
+                            .to_string(),
+                    );
+                }
+                let matches = discovery
+                    .get(&planned.identity)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let [item] = matches else {
+                    return Err(
+                        "blocked-member preservation could not resolve the exact member"
+                            .to_string(),
+                    );
+                };
+                if item.source_fingerprint.as_deref() != Some(&proof.source_fingerprint)
+                    || item.enabled != proof.current_enabled
+                {
+                    return Err("blocked-member preservation proof drifted".to_string());
+                }
+                preserved_indices.insert(proof.member_index);
+            }
+        }
+        if cohort.member_indices.iter().any(|member_index| {
+            reviewed.members[*member_index].outcome == GroupMemberPlanOutcome::Blocked
+                && !preserved_indices.contains(member_index)
+        }) {
+            return Err("execution cohort contains an unproved blocked member".to_string());
+        }
+        Ok(())
     }
 
     fn child_authorization(

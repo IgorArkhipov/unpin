@@ -17,7 +17,7 @@ use unpin_core::{
     },
     config::{UnpinConfig, UnpinConfigPaths},
     control_operation::{ReachAwareOperationFamily, ReachAwarePrincipal, ReachAwareRootBinding},
-    discovery::{DiscoveryRoots, discover_all},
+    discovery::{DiscoveryCategory, DiscoveryKind, DiscoveryLayer, DiscoveryRoots, discover_all},
     groups::{
         GroupAccessContext, GroupApprovalArtifactStore, GroupCohortBackupIndexV1, GroupController,
         GroupDefinitionV1, GroupMemberIdentity, GroupPlanDisposition, GroupPlanMode, GroupPlanner,
@@ -909,6 +909,365 @@ fn shared_resource_members_apply_in_one_cohort_with_one_backup() {
             .expect("non-member after restore")
             .enabled,
         non_member.enabled
+    );
+}
+
+#[test]
+fn best_effort_group_applies_actionable_cohort_with_missing_member() {
+    let harness = GroupHarness::new();
+    let missing = GroupMemberIdentity::new(
+        ProviderId::Codex,
+        DiscoveryKind::Skill,
+        DiscoveryCategory::Skill,
+        DiscoveryLayer::Global,
+        "codex:global:skill:missing-from-host",
+    )
+    .expect("missing member identity");
+    let personal = PersonalGroupStore::new(harness.context.clone());
+    let current = personal
+        .load("implementation")
+        .expect("load group")
+        .expect("implementation group");
+    let mut members = current.definition.members;
+    members.push(missing.clone());
+    personal
+        .replace(
+            &GroupDefinitionV1::new("implementation", members).expect("expanded definition"),
+            Some(&current.revision),
+            OwnerGeneration::new("group-control-test", 2).expect("definition owner"),
+        )
+        .expect("expand definition");
+
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
+    assert_eq!(
+        plan.lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Partial
+    );
+    plan.verify().expect("best-effort plan verifies");
+    let missing_plan = plan
+        .members
+        .iter()
+        .find(|member| member.identity == missing)
+        .expect("missing member plan");
+    assert_eq!(
+        missing_plan.outcome,
+        unpin_core::groups::GroupMemberPlanOutcome::Missing
+    );
+    assert_eq!(missing_plan.reason.as_deref(), Some("missing"));
+    assert!(missing_plan.affected_resources.is_empty());
+    assert!(plan.cohorts.iter().all(|cohort| {
+        !cohort
+            .member_indices
+            .iter()
+            .any(|index| plan.members[*index].identity == missing)
+    }));
+
+    let expectation = harness.expectation(&plan);
+    let result = harness
+        .controller
+        .apply(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-best-effort-missing",
+                NOW_UNIX,
+            ),
+        )
+        .expect("best-effort group apply");
+
+    assert_eq!(
+        result.lifecycle,
+        unpin_core::groups::GroupOperationLifecycle::Partial
+    );
+    assert_eq!(
+        result.provider_reach_lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Partial
+    );
+    assert_eq!(result.final_state, unpin_core::groups::GroupState::Mixed);
+    let missing_result = result
+        .members
+        .iter()
+        .find(|member| member.identity == missing)
+        .expect("missing member result");
+    assert_eq!(
+        missing_result.status,
+        unpin_core::groups::GroupApplyMemberStatus::Missing
+    );
+    assert_eq!(missing_result.reason.as_deref(), Some("missing"));
+    assert!(missing_result.cohort_id.is_none());
+    assert!(missing_result.backup_id.is_none());
+    assert_eq!(
+        result
+            .members
+            .iter()
+            .filter(|member| {
+                member.status == unpin_core::groups::GroupApplyMemberStatus::Changed
+            })
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn shared_resource_protected_member_stays_unchanged_while_safe_cohort_applies() {
+    let harness = GroupHarness::new();
+    let config = fs::read_to_string(&harness.config_path).expect("Codex config");
+    fs::write(
+        &harness.config_path,
+        format!("{config}\n[mcp_servers.unpin]\ncommand = \"unpin\"\n"),
+    )
+    .expect("protected MCP fixture");
+    let discovery =
+        discover_all(harness.context.discovery_roots()).expect("expanded group discovery");
+    let protected_item = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:configured-mcp:unpin")
+        .cloned()
+        .expect("protected MCP fixture");
+    let protected = GroupMemberIdentity::try_from(&protected_item).expect("protected MCP identity");
+    let personal = PersonalGroupStore::new(harness.context.clone());
+    let current = personal
+        .load("implementation")
+        .expect("load group")
+        .expect("implementation group");
+    let mut members = current.definition.members;
+    members.push(protected.clone());
+    personal
+        .replace(
+            &GroupDefinitionV1::new("implementation", members).expect("expanded definition"),
+            Some(&current.revision),
+            OwnerGeneration::new("group-control-test", 2).expect("definition owner"),
+        )
+        .expect("expand definition");
+
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
+    assert_eq!(
+        plan.lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Partial
+    );
+    let protected_index = plan
+        .members
+        .iter()
+        .position(|member| member.identity == protected)
+        .expect("protected member index");
+    let protected_plan = &plan.members[protected_index];
+    assert_eq!(
+        protected_plan.outcome,
+        unpin_core::groups::GroupMemberPlanOutcome::Blocked
+    );
+    assert_eq!(
+        protected_plan.reason.as_deref(),
+        Some(unpin_core::mutation::CONTROL_PLANE_PROTECTED_REASON)
+    );
+    assert_eq!(protected_plan.affected_resources.len(), 1);
+    assert_eq!(plan.cohorts.len(), 1);
+    assert_eq!(plan.cohorts[0].member_indices.len(), 3);
+    assert!(plan.cohorts[0].member_indices.contains(&protected_index));
+    let protected_resource = plan
+        .resources
+        .iter()
+        .find(|resource| resource.member_indices.contains(&protected_index))
+        .expect("protected member resource association");
+    assert_eq!(
+        protected_plan.affected_resources,
+        vec![protected_resource.resource_id.clone()]
+    );
+    let preservation = protected_resource
+        .preserved_members
+        .iter()
+        .find(|proof| proof.member_index == protected_index)
+        .expect("blocked-member preservation proof");
+    assert_eq!(
+        preservation.source_fingerprint,
+        protected_item
+            .source_fingerprint
+            .clone()
+            .expect("protected MCP source fingerprint")
+    );
+    assert_eq!(preservation.current_enabled, protected_item.enabled);
+
+    let expectation = harness.expectation(&plan);
+    let result = harness
+        .controller
+        .apply(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-best-effort-protected-shared-resource",
+                NOW_UNIX,
+            ),
+        )
+        .expect("best-effort shared-resource apply");
+
+    assert_eq!(
+        result.lifecycle,
+        unpin_core::groups::GroupOperationLifecycle::Partial
+    );
+    assert_eq!(
+        result.provider_reach_lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Partial
+    );
+    assert_eq!(result.final_state, unpin_core::groups::GroupState::Mixed);
+    let protected_result = result
+        .members
+        .iter()
+        .find(|member| member.identity == protected)
+        .expect("protected member result");
+    assert_eq!(
+        protected_result.status,
+        unpin_core::groups::GroupApplyMemberStatus::Blocked
+    );
+    assert_eq!(
+        protected_result.reason.as_deref(),
+        Some(unpin_core::mutation::CONTROL_PLANE_PROTECTED_REASON)
+    );
+    assert_eq!(
+        protected_result.cohort_id.as_deref(),
+        Some(plan.cohorts[0].cohort_id.as_str())
+    );
+
+    let after = discover_all(harness.context.discovery_roots()).expect("post-apply discovery");
+    assert!(
+        after
+            .items
+            .iter()
+            .find(|item| item.id == protected.id)
+            .expect("protected MCP after apply")
+            .enabled,
+        "the composed Codex config update must preserve the blocked MCP"
+    );
+    for member in plan
+        .members
+        .iter()
+        .filter(|member| member.outcome == unpin_core::groups::GroupMemberPlanOutcome::Changed)
+    {
+        assert!(
+            !after
+                .items
+                .iter()
+                .find(|item| {
+                    GroupMemberIdentity::try_from(*item)
+                        .is_ok_and(|identity| identity == member.identity)
+                })
+                .expect("safe member after apply")
+                .enabled
+        );
+    }
+}
+
+#[test]
+fn unsafe_shared_resource_blocks_only_its_cohort() {
+    let harness = GroupHarness::new();
+    let config = fs::read_to_string(&harness.config_path).expect("Codex config");
+    fs::write(
+        &harness.config_path,
+        format!(
+            "{config}\n[[skills.config]]\npath = {:?}\nenabled = true\n",
+            harness.first_skill_path.to_string_lossy()
+        ),
+    )
+    .expect("ambiguous Codex skill fixture");
+    let discovery =
+        discover_all(harness.context.discovery_roots()).expect("expanded group discovery");
+    let cursor = discovery
+        .items
+        .iter()
+        .find(|item| item.id == "cursor:global:configured-mcp:modern-global")
+        .map(GroupMemberIdentity::try_from)
+        .transpose()
+        .expect("Cursor MCP identity")
+        .expect("Cursor MCP fixture");
+    let personal = PersonalGroupStore::new(harness.context.clone());
+    let current = personal
+        .load("implementation")
+        .expect("load group")
+        .expect("implementation group");
+    let mut members = current.definition.members;
+    members.push(cursor.clone());
+    personal
+        .replace(
+            &GroupDefinitionV1::new("implementation", members).expect("expanded definition"),
+            Some(&current.revision),
+            OwnerGeneration::new("group-control-test", 2).expect("definition owner"),
+        )
+        .expect("expand definition");
+
+    let codex_before = fs::read_to_string(&harness.config_path).expect("Codex config before plan");
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
+    assert_eq!(
+        plan.lifecycle,
+        unpin_core::provider_reach::ProviderReachLifecycle::Partial
+    );
+    let ambiguous = plan
+        .members
+        .iter()
+        .find(|member| member.identity.id.contains("example-codex-admin-skill"))
+        .expect("ambiguous Codex member");
+    assert_eq!(
+        ambiguous.outcome,
+        unpin_core::groups::GroupMemberPlanOutcome::Blocked
+    );
+    assert_eq!(ambiguous.reason.as_deref(), Some("native-plan-blocked"));
+    let shared = plan
+        .members
+        .iter()
+        .find(|member| member.identity.id.contains("example-group-control-second"))
+        .expect("same-resource Codex member");
+    assert_eq!(
+        shared.outcome,
+        unpin_core::groups::GroupMemberPlanOutcome::Blocked
+    );
+    assert_eq!(shared.reason.as_deref(), Some("native-plan-blocked"));
+    let cursor_index = plan
+        .members
+        .iter()
+        .position(|member| member.identity == cursor)
+        .expect("Cursor member index");
+    assert_eq!(
+        plan.members[cursor_index].outcome,
+        unpin_core::groups::GroupMemberPlanOutcome::Changed
+    );
+    assert_eq!(plan.cohorts.len(), 1);
+    assert_eq!(plan.cohorts[0].member_indices, vec![cursor_index]);
+
+    let expectation = harness.expectation(&plan);
+    let result = harness
+        .controller
+        .apply(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-unsafe-shared-resource",
+                NOW_UNIX,
+            ),
+        )
+        .expect("disconnected safe cohort apply");
+
+    assert_eq!(
+        result.lifecycle,
+        unpin_core::groups::GroupOperationLifecycle::Partial
+    );
+    assert_eq!(result.final_state, unpin_core::groups::GroupState::Mixed);
+    assert_eq!(
+        fs::read_to_string(&harness.config_path).expect("Codex config after apply"),
+        codex_before,
+        "unsafe shared-resource cohort must remain untouched"
+    );
+    assert_eq!(
+        result
+            .members
+            .iter()
+            .find(|member| member.identity == cursor)
+            .expect("Cursor result")
+            .status,
+        unpin_core::groups::GroupApplyMemberStatus::Changed
     );
 }
 
