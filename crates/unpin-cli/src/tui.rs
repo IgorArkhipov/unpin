@@ -528,7 +528,7 @@ impl TuiState {
                 ),
                 Err(error) => (None, Some(error)),
             };
-        let (profile_workflow, gateway_workflow, session_workflow, hook_workflow, operations) =
+        let (mut profile_workflow, gateway_workflow, session_workflow, hook_workflow, operations) =
             match control_status.as_ref() {
                 Some(control) => (
                     profiles::ProfileWorkflow::new_with_policy(
@@ -561,6 +561,11 @@ impl TuiState {
                     Vec::new(),
                 ),
             };
+        profile_workflow.refresh_policy_maintenance(
+            &app_state_root,
+            &project_root,
+            backup_authentication_key.as_ref(),
+        );
         let restore_workflow = RestoreWorkflow::new(backups.clone(), operations);
         Self {
             items: discovery.items,
@@ -851,17 +856,24 @@ impl TuiState {
         };
         let result = match self.view {
             TuiView::Groups => unreachable!("groups handled above"),
-            TuiView::Profiles => match self.session_authority_key.as_ref() {
-                Some(authority) => self.profile_workflow.apply(
+            TuiView::Profiles => match (
+                self.session_authority_key.as_ref(),
+                self.backup_authentication_key.as_ref(),
+            ) {
+                (Some(authority), Some(backup)) => self.profile_workflow.apply(
                     &self.app_state_root,
                     &self.project_root,
                     &context,
                     authority,
+                    backup,
                     self.fixture_mode,
                 ),
-                None => {
+                (None, _) => {
                     Err("session authority key missing; run `unpin auth session init`".to_string())
                 }
+                (_, None) => Err(
+                    "backup authentication key missing; run `unpin auth backup init`".to_string(),
+                ),
             },
             TuiView::Gateways => match (
                 self.session_authority_key.as_ref(),
@@ -1356,6 +1368,11 @@ impl TuiState {
             control.profiles.clone(),
             &control.policies,
             discovery,
+        );
+        self.profile_workflow.refresh_policy_maintenance(
+            &self.app_state_root,
+            &self.project_root,
+            self.backup_authentication_key.as_ref(),
         );
         self.gateway_workflow = gateway::GatewayWorkflow::new(
             &control.repository_key,

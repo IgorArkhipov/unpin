@@ -884,6 +884,23 @@ fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_writing() {
 }
 
 #[test]
+fn policy_maintenance_status_is_read_only_and_returns_cli_handoff() {
+    let context = context();
+    let descriptor = tool_descriptor(&context, "unpin_get_policy_maintenance_status");
+    assert_eq!(descriptor["annotations"]["readOnlyHint"], true);
+
+    let status = call_tool(&context, "unpin_get_policy_maintenance_status", json!({}));
+    assert_eq!(status["status"], "unmanaged");
+    assert_eq!(status["humanAction"]["code"], "review-policy-migration");
+    assert!(
+        status["humanAction"]["guidance"]
+            .as_str()
+            .expect("CLI guidance")
+            .contains("unpin profile policy migrate")
+    );
+}
+
+#[test]
 fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_time_approval() {
     let temp = TempDir::new().expect("temporary group MCP root");
     let root = fs::canonicalize(temp.path()).expect("canonical group MCP root");
