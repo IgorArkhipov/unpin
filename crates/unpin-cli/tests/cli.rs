@@ -5919,3 +5919,82 @@ fn mcp_once_plans_cursor_local_plugin_toggle_through_guarded_vault() {
     );
     assert!(!app_state.path().join("vault").exists());
 }
+
+#[test]
+fn profile_policy_cli_plans_applies_and_reports_authenticated_migration() {
+    let temp = TempDir::new().expect("tempdir");
+    let fixture_root = fs::canonicalize(temp.path()).expect("canonical fixture root");
+    let project_root = fixture_root.join("project");
+    let app_state_root = fixture_root.join("state");
+    fs::create_dir_all(project_root.join(".unpin")).expect("workspace policy directory");
+    let git = Command::new("git")
+        .args(["init", "--quiet", "--initial-branch=main"])
+        .current_dir(&project_root)
+        .output()
+        .expect("git init");
+    assert!(git.status.success());
+    fs::write(
+        project_root.join(".unpin").join("policy.json"),
+        serde_json::to_vec_pretty(&unpin_core::profiles::ScopePolicy::default())
+            .expect("serialize workspace policy"),
+    )
+    .expect("write workspace policy");
+    let configure = |command: &mut assert_cmd::Command| {
+        command
+            .arg("--fixture-root")
+            .arg(&fixture_root)
+            .arg("--project-root")
+            .arg(&project_root)
+            .arg("--app-state-root")
+            .arg(&app_state_root)
+            .arg("--json");
+    };
+
+    let mut planned = Command::cargo_bin("unpin").expect("unpin binary");
+    planned.args(["profile", "policy", "migrate"]);
+    configure(&mut planned);
+    let planned = planned.output().expect("migration plan output");
+    assert!(
+        planned.status.success(),
+        "{}",
+        String::from_utf8_lossy(&planned.stderr)
+    );
+    let planned: serde_json::Value =
+        serde_json::from_slice(&planned.stdout).expect("migration plan JSON");
+    assert_eq!(planned["status"], "planned");
+    let fingerprint = planned["plan"]["planFingerprint"]
+        .as_str()
+        .expect("plan fingerprint");
+
+    let mut applied = Command::cargo_bin("unpin").expect("unpin binary");
+    applied.args(["profile", "policy", "migrate"]);
+    configure(&mut applied);
+    applied
+        .args(["--apply", "--confirm", "--plan-fingerprint"])
+        .arg(fingerprint);
+    let applied = applied.output().expect("migration apply output");
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: serde_json::Value =
+        serde_json::from_slice(&applied.stdout).expect("migration apply JSON");
+    assert_eq!(applied["status"], "applied");
+    assert!(applied["outcome"]["backupId"].as_str().is_some());
+
+    let mut status = Command::cargo_bin("unpin").expect("unpin binary");
+    status.args(["profile", "policy", "status", "--candidate-current"]);
+    configure(&mut status);
+    let status = status.output().expect("policy status output");
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("policy status JSON");
+    assert_eq!(status["status"], "managed");
+    assert_eq!(status["maintenance"]["classification"], "attached");
+    assert_eq!(status["maintenance"]["lifecycle"]["state"], "active");
+}

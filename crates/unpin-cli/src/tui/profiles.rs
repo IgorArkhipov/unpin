@@ -9,14 +9,16 @@ use unpin_core::{
         ReachAwarePrincipal, ReachAwareRootBinding,
     },
     discovery::DiscoveryOutput,
+    mutation::BackupAuthenticationKey,
     profiles::{
         CapabilityLockEnforcement, CapabilityLockSnapshot, CompiledProfileRevision,
-        GatewaySelection, PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyTarget, ProfileDefinitionEntry,
+        GatewaySelection, PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyMaintenanceApproval,
+        PolicyMaintenanceController, PolicyTarget, ProfileDefinitionEntry,
         ProfileProviderOperationController, ProfileProviderOperationError,
         ProfileProviderOperationPlan, ProfileProviderOperationStatus,
-        ProfileProviderReachAwareApplyContext, ProfileStore, ResolutionPolicies,
-        capability_lock_enforcement, compile_profile, profile_reach_scope_digest,
-        resolve_effective_gateway,
+        ProfileProviderReachAwareApplyContext, ProfileStore, ProtectedPolicyChangeError,
+        ResolutionPolicies, capability_lock_enforcement, compile_profile,
+        profile_reach_scope_digest, resolve_effective_gateway,
     },
     provider_reach::{ConnectionBoundary, ProviderReach, SelectedProviderProvenance},
     providers::ProviderId,
@@ -123,6 +125,7 @@ pub(super) struct ProfileWorkflow {
     last_error: Option<String>,
     capability_locks: Vec<CapabilityLockEnforcement>,
     capability_lock_digests: Vec<(ProviderId, String)>,
+    policy_maintenance_summary: String,
 }
 
 impl ProfileWorkflow {
@@ -145,6 +148,9 @@ impl ProfileWorkflow {
             last_error: None,
             capability_locks: Vec::new(),
             capability_lock_digests: Vec::new(),
+            policy_maintenance_summary:
+                "workspace policy maintenance: unavailable; action=`unpin profile policy status`"
+                    .to_string(),
         }
     }
 
@@ -331,7 +337,51 @@ impl ProfileWorkflow {
                 lock.enforcement
             ));
         }
+        details.push(self.policy_maintenance_summary.clone());
         details
+    }
+
+    pub(super) fn refresh_policy_maintenance(
+        &mut self,
+        app_state_root: &Path,
+        project_root: &Path,
+        backup_key: Option<&BackupAuthenticationKey>,
+    ) {
+        let Some(backup_key) = backup_key else {
+            self.policy_maintenance_summary =
+                "workspace policy maintenance: blocked; action=`unpin auth backup init`"
+                    .to_string();
+            return;
+        };
+        let target = match PolicyTarget::workspace(&self.repository_key, &self.workspace_key) {
+            Ok(target) => target,
+            Err(error) => {
+                self.policy_maintenance_summary =
+                    format!("workspace policy maintenance: invalid target ({error})");
+                return;
+            }
+        };
+        let controller =
+            PolicyMaintenanceController::new(app_state_root, project_root, backup_key.clone());
+        self.policy_maintenance_summary = match controller.status(&target, Some(project_root)) {
+            Ok(Some(status)) => format!(
+                "workspace policy maintenance: {:?}/{:?}; actions={}",
+                status.classification,
+                status.lifecycle,
+                if status.allowed_actions.is_empty() {
+                    "none".to_string()
+                } else {
+                    status.allowed_actions.join(",")
+                }
+            ),
+            Ok(None) => {
+                "workspace policy maintenance: unmanaged; action=`unpin profile policy migrate`"
+                    .to_string()
+            }
+            Err(error) => format!(
+                "workspace policy maintenance: blocked ({error}); action=`unpin profile policy status --json`"
+            ),
+        };
     }
 
     pub(super) fn plan(
@@ -420,6 +470,7 @@ impl ProfileWorkflow {
         project_root: &Path,
         context: &ControlApprovalContext,
         authority_key: &SessionAuthorityKey,
+        backup_key: &BackupAuthenticationKey,
         fixture_mode: bool,
     ) -> Result<&ControlOperationEnvelope, String> {
         if self.phase != WorkflowPhase::Confirmed {
@@ -471,16 +522,39 @@ impl ProfileWorkflow {
                     .map_err(|error| error.to_string())?,
             )
             .map_err(|error| error.to_string())?;
-        let result = match ProfileProviderOperationController::new(app_state_root)
-            .with_session_authority_key(authority_key.clone())
-            .apply_with_reach_aware(
-                &reviewed.plan,
-                authorization,
-                durable,
-                "unpin-tui-profile-provider",
-            ) {
-            Ok(result) => result,
-            Err(error) => {
+        let maintenance =
+            PolicyMaintenanceController::new(app_state_root, project_root, backup_key.clone());
+        let maintenance_approval = PolicyMaintenanceApproval {
+            confirmed: true,
+            plan_fingerprint: reviewed.plan.plan_fingerprint.clone(),
+            actor_id: "unpin-tui-profile-maintenance".to_string(),
+            reviewed_at_unix: u64::try_from(now_unix).unwrap_or_default(),
+            decision_digest: reviewed.plan.plan_fingerprint.clone(),
+        };
+        let protected = maintenance.protect_policy_change(
+            &reviewed.plan.target,
+            &reviewed.plan.operation_id,
+            &reviewed.plan.plan_fingerprint,
+            &maintenance_approval,
+            OwnerGeneration::new(
+                format!("unpin-tui-profile-backup-{}", reviewed.plan.operation_id),
+                1,
+            )
+            .map_err(|error| error.to_string())?,
+            || {
+                ProfileProviderOperationController::new(app_state_root)
+                    .with_session_authority_key(authority_key.clone())
+                    .apply_with_reach_aware(
+                        &reviewed.plan,
+                        authorization,
+                        durable,
+                        "unpin-tui-profile-provider",
+                    )
+            },
+        );
+        let protected = match protected {
+            Ok(protected) => protected,
+            Err(ProtectedPolicyChangeError::Apply(error)) => {
                 if matches!(
                     &error,
                     ProfileProviderOperationError::RecoveryRequired { .. }
@@ -489,7 +563,12 @@ impl ProfileWorkflow {
                 }
                 return Err(error.to_string());
             }
+            Err(ProtectedPolicyChangeError::Maintenance(error)) => {
+                self.phase = WorkflowPhase::RecoveryRequired;
+                return Err(error.to_string());
+            }
         };
+        let result = protected.result;
         let (phase, lifecycle) = match result.status {
             ProfileProviderOperationStatus::Applied => {
                 (WorkflowPhase::Applied, ControlOperationLifecycle::Applied)
@@ -565,6 +644,10 @@ mod tests {
         SessionAuthorityKey::new([0x53; 32])
     }
 
+    fn backup_key() -> BackupAuthenticationKey {
+        BackupAuthenticationKey::new([0x42; 32])
+    }
+
     #[test]
     fn profile_details_report_global_lock_revision_source_enforcement_and_action() {
         let capability_id = CapabilityId::new("skill.review").unwrap();
@@ -596,6 +679,24 @@ mod tests {
         assert!(details.contains("source=global"));
         assert!(details.contains("enforcement=Unsupported"));
         assert!(details.contains("action=`unpin profile lock`"));
+    }
+
+    #[test]
+    fn profile_details_surface_workspace_policy_maintenance_handoff() {
+        let temp = tempfile::TempDir::new().expect("tempdir");
+        let root = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let app_state = root.join("state");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("project");
+        let mut workflow = ProfileWorkflow::new("repo", "worktree", Vec::new());
+        workflow.refresh_policy_maintenance(
+            &app_state,
+            &project,
+            Some(&BackupAuthenticationKey::new([0x42; 32])),
+        );
+        let details = workflow.details().join("\n");
+        assert!(details.contains("workspace policy maintenance: unmanaged"));
+        assert!(details.contains("unpin profile policy migrate"));
     }
 
     fn workflow_with_source(source_scope: ProfileSourceScope) -> ProfileWorkflow {
@@ -654,7 +755,14 @@ mod tests {
         assert!(workflow.confirm());
         assert_eq!(workflow.phase(), WorkflowPhase::Confirmed);
         let result = workflow
-            .apply(&root, &root, &context, &authority_key(), true)
+            .apply(
+                &root,
+                &root,
+                &context,
+                &authority_key(),
+                &backup_key(),
+                true,
+            )
             .expect("fixture profile apply");
         assert_eq!(result.lifecycle, ControlOperationLifecycle::Applied);
         assert_eq!(workflow.phase(), WorkflowPhase::Applied);
@@ -761,7 +869,14 @@ mod tests {
         assert_eq!(planned.provider_coverage, vec![provider]);
         assert!(workflow.confirm());
         let applied = workflow
-            .apply(&root, &root, &context, &authority_key(), true)
+            .apply(
+                &root,
+                &root,
+                &context,
+                &authority_key(),
+                &backup_key(),
+                true,
+            )
             .unwrap();
         assert_eq!(applied.lifecycle, ControlOperationLifecycle::Applied);
 

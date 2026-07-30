@@ -40,8 +40,9 @@ use crate::mutation::{
 };
 use crate::profiles::{
     CapabilityLockChange, CapabilityLockSnapshot, CapabilityLockState, CompiledProfileRevision,
-    GatewaySelection, PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyChange, PolicyStore, PolicyTarget,
-    ProfileDefinition, ProfilePolicyController, ProfileProviderOperationController,
+    GatewaySelection, PROFILE_PROVIDER_APPROVAL_AUDIENCE, PolicyChange,
+    PolicyMaintenanceController, PolicyStore, PolicyTarget, ProfileDefinition,
+    ProfilePolicyController, ProfileProviderOperationController,
     ProfileProviderReachAwareApplyContext, ProfileReference, ProfileSelection, ProfileSourceScope,
     ProfileStore, capability_lock_enforcement, compile_profile, profile_reach_scope_digest,
     propose_profile, resolve_effective_gateway,
@@ -79,6 +80,7 @@ pub const UNPIN_MCP_TOOL_NAMES: &[&str] = &[
     "unpin_restore_backup",
     "unpin_run_doctor",
     "unpin_get_control_status",
+    "unpin_get_policy_maintenance_status",
     "unpin_list_catalog",
     "unpin_list_hooks",
     "unpin_plan_catalog_adoption",
@@ -717,6 +719,9 @@ fn handle_tool_call(context: &McpContext, request: &Value) -> Result<Value, Stri
         "unpin_list_backups" => structured_result(list_backups(context, &arguments)),
         "unpin_restore_backup" => structured_result(restore_backup_tool(context, &arguments)),
         "unpin_get_control_status" => structured_result(get_control_status(context, &arguments)?),
+        "unpin_get_policy_maintenance_status" => {
+            structured_result(get_policy_maintenance_status(context, &arguments)?)
+        }
         "unpin_list_catalog" => structured_result(list_catalog(context, &arguments)?),
         "unpin_list_hooks" => structured_result(list_hooks(context, &arguments)?),
         "unpin_plan_catalog_adoption" => {
@@ -1605,6 +1610,110 @@ fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> 
         "totalMatched": total_matched,
         "items": items,
         "warnings": discovery.warnings
+    }))
+}
+
+fn get_policy_maintenance_status(context: &McpContext, arguments: &Value) -> Result<Value, String> {
+    require_only_fields(
+        arguments,
+        &["repositoryKey", "workspaceKey", "candidateCurrent"],
+        "policy maintenance status arguments",
+    )?;
+    let repository_key = optional_string(arguments, "repositoryKey")?;
+    let workspace_key = optional_string(arguments, "workspaceKey")?;
+    let candidate_current = match arguments.get("candidateCurrent") {
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| "candidateCurrent must be a boolean".to_string())?,
+        None => false,
+    };
+    let target = match (repository_key, workspace_key) {
+        (Some(repository_key), Some(workspace_key)) => {
+            PolicyTarget::workspace(repository_key, workspace_key)
+                .map_err(|error| error.to_string())?
+        }
+        (None, None) => {
+            let identity = resolve_workspace_identity(&context.project_root)
+                .map_err(|error| error.to_string())?;
+            PolicyTarget::workspace(identity.repository_key, identity.workspace_key)
+                .map_err(|error| error.to_string())?
+        }
+        _ => {
+            return Err("repositoryKey and workspaceKey must be supplied together".to_string());
+        }
+    };
+    let Some(authentication_key) = context.backup_authentication_key.clone() else {
+        return Ok(json!({
+            "status": "blocked",
+            "reason": "backup-authentication-key-missing",
+            "target": target,
+            "humanAction": {
+                "code": "initialize-backup-authentication",
+                "guidance": "Run `unpin auth backup init`, restart the MCP session, then retry."
+            }
+        }));
+    };
+    let controller = PolicyMaintenanceController::new(
+        &context.app_state_root,
+        &context.project_root,
+        authentication_key,
+    );
+    let candidate = candidate_current.then_some(context.project_root.as_path());
+    let status = match controller.status(&target, candidate) {
+        Ok(status) => status,
+        Err(error) => {
+            return Ok(json!({
+                "status": "blocked",
+                "reason": "policy-maintenance-verification-failed",
+                "message": error.to_string(),
+                "target": target,
+                "humanAction": {
+                    "code": "inspect-policy-maintenance",
+                    "guidance": "Run `unpin profile policy status --json` with the recorded workspace keys. MCP policy mutation remains disabled."
+                }
+            }));
+        }
+    };
+    let Some(status) = status else {
+        return Ok(json!({
+            "status": "unmanaged",
+            "target": target,
+            "humanAction": {
+                "code": "review-policy-migration",
+                "guidance": "Run `unpin profile policy migrate --json`, review the plan, then apply it through the CLI with exact confirmation."
+            }
+        }));
+    };
+    let human_action = status.allowed_actions.first().map(|action| {
+        let PolicyTarget::Workspace {
+            repository_key,
+            workspace_key,
+        } = &status.target
+        else {
+            unreachable!("maintenance records are workspace-scoped");
+        };
+        let guidance = match action.as_str() {
+            "reattach" => format!(
+                "Run `unpin profile policy reattach --repository-key {repository_key} --workspace-key {workspace_key} --json`, review the plan, then apply it through the CLI."
+            ),
+            "discard" => format!(
+                "Run `unpin profile policy discard --repository-key {repository_key} --workspace-key {workspace_key} --json`, review the plan, then apply it through the CLI."
+            ),
+            "cleanup" => format!(
+                "Run `unpin profile policy cleanup --repository-key {repository_key} --workspace-key {workspace_key} --json`, review the plan, then apply it through the CLI."
+            ),
+            _ => "Inspect the authenticated policy status in the CLI.".to_string(),
+        };
+        json!({
+            "code": format!("review-policy-{action}"),
+            "guidance": guidance
+        })
+    });
+    Ok(json!({
+        "status": "managed",
+        "maintenance": status,
+        "humanAction": human_action,
+        "mutationsAvailable": false
     }))
 }
 
@@ -4828,6 +4937,7 @@ fn tool_title(name: &str) -> &'static str {
         "unpin_restore_backup" => "Request Unpin backup restore",
         "unpin_run_doctor" => "Run Unpin doctor",
         "unpin_get_control_status" => "Get Unpin control status",
+        "unpin_get_policy_maintenance_status" => "Get Unpin workspace policy maintenance status",
         "unpin_list_catalog" => "List Unpin catalog",
         "unpin_list_hooks" => "List Unpin hooks",
         "unpin_plan_catalog_adoption" => "Plan Unpin catalog adoption",
@@ -4892,6 +5002,9 @@ fn tool_description(name: &str) -> &'static str {
         "unpin_run_doctor" => "Return structured fixture and provider discovery health output.",
         "unpin_get_control_status" => {
             "Return redacted catalog, profiles, policies, gateway, sessions, and hook coverage state."
+        }
+        "unpin_get_policy_maintenance_status" => {
+            "Return authenticated workspace-policy binding and orphan classification with exact CLI handoffs; never mutate policy state."
         }
         "unpin_list_catalog" => {
             "List normalized catalog capabilities and provider contribution fan-out."
@@ -5125,6 +5238,19 @@ fn tool_input_schema(name: &str, provider_scope: McpProviderScope) -> Value {
             "type": "object",
             "properties": {
                 "operationId": non_empty_string_schema()
+            },
+            "additionalProperties": false
+        }),
+        "unpin_get_policy_maintenance_status" => json!({
+            "type": "object",
+            "properties": {
+                "repositoryKey": non_empty_string_schema(),
+                "workspaceKey": non_empty_string_schema(),
+                "candidateCurrent": { "type": "boolean" }
+            },
+            "dependentRequired": {
+                "repositoryKey": ["workspaceKey"],
+                "workspaceKey": ["repositoryKey"]
             },
             "additionalProperties": false
         }),
@@ -5438,6 +5564,7 @@ fn tool_annotations(name: &str) -> Value {
         | "unpin_restore_backup"
         | "unpin_run_doctor"
         | "unpin_get_control_status"
+        | "unpin_get_policy_maintenance_status"
         | "unpin_list_catalog"
         | "unpin_list_hooks"
         | "unpin_plan_catalog_adoption"
