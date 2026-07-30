@@ -353,6 +353,11 @@ isolated copies of committed fixtures, and restores every copy byte-for-byte:
 python3 scripts/run_local_provider_matrix.py
 ```
 
+Each quality gate has a 20-minute default timeout. For an unrestricted
+release-evidence run on a known-slow host, pass
+`--quality-gate-timeout-seconds 0`; this disables only the quality-gate timeout
+and preserves the runner's per-case safety limits.
+
 Runner prints a private evidence directory outside the checkout. The
 pre-release baseline run `2026-07-24-184505-local-matrix` was archived under the
 repository's ignored `tmp/2026-07-24-184505-local-matrix` directory. It was

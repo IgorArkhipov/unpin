@@ -8,6 +8,7 @@ import collections
 import contextlib
 import datetime as dt
 import hashlib
+import math
 import json
 import os
 import plistlib
@@ -400,6 +401,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--skip-live", action="store_true")
     parser.add_argument("--skip-quality-gates", action="store_true")
+    parser.add_argument(
+        "--quality-gate-timeout-seconds",
+        type=quality_gate_timeout_seconds,
+        default=1_200,
+        help=(
+            "Maximum seconds per quality gate (default: 1200). "
+            "Use 0 to wait without a timeout."
+        ),
+    )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
         "--finalize",
@@ -407,6 +417,20 @@ def parse_args() -> argparse.Namespace:
         help="Validate screenshots and write evidence-manifest.json for an existing run.",
     )
     return parser.parse_args()
+
+
+def quality_gate_timeout_seconds(value: str) -> float | None:
+    try:
+        seconds = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "quality-gate timeout must be a non-negative number"
+        ) from error
+    if not math.isfinite(seconds) or seconds < 0:
+        raise argparse.ArgumentTypeError(
+            "quality-gate timeout must be a finite non-negative number"
+        )
+    return None if seconds == 0 else seconds
 
 
 def default_cargo_path() -> Path:
@@ -464,7 +488,7 @@ def run_command(
     *,
     input_text: str | None = None,
     check: bool = True,
-    timeout_seconds: float = 600,
+    timeout_seconds: float | None = 600,
 ) -> subprocess.CompletedProcess[str]:
     rendered = [str(part) for part in command]
     environment = (

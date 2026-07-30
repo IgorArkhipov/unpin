@@ -1,3 +1,4 @@
+import argparse
 import json
 import math
 import os
@@ -16,6 +17,7 @@ from local_provider_matrix_support import (
     REPO_ROOT,
     MatrixCommandTimeout,
     MatrixFailure,
+    quality_gate_timeout_seconds,
     run_command,
 )
 from run_local_provider_matrix import (
@@ -422,6 +424,39 @@ class LiveInventoryFilterTests(unittest.TestCase):
                 call.kwargs["timeout_seconds"],
                 QUALITY_GATE_TIMEOUT_SECONDS,
             )
+
+    def test_quality_gate_timeout_can_be_disabled_for_explicit_release_runs(self) -> None:
+        completed = subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout="test result: ok. 1 passed\n",
+            stderr="",
+        )
+        with tempfile.TemporaryDirectory(prefix="unpin-local-matrix-test-") as root:
+            with mock.patch.object(
+                matrix_runner,
+                "run_command",
+                return_value=completed,
+            ) as run_command:
+                matrix_runner.run_quality_gates(
+                    Path("/test/cargo"),
+                    Path("/test/unpin"),
+                    Path(root),
+                    timeout_seconds=None,
+                )
+
+        for call in run_command.call_args_list:
+            self.assertIsNone(call.kwargs["timeout_seconds"])
+
+    def test_quality_gate_timeout_parser_accepts_zero_and_rejects_invalid_values(
+        self,
+    ) -> None:
+        self.assertIsNone(quality_gate_timeout_seconds("0"))
+        self.assertEqual(quality_gate_timeout_seconds("1.5"), 1.5)
+        for value in ("-1", "nan", "infinity", "not-a-number"):
+            with self.subTest(value=value):
+                with self.assertRaises(argparse.ArgumentTypeError):
+                    quality_gate_timeout_seconds(value)
 
     def test_quality_gate_timeout_writes_partial_failure_evidence(self) -> None:
         timeout = MatrixCommandTimeout(
