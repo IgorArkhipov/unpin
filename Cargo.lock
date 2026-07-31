@@ -828,11 +828,10 @@ dependencies = [
 
 [[package]]
 name = "event-listener"
-version = "5.4.1"
+version = "5.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e13b66accf52311f30a0db42147dadea9850cb48cd070028831ae5f5d4b856ab"
+checksum = "5a23add41df1562121a9393cb065eab5146a1242410f23a644851e90cfd669d2"
 dependencies = [
- "concurrent-queue",
  "parking",
  "pin-project-lite",
 ]
@@ -3053,7 +3052,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unpin-cli"
-version = "0.1.0-beta.6"
+version = "0.1.0-beta.7"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3076,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "unpin-core"
-version = "0.1.0-beta.6"
+version = "0.1.0-beta.7"
 dependencies = [
  "getrandom 0.4.3",
  "hmac 0.13.0",

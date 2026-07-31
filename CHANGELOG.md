@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.7] - 2026-07-31
+
+### Security
+
+- Updated the transitive `event-listener` dependency from 5.4.1 to 5.4.2 to
+  resolve RustSec advisory RUSTSEC-2026-0221.
+
 ## [0.1.0-beta.6] - 2026-07-31
 
 ### Fixed
@@ -101,7 +108,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.6...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.7...HEAD
+[0.1.0-beta.7]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.7
 [0.1.0-beta.6]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.4
