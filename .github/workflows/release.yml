@@ -23,7 +23,7 @@ jobs:
             target: aarch64-apple-darwin
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-          - runner: ubuntu-24.04
+          - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
     permissions:
@@ -62,6 +62,13 @@ jobs:
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli
+
+      - name: Verify GNU/Linux release artifact compatibility
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        shell: bash
+        run: >
+          scripts/verify_linux_release_artifact.sh
+          target/x86_64-unknown-linux-gnu/release/unpin
 
       - name: Install SBOM generator
         uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
@@ -134,6 +141,13 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          shasum -a 256 -- *.tar.gz *.cdx.json > SHA256SUMS
 
       - name: Create or refresh draft
         env:
