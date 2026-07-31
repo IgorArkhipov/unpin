@@ -116,8 +116,8 @@ def parse_version(
     cwd: Path,
     environment: dict[str, str],
 ) -> str:
-    output = run([command, "--version"], cwd=cwd, environment=environment).stdout
-    version = output.strip().splitlines()
+    process = run([command, "--version"], cwd=cwd, environment=environment)
+    version = f"{process.stdout}\n{process.stderr}".strip().splitlines()
     if not version:
         raise SystemExit(f"{command.name} did not report a version")
     return version[0]
