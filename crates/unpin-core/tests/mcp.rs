@@ -838,10 +838,14 @@ fn cursor_workspace_mcp_plan_preserves_sqlite_target_type() {
 }
 
 #[test]
-fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_writing() {
+fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_provider_write() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
     copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let pi_skill = fixture_copy
+        .path()
+        .join("pi/project/.pi/skills/example-pi-project-skill/SKILL.md");
+    let original_pi_skill = fs::read(&pi_skill).expect("original Pi skill");
     let mut context = context_with_roots(fixture_copy.path(), app_state.path());
     context.backup_authentication_key = None;
     context.authentication.backup_authentication = McpCredentialReadiness::missing();
@@ -880,6 +884,11 @@ fn mcp_without_backup_key_allows_plans_and_hands_off_apply_without_writing() {
         serde_json::Value::Object(apply_arguments),
     );
     assert_eq!(applied["status"], "human-action-required");
+    assert_eq!(
+        fs::read(&pi_skill).expect("Pi skill after handoff"),
+        original_pi_skill
+    );
+    assert!(app_state.path().join("transactions").exists());
     assert!(!app_state.path().join("backups").exists());
 }
 
@@ -2873,7 +2882,7 @@ fn profile_provider_mcp_schema_and_reach_authority_are_bound() {
         required_input_fields(&plan),
         vec!["profileId", "mode", "providerReach"]
     );
-    assert_eq!(plan["annotations"]["readOnlyHint"], true);
+    assert_eq!(plan["annotations"]["readOnlyHint"], false);
     assert_eq!(
         tool_descriptor(&context, "unpin_apply_profile_provider")["inputSchema"]["required"],
         json!([
@@ -3184,7 +3193,7 @@ fn descriptors_constrain_known_input_values() {
 }
 
 #[test]
-fn descriptors_include_safety_annotations() {
+fn descriptors_distinguish_read_only_and_stateful_handoff_tools() {
     let context = context();
 
     for name in [
@@ -3192,8 +3201,6 @@ fn descriptors_include_safety_annotations() {
         "unpin_list_items",
         "unpin_plan_toggle_item",
         "unpin_plan_toggle_items",
-        "unpin_apply_toggle_item",
-        "unpin_apply_toggle_items",
         "unpin_list_backups",
         "unpin_restore_backup",
         "unpin_run_doctor",
@@ -3204,6 +3211,30 @@ fn descriptors_include_safety_annotations() {
             json!({ "readOnlyHint": true }),
             "{name} should be annotated as read-only"
         );
+    }
+
+    for name in [
+        "unpin_apply_toggle_item",
+        "unpin_apply_toggle_items",
+        "unpin_plan_profile_provider",
+    ] {
+        let descriptor = tool_descriptor(&context, name);
+        assert_eq!(
+            descriptor["annotations"],
+            json!({
+                "readOnlyHint": false,
+                "destructiveHint": false,
+            }),
+            "{name} should disclose its non-destructive Unpin app-state write"
+        );
+        let description = descriptor["description"]
+            .as_str()
+            .expect("tool description should be a string");
+        assert!(
+            description
+                .contains("transaction/payload metadata and coordination locks in Unpin app state")
+        );
+        assert!(description.contains("without mutating provider configuration"));
     }
 }
 

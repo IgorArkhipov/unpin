@@ -5016,13 +5016,13 @@ fn tool_description(name: &str) -> &'static str {
             "Plan a reversible toggle for one selected provider item without writing."
         }
         "unpin_apply_toggle_item" => {
-            "Validate one exact toggle plan and return a human-action handoff without writing."
+            "Validate one exact toggle plan, persist transaction/payload metadata and coordination locks in Unpin app state, and return a human-action handoff without mutating provider configuration."
         }
         "unpin_plan_toggle_items" => {
             "Plan a bulk selector toggle and return a stable review fingerprint."
         }
         "unpin_apply_toggle_items" => {
-            "Validate a reviewed bulk toggle plan and return a human-action handoff without writing."
+            "Validate a reviewed bulk toggle plan, persist transaction/payload metadata and coordination locks in Unpin app state, and return a human-action handoff without mutating provider configuration."
         }
         "unpin_list_backups" => "List recent Unpin mutation backups from local app state.",
         "unpin_restore_backup" => {
@@ -5066,7 +5066,7 @@ fn tool_description(name: &str) -> &'static str {
             "Validate an exact profile policy fingerprint and return a CLI human-approval handoff without writing."
         }
         "unpin_plan_profile_provider" => {
-            "Plan a named compiled profile for the explicitly reviewed provider reach without writing."
+            "Plan a named compiled profile for the explicitly reviewed provider reach, persist transaction/payload metadata and coordination locks in Unpin app state, and return it without mutating provider configuration."
         }
         "unpin_apply_profile_provider" => {
             "Validate an exact provider-profile reach fingerprint and return a schema-v2 CLI human-approval handoff without writing."
@@ -5580,6 +5580,12 @@ fn tool_annotations(name: &str) -> Value {
             "destructiveHint": true,
             "idempotentHint": false
         }),
+        "unpin_apply_toggle_item" | "unpin_apply_toggle_items" | "unpin_plan_profile_provider" => {
+            json!({
+                "readOnlyHint": false,
+                "destructiveHint": false
+            })
+        }
         "unpin_get_inventory_summary"
         | "unpin_list_items"
         | "unpin_list_inventory_groups"
@@ -5587,8 +5593,6 @@ fn tool_annotations(name: &str) -> Value {
         | "unpin_plan_inventory_group"
         | "unpin_plan_toggle_item"
         | "unpin_plan_toggle_items"
-        | "unpin_apply_toggle_item"
-        | "unpin_apply_toggle_items"
         | "unpin_list_backups"
         | "unpin_restore_backup"
         | "unpin_run_doctor"
@@ -5604,7 +5608,6 @@ fn tool_annotations(name: &str) -> Value {
         | "unpin_validate_profile"
         | "unpin_plan_profile_policy"
         | "unpin_apply_profile_policy"
-        | "unpin_plan_profile_provider"
         | "unpin_apply_profile_provider"
         | "unpin_get_capability_locks"
         | "unpin_plan_capability_lock"

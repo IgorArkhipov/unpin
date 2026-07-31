@@ -155,10 +155,14 @@ and includes a prompt you can give an agent to configure and verify the
 connection automatically. The
 [MCP capability-control prompt library](docs/MCP-PROMPTS.md) covers project
 allowlists, inventory groups, profiles, capability locks, hooks, sessions, and
-restore. MCP normally inspects and prepares plans without writing. A persistent
-server started with `--enable-approved-group-apply` can additionally apply one
-exact inventory-group plan only after a human approves its challenge through
-the CLI or TUI; every other persistent MCP operation remains handoff-only.
+restore. Most MCP tools only inspect state and prepare plans. The three
+handoff-sealing tools `unpin_apply_toggle_item`, `unpin_apply_toggle_items`, and
+`unpin_plan_profile_provider` also persist transaction/payload metadata and
+coordination locks under Unpin app state, but do not mutate provider
+configuration. A persistent server started with `--enable-approved-group-apply`
+can additionally apply one exact inventory-group plan only after a human
+approves its challenge through the CLI or TUI; every other persistent MCP
+operation remains handoff-only.
 
 ## Command Surface
 
@@ -558,7 +562,7 @@ printf '%s\n' "$request" \
   | cargo run -p unpin-cli -- mcp --fixture-root crates/unpin-core/tests/fixtures --once
 ```
 
-MCP apply tools require exact reviewed fingerprints and return structured human-action handoffs without writing provider state. Bulk requests also require `maxItems`. Configured MCP entries named `unpin` remain protected from disable attempts through their own control plane.
+MCP apply tools require exact reviewed fingerprints and return structured human-action handoffs without writing provider state. Handoff sealing may still persist internal transaction/payload metadata and coordination locks under Unpin app state. Bulk requests also require `maxItems`. Configured MCP entries named `unpin` remain protected from disable attempts through their own control plane.
 
 ## Development
 
