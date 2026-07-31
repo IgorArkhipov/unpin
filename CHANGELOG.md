@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.8] - 2026-07-31
+
+### Fixed
+
+- Corrected MCP annotations for human-handoff tools that persist internal
+  Unpin transaction, payload, and coordination state: they now report
+  `readOnlyHint: false` and `destructiveHint: false` while continuing to leave
+  provider configuration unchanged.
+- Added contract coverage that verifies the handoff state is created without
+  changing the target provider bytes.
+
 ## [0.1.0-beta.7] - 2026-07-31
 
 ### Security
@@ -108,7 +119,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.7...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.8...HEAD
+[0.1.0-beta.8]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.8
 [0.1.0-beta.7]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.7
 [0.1.0-beta.6]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.5
