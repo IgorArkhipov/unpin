@@ -6,13 +6,13 @@ workflows.
 
 ## Distribution status and quick start
 
-Unpin `0.1.0-beta.5` hardens reusable inventory-group execution and adds
-authenticated workspace-policy maintenance to the beta foundation. Release
-artifacts are published only after required CI and provider evidence are
-complete. GitHub Releases then provides
+Unpin `0.1.0-beta.6` is a delivery-only compatibility release: its GNU/Linux
+archive is built on Ubuntu 22.04 and supports glibc 2.35 or newer, including
+Debian 12. Release artifacts are published only after required CI and
+release-specific evidence are complete. GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
 GNU/Linux, together with CycloneDX SBOM attestations, SHA-256 checksums, and
-approved provider-matrix evidence. The binaries are not Apple-notarized or
+approved release evidence. The binaries are not Apple-notarized or
 platform-code-signed. crates.io and package-manager distribution are deferred.
 
 After publication, download the archive for your platform from
@@ -20,7 +20,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.1.0-beta.5-TARGET.tar.gz \
+gh attestation verify unpin-v0.1.0-beta.6-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -28,7 +28,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.1.0-beta.5-TARGET
+cd unpin-v0.1.0-beta.6-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"

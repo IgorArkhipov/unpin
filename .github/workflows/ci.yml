@@ -39,6 +39,35 @@ jobs:
           python3 -m unittest discover -s scripts -p 'test_*.py'
           python3 -m py_compile scripts/*.py
 
+  linux-release-compatibility:
+    name: Linux release compatibility
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          toolchain: 1.97.1
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: linux-release-compatibility
+
+      - name: Build Linux release binary
+        run: >
+          cargo build --release --locked --target x86_64-unknown-linux-gnu
+          -p unpin-cli
+
+      - name: Verify Linux release artifact compatibility
+        shell: bash
+        run: >
+          scripts/verify_linux_release_artifact.sh
+          target/x86_64-unknown-linux-gnu/release/unpin
+
   rust:
     name: Rust (${{ matrix.platform }})
     strategy:

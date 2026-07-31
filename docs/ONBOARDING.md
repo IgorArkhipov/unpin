@@ -24,14 +24,15 @@ configuration for Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It
 normalizes provider-specific skills, MCP servers, plugins, hooks, agents, and
 settings into one inventory.
 
-Unpin `0.1.0-beta.5` hardens reusable inventory-group execution and adds
-authenticated workspace-policy maintenance to the beta foundation. Release
-artifacts are published only after required CI and provider evidence are
-complete. GitHub Releases then provides
+Unpin `0.1.0-beta.6` is a delivery-only compatibility release: its GNU/Linux
+archive is built on Ubuntu 22.04 and supports glibc 2.35 or newer, including
+Debian 12. Release artifacts are published only after required CI and
+release-specific evidence are complete. GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
 GNU/Linux. crates.io, package-manager distribution, and platform code signing
 are deferred. The full fixture-backed matrix and available-host validation run
-locally on macOS; CI also verifies supported build targets.
+locally on macOS for program-logic releases; CI also verifies supported build
+targets.
 
 The central safety rule is plan first, apply the exact reviewed plan second.
 Persistent writes require confirmation, an exact plan fingerprint, scoped

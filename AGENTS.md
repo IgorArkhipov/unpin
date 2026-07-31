@@ -89,6 +89,11 @@ Testing guidance:
 - Public release candidates should also pass
   `python3 scripts/validate_live_provider_hosts.py` with supported Pi and
   OpenCode executables on `PATH`.
+- A maintainer-approved delivery-only release that changes no program logic may
+  replace those two gates with focused release-build evidence: workflow lint,
+  locked metadata, a version smoke, a verified GNU/Linux glibc ceiling, and a
+  Debian 12 artifact smoke. Document the exception and post-tag verification
+  in the release notes and PR.
 
 ## Provider-Specific Notes
 

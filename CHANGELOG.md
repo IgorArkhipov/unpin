@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.6] - 2026-07-31
+
+### Fixed
+
+- GNU/Linux archives are now built on Ubuntu 22.04, lowering the glibc
+  baseline to 2.35 and restoring compatibility with Debian 12 (glibc 2.36).
+
 ## [0.1.0-beta.5] - 2026-07-29
 
 ### Added
@@ -94,7 +101,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.5...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.6...HEAD
+[0.1.0-beta.6]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.6
 [0.1.0-beta.5]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.5
 [0.1.0-beta.4]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.4
 [0.1.0-beta.3]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.3
