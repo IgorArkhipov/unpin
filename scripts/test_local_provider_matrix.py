@@ -12,6 +12,7 @@ from unittest import mock
 import local_provider_matrix_support as matrix_support
 import local_provider_matrix_cases as matrix_cases
 import run_local_provider_matrix as matrix_runner
+from local_provider_matrix_finalize import mcp_no_write_handoff_contract_complete
 from local_provider_matrix_support import (
     FIXTURE_ROOT,
     REPO_ROOT,
@@ -27,6 +28,41 @@ from run_local_provider_matrix import (
     live_item_has_cross_provider_shared_source,
     live_plan_state_paths,
 )
+
+
+class McpFinalizationContractTests(unittest.TestCase):
+    def test_accepts_handoffs_and_shared_source_prewrite_blocks(self) -> None:
+        standard_case = {
+            "mcpWritesEnabled": False,
+            "unreviewedApplyBlocked": True,
+            "humanActionHandoff": True,
+            "sharedSourceFanout": {"asserted": False},
+        }
+        shared_source_case = {
+            "confirmationBlocked": True,
+            "sharedSourceFanout": {
+                "asserted": True,
+                "blockedBeforeWrite": True,
+            },
+        }
+
+        self.assertTrue(
+            mcp_no_write_handoff_contract_complete(
+                [standard_case, shared_source_case]
+            )
+        )
+
+    def test_rejects_shared_source_case_without_prewrite_block(self) -> None:
+        self.assertFalse(
+            mcp_no_write_handoff_contract_complete(
+                [
+                    {
+                        "confirmationBlocked": True,
+                        "sharedSourceFanout": {"asserted": True},
+                    }
+                ]
+            )
+        )
 
 
 class LiveInventoryFilterTests(unittest.TestCase):
