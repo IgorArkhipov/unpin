@@ -24,10 +24,12 @@ configuration for Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It
 normalizes provider-specific skills, MCP servers, plugins, hooks, agents, and
 settings into one inventory.
 
-Unpin `0.1.0-beta.7` is a security-maintenance release: it updates the
-transitive `event-listener` dependency to resolve RustSec advisory
-RUSTSEC-2026-0221. Its GNU/Linux archive remains built on Ubuntu 22.04 and
-supports glibc 2.35 or newer, including Debian 12. Release artifacts are
+Unpin `0.1.0-beta.8` is an MCP contract-correction release: human-handoff
+tools now accurately disclose their internal Unpin app-state writes without
+implying that they mutate provider configuration. MCP clients that cache tool
+descriptors should reconnect after upgrading. Its GNU/Linux archive remains
+built on Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12.
+Release artifacts are
 published only after required CI and release-specific evidence are complete.
 GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
