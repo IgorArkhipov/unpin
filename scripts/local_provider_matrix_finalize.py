@@ -98,6 +98,25 @@ def tighten_artifact_permissions(artifact_root: Path) -> None:
         path.chmod(0o700 if path.is_dir() else 0o600)
 
 
+def mcp_no_write_handoff_contract_complete(mcp_cases: list[dict[str, Any]]) -> bool:
+    for case in mcp_cases:
+        fanout = case.get("sharedSourceFanout", {})
+        if fanout.get("asserted") is True:
+            if (
+                case.get("confirmationBlocked") is not True
+                or fanout.get("blockedBeforeWrite") is not True
+            ):
+                return False
+            continue
+        if (
+            case.get("mcpWritesEnabled") is not False
+            or case.get("unreviewedApplyBlocked") is not True
+            or case.get("humanActionHandoff") is not True
+        ):
+            return False
+    return True
+
+
 def finalize_artifacts(artifact_root: Path) -> dict[str, Any]:
     root = validate_artifact_root(artifact_root)
     required = [
@@ -245,12 +264,7 @@ def finalize_artifacts(artifact_root: Path) -> dict[str, Any]:
             or any(case.get("status") != "passed" for case in cases)
         ):
             raise MatrixFailure(f"cannot finalize; {label} matrix is incomplete")
-    if any(
-        case.get("mcpWritesEnabled") is not False
-        or case.get("unreviewedApplyBlocked") is not True
-        or case.get("humanActionHandoff") is not True
-        for case in mcp_cases
-    ):
+    if not mcp_no_write_handoff_contract_complete(mcp_cases):
         raise MatrixFailure(
             "cannot finalize; MCP no-write human-action handoff contract is incomplete"
         )
