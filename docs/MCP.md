@@ -23,6 +23,13 @@ policy, gateway, session, and hook apply tools return a structured human-action
 handoff. Complete that handoff through the Unpin CLI or TUI after reviewing the
 exact plan.
 
+This boundary distinguishes provider writes from internal handoff-state writes.
+`unpin_apply_toggle_item`, `unpin_apply_toggle_items`, and
+`unpin_plan_profile_provider` are non-destructive but not read-only: they
+persist transaction/payload metadata and coordination lock files under the
+configured Unpin app-state root so the CLI or TUI can continue the exact
+operation. They do not mutate provider configuration.
+
 Inventory groups have one narrow opt-in exception. A persistent server started
 with `--enable-approved-group-apply` may apply an exact group operation only
 after the CLI or TUI independently verifies its challenge and issues a
