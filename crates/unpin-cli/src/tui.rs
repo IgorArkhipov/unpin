@@ -17,7 +17,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 use serde_json::json;
 use unpin_core::approval::ControlApprovalContext;
@@ -52,6 +52,8 @@ mod profiles;
 mod sessions;
 
 type TuiResult<T> = Result<T, Box<dyn Error>>;
+
+const CONTROL_SCROLL_STEP: u16 = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum WorkflowPhase {
@@ -111,6 +113,18 @@ impl TuiView {
             Self::RestoreOperations => "restore/operations",
         }
     }
+
+    const fn title(self) -> &'static str {
+        match self {
+            Self::Inventory => "Inventory",
+            Self::Groups => "Groups",
+            Self::Profiles => "Profiles",
+            Self::Gateways => "Gateways",
+            Self::Sessions => "Sessions",
+            Self::Hooks => "Hooks",
+            Self::RestoreOperations => "Restore Operations",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,6 +160,8 @@ struct TuiState {
     approval_context_error: Option<String>,
     fixture_mode: bool,
     view: TuiView,
+    control_scroll: u16,
+    control_scroll_limit: u16,
     profile_workflow: profiles::ProfileWorkflow,
     group_workflow: groups::GroupWorkflow,
     gateway_workflow: gateway::GatewayWorkflow,
@@ -582,6 +598,8 @@ impl TuiState {
             approval_context_error,
             fixture_mode: cfg!(test),
             view: TuiView::Inventory,
+            control_scroll: 0,
+            control_scroll_limit: u16::MAX,
             profile_workflow,
             group_workflow: groups::GroupWorkflow::empty(),
             gateway_workflow,
@@ -658,6 +676,19 @@ impl TuiState {
             .unwrap_or(0);
         self.view = TuiView::ALL[(current + 1) % TuiView::ALL.len()];
         self.search_editing = false;
+        self.control_scroll = 0;
+        self.control_scroll_limit = u16::MAX;
+    }
+
+    fn scroll_control_up(&mut self) {
+        self.control_scroll = self.control_scroll.saturating_sub(CONTROL_SCROLL_STEP);
+    }
+
+    fn scroll_control_down(&mut self) {
+        self.control_scroll = self
+            .control_scroll
+            .saturating_add(CONTROL_SCROLL_STEP)
+            .min(self.control_scroll_limit);
     }
 
     fn active_rows(&self) -> Vec<String> {
@@ -2239,6 +2270,14 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.cycle_view();
                 true
             }
+            KeyCode::PageUp if state.view != TuiView::Inventory => {
+                state.scroll_control_up();
+                true
+            }
+            KeyCode::PageDown if state.view != TuiView::Inventory => {
+                state.scroll_control_down();
+                true
+            }
             KeyCode::Down | KeyCode::Char('j') => {
                 state.move_next();
                 true
@@ -2363,7 +2402,7 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Tu
     Ok(())
 }
 
-fn draw(frame: &mut Frame<'_>, state: &TuiState) {
+fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2390,7 +2429,7 @@ fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         Line::from(format!("Staged: {}", state.staged_count())),
         Line::from(format!("Last action: {}", last_action_label(state))),
         Line::from(format!("Last control: {}", last_control_label(state))),
-        Line::from(format!("View: {}", state.view.label())),
+        Line::from(format!("View: {}", state.view.title())),
         Line::from(provider_summary(&state.items)),
         Line::from(format!("Filters: {}", state.filter_summary())),
         Line::from(format!("Search: {}", search_summary(state))),
@@ -2416,7 +2455,7 @@ fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(state.view.label()),
+                .title(state.view.title()),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     if state.view == TuiView::Inventory {
@@ -2438,21 +2477,32 @@ fn draw(frame: &mut Frame<'_>, state: &TuiState) {
         ])
         .split(body[1]);
 
-    frame.render_widget(selected_detail(state), detail_chunks[0]);
+    let control_scroll_limit = control_scroll_offset(
+        &state.active_details(),
+        u16::MAX,
+        detail_chunks[0].width,
+        detail_chunks[0].height,
+    );
+    state.control_scroll_limit = control_scroll_limit;
+    let control_scroll = state.control_scroll.min(control_scroll_limit);
+    state.control_scroll = control_scroll;
+    frame.render_widget(selected_detail(state, control_scroll), detail_chunks[0]);
     frame.render_widget(warning_detail(state), detail_chunks[1]);
     frame.render_widget(backup_detail(state), detail_chunks[2]);
 
     let footer = Paragraph::new(
-        "v view | j/k move | m action/target | p/l/c filters | / search | space select/plan | enter confirm | a apply | groups: n/e/R/d/h/r/o/w/X-export | u unstage | q quit",
+        "v view | j/k move | PgUp/PgDn scroll Control | m action/target | p/l/c filters | / search | space select/plan | enter confirm | a apply | groups: n/e/R/d/h/r/o/w/X-export | u unstage | q quit",
     )
     .block(Block::default().borders(Borders::ALL).title("Commands"));
     frame.render_widget(footer, chunks[2]);
 }
 
-fn selected_detail(state: &TuiState) -> Paragraph<'static> {
+fn selected_detail(state: &TuiState, control_scroll: u16) -> Paragraph<'static> {
     if state.view != TuiView::Inventory {
         let lines: Vec<_> = state.active_details().into_iter().map(Line::from).collect();
         return Paragraph::new(lines)
+            .wrap(Wrap { trim: true })
+            .scroll((control_scroll, 0))
             .block(Block::default().borders(Borders::ALL).title("Control"));
     }
     let lines = if let Some(item) = state.selected_item() {
@@ -2475,6 +2525,52 @@ fn selected_detail(state: &TuiState) -> Paragraph<'static> {
     };
 
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Selected"))
+}
+
+fn control_scroll_offset(
+    details: &[String],
+    requested: u16,
+    area_width: u16,
+    area_height: u16,
+) -> u16 {
+    let line_count =
+        wrapped_control_line_count(details, usize::from(area_width.saturating_sub(2).max(1)));
+    let max_scroll = line_count
+        .saturating_sub(usize::from(area_height.saturating_sub(2)))
+        .min(usize::from(u16::MAX)) as u16;
+    requested.min(max_scroll)
+}
+
+fn wrapped_control_line_count(details: &[String], width: usize) -> usize {
+    details
+        .iter()
+        .map(|detail| {
+            let mut complete_rows = 0;
+            let mut current_width = 0;
+            let mut saw_word = false;
+
+            for word in detail.split_whitespace() {
+                saw_word = true;
+                let word_width = Line::from(word).width();
+                if word_width > width {
+                    if current_width > 0 {
+                        complete_rows += 1;
+                    }
+                    complete_rows += word_width / width;
+                    current_width = word_width % width;
+                } else if current_width == 0 {
+                    current_width = word_width;
+                } else if current_width + 1 + word_width <= width {
+                    current_width += 1 + word_width;
+                } else {
+                    complete_rows += 1;
+                    current_width = word_width;
+                }
+            }
+
+            complete_rows + usize::from(current_width > 0 || !saw_word)
+        })
+        .sum()
 }
 
 fn warning_detail(state: &TuiState) -> Paragraph<'static> {
@@ -4414,6 +4510,98 @@ mod tests {
         assert_eq!(
             workflow.last_error.as_deref(),
             Some("retry remains blocked")
+        );
+    }
+
+    #[test]
+    fn group_control_uses_a_title_case_view_name_and_wraps_details() {
+        use ratatui::widgets::Widget;
+
+        assert_eq!(TuiView::Groups.title(), "Groups");
+
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        state.view = TuiView::Groups;
+
+        let area = ratatui::layout::Rect::new(0, 0, 28, 8);
+        let mut buffer = ratatui::buffer::Buffer::empty(area);
+        selected_detail(&state, 0).render(area, &mut buffer);
+        let rendered = (0..area.height)
+            .map(|y| {
+                (0..area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(rendered.contains("phase=browsing"), "{rendered}");
+    }
+
+    #[test]
+    fn group_control_scrolls_within_wrapped_content() {
+        let details = vec![
+            "a detailed group plan line that must wrap across the narrow control pane".to_string(),
+        ];
+        let capped = control_scroll_offset(&details, u16::MAX, 16, 5);
+        assert!(capped > 0, "wrapped content should be scrollable");
+        assert!(
+            capped < u16::MAX,
+            "scroll must be capped to rendered content"
+        );
+
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        state.view = TuiView::Groups;
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::PageDown)),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(state.control_scroll, CONTROL_SCROLL_STEP);
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::PageUp)),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(state.control_scroll, 0);
+    }
+
+    #[test]
+    fn drawing_clamps_group_control_scroll_before_the_next_key_event() {
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        state.view = TuiView::Groups;
+        state.control_scroll = u16::MAX;
+
+        let backend = ratatui::backend::TestBackend::new(28, 30);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw control pane");
+
+        assert!(state.control_scroll < u16::MAX);
+        let max_scroll = state.control_scroll_limit;
+        assert_eq!(state.control_scroll, max_scroll);
+
+        for _ in 0..32 {
+            assert_eq!(
+                handle_tui_event(&mut state, key_event(KeyCode::PageDown)),
+                TuiEventOutcome::Redraw
+            );
+        }
+        assert_eq!(state.control_scroll, max_scroll);
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::PageUp)),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(
+            state.control_scroll,
+            max_scroll.saturating_sub(CONTROL_SCROLL_STEP)
         );
     }
 }
