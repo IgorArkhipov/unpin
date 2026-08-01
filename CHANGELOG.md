@@ -7,6 +7,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.11] - 2026-08-01
+
+### Fixed
+
+- Clarified named-group control plans in the terminal UI: `Groups` now uses the
+  standard title case, long control content wraps and scrolls, and group
+  identities are shown as `Agent | scope | type | name` without duplicated
+  namespaces.
+
 ## [0.1.0-beta.10] - 2026-07-31
 
 ### Fixed
@@ -135,7 +144,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.10...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.11...HEAD
+
+[0.1.0-beta.11]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.11
 [0.1.0-beta.10]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.10
 [0.1.0-beta.9]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.9
 [0.1.0-beta.8]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.8
