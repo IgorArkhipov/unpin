@@ -367,8 +367,15 @@ impl GroupWorkflow {
                 .enumerate()
                 .map(|(index, item)| {
                     let identity = GroupMemberIdentity::try_from(*item).ok();
+                    let label = format!(
+                        "{} | {} | {} | {}",
+                        provider_display_name(item.provider),
+                        item.layer.as_str(),
+                        item.kind.as_str(),
+                        item.display_name,
+                    );
                     format!(
-                        "{} [{}] {}:{}:{}:{}:{}",
+                        "{} [{}] {label}",
                         if index == self.member_selected {
                             ">"
                         } else {
@@ -382,11 +389,6 @@ impl GroupWorkflow {
                         } else {
                             " "
                         },
-                        item.provider.as_str(),
-                        item.layer.as_str(),
-                        item.kind.as_str(),
-                        item.category.as_str(),
-                        item.id,
                     )
                 })
                 .collect();
@@ -506,7 +508,7 @@ impl GroupWorkflow {
             for member in &review.claims.plan.members {
                 details.push(format!(
                     "MCP effect: {} outcome={:?} reason={}",
-                    member.identity.canonical_key(),
+                    group_member_label(&member.identity),
                     member.outcome,
                     member.reason.as_deref().unwrap_or("none"),
                 ));
@@ -541,12 +543,8 @@ impl GroupWorkflow {
             ));
             for member in &group.members {
                 details.push(format!(
-                    "{}:{}:{}:{}:{} enabled={:?} eligible={} reason={:?}",
-                    member.identity.provider.as_str(),
-                    member.identity.layer.as_str(),
-                    member.identity.kind.as_str(),
-                    member.identity.category.as_str(),
-                    member.identity.id,
+                    "{} enabled={:?} eligible={} reason={:?}",
+                    group_member_label(&member.identity),
                     member.enabled,
                     member.eligible,
                     member.reason,
@@ -568,9 +566,8 @@ impl GroupWorkflow {
             ));
             for coverage in &reviewed.plan.provider_coverage.entries {
                 details.push(format!(
-                    "coverage: {} target={} included={} reason={}",
-                    coverage.provider.as_str(),
-                    coverage.target_id,
+                    "coverage: {} included={} reason={}",
+                    coverage_target_label(coverage.provider, &coverage.target_id),
                     coverage.included,
                     coverage.reason.map_or("none", |reason| reason.as_str()),
                 ));
@@ -578,7 +575,7 @@ impl GroupWorkflow {
             for member in &reviewed.plan.members {
                 details.push(format!(
                     "effect: {} outcome={:?} reason={}",
-                    member.identity.id,
+                    group_member_label(&member.identity),
                     member.outcome,
                     member.reason.as_deref().unwrap_or("none"),
                 ));
@@ -595,7 +592,7 @@ impl GroupWorkflow {
             for member in &result.members {
                 details.push(format!(
                     "member result: {} status={:?} cohort={} failure={} backup={} reason={}",
-                    member.identity.id,
+                    group_member_label(&member.identity),
                     member.status,
                     member.cohort_id.as_deref().unwrap_or("none"),
                     member
@@ -1507,6 +1504,67 @@ fn target_label(target: GroupTargetState) -> &'static str {
     }
 }
 
+fn group_member_label(member: &GroupMemberIdentity) -> String {
+    format!(
+        "{} | {} | {} | {}",
+        provider_display_name(member.provider),
+        member.layer.as_str(),
+        member.kind.as_str(),
+        group_member_name(member),
+    )
+}
+
+fn coverage_target_label(provider: ProviderId, target_id: &str) -> String {
+    let mut parts = target_id.splitn(4, ':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(target_provider), Some(layer), Some(kind), Some(name))
+            if target_provider == provider.as_str() =>
+        {
+            format!(
+                "{} | {layer} | {} | {name}",
+                provider_display_name(provider),
+                coverage_target_kind(kind)
+            )
+        }
+        _ => target_id.to_string(),
+    }
+}
+
+fn coverage_target_kind(category: &str) -> &str {
+    match category {
+        "skill" => "skill",
+        "configured-mcp" => "mcp",
+        "agent" => "agent",
+        "hook" => "hook",
+        "provider-setting" => "setting",
+        "tool" | "plugin-config" | "plugin-manifest" => "plugin",
+        other => other,
+    }
+}
+
+fn provider_display_name(provider: ProviderId) -> &'static str {
+    match provider {
+        ProviderId::Claude => "Claude Code",
+        ProviderId::Codex => "Codex",
+        ProviderId::Cursor => "Cursor",
+        ProviderId::Pi => "Pi",
+        ProviderId::OpenCode => "OpenCode",
+        ProviderId::Zed => "Zed",
+    }
+}
+
+fn group_member_name(member: &GroupMemberIdentity) -> &str {
+    let mut parts = member.id.splitn(4, ':');
+    match (parts.next(), parts.next(), parts.next(), parts.next()) {
+        (Some(provider), Some(layer), Some(_), Some(name))
+            if provider == member.provider.as_str() && layer == member.layer.as_str() =>
+        {
+            name
+        }
+        _ => &member.id,
+    }
+}
+
 fn group_provider_root(
     roots: &unpin_core::discovery::DiscoveryRoots,
     provider: ProviderId,
@@ -1604,6 +1662,173 @@ mod tests {
         assert_eq!(workflow.target, GroupTargetState::Disable);
         workflow.cycle_target();
         assert_eq!(workflow.target, GroupTargetState::Enable);
+    }
+
+    #[test]
+    fn member_rows_use_compact_identity_labels() {
+        let (_root, mut workflow, discovery) = workflow_with_fixture();
+        let item = discovery
+            .items
+            .iter()
+            .find(|item| item.id == "claude:global:skill:example-claude-global-skill")
+            .expect("Claude fixture skill");
+        let mcp_item = discovery
+            .items
+            .iter()
+            .find(|item| item.provider == ProviderId::Claude && item.display_name == "global-docs")
+            .expect("Claude fixture MCP");
+        let identity = GroupMemberIdentity::try_from(item).expect("group member identity");
+
+        workflow
+            .start_create(vec![identity])
+            .expect("start group draft");
+        for character in "release-kit".chars() {
+            workflow.push_text_char(character);
+        }
+        workflow.finish_text_input().expect("finish group name");
+
+        let rows = workflow.rows(&[item, mcp_item]);
+        assert_eq!(
+            rows,
+            vec![
+                "> [x] Claude Code | global | skill | example-claude-global-skill".to_string(),
+                "  [ ] Claude Code | global | mcp | global-docs".to_string(),
+            ]
+        );
+        assert!(!rows[0].contains("skill:skill"));
+        assert!(!rows[0].contains("claude:global:skill:claude:global"));
+    }
+
+    #[test]
+    fn group_member_label_compacts_matching_ids_and_preserves_other_ids() {
+        let matching = GroupMemberIdentity::new(
+            ProviderId::Claude,
+            DiscoveryKind::Skill,
+            DiscoveryCategory::Skill,
+            DiscoveryLayer::Global,
+            "claude:global:skill:example-claude-global-skill",
+        )
+        .expect("matching identity");
+        assert_eq!(
+            group_member_label(&matching),
+            "Claude Code | global | skill | example-claude-global-skill"
+        );
+
+        let non_matching = GroupMemberIdentity::new(
+            ProviderId::Claude,
+            DiscoveryKind::Skill,
+            DiscoveryCategory::Skill,
+            DiscoveryLayer::Global,
+            "legacy:global:skill:example-claude-global-skill",
+        )
+        .expect("non-matching identity");
+        assert_eq!(
+            group_member_label(&non_matching),
+            "Claude Code | global | skill | legacy:global:skill:example-claude-global-skill"
+        );
+    }
+
+    #[test]
+    fn coverage_target_label_compacts_matching_ids_and_preserves_other_ids() {
+        assert_eq!(
+            coverage_target_label(
+                ProviderId::Claude,
+                "claude:global:skill:example-claude-global-skill",
+            ),
+            "Claude Code | global | skill | example-claude-global-skill"
+        );
+        assert_eq!(
+            coverage_target_label(ProviderId::Codex, "codex:global:configured-mcp:github",),
+            "Codex | global | mcp | github"
+        );
+        assert_eq!(
+            coverage_target_label(
+                ProviderId::Claude,
+                "claude:global:tool:plugin-source:example-plugin",
+            ),
+            "Claude Code | global | plugin | plugin-source:example-plugin"
+        );
+        assert_eq!(
+            coverage_target_label(
+                ProviderId::Claude,
+                "legacy:global:skill:example-claude-global-skill",
+            ),
+            "legacy:global:skill:example-claude-global-skill"
+        );
+    }
+
+    #[test]
+    fn reviewed_plan_details_use_compact_coverage_and_effect_labels() {
+        let (_root, mut workflow, discovery) = workflow_with_fixture();
+        let item = discovery
+            .items
+            .iter()
+            .find(|item| item.id == "codex:global:configured-mcp:github")
+            .expect("toggleable Codex fixture MCP");
+        let zed_item = discovery
+            .items
+            .iter()
+            .find(|item| item.id == "zed:global:configured-mcp:github")
+            .expect("Zed fixture MCP");
+        let identity = GroupMemberIdentity::try_from(item).expect("group member identity");
+        let zed_identity = GroupMemberIdentity::try_from(zed_item).expect("Zed group member");
+        let store = workflow
+            .resolver
+            .as_ref()
+            .expect("group resolver")
+            .personal_store()
+            .clone();
+        store
+            .create(
+                &GroupDefinitionV1::new("compact-details", vec![identity, zed_identity])
+                    .expect("group definition"),
+                OwnerGeneration::new("tui-compact-details-test", 1).expect("owner"),
+            )
+            .expect("create group");
+        workflow.refresh(&discovery).expect("refresh groups");
+        workflow.selected = workflow
+            .records
+            .iter()
+            .position(|record| record.definition.name == "compact-details")
+            .expect("selected compact-details group");
+        workflow.target = if item.enabled {
+            GroupTargetState::Disable
+        } else {
+            GroupTargetState::Enable
+        };
+        workflow.provider_reach =
+            ProviderReach::selected(ProviderId::Codex, SelectedProviderProvenance::TuiControl);
+        let access = workflow
+            .resolver
+            .as_ref()
+            .expect("group resolver")
+            .context()
+            .clone();
+        let approval_context =
+            ControlApprovalContext::new(access.repository_key(), access.workspace_key())
+                .expect("approval context");
+
+        workflow.plan(&approval_context).expect("review plan");
+        let details = workflow.details();
+        let coverage_label = "Codex | global | mcp | github";
+        let effect_label = "Codex | global | mcp | github";
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains(&format!("coverage: {coverage_label}"))),
+            "{details:#?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains(&format!("effect: {effect_label}"))),
+            "{details:#?}"
+        );
+        assert!(
+            !details
+                .iter()
+                .any(|detail| detail.contains("codex:global:configured-mcp:github"))
+        );
     }
 
     #[test]
