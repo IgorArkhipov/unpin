@@ -38,7 +38,6 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
         with:
-          toolchain: 1.97.1
           targets: ${{ matrix.target }}
 
       - name: Cache Cargo
@@ -164,6 +163,11 @@ jobs:
                 --json isDraft \
                 --jq '.isDraft'
             )" = "true"
+            gh release view "${GITHUB_REF_NAME}" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --json assets \
+              --jq '.assets[].name' \
+              | python3 scripts/check_release_assets.py reject-evidence
             gh release upload "${GITHUB_REF_NAME}" dist/* \
               --repo "${GITHUB_REPOSITORY}" \
               --clobber
