@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.9] - 2026-07-31
+
+### Fixed
+
+- Corrected the pinned Rust 1.96.1 setup action and removed unsupported
+  toolchain inputs from CI so the MSRV jobs prove the intended compiler.
+- Hardened release evidence and publication so workflow-generated checksums
+  remain the trust root, evidence uploads are staged without clobbering, and
+  publication requires fresh checksums plus the exact expected asset set.
+
 ## [0.1.0-beta.8] - 2026-07-31
 
 ### Fixed
@@ -119,7 +129,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.8...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.9...HEAD
+[0.1.0-beta.9]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.9
 [0.1.0-beta.8]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.8
 [0.1.0-beta.7]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.7
 [0.1.0-beta.6]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.6
