@@ -7,14 +7,18 @@ import argparse
 import gzip
 import hashlib
 import json
+import os
 import re
 import tarfile
+import tempfile
 from pathlib import Path
 
 
 TAG_PATTERN = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z.-]+)?$")
 COMMIT_PATTERN = re.compile(r"^[0-9a-f]{40}$")
 SHA256_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
+CHECKSUM_LINE_PATTERN = re.compile(r"^([0-9a-f]{64})  (.+)$")
+RELEASE_ASSET_NAME_PATTERN = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._-]*$")
 CLEAN_WORKSPACE_DIGEST = (
     "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 )
@@ -30,6 +34,46 @@ def sha256_file(path: Path) -> str:
 
 def regular_file(path: Path) -> bool:
     return path.is_file() and not path.is_symlink()
+
+
+def verified_release_checksums(
+    asset_dir: Path, checksum_path: Path
+) -> tuple[bytes, int]:
+    if not os.path.lexists(checksum_path):
+        raise SystemExit("release checksum manifest is missing")
+    if not regular_file(checksum_path):
+        raise SystemExit("release checksum manifest is unsafe")
+    try:
+        checksum_bytes = checksum_path.read_bytes()
+        checksum_text = checksum_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise SystemExit("release checksum manifest entry is invalid") from error
+    if not checksum_text or not checksum_text.endswith("\n"):
+        raise SystemExit("release checksum manifest entry is invalid")
+
+    names: set[str] = set()
+    for line in checksum_text.splitlines():
+        matched = CHECKSUM_LINE_PATTERN.fullmatch(line)
+        if matched is None:
+            raise SystemExit("release checksum manifest entry is invalid")
+        digest, name = matched.groups()
+        if (
+            name == checksum_path.name
+            or Path(name).name != name
+            or "\\" in name
+            or RELEASE_ASSET_NAME_PATTERN.fullmatch(name) is None
+        ):
+            raise SystemExit(f"release checksum asset name is unsafe: {name}")
+        if name in names:
+            raise SystemExit("release checksum manifest contains duplicates")
+        names.add(name)
+
+        asset = asset_dir / name
+        if not regular_file(asset):
+            raise SystemExit(f"release asset is missing or unsafe: {name}")
+        if sha256_file(asset) != digest:
+            raise SystemExit(f"release checksum mismatch: {name}")
+    return checksum_bytes, len(names)
 
 
 def manifest_file(root: Path, relative: str) -> Path:
@@ -82,8 +126,9 @@ def build_evidence_archive(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Verify one finalized local provider matrix and add its approved "
-            "evidence archive, manifest, and SHA256SUMS to a release asset directory."
+            "Verify one finalized local provider matrix, add its approved evidence "
+            "archive and manifest, verify the workflow checksums, and extend "
+            "SHA256SUMS in a release asset directory."
         )
     )
     parser.add_argument("--artifact-root", type=Path, required=True)
@@ -166,31 +211,76 @@ def main() -> int:
     archive_path = asset_dir / f"{prefix}.tar.gz"
     release_manifest = asset_dir / f"{prefix}-manifest.json"
     checksum_path = asset_dir / "SHA256SUMS"
-    for output in (archive_path, release_manifest, checksum_path):
-        if output.exists():
+    checksum_bytes, workflow_asset_count = verified_release_checksums(
+        asset_dir, checksum_path
+    )
+    for output in (archive_path, release_manifest):
+        if os.path.lexists(output):
             raise SystemExit(f"refusing to overwrite release asset: {output.name}")
 
-    build_evidence_archive(
-        artifact_root,
-        publishable,
-        manifest_path,
-        archive_path,
-    )
-    with manifest_path.open("rb") as source, release_manifest.open("xb") as destination:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            destination.write(chunk)
-
-    assets = sorted(
-        path
-        for path in asset_dir.iterdir()
-        if regular_file(path) and path.name != checksum_path.name
-    )
-    if not assets:
-        raise SystemExit("release asset directory is empty")
-    with checksum_path.open("x", encoding="utf-8") as checksum_output:
-        checksum_output.write(
-            "".join(f"{sha256_file(path)}  {path.name}\n" for path in assets)
+    committed: list[tuple[Path, Path]] = []
+    with tempfile.TemporaryDirectory(
+        prefix=".unpin-release-evidence-", dir=asset_dir
+    ) as staging_directory:
+        staging_dir = Path(staging_directory)
+        staged_archive = staging_dir / archive_path.name
+        staged_manifest = staging_dir / release_manifest.name
+        staged_checksums = staging_dir / checksum_path.name
+        build_evidence_archive(
+            artifact_root,
+            publishable,
+            manifest_path,
+            staged_archive,
         )
+        with (
+            manifest_path.open("rb") as source,
+            staged_manifest.open("xb") as destination,
+        ):
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                destination.write(chunk)
+
+        evidence_checksum_entries = [
+            (sha256_file(staged_archive), archive_path.name),
+            (sha256_file(staged_manifest), release_manifest.name),
+        ]
+        with staged_checksums.open("xb") as checksum_output:
+            checksum_output.write(checksum_bytes)
+            checksum_output.write(
+                "".join(
+                    f"{digest}  {name}\n"
+                    for digest, name in evidence_checksum_entries
+                ).encode("utf-8")
+            )
+
+        try:
+            for staged, final in (
+                (staged_archive, archive_path),
+                (staged_manifest, release_manifest),
+            ):
+                try:
+                    os.link(staged, final)
+                except FileExistsError:
+                    raise SystemExit(
+                        f"refusing to overwrite release asset: {final.name}"
+                    ) from None
+                committed.append((staged, final))
+
+            if (
+                not regular_file(checksum_path)
+                or checksum_path.read_bytes() != checksum_bytes
+            ):
+                raise SystemExit(
+                    "release checksum manifest changed during evidence preparation"
+                )
+            staged_checksums.replace(checksum_path)
+        except BaseException:
+            for staged, final in reversed(committed):
+                try:
+                    if regular_file(final) and final.samefile(staged):
+                        final.unlink()
+                except FileNotFoundError:
+                    pass
+            raise
 
     print(
         json.dumps(
@@ -199,7 +289,7 @@ def main() -> int:
                 "tag": args.tag,
                 "matrixRun": manifest.get("runId"),
                 "publishableFiles": len(publishable),
-                "releaseAssetsChecksummed": len(assets),
+                "releaseAssetsChecksummed": workflow_asset_count + 2,
                 "assetDirectory": str(asset_dir),
             },
             sort_keys=True,

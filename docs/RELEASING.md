@@ -96,16 +96,32 @@ python3 scripts/prepare_release_evidence.py \
   --expected-commit "$(git rev-parse 'vVERSION^{commit}')"
 ```
 
-Inspect `SHA256SUMS` and the evidence archive, then upload only the newly
-prepared files:
+The preparation script treats the workflow-generated `SHA256SUMS` as the trust
+root: it validates every listed download before creating files, preserves those
+entries exactly, ignores unrelated local files, and adds only the evidence
+archive and evidence manifest. Inspect the extended `SHA256SUMS` and evidence
+archive. Upload the two new evidence assets without replacement, then replace
+only the validated checksum manifest:
 
 ```bash
 gh release upload vVERSION \
   "$release_assets"/unpin-vVERSION-provider-matrix-evidence.tar.gz \
   "$release_assets"/unpin-vVERSION-provider-matrix-evidence-manifest.json \
-  "$release_assets"/SHA256SUMS \
   --repo IgorArkhipov/unpin
+gh release upload vVERSION \
+  "$release_assets"/SHA256SUMS \
+  --repo IgorArkhipov/unpin \
+  --clobber
 ```
+
+Do not rerun the tag workflow after uploading provider-matrix evidence. The
+workflow intentionally refuses to refresh a draft containing either evidence
+asset because its build-only `SHA256SUMS` would drop the evidence entries. If a
+rebuild is required, remove both evidence assets from the draft, rerun the tag
+workflow, download every draft asset into a new directory, and repeat evidence
+preparation and upload. If an evidence upload only partially succeeds, do not
+publish; remove the partial evidence asset from the draft and repeat the same
+fresh-download procedure.
 
 For a delivery-only artifact exception, skip the ordinary evidence path: the
 draft already contains the generated `SHA256SUMS`. Verify its checksums and the
@@ -113,31 +129,52 @@ GNU/Linux archive before publication:
 
 ```bash
 (
+  set -euo pipefail
   cd "$release_assets"
   shasum -a 256 -c SHA256SUMS
+  gh attestation verify unpin-vVERSION-x86_64-unknown-linux-gnu.tar.gz \
+    --repo IgorArkhipov/unpin
+  tar -xzf unpin-vVERSION-x86_64-unknown-linux-gnu.tar.gz
+  docker run --rm \
+    -v "$release_assets"/unpin-vVERSION-x86_64-unknown-linux-gnu/unpin:/opt/unpin:ro \
+    debian:12 /opt/unpin --version
+  docker run --rm \
+    -v "$release_assets"/unpin-vVERSION-x86_64-unknown-linux-gnu/unpin:/opt/unpin:ro \
+    debian:12 /opt/unpin --help
 )
-gh attestation verify unpin-vVERSION-x86_64-unknown-linux-gnu.tar.gz \
-  --repo IgorArkhipov/unpin
-tar -xzf "$release_assets"/unpin-vVERSION-x86_64-unknown-linux-gnu.tar.gz \
-  -C "$release_assets"
-docker run --rm \
-  -v "$release_assets"/unpin-vVERSION-x86_64-unknown-linux-gnu/unpin:/opt/unpin:ro \
-  debian:12 /opt/unpin --version
-docker run --rm \
-  -v "$release_assets"/unpin-vVERSION-x86_64-unknown-linux-gnu/unpin:/opt/unpin:ro \
-  debian:12 /opt/unpin --help
 ```
 
 ## Publish and verify
 
 Confirm private vulnerability reporting and immutable releases are enabled, then
-publish the complete draft:
+download the complete draft into another new private directory. Verify every
+checksum and require the draft's exact asset-name set to equal the names in
+`SHA256SUMS` plus `SHA256SUMS` itself:
 
 ```bash
-gh release edit vVERSION \
-  --repo IgorArkhipov/unpin \
-  --draft=false \
-  --prerelease
+(
+  set -euo pipefail
+  draft_verification_assets="$(mktemp -d)"
+  gh release download vVERSION \
+    --repo IgorArkhipov/unpin \
+    --dir "$draft_verification_assets"
+  (
+    cd "$draft_verification_assets"
+    shasum -a 256 -c SHA256SUMS
+  )
+  gh release view vVERSION \
+    --repo IgorArkhipov/unpin \
+    --json assets \
+    --jq '.assets[].name' \
+    | python3 scripts/check_release_assets.py verify-set \
+        --checksums "$draft_verification_assets"/SHA256SUMS
+
+  printf 'draft verification passed; publishing vVERSION\n'
+  gh release edit vVERSION \
+    --repo IgorArkhipov/unpin \
+    --draft=false \
+    --prerelease
+)
 ```
 
 After publication:
