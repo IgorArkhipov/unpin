@@ -3052,7 +3052,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unpin-cli"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3075,7 +3075,7 @@ dependencies = [
 
 [[package]]
 name = "unpin-core"
-version = "0.1.0-beta.8"
+version = "0.1.0-beta.9"
 dependencies = [
  "getrandom 0.4.3",
  "hmac 0.13.0",
