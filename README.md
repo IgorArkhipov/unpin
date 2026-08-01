@@ -6,7 +6,7 @@ workflows.
 
 ## Distribution status and quick start
 
-Unpin `0.1.0-beta.9` is a delivery-only release that hardens checksum,
+Unpin `0.1.0-beta.10` is a delivery-only release that hardens checksum,
 evidence-upload, asset-set, and pinned Rust toolchain gates. It changes no Unpin
 program logic or provider behavior. Its GNU/Linux archive remains built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
@@ -23,7 +23,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.1.0-beta.9-TARGET.tar.gz \
+gh attestation verify unpin-v0.1.0-beta.10-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -31,7 +31,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.1.0-beta.9-TARGET
+cd unpin-v0.1.0-beta.10-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"
