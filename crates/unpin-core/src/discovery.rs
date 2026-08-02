@@ -5,6 +5,8 @@ use std::{
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    thread,
 };
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension, types::Value as SqliteValue};
@@ -2919,64 +2921,225 @@ fn add_project_ancestors(
     scope_roots.extend(ancestors);
 }
 
+const MAX_PROJECT_SCOPE_SCAN_WORKERS: usize = 8;
+
+#[derive(Default)]
+struct ProjectScopeScan {
+    scope_roots: BTreeSet<PathBuf>,
+    skipped_directories: usize,
+}
+
+struct ProjectScopeDirectoryScan {
+    scope_root: Option<PathBuf>,
+    child_directories: Vec<PathBuf>,
+    skipped_directories: usize,
+}
+
 fn add_descendant_skill_scopes(
     search_root: &Path,
     repository_root: &Path,
     relative_skill_root: &Path,
     scope_roots: &mut BTreeSet<PathBuf>,
 ) -> Result<usize, DiscoveryError> {
+    add_descendant_skill_scopes_with_worker_limit(
+        search_root,
+        repository_root,
+        relative_skill_root,
+        scope_roots,
+        project_scope_scan_worker_limit(),
+    )
+}
+
+fn add_descendant_skill_scopes_with_worker_limit(
+    search_root: &Path,
+    repository_root: &Path,
+    relative_skill_root: &Path,
+    scope_roots: &mut BTreeSet<PathBuf>,
+    worker_limit: usize,
+) -> Result<usize, DiscoveryError> {
     if !search_root.is_dir() {
         return Ok(0);
     }
 
-    let mut skipped_directories = 0;
-    let mut pending = vec![search_root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        if directory.join(relative_skill_root).is_dir() {
-            scope_roots.insert(directory.clone());
-        }
+    let worker_limit = worker_limit.max(1);
+    let mut scan = ProjectScopeScan::default();
+    let mut frontier = vec![search_root.to_path_buf()];
+    while frontier.len() < worker_limit {
+        let Some(directory) = frontier.pop() else {
+            break;
+        };
+        let directory_scan = scan_project_scope_directory(
+            &directory,
+            search_root,
+            repository_root,
+            relative_skill_root,
+        )?;
+        extend_project_scope_scan(&mut scan, &directory_scan);
+        frontier.extend(directory_scan.child_directories);
+    }
 
-        let read_dir = match fs::read_dir(&directory) {
-            Ok(read_dir) => read_dir,
-            Err(error)
-                if directory != search_root && recoverable_project_scope_scan_error(&error) =>
-            {
+    for subtree_scan in scan_project_scope_frontier(
+        &frontier,
+        search_root,
+        repository_root,
+        relative_skill_root,
+        worker_limit,
+    )? {
+        scan.scope_roots.extend(subtree_scan.scope_roots);
+        scan.skipped_directories += subtree_scan.skipped_directories;
+    }
+
+    scope_roots.extend(scan.scope_roots);
+    Ok(scan.skipped_directories)
+}
+
+fn project_scope_scan_worker_limit() -> usize {
+    thread::available_parallelism()
+        .map_or(1, |count| count.get().min(MAX_PROJECT_SCOPE_SCAN_WORKERS))
+}
+
+fn scan_project_scope_frontier(
+    frontier: &[PathBuf],
+    search_root: &Path,
+    repository_root: &Path,
+    relative_skill_root: &Path,
+    worker_limit: usize,
+) -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
+    let worker_count = frontier.len().min(worker_limit);
+    if worker_count == 0 {
+        return Ok(Vec::new());
+    }
+    if worker_count == 1 {
+        return Ok(vec![scan_project_scope_subtree(
+            &frontier[0],
+            search_root,
+            repository_root,
+            relative_skill_root,
+        )?]);
+    }
+
+    let next_directory = AtomicUsize::new(0);
+    thread::scope(|scope| -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
+        let handles = (0..worker_count)
+            .map(|_| {
+                scope.spawn(|| -> Result<ProjectScopeScan, DiscoveryError> {
+                    let mut scan = ProjectScopeScan::default();
+                    loop {
+                        let index = next_directory.fetch_add(1, AtomicOrdering::Relaxed);
+                        let Some(directory) = frontier.get(index) else {
+                            break;
+                        };
+                        let subtree_scan = scan_project_scope_subtree(
+                            directory,
+                            search_root,
+                            repository_root,
+                            relative_skill_root,
+                        )?;
+                        scan.scope_roots.extend(subtree_scan.scope_roots);
+                        scan.skipped_directories += subtree_scan.skipped_directories;
+                    }
+                    Ok(scan)
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut scans = Vec::with_capacity(worker_count);
+        for handle in handles {
+            scans.push(handle.join().expect("project scope scan worker panicked")?);
+        }
+        Ok(scans)
+    })
+}
+
+fn scan_project_scope_subtree(
+    start: &Path,
+    search_root: &Path,
+    repository_root: &Path,
+    relative_skill_root: &Path,
+) -> Result<ProjectScopeScan, DiscoveryError> {
+    let mut scan = ProjectScopeScan::default();
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let directory_scan = scan_project_scope_directory(
+            &directory,
+            search_root,
+            repository_root,
+            relative_skill_root,
+        )?;
+        extend_project_scope_scan(&mut scan, &directory_scan);
+        pending.extend(directory_scan.child_directories);
+    }
+    Ok(scan)
+}
+
+fn extend_project_scope_scan(
+    scan: &mut ProjectScopeScan,
+    directory_scan: &ProjectScopeDirectoryScan,
+) {
+    if let Some(scope_root) = &directory_scan.scope_root {
+        scan.scope_roots.insert(scope_root.clone());
+    }
+    scan.skipped_directories += directory_scan.skipped_directories;
+}
+
+fn scan_project_scope_directory(
+    directory: &Path,
+    search_root: &Path,
+    repository_root: &Path,
+    relative_skill_root: &Path,
+) -> Result<ProjectScopeDirectoryScan, DiscoveryError> {
+    let scope_root = directory
+        .join(relative_skill_root)
+        .is_dir()
+        .then(|| directory.to_path_buf());
+    let read_dir = match fs::read_dir(directory) {
+        Ok(read_dir) => read_dir,
+        Err(error) if directory != search_root && recoverable_project_scope_scan_error(&error) => {
+            return Ok(ProjectScopeDirectoryScan {
+                scope_root,
+                child_directories: Vec::new(),
+                skipped_directories: 1,
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut skipped_directories = 0;
+    let mut entries = Vec::new();
+    for entry in read_dir {
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(error) if recoverable_project_scope_scan_error(&error) => {
+                skipped_directories += 1;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+
+    let mut child_directories = Vec::new();
+    for entry in entries.into_iter().rev() {
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if recoverable_project_scope_scan_error(&error) => {
                 skipped_directories += 1;
                 continue;
             }
             Err(error) => return Err(error.into()),
         };
-        let mut entries = Vec::new();
-        for entry in read_dir {
-            match entry {
-                Ok(entry) => entries.push(entry),
-                Err(error) if recoverable_project_scope_scan_error(&error) => {
-                    skipped_directories += 1;
-                }
-                Err(error) => return Err(error.into()),
-            }
+        if !file_type.is_dir()
+            || should_skip_project_scope_dir(&entry.file_name())
+            || is_repository_tmp_dir(repository_root, &entry.path())
+        {
+            continue;
         }
-        entries.sort_by_key(|entry| entry.file_name());
-        for entry in entries.into_iter().rev() {
-            let file_type = match entry.file_type() {
-                Ok(file_type) => file_type,
-                Err(error) if recoverable_project_scope_scan_error(&error) => {
-                    skipped_directories += 1;
-                    continue;
-                }
-                Err(error) => return Err(error.into()),
-            };
-            if !file_type.is_dir()
-                || should_skip_project_scope_dir(&entry.file_name())
-                || is_repository_tmp_dir(repository_root, &entry.path())
-            {
-                continue;
-            }
-            pending.push(entry.path());
-        }
+        child_directories.push(entry.path());
     }
 
-    Ok(skipped_directories)
+    Ok(ProjectScopeDirectoryScan {
+        scope_root,
+        child_directories,
+        skipped_directories,
+    })
 }
 
 fn recoverable_project_scope_scan_error(error: &std::io::Error) -> bool {
@@ -5066,5 +5229,73 @@ mod tests {
 
         assert!(read_cursor_workspace_disabled_server_ids(&database_path).is_err());
         assert!(!database_path.exists());
+    }
+
+    #[test]
+    fn parallel_project_scope_scan_matches_serial_reference() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path();
+        let mut expected = BTreeSet::new();
+
+        for index in 0..16 {
+            let scope_root = repository_root
+                .join(format!("group-{index:02}"))
+                .join("nested");
+            write_test_file(
+                &scope_root
+                    .join(".claude")
+                    .join("skills")
+                    .join("benchmark")
+                    .join("SKILL.md"),
+            );
+            expected.insert(scope_root);
+        }
+        write_test_file(
+            &repository_root
+                .join("node_modules")
+                .join("ignored")
+                .join(".claude")
+                .join("skills")
+                .join("benchmark")
+                .join("SKILL.md"),
+        );
+        write_test_file(
+            &repository_root
+                .join("tmp")
+                .join("ignored")
+                .join(".claude")
+                .join("skills")
+                .join("benchmark")
+                .join("SKILL.md"),
+        );
+
+        let mut serial_scopes = BTreeSet::new();
+        let serial_skipped = add_descendant_skill_scopes_with_worker_limit(
+            repository_root,
+            repository_root,
+            Path::new(".claude/skills"),
+            &mut serial_scopes,
+            1,
+        )
+        .expect("serial scope scan");
+        let mut parallel_scopes = BTreeSet::new();
+        let parallel_skipped = add_descendant_skill_scopes_with_worker_limit(
+            repository_root,
+            repository_root,
+            Path::new(".claude/skills"),
+            &mut parallel_scopes,
+            4,
+        )
+        .expect("parallel scope scan");
+
+        assert_eq!(serial_scopes, expected);
+        assert_eq!(parallel_scopes, serial_scopes);
+        assert_eq!(parallel_skipped, serial_skipped);
+    }
+
+    fn write_test_file(path: &Path) {
+        fs::create_dir_all(path.parent().expect("test file parent"))
+            .expect("create test file parent");
+        fs::write(path, "# Test skill\n").expect("write test skill");
     }
 }
