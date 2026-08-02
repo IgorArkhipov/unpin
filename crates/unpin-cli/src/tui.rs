@@ -2151,10 +2151,8 @@ fn render_headless_state(state: &TuiState) -> String {
     }
 
     lines.push(String::new());
-    lines.push(
-        "Commands: v view | j/k move | m action/backend | s profile-scope | r profile-provider | P group-reach | f force | p provider-filter | l layer | c category | / search | space plan | enter confirm | a apply | groups: X export-MCP | u unstage | q quit"
-            .to_string(),
-    );
+    lines.push("Commands:".to_string());
+    lines.extend(headless_command_legend(state.view));
     lines.join("\n")
 }
 
@@ -2259,14 +2257,14 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
             _ => false,
         },
         Event::Key(key) => match key.code {
-            KeyCode::Char('q') => return TuiEventOutcome::Quit,
+            KeyCode::Char('q' | 'Q') => return TuiEventOutcome::Quit,
             KeyCode::Esc => {
                 if !state.cancel_group_interaction() {
                     return TuiEventOutcome::Quit;
                 }
                 true
             }
-            KeyCode::Char('v') => {
+            KeyCode::Char('v' | 'V') => {
                 state.cycle_view();
                 true
             }
@@ -2286,15 +2284,15 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.move_previous();
                 true
             }
-            KeyCode::Char('m') => {
+            KeyCode::Char('m' | 'M') => {
                 state.cycle_active_action();
                 true
             }
-            KeyCode::Char('f') => {
+            KeyCode::Char('f' | 'F') => {
                 state.toggle_gateway_force();
                 true
             }
-            KeyCode::Char('s') => {
+            KeyCode::Char('s' | 'S') => {
                 state.cycle_profile_scope();
                 true
             }
@@ -2306,11 +2304,11 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 }
                 true
             }
-            KeyCode::Char('n') => {
+            KeyCode::Char('n' | 'N') => {
                 state.start_group_create();
                 true
             }
-            KeyCode::Char('e') => {
+            KeyCode::Char('e' | 'E') => {
                 state.start_group_edit();
                 true
             }
@@ -2318,19 +2316,19 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.start_group_rename();
                 true
             }
-            KeyCode::Char('d') => {
+            KeyCode::Char('d' | 'D') => {
                 state.start_group_delete();
                 true
             }
-            KeyCode::Char('h') => {
+            KeyCode::Char('h' | 'H') => {
                 state.show_group_history();
                 true
             }
-            KeyCode::Char('o') => {
+            KeyCode::Char('o' | 'O') => {
                 state.start_group_mcp_approval();
                 true
             }
-            KeyCode::Char('w') => {
+            KeyCode::Char('w' | 'W') => {
                 state.stage_group_definition_save();
                 true
             }
@@ -2342,11 +2340,11 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.cycle_group_provider_reach();
                 true
             }
-            KeyCode::Char('l') => {
+            KeyCode::Char('l' | 'L') => {
                 state.cycle_layer_filter();
                 true
             }
-            KeyCode::Char('c') => {
+            KeyCode::Char('c' | 'C') => {
                 state.cycle_category_filter();
                 true
             }
@@ -2372,11 +2370,11 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.confirm_active_action();
                 true
             }
-            KeyCode::Char('a') => {
+            KeyCode::Char('a' | 'A') => {
                 state.apply_active_action();
                 true
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('u' | 'U') => {
                 state.clear_staged();
                 true
             }
@@ -2402,14 +2400,111 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Tu
     Ok(())
 }
 
+fn command_legend(view: TuiView) -> Vec<Line<'static>> {
+    let mnemonic_style = Style::default().add_modifier(Modifier::UNDERLINED);
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("V", mnemonic_style),
+            Span::raw("iew | j/k move | PgUp/PgDn scroll Control | "),
+            Span::styled("M", mnemonic_style),
+            Span::raw("ode/action | filter: "),
+            Span::styled("p", mnemonic_style),
+            Span::raw("rovider/"),
+            Span::styled("l", mnemonic_style),
+            Span::raw("ayer/"),
+            Span::styled("c", mnemonic_style),
+            Span::raw("ategory"),
+        ]),
+        Line::from(vec![
+            Span::raw("/ search | space select/plan | enter confirm | "),
+            Span::styled("A", mnemonic_style),
+            Span::raw("pply | "),
+            Span::styled("U", mnemonic_style),
+            Span::raw("nstage | "),
+            Span::styled("Q", mnemonic_style),
+            Span::raw("uit"),
+        ]),
+    ];
+
+    match view {
+        TuiView::Profiles => lines.push(Line::from(vec![
+            Span::raw("Profiles: "),
+            Span::styled("s", mnemonic_style),
+            Span::raw("cope | "),
+            Span::styled("r", mnemonic_style),
+            Span::raw(" provider"),
+        ])),
+        TuiView::Gateways => lines.push(Line::from(vec![
+            Span::raw("Gateways: "),
+            Span::styled("f", mnemonic_style),
+            Span::raw("orce"),
+        ])),
+        TuiView::Groups => lines.extend([
+            Line::from(vec![
+                Span::raw("Groups: "),
+                Span::styled("P", mnemonic_style),
+                Span::raw(" reach | "),
+                Span::styled("s", mnemonic_style),
+                Span::raw(" scope | "),
+                Span::styled("N", mnemonic_style),
+                Span::raw("ew | "),
+                Span::styled("E", mnemonic_style),
+                Span::raw("dit | "),
+                Span::styled("R", mnemonic_style),
+                Span::raw("ename | "),
+                Span::styled("D", mnemonic_style),
+                Span::raw("elete"),
+            ]),
+            Line::from(vec![
+                Span::styled("H", mnemonic_style),
+                Span::raw("istory | "),
+                Span::styled("r", mnemonic_style),
+                Span::raw("estore | "),
+                Span::styled("O", mnemonic_style),
+                Span::raw("pen approval | "),
+                Span::styled("W", mnemonic_style),
+                Span::raw("rite definition | e"),
+                Span::styled("X", mnemonic_style),
+                Span::raw("port"),
+            ]),
+        ]),
+        _ => {}
+    }
+
+    lines
+}
+
+fn headless_command_legend(view: TuiView) -> Vec<String> {
+    command_legend(view)
+        .into_iter()
+        .map(|line| {
+            line.spans
+                .into_iter()
+                .map(|span| {
+                    if span.style.add_modifier.contains(Modifier::UNDERLINED) {
+                        span.content
+                            .chars()
+                            .flat_map(|character| [character, '\u{0332}'])
+                            .collect()
+                    } else {
+                        span.content.into_owned()
+                    }
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     let area = frame.area();
+    let command_legend = command_legend(state.view);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(14),
-            Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Min(3),
+            Constraint::Length(command_legend.len() as u16 + 2),
         ])
         .split(area);
 
@@ -2490,10 +2585,8 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     frame.render_widget(warning_detail(state), detail_chunks[1]);
     frame.render_widget(backup_detail(state), detail_chunks[2]);
 
-    let footer = Paragraph::new(
-        "v view | j/k move | PgUp/PgDn scroll Control | m action/target | p/l/c filters | / search | space select/plan | enter confirm | a apply | groups: n/e/R/d/h/r/o/w/X-export | u unstage | q quit",
-    )
-    .block(Block::default().borders(Borders::ALL).title("Commands"));
+    let footer = Paragraph::new(command_legend)
+        .block(Block::default().borders(Borders::ALL).title("Commands"));
     frame.render_widget(footer, chunks[2]);
 }
 
@@ -4603,5 +4696,136 @@ mod tests {
             state.control_scroll,
             max_scroll.saturating_sub(CONTROL_SCROLL_STEP)
         );
+    }
+
+    #[test]
+    fn command_legend_underlines_printable_action_mnemonics() {
+        let legend = command_legend(TuiView::Inventory);
+        let underlined = legend
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(underlined, ["V", "M", "p", "l", "c", "A", "U", "Q"]);
+    }
+
+    #[test]
+    fn headless_command_legend_preserves_the_underlined_mnemonics() {
+        let rendered = headless_command_legend(TuiView::Inventory).join("\n");
+
+        assert!(rendered.contains("V\u{0332}iew"));
+        assert!(rendered.contains("M\u{0332}ode/action"));
+        assert!(rendered.contains("A\u{0332}pply"));
+        assert!(rendered.contains("Q\u{0332}uit"));
+        assert!(!rendered.contains("v view"));
+    }
+
+    #[test]
+    fn group_command_legend_names_each_group_action() {
+        let legend = command_legend(TuiView::Groups);
+        let rendered = legend
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("Groups: P reach | s scope | New | Edit | Rename | Delete"));
+        assert!(rendered.contains("History | restore | Open approval | Write definition | eXport"));
+
+        let underlined = legend
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+        assert!(underlined.ends_with(&["P", "s", "N", "E", "R", "D", "H", "r", "O", "W", "X"]));
+    }
+
+    #[test]
+    fn command_legend_includes_view_specific_controls() {
+        let rendered = |view| {
+            command_legend(view)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        };
+
+        assert!(rendered(TuiView::Profiles).contains("Profiles: scope | r provider"));
+        assert!(rendered(TuiView::Gateways).contains("Gateways: force"));
+        assert!(
+            TuiView::ALL
+                .iter()
+                .all(|view| !command_legend(*view).is_empty())
+        );
+    }
+
+    #[test]
+    fn displayed_mnemonics_dispatch_to_tui_actions() {
+        let new_state = |view| {
+            let mut state = TuiState::new(DiscoveryOutput {
+                items: Vec::new(),
+                warnings: Vec::new(),
+            });
+            state.view = view;
+            state
+        };
+
+        let mut state = new_state(TuiView::Inventory);
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('V'))),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(state.view, TuiView::Groups);
+        for mnemonic in ['M', 'p', 'l', 'c', 'A', 'U'] {
+            let mut state = new_state(TuiView::Inventory);
+            assert_eq!(
+                handle_tui_event(&mut state, key_event(KeyCode::Char(mnemonic))),
+                TuiEventOutcome::Redraw,
+                "{mnemonic} should be bound"
+            );
+        }
+        assert_eq!(
+            handle_tui_event(
+                &mut new_state(TuiView::Inventory),
+                key_event(KeyCode::Char('Q'))
+            ),
+            TuiEventOutcome::Quit
+        );
+        for mnemonic in ['P', 's', 'N', 'E', 'R', 'D', 'H', 'r', 'O', 'W', 'X'] {
+            let mut state = new_state(TuiView::Groups);
+            assert_eq!(
+                handle_tui_event(&mut state, key_event(KeyCode::Char(mnemonic))),
+                TuiEventOutcome::Redraw,
+                "{mnemonic} should be bound in Groups"
+            );
+        }
+    }
+
+    #[test]
+    fn groups_footer_is_visible_in_a_short_narrow_terminal() {
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        state.view = TuiView::Groups;
+
+        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw groups footer");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Groups: P reach | s scope | New | Edit | Rename | Delete"));
+        assert!(rendered.contains("History | restore | Open approval | Write definition | eXport"));
     }
 }
