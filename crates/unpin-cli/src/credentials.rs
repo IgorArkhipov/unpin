@@ -1,4 +1,5 @@
 mod approval;
+pub(crate) use approval::require_live_apply_terminal;
 mod backup_authentication;
 mod cursor_dashboard;
 mod session_authority;
