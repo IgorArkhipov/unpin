@@ -24,10 +24,12 @@ configuration for Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It
 normalizes provider-specific skills, MCP servers, plugins, hooks, agents, and
 settings into one inventory.
 
-Unpin `0.1.0-beta.11` improves named-group control plans: the `Groups` title is
-consistent, long control content wraps and scrolls, and group identities stay
-legible without duplicated namespaces. It is a program-logic release, so the
-full provider matrix and live-host validation are required before publication.
+Unpin `0.1.0-beta.12` makes TUI commands easier to scan: the interactive
+footer names each available command and underlines its mnemonic, while plain
+headless output brackets the same key. Header and footer content prioritizes
+current state rather than overlapping in narrow or short terminals. It is a
+program-logic release, so
+the full provider matrix and live-host validation are required before publication.
 Its GNU/Linux archive remains built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
 artifacts are

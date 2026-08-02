@@ -2599,10 +2599,10 @@ fn tui_headless_renders_inventory_view() {
     assert!(stdout.contains("operation: renamePath"));
     assert!(stdout.contains("writes: no writes were performed"));
     assert!(stdout.contains("Commands:"));
-    assert!(stdout.contains("Q\u{0332}uit"));
-    assert!(stdout.contains("p\u{0332}rovider"));
-    assert!(stdout.contains("l\u{0332}ayer"));
-    assert!(stdout.contains("c\u{0332}ategory"));
+    assert!(stdout.contains("[Q]uit"));
+    assert!(stdout.contains("filter: [p]rovider/[l]ayer/[c]ategory"));
+    assert!(stdout.contains("Commands (Groups):"));
+    assert!(stdout.contains("Groups: [P] reach"));
 }
 
 #[test]

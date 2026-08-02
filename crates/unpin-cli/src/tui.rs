@@ -1838,19 +1838,42 @@ impl TuiState {
         };
     }
 
+    fn inventory_filters_available(&self) -> bool {
+        self.view == TuiView::Inventory
+            || (self.view == TuiView::Groups && self.group_workflow.uses_inventory_rows())
+    }
+
+    fn scope_control_available(&self) -> bool {
+        self.view == TuiView::Profiles
+            || (self.view == TuiView::Groups && self.group_workflow.can_cycle_draft_scope())
+    }
+
+    fn group_mcp_export_available(&self) -> bool {
+        self.view == TuiView::Groups && self.mcp_approval_handoff.is_some()
+    }
+
     fn cycle_provider_filter(&mut self) {
+        if !self.inventory_filters_available() {
+            return;
+        }
         let choices = self.provider_choices();
         self.provider_filter = next_choice(self.provider_filter, &choices);
         self.clamp_selected();
     }
 
     fn cycle_layer_filter(&mut self) {
+        if !self.inventory_filters_available() {
+            return;
+        }
         let choices = self.layer_choices();
         self.layer_filter = next_choice(self.layer_filter, &choices);
         self.clamp_selected();
     }
 
     fn cycle_category_filter(&mut self) {
+        if !self.inventory_filters_available() {
+            return;
+        }
         let choices = self.category_choices();
         self.category_filter = next_choice(self.category_filter, &choices);
         self.clamp_selected();
@@ -2153,6 +2176,12 @@ fn render_headless_state(state: &TuiState) -> String {
     lines.push(String::new());
     lines.push("Commands:".to_string());
     lines.extend(headless_command_legend(state.view));
+    for view in TuiView::ALL {
+        if view != state.view {
+            lines.push(format!("Commands ({}):", view.title()));
+            lines.extend(headless_command_legend(view));
+        }
+    }
     lines.join("\n")
 }
 
@@ -2292,7 +2321,7 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.toggle_gateway_force();
                 true
             }
-            KeyCode::Char('s' | 'S') => {
+            KeyCode::Char('s' | 'S') if state.scope_control_available() => {
                 state.cycle_profile_scope();
                 true
             }
@@ -2332,7 +2361,7 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.stage_group_definition_save();
                 true
             }
-            KeyCode::Char('p') => {
+            KeyCode::Char('p') if state.inventory_filters_available() => {
                 state.cycle_provider_filter();
                 true
             }
@@ -2340,23 +2369,23 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.cycle_group_provider_reach();
                 true
             }
-            KeyCode::Char('l' | 'L') => {
+            KeyCode::Char('l' | 'L') if state.inventory_filters_available() => {
                 state.cycle_layer_filter();
                 true
             }
-            KeyCode::Char('c' | 'C') => {
+            KeyCode::Char('c' | 'C') if state.inventory_filters_available() => {
                 state.cycle_category_filter();
                 true
             }
-            KeyCode::Char('/') => {
+            KeyCode::Char('/') if state.inventory_filters_available() => {
                 state.start_search_editing();
                 true
             }
-            KeyCode::Char('x') => {
+            KeyCode::Char('x') if state.inventory_filters_available() => {
                 state.clear_search_query();
                 true
             }
-            KeyCode::Char('X') => {
+            KeyCode::Char('X') if state.group_mcp_export_available() => {
                 state.export_group_mcp_handoff();
                 true
             }
@@ -2402,30 +2431,54 @@ fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Tu
 
 fn command_legend(view: TuiView) -> Vec<Line<'static>> {
     let mnemonic_style = Style::default().add_modifier(Modifier::UNDERLINED);
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("V", mnemonic_style),
-            Span::raw("iew | j/k move | PgUp/PgDn scroll Control | "),
-            Span::styled("M", mnemonic_style),
-            Span::raw("ode/action | filter: "),
+    let supports_active_action = matches!(
+        view,
+        TuiView::Groups | TuiView::Profiles | TuiView::Gateways
+    );
+    let mut primary_controls = vec![
+        Span::styled("V", mnemonic_style),
+        Span::raw(if view == TuiView::Inventory {
+            "iew | j/k move | filter: "
+        } else if supports_active_action {
+            "iew | j/k move | PgUp/PgDn scroll Control | "
+        } else {
+            "iew | j/k move | PgUp/PgDn scroll Control"
+        }),
+    ];
+    if supports_active_action {
+        primary_controls.extend([Span::styled("M", mnemonic_style), Span::raw("ode/action")]);
+    }
+    if view == TuiView::Inventory {
+        primary_controls.extend([
             Span::styled("p", mnemonic_style),
             Span::raw("rovider/"),
             Span::styled("l", mnemonic_style),
             Span::raw("ayer/"),
             Span::styled("c", mnemonic_style),
             Span::raw("ategory"),
-        ]),
-        Line::from(vec![
-            Span::raw("/ search | space select/plan | enter confirm | "),
-            Span::styled("A", mnemonic_style),
-            Span::raw("pply | "),
-            Span::styled("U", mnemonic_style),
-            Span::raw("nstage | "),
-            Span::styled("Q", mnemonic_style),
-            Span::raw("uit"),
-        ]),
+        ]);
+    }
+
+    let mut secondary_controls = vec![
+        Span::raw("space select/plan | enter confirm | "),
+        Span::styled("A", mnemonic_style),
+        Span::raw("pply | "),
+        Span::styled("U", mnemonic_style),
+        Span::raw("nstage | "),
+        Span::styled("Q", mnemonic_style),
+        Span::raw("uit | Esc end input/quit"),
     ];
+    if view == TuiView::Inventory {
+        secondary_controls.splice(
+            0..0,
+            [
+                Span::raw("/ search | "),
+                Span::styled("x", mnemonic_style),
+                Span::raw(" clear search | "),
+            ],
+        );
+    }
+    let mut lines = vec![Line::from(primary_controls), Line::from(secondary_controls)];
 
     match view {
         TuiView::Profiles => lines.push(Line::from(vec![
@@ -2445,8 +2498,6 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
                 Span::raw("Groups: "),
                 Span::styled("P", mnemonic_style),
                 Span::raw(" reach | "),
-                Span::styled("s", mnemonic_style),
-                Span::raw(" scope | "),
                 Span::styled("N", mnemonic_style),
                 Span::raw("ew | "),
                 Span::styled("E", mnemonic_style),
@@ -2464,9 +2515,7 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
                 Span::styled("O", mnemonic_style),
                 Span::raw("pen approval | "),
                 Span::styled("W", mnemonic_style),
-                Span::raw("rite definition | e"),
-                Span::styled("X", mnemonic_style),
-                Span::raw("port"),
+                Span::raw("rite definition"),
             ]),
         ]),
         _ => {}
@@ -2475,40 +2524,106 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
     lines
 }
 
+fn command_legend_for_state(state: &TuiState) -> Vec<Line<'static>> {
+    if state.group_text_editing() {
+        return vec![Line::from(
+            "Group input: type | backspace delete | enter submit | esc cancel",
+        )];
+    }
+    if state.search_editing() {
+        return vec![Line::from(
+            "Search input: type | backspace delete | enter/esc finish",
+        )];
+    }
+
+    let mut lines = command_legend(state.view);
+    if state.view == TuiView::Groups && state.inventory_filters_available() {
+        let mnemonic_style = Style::default().add_modifier(Modifier::UNDERLINED);
+        lines[0].spans.extend([
+            Span::raw(" | filter: "),
+            Span::styled("p", mnemonic_style),
+            Span::raw("rovider/"),
+            Span::styled("l", mnemonic_style),
+            Span::raw("ayer/"),
+            Span::styled("c", mnemonic_style),
+            Span::raw("ategory"),
+        ]);
+        lines[1].spans.splice(
+            0..0,
+            [
+                Span::raw("/ search | "),
+                Span::styled("x", mnemonic_style),
+                Span::raw(" clear search | "),
+            ],
+        );
+    }
+    if state.view == TuiView::Groups && state.group_workflow.can_cycle_draft_scope() {
+        lines.push(Line::from(vec![
+            Span::raw("Groups draft: "),
+            Span::styled("s", Style::default().add_modifier(Modifier::UNDERLINED)),
+            Span::raw("cope"),
+        ]));
+    }
+    if state.group_mcp_export_available() {
+        lines.push(Line::from(vec![
+            Span::raw("MCP approval: e"),
+            Span::styled("X", Style::default().add_modifier(Modifier::UNDERLINED)),
+            Span::raw("port"),
+        ]));
+    }
+    lines
+}
+
 fn headless_command_legend(view: TuiView) -> Vec<String> {
-    command_legend(view)
+    let mut lines = command_legend(view)
         .into_iter()
         .map(|line| {
             line.spans
                 .into_iter()
                 .map(|span| {
+                    let content = span.content.into_owned();
                     if span.style.add_modifier.contains(Modifier::UNDERLINED) {
-                        span.content
-                            .chars()
-                            .flat_map(|character| [character, '\u{0332}'])
-                            .collect()
+                        format!("[{content}]")
                     } else {
-                        span.content.into_owned()
+                        content
                     }
                 })
                 .collect()
         })
-        .collect()
+        .collect::<Vec<_>>();
+    if view == TuiView::Groups {
+        lines.push("MCP approval: e[X]port (after approval)".to_string());
+    }
+    lines
 }
 
-fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
-    let area = frame.area();
-    let command_legend = command_legend(state.view);
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(14),
-            Constraint::Min(3),
-            Constraint::Length(command_legend.len() as u16 + 2),
-        ])
-        .split(area);
+fn command_footer(command_legend: Vec<Line<'static>>) -> Paragraph<'static> {
+    Paragraph::new(command_legend)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title("Commands"))
+}
 
-    let header = Paragraph::new(vec![
+fn wrapped_line_height(lines: &[Line<'_>], available_width: u16) -> u16 {
+    let details = lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|span| span.content.as_ref())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    let content_width = usize::from(available_width.saturating_sub(2)).max(1);
+
+    u16::try_from(wrapped_control_line_count(&details, content_width)).unwrap_or(u16::MAX)
+}
+
+fn command_footer_height(command_legend: &[Line<'_>], available_width: u16) -> u16 {
+    wrapped_line_height(command_legend, available_width).saturating_add(2)
+}
+
+fn inventory_header_lines(state: &TuiState, content_height: u16) -> Vec<Line<'static>> {
+    let full = vec![
         Line::from(vec![Span::styled(
             "Unpin",
             Style::default().add_modifier(Modifier::BOLD),
@@ -2528,8 +2643,92 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         Line::from(provider_summary(&state.items)),
         Line::from(format!("Filters: {}", state.filter_summary())),
         Line::from(format!("Search: {}", search_summary(state))),
-    ])
-    .block(Block::default().borders(Borders::ALL).title("Inventory"));
+    ];
+    if usize::from(content_height) >= full.len() {
+        return full;
+    }
+
+    vec![
+        Line::from(vec![
+            Span::styled("Unpin", Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" | View: {}", state.view.title())),
+        ]),
+        Line::from(format!(
+            "Items: {} | Showing: {} | Warnings: {} | Staged: {}",
+            state.items.len(),
+            state.visible_count(),
+            state.warnings.len(),
+            state.staged_count(),
+        )),
+        Line::from(format!(
+            "Filters: {} | Search: {}",
+            state.filter_summary(),
+            search_summary(state)
+        )),
+        Line::from(format!("Last action: {}", last_action_label(state))),
+        Line::from(format!("Last control: {}", last_control_label(state))),
+        Line::from(format!(
+            "Backups: {} | Backup authentication: {}",
+            state.backups.len(),
+            backup_authentication_readiness_label(state)
+        )),
+        Line::from(provider_summary(&state.items)),
+    ]
+    .into_iter()
+    .take(usize::from(content_height))
+    .collect()
+}
+
+fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
+    const MIN_BODY_HEIGHT: u16 = 6;
+    const MIN_HEADER_HEIGHT: u16 = 3;
+    const MIN_FOOTER_HEIGHT: u16 = 3;
+    const MAX_HEADER_HEIGHT: u16 = 14;
+
+    let area = frame.area();
+    let command_legend = command_legend_for_state(state);
+    let requested_footer_height = command_footer_height(&command_legend, area.width);
+    let header_minimum = MIN_HEADER_HEIGHT.min(area.height);
+    let footer_minimum = MIN_FOOTER_HEIGHT.min(area.height.saturating_sub(header_minimum));
+    let body_height = MIN_BODY_HEIGHT.min(
+        area.height
+            .saturating_sub(header_minimum.saturating_add(footer_minimum)),
+    );
+    let remaining_height = area.height.saturating_sub(body_height);
+    let max_header_height = remaining_height
+        .saturating_sub(footer_minimum)
+        .min(MAX_HEADER_HEIGHT);
+    let full_header_lines = inventory_header_lines(state, u16::MAX);
+    let full_header_height = wrapped_line_height(&full_header_lines, area.width).saturating_add(2);
+    let header_lines =
+        if full_header_height.saturating_add(requested_footer_height) <= remaining_height {
+            full_header_lines
+        } else {
+            inventory_header_lines(
+                state,
+                u16::try_from(full_header_lines.len().saturating_sub(1)).unwrap_or(u16::MAX),
+            )
+        };
+    let header_height = wrapped_line_height(&header_lines, area.width)
+        .saturating_add(2)
+        .min(max_header_height);
+    let header_height = header_height.max(header_minimum).min(max_header_height);
+    let footer_height = requested_footer_height
+        .min(remaining_height.saturating_sub(header_height))
+        .max(footer_minimum);
+    let footer = command_footer(command_legend);
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(header_height),
+            Constraint::Min(body_height),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
+
+    let header = Paragraph::new(header_lines)
+        .wrap(Wrap { trim: true })
+        .block(Block::default().borders(Borders::ALL).title("Inventory"));
     frame.render_widget(header, chunks[0]);
 
     let body = Layout::default()
@@ -2585,8 +2784,6 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     frame.render_widget(warning_detail(state), detail_chunks[1]);
     frame.render_widget(backup_detail(state), detail_chunks[2]);
 
-    let footer = Paragraph::new(command_legend)
-        .block(Block::default().borders(Borders::ALL).title("Commands"));
     frame.render_widget(footer, chunks[2]);
 }
 
@@ -3057,6 +3254,12 @@ mod tests {
             .mcp_approval_handoff
             .clone()
             .expect("issued handoff remains structured");
+        let export_legend = command_legend_for_state(&state)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(export_legend.contains("MCP approval: eXport"));
         assert_eq!(
             fs::read(&provider_path).expect("provider config after approval"),
             provider_before
@@ -4708,18 +4911,45 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>();
 
-        assert_eq!(underlined, ["V", "M", "p", "l", "c", "A", "U", "Q"]);
+        assert_eq!(underlined, ["V", "p", "l", "c", "x", "A", "U", "Q"]);
     }
 
     #[test]
-    fn headless_command_legend_preserves_the_underlined_mnemonics() {
+    fn inventory_legend_omits_disabled_control_scrolling() {
+        assert!(
+            !command_legend(TuiView::Inventory)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.content.contains("PgUp/PgDn"))
+        );
+    }
+
+    #[test]
+    fn footer_height_accounts_for_wrapped_command_legend() {
+        let legend = vec![Line::from("12345678")];
+
+        assert_eq!(command_footer_height(&legend, 10), 3);
+        assert_eq!(command_footer_height(&legend, 6), 4);
+        assert!(
+            command_footer_height(&command_legend(TuiView::Groups), 30)
+                > u16::try_from(command_legend(TuiView::Groups).len())
+                    .unwrap()
+                    .saturating_add(2)
+        );
+    }
+
+    #[test]
+    fn headless_command_legend_preserves_literal_action_labels() {
         let rendered = headless_command_legend(TuiView::Inventory).join("\n");
 
-        assert!(rendered.contains("V\u{0332}iew"));
-        assert!(rendered.contains("M\u{0332}ode/action"));
-        assert!(rendered.contains("A\u{0332}pply"));
-        assert!(rendered.contains("Q\u{0332}uit"));
-        assert!(!rendered.contains("v view"));
+        assert!(rendered.contains("[V]iew | j/k move | filter: [p]rovider/[l]ayer/[c]ategory"));
+        assert!(rendered.contains("[x] clear search"));
+        assert!(rendered.contains("[A]pply"));
+        assert!(rendered.contains("[Q]uit"));
+        assert!(!rendered.contains('\u{0332}'));
+
+        let groups = headless_command_legend(TuiView::Groups).join("\n");
+        assert!(groups.contains("MCP approval: e[X]port (after approval)"));
     }
 
     #[test]
@@ -4731,8 +4961,10 @@ mod tests {
             .map(|span| span.content.as_ref())
             .collect::<String>();
 
-        assert!(rendered.contains("Groups: P reach | s scope | New | Edit | Rename | Delete"));
-        assert!(rendered.contains("History | restore | Open approval | Write definition | eXport"));
+        assert!(rendered.contains("Groups: P reach | New | Edit | Rename | Delete"));
+        assert!(rendered.contains("History | restore | Open approval"));
+        assert!(rendered.contains("Write definition"));
+        assert!(!rendered.contains("eXport"));
 
         let underlined = legend
             .iter()
@@ -4740,7 +4972,12 @@ mod tests {
             .filter(|span| span.style.add_modifier.contains(Modifier::UNDERLINED))
             .map(|span| span.content.as_ref())
             .collect::<Vec<_>>();
-        assert!(underlined.ends_with(&["P", "s", "N", "E", "R", "D", "H", "r", "O", "W", "X"]));
+        assert_eq!(
+            underlined,
+            [
+                "V", "M", "A", "U", "Q", "P", "N", "E", "R", "D", "H", "r", "O", "W"
+            ]
+        );
     }
 
     #[test]
@@ -4755,11 +4992,39 @@ mod tests {
 
         assert!(rendered(TuiView::Profiles).contains("Profiles: scope | r provider"));
         assert!(rendered(TuiView::Gateways).contains("Gateways: force"));
+        assert!(rendered(TuiView::Groups).contains("Mode/action"));
+        assert!(rendered(TuiView::Groups).contains("Esc end input/quit"));
+        assert!(!rendered(TuiView::Sessions).contains("Mode/action"));
+        assert!(!rendered(TuiView::Sessions).contains("filter: provider/layer/category"));
+        assert!(!rendered(TuiView::Sessions).ends_with(" | "));
         assert!(
             TuiView::ALL
                 .iter()
                 .all(|view| !command_legend(*view).is_empty())
         );
+    }
+
+    #[test]
+    fn text_input_legend_hides_consumed_command_mnemonics() {
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('/'))),
+            TuiEventOutcome::Redraw
+        );
+
+        let rendered = command_legend_for_state(&state)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert_eq!(
+            rendered,
+            "Search input: type | backspace delete | enter/esc finish"
+        );
+        assert!(!rendered.contains("Apply"));
     }
 
     #[test]
@@ -4779,14 +5044,38 @@ mod tests {
             TuiEventOutcome::Redraw
         );
         assert_eq!(state.view, TuiView::Groups);
-        for mnemonic in ['M', 'p', 'l', 'c', 'A', 'U'] {
-            let mut state = new_state(TuiView::Inventory);
+        let mut state = TuiState::new(discovery(vec![item(
+            "mnemonic-inventory-filter",
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        )]));
+        for mnemonic in ['p', 'l', 'c'] {
+            let filters_before = state.filter_summary();
             assert_eq!(
                 handle_tui_event(&mut state, key_event(KeyCode::Char(mnemonic))),
                 TuiEventOutcome::Redraw,
                 "{mnemonic} should be bound"
             );
+            assert_ne!(state.filter_summary(), filters_before);
         }
+        assert!(state.stage_selected_toggle());
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('U'))),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(state.staged_count(), 0, "U should clear staged changes");
+        let mut state = new_state(TuiView::Inventory);
+        state.set_search_query("clear me");
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('x'))),
+            TuiEventOutcome::Redraw
+        );
+        assert!(
+            state.search_query.is_empty(),
+            "x should clear the search query"
+        );
         assert_eq!(
             handle_tui_event(
                 &mut new_state(TuiView::Inventory),
@@ -4794,25 +5083,134 @@ mod tests {
             ),
             TuiEventOutcome::Quit
         );
-        for mnemonic in ['P', 's', 'N', 'E', 'R', 'D', 'H', 'r', 'O', 'W', 'X'] {
+        let mut state = new_state(TuiView::Groups);
+        let details_before = state.active_details();
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('P'))),
+            TuiEventOutcome::Redraw
+        );
+        assert_ne!(
+            state.active_details(),
+            details_before,
+            "P should change the active group reach"
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('s'))),
+            TuiEventOutcome::Ignore,
+            "s should not be active outside a group-create draft"
+        );
+        for mnemonic in ['N', 'E', 'R', 'D', 'H', 'r', 'O', 'W'] {
             let mut state = new_state(TuiView::Groups);
+            let details_before = state.active_details();
             assert_eq!(
                 handle_tui_event(&mut state, key_event(KeyCode::Char(mnemonic))),
                 TuiEventOutcome::Redraw,
                 "{mnemonic} should be bound in Groups"
             );
+            assert_ne!(
+                state.active_details(),
+                details_before,
+                "{mnemonic} should report an observable Groups result"
+            );
+        }
+        let mut state = TuiState::new(discovery(vec![item(
+            "mnemonic-group-member",
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        )]));
+        assert!(state.stage_selected_toggle());
+        state.view = TuiView::Groups;
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('N'))),
+            TuiEventOutcome::Redraw
+        );
+        assert!(state.group_text_editing(), "N should start a group draft");
+        assert_eq!(
+            command_legend_for_state(&state)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>(),
+            "Group input: type | backspace delete | enter submit | esc cancel"
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, Event::Paste("mnemonics".to_string())),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Enter)),
+            TuiEventOutcome::Redraw
+        );
+        let details_before = state.active_details();
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('s'))),
+            TuiEventOutcome::Redraw
+        );
+        assert_ne!(
+            state.active_details(),
+            details_before,
+            "s should change the group draft scope"
+        );
+        let filters_before = state.filter_summary();
+        for mnemonic in ['p', 'l', 'c'] {
+            assert_eq!(
+                handle_tui_event(&mut state, key_event(KeyCode::Char(mnemonic))),
+                TuiEventOutcome::Redraw
+            );
+        }
+        assert_ne!(state.filter_summary(), filters_before);
+        let draft_legend = command_legend_for_state(&state)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+        assert!(draft_legend.contains("filter: provider/layer/category"));
+        assert!(draft_legend.contains("/ search | x clear search"));
+        assert!(draft_legend.contains("Groups draft: scope"));
+        let mut state = new_state(TuiView::Groups);
+        let filters_before = state.filter_summary();
+        for mnemonic in ['p', 'l', 'c'] {
+            assert_eq!(
+                handle_tui_event(&mut state, key_event(KeyCode::Char(mnemonic))),
+                TuiEventOutcome::Ignore
+            );
+        }
+        assert_eq!(state.filter_summary(), filters_before);
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('/'))),
+            TuiEventOutcome::Ignore
+        );
+        for (view, mnemonic, name) in [
+            (TuiView::Groups, 'M', "Groups"),
+            (TuiView::Profiles, 'r', "Profiles"),
+            (TuiView::Gateways, 'f', "Gateways"),
+        ] {
+            let mut state = new_state(view);
+            let details_before = state.active_details();
+            assert_eq!(
+                handle_tui_event(&mut state, key_event(KeyCode::Char(mnemonic))),
+                TuiEventOutcome::Redraw,
+                "{mnemonic} should be bound in {name}"
+            );
+            assert_ne!(
+                state.active_details(),
+                details_before,
+                "{mnemonic} should change {name} state"
+            );
         }
     }
 
     #[test]
-    fn groups_footer_is_visible_in_a_short_narrow_terminal() {
+    fn groups_footer_and_header_are_visible_in_a_narrow_terminal() {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
         });
         state.view = TuiView::Groups;
 
-        let backend = ratatui::backend::TestBackend::new(80, 24);
+        let backend = ratatui::backend::TestBackend::new(61, 24);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| draw(frame, &mut state))
@@ -4825,7 +5223,114 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
 
-        assert!(rendered.contains("Groups: P reach | s scope | New | Edit | Rename | Delete"));
-        assert!(rendered.contains("History | restore | Open approval | Write definition | eXport"));
+        assert!(rendered.contains("Groups: P reach | New | Edit | Rename | Delete"));
+        assert!(rendered.contains("Unpin | View: Groups"));
+        assert!(rendered.contains("Filters:"));
+        assert!(rendered.contains("Search:"));
+        assert!(rendered.contains("History | restore | Open approval"));
+        assert!(rendered.contains("Write definition"));
+        assert!(!rendered.contains("eXport"));
+    }
+
+    #[test]
+    fn inventory_header_wraps_active_filters_and_search_in_a_narrow_terminal() {
+        let mut state = TuiState::new(discovery(vec![item(
+            "narrow-inventory",
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        )]));
+        state.cycle_provider_filter();
+        state.cycle_layer_filter();
+        state.cycle_category_filter();
+        state.set_search_query("narrow-header");
+
+        let backend = ratatui::backend::TestBackend::new(61, 24);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw inventory header");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("Filters:"));
+        assert!(rendered.contains("Search:"));
+        assert!(rendered.contains("narrow-header"));
+    }
+
+    #[test]
+    fn short_terminal_layout_does_not_overcommit_rows() {
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let backend = ratatui::backend::TestBackend::new(20, 16);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw short terminal");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Unpin"));
+        assert!(rendered.contains("Items:"));
+    }
+
+    #[test]
+    fn short_narrow_layout_preserves_filter_and_search_state() {
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        state.view = TuiView::Groups;
+        let backend = ratatui::backend::TestBackend::new(40, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw short narrow terminal");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Filters:"));
+        assert!(rendered.contains("Search:"));
+    }
+
+    #[test]
+    fn shortest_layout_reserves_a_header_state_line_before_footer_detail() {
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let backend = ratatui::backend::TestBackend::new(40, 7);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw shortest terminal");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Unpin"));
+        assert!(rendered.contains("View:"));
     }
 }

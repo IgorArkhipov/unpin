@@ -13,7 +13,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 - Reworked the terminal command footer into named, underlined mnemonics. The
   active view now shows every available contextual control without repeating a
-  separate shortcut token.
+  separate shortcut token; plain headless output marks the same keys in
+  brackets.
+- Let `p`/`l`/`c` narrow member candidates while creating or editing a named
+  group, and prioritized compact header state ahead of wrapped command-footer
+  detail so narrow and short terminals do not overlap or lose their summary.
+- Replaced the action legend with input-specific guidance while search or a
+  group name is being edited, so the footer never advertises keys consumed as text.
 - Updated direct Rust dependencies: `http` 1.5.0, `jsonc-parser` 0.33.1, and
   `rmcp` 3.0.1.
 
@@ -161,7 +167,7 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.11...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.12...HEAD
 
 [0.1.0-beta.12]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.12
 
