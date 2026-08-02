@@ -281,14 +281,7 @@ fn require_controlling_terminal_presence(
     expectation: &ApprovalExpectation,
     plan_fingerprint: &str,
 ) -> Result<(), String> {
-    if ![
-        io::stdin().is_terminal(),
-        io::stdout().is_terminal(),
-        io::stderr().is_terminal(),
-    ]
-    .into_iter()
-    .any(|is_terminal| is_terminal)
-    {
+    if !(io::stdin().is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal()) {
         return Err(
             "interactive human approval requires a controlling terminal; --confirm and stdin are insufficient: standard streams are not terminals"
                 .to_string(),
