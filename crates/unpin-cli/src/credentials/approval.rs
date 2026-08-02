@@ -19,9 +19,9 @@ use unpin_core::{
 };
 use zeroize::Zeroizing;
 
-use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore};
+use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore, broker};
 
-const APPROVAL_ACCOUNT: &str = "transition-approval-key-v1";
+pub(super) const APPROVAL_ACCOUNT: &str = "transition-approval-key-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ApprovalKeyState {
@@ -53,7 +53,12 @@ pub(crate) fn approval_key_status_for_mode(
             key_id: fixture_approval_key(app_state_root)?.key_id(),
         });
     }
-    approval_key_status(&KeychainSecretStore)
+    Ok(broker::resolve_runtime_bundle(app_state_root)?
+        .approval()
+        .map(ApprovalKey::new)
+        .map_or(ApprovalKeyState::Missing, |key| ApprovalKeyState::Ready {
+            key_id: key.key_id(),
+        }))
 }
 
 pub(crate) fn initialize_approval_key(
@@ -241,7 +246,9 @@ pub(crate) fn resolve_approval_key(
     if fixture_mode {
         return fixture_approval_key(app_state_root).map(Some);
     }
-    load_approval_key(&KeychainSecretStore)
+    Ok(broker::resolve_runtime_bundle(app_state_root)?
+        .approval()
+        .map(ApprovalKey::new))
 }
 
 trait HumanPresence {

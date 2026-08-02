@@ -31,10 +31,10 @@ use unpin_core::discovery::{
 };
 use unpin_core::groups::{GroupAccessContext, GroupMemberIdentity, GroupOperationLifecycle};
 use unpin_core::mutation::{
-    BackupAuthenticationKey, BackupAuthenticationStatus, BackupSummary, NativeToggleController,
-    NativeTogglePlan, RestoreControlError, RestoreControlPlan, RestoreController, RestoreStatus,
-    TogglePlanRequest, ToggleResult, ToggleStatus, load_backup_summaries_authenticated,
-    plan_toggle,
+    BackupAuthenticationKey, BackupAuthenticationStatus, BackupDeletionPlan, BackupSummary,
+    NativeToggleController, NativeTogglePlan, RestoreControlError, RestoreControlPlan,
+    RestoreController, RestoreStatus, TogglePlanRequest, ToggleResult, ToggleStatus, delete_backup,
+    load_backup_summaries_authenticated, plan_backup_deletion, plan_toggle,
 };
 use unpin_core::sessions::SessionAuthorityKey;
 #[cfg(test)]
@@ -213,6 +213,7 @@ struct RestoreWorkflow {
     operations: Vec<ControlOperationStatus>,
     selected: usize,
     reviewed: Option<ReviewedRestorePlan>,
+    deletion: Option<BackupDeletionPlan>,
     phase: WorkflowPhase,
     last_envelope: Option<ControlOperationEnvelope>,
     last_error: Option<String>,
@@ -225,6 +226,7 @@ impl RestoreWorkflow {
             operations,
             selected: 0,
             reviewed: None,
+            deletion: None,
             phase: WorkflowPhase::Browsing,
             last_envelope: None,
             last_error: None,
@@ -257,7 +259,7 @@ impl RestoreWorkflow {
                 format!(
                     "{} {} entries={} restorable={} auth={}",
                     if index == self.selected { ">" } else { " " },
-                    backup.backup_id,
+                    backup_display_label(backup),
                     backup.item_count,
                     backup.restorable,
                     backup_authentication_label(backup.authentication)
@@ -281,6 +283,7 @@ impl RestoreWorkflow {
         )];
         if let Some(backup) = self.backups.get(self.selected) {
             details.push(format!("selected: {}", backup.backup_id));
+            details.push(format!("target: {}", backup_display_label(backup)));
             details.push(format!("created: {}", backup.created_at));
             details.push(format!("targets: {}", backup.paths.len()));
         } else {
@@ -301,6 +304,9 @@ impl RestoreWorkflow {
                 "resources: {}",
                 reviewed.plan.affected_resources.len()
             ));
+        }
+        if let Some(deletion) = &self.deletion {
+            details.push(format!("delete backup: {}", deletion.backup_id));
         }
         if let Some(envelope) = &self.last_envelope {
             details.push(format!(
@@ -345,17 +351,62 @@ impl RestoreWorkflow {
             json!({"plan": plan}),
         );
         self.reviewed = Some(ReviewedRestorePlan { plan, envelope });
+        self.deletion = None;
         self.phase = WorkflowPhase::Planned;
         self.last_error = None;
         Ok(&self.reviewed.as_ref().expect("reviewed plan set").envelope)
     }
 
     fn confirm(&mut self) -> bool {
-        if self.reviewed.is_none() {
+        if self.reviewed.is_none() && self.deletion.is_none() {
             return false;
         }
         self.phase = WorkflowPhase::Confirmed;
         true
+    }
+
+    fn plan_deletion(&mut self, app_state_root: &Path) -> Result<(), String> {
+        let backup = self
+            .backups
+            .get(self.selected)
+            .ok_or_else(|| "no backup selected".to_string())?;
+        self.deletion = Some(plan_backup_deletion(app_state_root, &backup.backup_id)?);
+        self.reviewed = None;
+        self.phase = WorkflowPhase::Planned;
+        self.last_error = None;
+        Ok(())
+    }
+
+    fn has_pending_deletion(&self) -> bool {
+        self.deletion.is_some()
+    }
+
+    fn deletion_is_confirmed(&self) -> bool {
+        self.deletion.is_some() && self.phase == WorkflowPhase::Confirmed
+    }
+
+    fn apply_deletion(
+        &mut self,
+        app_state_root: &Path,
+    ) -> Result<unpin_core::mutation::BackupDeletionResult, String> {
+        if self.phase != WorkflowPhase::Confirmed {
+            return Err("backup deletion must be confirmed before apply".to_string());
+        }
+        let plan = self
+            .deletion
+            .as_ref()
+            .ok_or_else(|| "backup deletion plan is missing".to_string())?;
+        let result = delete_backup(app_state_root, plan)?;
+        self.deletion = None;
+        self.phase = WorkflowPhase::Applied;
+        self.last_error = None;
+        Ok(result)
+    }
+
+    fn replace_backups(&mut self, backups: Vec<BackupSummary>) {
+        self.backups = backups;
+        self.selected = self.selected.min(self.backups.len().saturating_sub(1));
+        self.reset_review();
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -451,6 +502,7 @@ impl RestoreWorkflow {
 
     fn reset_review(&mut self) {
         self.reviewed = None;
+        self.deletion = None;
         self.phase = WorkflowPhase::Browsing;
         self.last_error = None;
     }
@@ -847,6 +899,25 @@ impl TuiState {
         }
     }
 
+    fn plan_backup_deletion(&mut self) -> bool {
+        if self.view != TuiView::RestoreOperations {
+            return false;
+        }
+        match self.restore_workflow.plan_deletion(&self.app_state_root) {
+            Ok(()) => {
+                self.last_action = Some(TuiActionStatus::Success(
+                    "backup deletion planned; press Enter to confirm, then A to apply".to_string(),
+                ));
+                true
+            }
+            Err(error) => {
+                self.restore_workflow.record_error(error.clone());
+                self.last_action = Some(TuiActionStatus::Error(error));
+                false
+            }
+        }
+    }
+
     fn confirm_active_action(&mut self) -> bool {
         if self.view == TuiView::Inventory {
             return self.confirm_staged();
@@ -861,9 +932,14 @@ impl TuiState {
             TuiView::Inventory => unreachable!("inventory handled above"),
         };
         if confirmed {
-            self.last_action = Some(TuiActionStatus::Success(
-                "control plan confirmed; apply still requires human presence".to_string(),
-            ));
+            let message = if self.view == TuiView::RestoreOperations
+                && self.restore_workflow.has_pending_deletion()
+            {
+                "backup deletion confirmed; press A to apply"
+            } else {
+                "control plan confirmed; apply still requires human presence"
+            };
+            self.last_action = Some(TuiActionStatus::Success(message.to_string()));
         }
         confirmed
     }
@@ -875,6 +951,34 @@ impl TuiState {
         }
         if self.view == TuiView::Groups {
             self.apply_group_action();
+            return;
+        }
+        if self.view == TuiView::RestoreOperations && self.restore_workflow.has_pending_deletion() {
+            let deletion_was_confirmed = self.restore_workflow.deletion_is_confirmed();
+            match self.restore_workflow.apply_deletion(&self.app_state_root) {
+                Ok(result) => {
+                    self.backups = load_backup_summaries_authenticated(
+                        &self.app_state_root,
+                        self.backup_authentication_key.as_ref(),
+                    );
+                    self.restore_workflow.replace_backups(self.backups.clone());
+                    self.last_action = Some(TuiActionStatus::Success(format!(
+                        "backup {} deleted",
+                        result.backup_id
+                    )));
+                }
+                Err(error) => {
+                    if deletion_was_confirmed {
+                        self.backups = load_backup_summaries_authenticated(
+                            &self.app_state_root,
+                            self.backup_authentication_key.as_ref(),
+                        );
+                        self.restore_workflow.replace_backups(self.backups.clone());
+                    }
+                    self.restore_workflow.record_error(error.clone());
+                    self.last_action = Some(TuiActionStatus::Error(error));
+                }
+            }
             return;
         }
         let Some(context) = self.approval_context.clone() else {
@@ -2305,11 +2409,11 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.scroll_control_down();
                 true
             }
-            KeyCode::Down | KeyCode::Char('j') => {
+            KeyCode::Down => {
                 state.move_next();
                 true
             }
-            KeyCode::Up | KeyCode::Char('k') => {
+            KeyCode::Up => {
                 state.move_previous();
                 true
             }
@@ -2343,6 +2447,10 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
             }
             KeyCode::Char('R') => {
                 state.start_group_rename();
+                true
+            }
+            KeyCode::Char('D') if state.view == TuiView::RestoreOperations => {
+                state.plan_backup_deletion();
                 true
             }
             KeyCode::Char('d' | 'D') => {
@@ -2438,11 +2546,11 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
     let mut primary_controls = vec![
         Span::styled("V", mnemonic_style),
         Span::raw(if view == TuiView::Inventory {
-            "iew | j/k move | filter: "
+            "iew | ↑/↓ move | filter: "
         } else if supports_active_action {
-            "iew | j/k move | PgUp/PgDn scroll Control | "
+            "iew | ↑/↓ move | PgUp/PgDn scroll | "
         } else {
-            "iew | j/k move | PgUp/PgDn scroll Control"
+            "iew | ↑/↓ move | PgUp/PgDn scroll"
         }),
     ];
     if supports_active_action {
@@ -2460,7 +2568,7 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
     }
 
     let mut secondary_controls = vec![
-        Span::raw("space select/plan | enter confirm | "),
+        Span::raw("Space select/plan | Enter confirm | "),
         Span::styled("A", mnemonic_style),
         Span::raw("pply | "),
         Span::styled("U", mnemonic_style),
@@ -2518,6 +2626,11 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
                 Span::raw("rite definition"),
             ]),
         ]),
+        TuiView::RestoreOperations => lines.push(Line::from(vec![
+            Span::raw("Restore: "),
+            Span::styled("D", mnemonic_style),
+            Span::raw("elete backup"),
+        ])),
         _ => {}
     }
 
@@ -2737,6 +2850,11 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         .split(chunks[1]);
 
     let active_rows = state.active_rows();
+    let selected_row = if state.view == TuiView::Inventory {
+        (state.visible_count() > 0).then_some(state.selected)
+    } else {
+        active_rows.iter().position(|row| row.starts_with('>'))
+    };
     let list_items = if active_rows.is_empty() {
         vec![ListItem::new("No rows in this view.")]
     } else {
@@ -2752,15 +2870,9 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
                 .title(state.view.title()),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    if state.view == TuiView::Inventory {
-        let mut list_state = ListState::default();
-        if state.visible_count() > 0 {
-            list_state.select(Some(state.selected));
-        }
-        frame.render_stateful_widget(list, body[0], &mut list_state);
-    } else {
-        frame.render_widget(list, body[0]);
-    }
+    let mut list_state = ListState::default();
+    list_state.select(selected_row);
+    frame.render_stateful_widget(list, body[0], &mut list_state);
 
     let detail_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2990,12 +3102,27 @@ fn warning_label(warning: &DiscoveryWarning) -> String {
 
 fn backup_label(backup: &BackupSummary) -> String {
     format!(
-        "- {} created: {} entries: {} restorable: {} authentication: {}",
-        backup.backup_id,
+        "- {} created: {} entries: {} restorable: {} authentication: {} id: {}",
+        backup_display_label(backup),
         backup.created_at,
         backup.item_count,
         backup.restorable,
-        backup_authentication_label(backup.authentication)
+        backup_authentication_label(backup.authentication),
+        backup.backup_id,
+    )
+}
+
+fn backup_display_label(backup: &BackupSummary) -> String {
+    format!(
+        "{} {} {} → {}",
+        backup.selection.provider.as_str(),
+        backup.selection.layer.as_str(),
+        backup.selection.display_name,
+        if backup.target_enabled {
+            "enabled"
+        } else {
+            "disabled"
+        },
     )
 }
 
@@ -3975,15 +4102,10 @@ mod tests {
             new_index < old_index,
             "backups should sort newest first; got:\n{output}"
         );
-        assert!(
-            output
-                .contains("- backup-new created: 2026-06-20T12:00:00Z entries: 1 restorable: true")
-        );
-        assert!(
-            output.contains(
-                "- backup-old created: 2026-06-20T10:00:00Z entries: 0 restorable: false"
-            )
-        );
+        assert!(output.contains("claude project example → disabled created: 2026-06-20T12:00:00Z entries: 1 restorable: true"));
+        assert!(output.contains("id: backup-new"));
+        assert!(output.contains("claude project example → disabled created: 2026-06-20T10:00:00Z entries: 0 restorable: false"));
+        assert!(output.contains("id: backup-old"));
     }
 
     #[test]
@@ -4043,24 +4165,14 @@ mod tests {
         let output = render_headless_state(&state);
 
         assert!(output.contains("Backups: 4"));
-        assert!(
-            output.contains(
-                "- backup-valid created: 2026-06-20T12:03:00Z entries: 1 restorable: true"
-            )
-        );
-        assert!(
-            output.contains(
-                "- backup-other created: 2026-06-20T12:02:00Z entries: 1 restorable: false"
-            )
-        );
-        assert!(output.contains(
-            "- backup-traversal created: 2026-06-20T12:01:00Z entries: 1 restorable: false"
-        ));
-        assert!(
-            output.contains(
-                "- backup-empty created: 2026-06-20T12:00:00Z entries: 0 restorable: false"
-            )
-        );
+        assert!(output.contains("created: 2026-06-20T12:03:00Z entries: 1 restorable: true"));
+        assert!(output.contains("id: backup-valid"));
+        assert!(output.contains("created: 2026-06-20T12:02:00Z entries: 1 restorable: false"));
+        assert!(output.contains("id: backup-mismatch"));
+        assert!(output.contains("created: 2026-06-20T12:01:00Z entries: 1 restorable: false"));
+        assert!(output.contains("id: backup-traversal"));
+        assert!(output.contains("created: 2026-06-20T12:00:00Z entries: 0 restorable: false"));
+        assert!(output.contains("id: backup-empty"));
     }
 
     #[test]
@@ -4942,7 +5054,7 @@ mod tests {
     fn headless_command_legend_preserves_literal_action_labels() {
         let rendered = headless_command_legend(TuiView::Inventory).join("\n");
 
-        assert!(rendered.contains("[V]iew | j/k move | filter: [p]rovider/[l]ayer/[c]ategory"));
+        assert!(rendered.contains("[V]iew | ↑/↓ move | filter: [p]rovider/[l]ayer/[c]ategory"));
         assert!(rendered.contains("[x] clear search"));
         assert!(rendered.contains("[A]pply"));
         assert!(rendered.contains("[Q]uit"));
@@ -5332,5 +5444,164 @@ mod tests {
             .collect::<String>();
         assert!(rendered.contains("Unpin"));
         assert!(rendered.contains("View:"));
+    }
+
+    fn restore_backup_summary(index: usize) -> BackupSummary {
+        let mut selection = item(
+            &format!("backup-target-{index}"),
+            ProviderId::Codex,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        );
+        selection.display_name = format!("target-{index}");
+        BackupSummary {
+            backup_id: format!("backup-{index:03}"),
+            created_at: format!("2026-08-01T00:{index:02}:00Z"),
+            item_count: 1,
+            providers: vec!["codex".to_string()],
+            layers: vec!["global".to_string()],
+            paths: vec![format!("/state/backup-target-{index}")],
+            restorable: true,
+            authentication: BackupAuthenticationStatus::Verified,
+            selection,
+            target_enabled: index.is_multiple_of(2),
+        }
+    }
+
+    #[test]
+    fn restore_list_follows_the_selected_backup_and_uses_descriptive_labels() {
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        let backups = (0..30).map(restore_backup_summary).collect::<Vec<_>>();
+        state.backups.clone_from(&backups);
+        state.restore_workflow = RestoreWorkflow::new(backups, Vec::new());
+        state.view = TuiView::RestoreOperations;
+        for _ in 0..20 {
+            state.move_next();
+        }
+
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw restore list");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(rendered.contains("> codex global target-20 → enabled"));
+        assert!(!state.restore_workflow.rows()[20].contains("backup-020"));
+    }
+
+    #[test]
+    fn restore_backup_deletion_requires_confirmation_before_apply() {
+        let app_state = TempDir::new().expect("temporary app state");
+        let mut state = TuiState::new_with_app_state_root(
+            DiscoveryOutput {
+                items: Vec::new(),
+                warnings: Vec::new(),
+            },
+            app_state.path().to_path_buf(),
+        );
+        let backup = restore_backup_summary(1);
+        let backup_root = state.app_state_root.join("backups").join(&backup.backup_id);
+        fs::create_dir_all(&backup_root).expect("backup directory");
+        fs::write(
+            backup_root.join("manifest.json"),
+            "{\"backupId\":\"backup-001\"}\n",
+        )
+        .expect("backup manifest");
+        state.backups = vec![backup.clone()];
+        state.restore_workflow = RestoreWorkflow::new(vec![backup], Vec::new());
+        state.view = TuiView::RestoreOperations;
+
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('D'))),
+            TuiEventOutcome::Redraw
+        );
+        assert!(backup_root.is_dir());
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('A'))),
+            TuiEventOutcome::Redraw
+        );
+        assert!(backup_root.is_dir(), "unconfirmed deletion must not apply");
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Enter)),
+            TuiEventOutcome::Redraw
+        );
+        assert!(matches!(
+            state.last_action,
+            Some(TuiActionStatus::Success(ref message))
+                if message == "backup deletion confirmed; press A to apply"
+        ));
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('A'))),
+            TuiEventOutcome::Redraw
+        );
+        assert!(!backup_root.exists());
+        assert!(state.restore_workflow.rows().is_empty());
+        assert!(
+            state
+                .restore_workflow
+                .details()
+                .iter()
+                .any(|detail| detail == "selected: none")
+        );
+
+        let backend = ratatui::backend::TestBackend::new(100, 20);
+        let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw empty restore list");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("No rows in this view."));
+    }
+
+    #[test]
+    fn command_legend_uses_arrow_navigation_and_capitalized_actions() {
+        let legend = command_legend(TuiView::RestoreOperations)
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(legend.contains("↑/↓ move"));
+        assert!(legend.contains("PgUp/PgDn scroll"));
+        assert!(legend.contains("Space select/plan | Enter confirm"));
+        assert!(legend.contains("Restore: Delete backup"));
+        assert!(!legend.contains("j/k"));
+        assert!(!legend.contains("Control"));
+
+        let mut state = TuiState::new(DiscoveryOutput {
+            items: Vec::new(),
+            warnings: Vec::new(),
+        });
+        state.restore_workflow = RestoreWorkflow::new(
+            vec![restore_backup_summary(0), restore_backup_summary(1)],
+            Vec::new(),
+        );
+        state.view = TuiView::RestoreOperations;
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('j'))),
+            TuiEventOutcome::Ignore
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Down)),
+            TuiEventOutcome::Redraw
+        );
+        assert!(state.active_rows()[1].starts_with('>'));
     }
 }

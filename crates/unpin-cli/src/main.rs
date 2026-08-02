@@ -135,6 +135,13 @@ impl DiscoveryRootArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Internal credential broker process for local MCP and CLI clients.
+    #[command(hide = true)]
+    CredentialBroker {
+        /// Unpin-owned state root that owns the private broker socket.
+        #[arg(long)]
+        app_state_root: PathBuf,
+    },
     /// Manage credentials used by Unpin safety features.
     Auth {
         #[command(subcommand)]
@@ -436,6 +443,15 @@ fn main() -> ExitCode {
     };
 
     match cli.command {
+        Some(Commands::CredentialBroker { app_state_root }) => {
+            match credentials::run_credential_broker(&app_state_root) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("credential broker failed: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
         Some(Commands::Auth { command }) => run_auth_command(command),
         Some(Commands::Providers) => {
             println!("{}", render_providers());

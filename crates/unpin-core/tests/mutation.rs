@@ -15,7 +15,8 @@ use unpin_core::{
         BackupAuthenticationKey, BackupAuthenticationStatus, NativeToggleControlError,
         NativeToggleController, RestoreBackupInput, RestoreControlError, RestoreController,
         RestoreStatus, TogglePlanRequest, ToggleResult, ToggleStatus, authenticate_legacy_backup,
-        load_backup_summaries_authenticated, plan_toggle as core_plan_toggle, restore_backup,
+        delete_backup, load_backup_summaries_authenticated, plan_backup_deletion,
+        plan_toggle as core_plan_toggle, restore_backup,
     },
     provider_reach::{
         ConnectionBoundary, DerivedTargetKind, ProviderReach, ProviderReachError,
@@ -270,6 +271,89 @@ fn apply_example_skill_backup(
         item,
         result.backup_id.expect("applied toggle has backup id"),
     )
+}
+
+#[test]
+fn backup_deletion_is_bound_to_the_reviewed_manifest_and_audited() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let (_, backup_id) = apply_example_skill_backup(fixture_copy.path(), app_state.path());
+
+    let plan = plan_backup_deletion(app_state.path(), &backup_id).expect("backup deletion plan");
+    let deleted = delete_backup(app_state.path(), &plan).expect("delete reviewed backup");
+
+    assert_eq!(deleted.backup_id, backup_id);
+    assert!(!app_state.path().join("backups").join(&backup_id).exists());
+    let audit = audit_log(app_state.path()).expect("backup deletion audit");
+    assert!(audit.contains("backup-delete-requested"));
+    assert!(audit.contains("backup-deleted"));
+    assert!(audit.contains(&backup_id));
+    assert!(audit.contains(&plan.manifest_digest));
+}
+
+#[test]
+fn backup_deletion_refuses_manifest_drift_after_planning() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let (_, backup_id) = apply_example_skill_backup(fixture_copy.path(), app_state.path());
+    let plan = plan_backup_deletion(app_state.path(), &backup_id).expect("backup deletion plan");
+    let manifest_path = app_state
+        .path()
+        .join("backups")
+        .join(&backup_id)
+        .join("manifest.json");
+    let manifest = fs::read_to_string(&manifest_path).expect("backup manifest");
+    fs::write(&manifest_path, format!("{manifest}\n")).expect("drift backup manifest");
+
+    let error = delete_backup(app_state.path(), &plan).expect_err("manifest drift is blocked");
+
+    assert!(error.contains("backup changed after deletion was planned"));
+    assert!(app_state.path().join("backups").join(backup_id).is_dir());
+}
+
+#[test]
+fn backup_deletion_uses_the_reviewed_directory_when_a_manifest_claims_another_id() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let (_, backup_id) = apply_example_skill_backup(fixture_copy.path(), app_state.path());
+    let decoy_id = "backup-decoy";
+    let backups_root = app_state.path().join("backups");
+    copy_dir_all(&backups_root.join(&backup_id), &backups_root.join(decoy_id));
+
+    let summaries =
+        load_backup_summaries_authenticated(app_state.path(), Some(&backup_authentication_key()));
+    let decoy = summaries
+        .iter()
+        .find(|summary| summary.backup_id == decoy_id)
+        .expect("decoy backup summary uses its directory identity");
+    assert_eq!(decoy.authentication, BackupAuthenticationStatus::Failed);
+
+    let plan = plan_backup_deletion(app_state.path(), decoy_id).expect("plan decoy deletion");
+    delete_backup(app_state.path(), &plan).expect("delete reviewed decoy directory");
+
+    assert!(backups_root.join(&backup_id).is_dir());
+    assert!(!backups_root.join(decoy_id).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn backup_deletion_refuses_a_backup_tree_with_a_symlink() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let (_, backup_id) = apply_example_skill_backup(fixture_copy.path(), app_state.path());
+    let backup_root = app_state.path().join("backups").join(&backup_id);
+    std::os::unix::fs::symlink(fixture_copy.path(), backup_root.join("unsafe-link"))
+        .expect("add unsafe backup entry");
+
+    let error = plan_backup_deletion(app_state.path(), &backup_id)
+        .expect_err("unsafe backup tree is rejected");
+
+    assert!(error.contains("symlink or special file"));
+    assert!(backup_root.is_dir());
 }
 
 fn copy_dir_all(source: &Path, destination: &Path) {

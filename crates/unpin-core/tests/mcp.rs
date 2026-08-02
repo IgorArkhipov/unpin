@@ -4440,7 +4440,7 @@ fn mcp_backup_summaries_mark_invalid_restore_manifests_unrestorable() {
     assert_eq!(backup_rows[0]["backupId"], "backup-valid");
     assert_eq!(backup_rows[0]["restorable"], true);
     assert_eq!(backup_rows[0]["authentication"], "verified");
-    assert_eq!(backup_rows[1]["backupId"], "backup-other");
+    assert_eq!(backup_rows[1]["backupId"], "backup-mismatch");
     assert_eq!(backup_rows[1]["restorable"], false);
     assert_eq!(backup_rows[1]["authentication"], "failed");
     assert_eq!(backup_rows[2]["backupId"], "backup-traversal");
@@ -4454,7 +4454,7 @@ fn mcp_backup_summaries_mark_invalid_restore_manifests_unrestorable() {
     assert_eq!(limited["totalBackups"], 4);
     assert_eq!(limited_rows.len(), 2);
     assert_eq!(limited_rows[0]["backupId"], "backup-valid");
-    assert_eq!(limited_rows[1]["backupId"], "backup-other");
+    assert_eq!(limited_rows[1]["backupId"], "backup-mismatch");
 }
 
 #[test]

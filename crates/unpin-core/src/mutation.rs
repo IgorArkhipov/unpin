@@ -200,6 +200,23 @@ pub struct BackupSummary {
     pub target_enabled: bool,
 }
 
+/// A reviewed backup deletion bound to the exact manifest bytes that were shown
+/// to the user. Applying a stale plan is rejected rather than deleting a
+/// backup that changed after review.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupDeletionPlan {
+    pub backup_id: String,
+    pub manifest_digest: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupDeletionResult {
+    pub backup_id: String,
+    pub deleted_at: String,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BackupAuthenticationStatus {
@@ -1779,6 +1796,109 @@ pub fn load_backup_summary_authenticated(
     ))
 }
 
+/// Prepares deletion of one backup without mutating it.
+pub fn plan_backup_deletion(
+    app_state_root: &Path,
+    backup_id: &str,
+) -> Result<BackupDeletionPlan, String> {
+    let raw = read_backup_deletion_manifest(app_state_root, backup_id)?;
+    Ok(BackupDeletionPlan {
+        backup_id: backup_id.to_string(),
+        manifest_digest: transition_digest(raw.as_bytes()),
+    })
+}
+
+/// Removes a backup only when its reviewed manifest is unchanged.
+pub fn delete_backup(
+    app_state_root: &Path,
+    plan: &BackupDeletionPlan,
+) -> Result<BackupDeletionResult, String> {
+    let lock = acquire_mutation_lock(app_state_root)?;
+    let raw = read_backup_deletion_manifest(app_state_root, &plan.backup_id)?;
+    if transition_digest(raw.as_bytes()) != plan.manifest_digest {
+        return Err("backup changed after deletion was planned; review it again".to_string());
+    }
+
+    let deleted_at = current_timestamp()?;
+    fs::create_dir_all(app_state_root.join("audit")).map_err(|error| error.to_string())?;
+    let requested = BackupDeletionAuditEntry {
+        version: 1,
+        event: "backup-delete-requested".to_string(),
+        created_at: deleted_at.clone(),
+        backup_id: plan.backup_id.clone(),
+        manifest_digest: plan.manifest_digest.clone(),
+    };
+    append_audit_entry(app_state_root, &requested).map_err(|error| error.to_string())?;
+
+    let backups_root = app_state_root.join("backups");
+    let backup_root = backups_root.join(&plan.backup_id);
+    let quarantine_root = backups_root.join(".quarantine");
+    fs::create_dir_all(&quarantine_root).map_err(|error| error.to_string())?;
+    validate_path_has_no_symlink_components(app_state_root, &quarantine_root)?;
+    let quarantine_path = quarantine_root.join(&plan.backup_id);
+    if quarantine_path.exists() {
+        return Err(format!(
+            "backup deletion recovery copy already exists for {}; inspect it before retrying",
+            plan.backup_id
+        ));
+    }
+    fs::rename(&backup_root, &quarantine_path).map_err(|error| error.to_string())?;
+    if let Err(error) = fs::remove_dir_all(&quarantine_path) {
+        let recovery = BackupDeletionAuditEntry {
+            event: "backup-delete-recovery-required".to_string(),
+            ..requested
+        };
+        let _ = append_audit_entry(app_state_root, &recovery);
+        return Err(format!(
+            "backup moved to deletion quarantine but cleanup failed; recovery copy was retained: {error}"
+        ));
+    }
+
+    let deleted = BackupDeletionAuditEntry {
+        event: "backup-deleted".to_string(),
+        ..requested
+    };
+    append_audit_entry(app_state_root, &deleted)
+        .map_err(|error| format!("backup was deleted but audit completion failed: {error}"))?;
+    drop(lock);
+
+    Ok(BackupDeletionResult {
+        backup_id: plan.backup_id.clone(),
+        deleted_at,
+    })
+}
+
+fn read_backup_deletion_manifest(app_state_root: &Path, backup_id: &str) -> Result<String, String> {
+    if !valid_backup_id(backup_id) {
+        return Err(format!("invalid backup id: {backup_id}"));
+    }
+    let backup_root = app_state_root.join("backups").join(backup_id);
+    validate_path_has_no_symlink_components(app_state_root, &backup_root)?;
+    let metadata = fs::symlink_metadata(&backup_root).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(format!(
+            "backup directory must be a regular directory: {}",
+            backup_root.display()
+        ));
+    }
+    if !directory_tree_is_plain(&backup_root).map_err(|error| error.to_string())? {
+        return Err(format!(
+            "backup directory contains a symlink or special file: {}",
+            backup_root.display()
+        ));
+    }
+    let manifest_path = backup_root.join("manifest.json");
+    validate_path_has_no_symlink_components(app_state_root, &manifest_path)?;
+    let metadata = fs::symlink_metadata(&manifest_path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(format!(
+            "backup manifest must be a regular file: {}",
+            manifest_path.display()
+        ));
+    }
+    fs::read_to_string(manifest_path).map_err(|error| error.to_string())
+}
+
 /// Establishes trust in one legacy v1 backup by authenticating its current manifest and payloads.
 ///
 /// Callers must review or otherwise trust legacy backup contents before invoking this function.
@@ -1839,7 +1959,10 @@ fn backup_summary_from_manifest(
     paths.sort();
 
     BackupSummary {
-        backup_id: manifest.backup_id,
+        // The directory name is the trusted identity for subsequent restore and
+        // deletion paths. A malformed manifest remains visible as failed but
+        // can never redirect an operation to another backup directory.
+        backup_id: backup_dir_name.to_string(),
         created_at: manifest.created_at,
         item_count: manifest.entries.len(),
         providers,
@@ -7451,6 +7574,16 @@ struct RestoreAuditEntry {
     created_at: String,
     backup_id: String,
     affected_targets: Vec<MutationTarget>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackupDeletionAuditEntry {
+    version: u8,
+    event: String,
+    created_at: String,
+    backup_id: String,
+    manifest_digest: String,
 }
 
 #[derive(Debug, Serialize)]

@@ -24,11 +24,11 @@ configuration for Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It
 normalizes provider-specific skills, MCP servers, plugins, hooks, agents, and
 settings into one inventory.
 
-Unpin `0.1.0-beta.12` makes TUI commands easier to scan: the interactive
-footer names each available command and underlines its mnemonic, while plain
-headless output brackets the same key. Header and footer content prioritizes
-current state rather than overlapping in narrow or short terminals. It is a
-program-logic release, so
+Unpin `0.1.0-beta.13` makes backups understandable and manageable in the TUI:
+Restore Operations identifies the provider, scope, affected item, state, and
+creation time, keeps the selected row visible, and offers a reviewed delete
+flow. On macOS, concurrent CLI/MCP clients reuse an idle-expiring local
+credential broker instead of repeatedly opening Keychain. It is a program-logic release, so
 the full provider matrix and live-host validation are required before publication.
 Its GNU/Linux archive remains built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
