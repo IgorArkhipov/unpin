@@ -13,6 +13,7 @@ use super::{
 
 const CREDENTIAL_BUNDLE_ACCOUNT: &str = "credential-bundle-v1";
 const BUNDLE_VERSION: u8 = 1;
+#[cfg(unix)]
 const REQUEST_BUNDLE: u8 = 1;
 const RESPONSE_BYTES: usize = 100;
 #[cfg(unix)]
