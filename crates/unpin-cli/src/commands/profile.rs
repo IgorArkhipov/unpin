@@ -1354,6 +1354,11 @@ fn apply_profile(
     ) {
         return command_error_exit(options.json, "blocked", &error);
     }
+    if let Err(error) =
+        credentials::require_live_apply_terminal(options.roots.fixture_root.is_some())
+    {
+        return command_error_exit(options.json, "blocked", &error);
+    }
     let session_authority_key = match credentials::resolve_session_authority_key(
         options.roots.fixture_root.is_some(),
         &config.app_state_root,
@@ -1586,6 +1591,9 @@ fn apply_profile_with_reach(
             config.project_root.as_path(),
         ],
     ) {
+        return crate::command_error_exit_code(options.json, "blocked", &error, 3);
+    }
+    if let Err(error) = credentials::require_live_apply_terminal(fixture_mode) {
         return crate::command_error_exit_code(options.json, "blocked", &error, 3);
     }
     let session_key =

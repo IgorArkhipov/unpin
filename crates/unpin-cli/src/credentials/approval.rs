@@ -3,7 +3,10 @@ use std::path::Path;
 #[cfg(any(unix, test))]
 use std::io::Write;
 #[cfg(unix)]
-use std::{fs::OpenOptions, io::Read};
+use std::{
+    fs::OpenOptions,
+    io::{self, IsTerminal, Read},
+};
 
 use unpin_core::{
     approval::{
@@ -278,7 +281,24 @@ fn require_controlling_terminal_presence(
     expectation: &ApprovalExpectation,
     plan_fingerprint: &str,
 ) -> Result<(), String> {
-    let mut tty = OpenOptions::new()
+    let mut tty = open_controlling_terminal()?;
+    render_human_approval_prompt(&mut tty, expectation, plan_fingerprint)?;
+    tty.flush()
+        .map_err(|error| format!("human approval prompt could not be displayed: {error}"))?;
+    let response = read_human_presence_response(&mut tty)?;
+    validate_human_presence_response(&response, plan_fingerprint)
+}
+
+#[cfg(unix)]
+fn open_controlling_terminal() -> Result<std::fs::File, String> {
+    if !(io::stdin().is_terminal() || io::stdout().is_terminal() || io::stderr().is_terminal()) {
+        return Err(
+            "interactive human approval requires a controlling terminal; --confirm and stdin are insufficient: standard streams are not terminals"
+                .to_string(),
+        );
+    }
+
+    OpenOptions::new()
         .read(true)
         .write(true)
         .open("/dev/tty")
@@ -286,12 +306,29 @@ fn require_controlling_terminal_presence(
             format!(
                 "interactive human approval requires a controlling terminal; --confirm and stdin are insufficient: {error}"
             )
-        })?;
-    render_human_approval_prompt(&mut tty, expectation, plan_fingerprint)?;
-    tty.flush()
-        .map_err(|error| format!("human approval prompt could not be displayed: {error}"))?;
-    let response = read_human_presence_response(&mut tty)?;
-    validate_human_presence_response(&response, plan_fingerprint)
+        })
+}
+
+pub(crate) fn require_live_apply_terminal(fixture_mode: bool) -> Result<(), String> {
+    if fixture_mode {
+        return Ok(());
+    }
+
+    require_controlling_terminal()
+}
+
+#[cfg(unix)]
+fn require_controlling_terminal() -> Result<(), String> {
+    let _tty = open_controlling_terminal()?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn require_controlling_terminal() -> Result<(), String> {
+    Err(
+        "interactive human approval is unsupported on this platform; live apply is blocked"
+            .to_string(),
+    )
 }
 
 #[cfg(not(unix))]

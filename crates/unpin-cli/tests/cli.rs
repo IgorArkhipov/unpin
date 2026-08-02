@@ -960,12 +960,10 @@ fn detached_live_profile_apply_fails_before_mutation() {
         String::from_utf8_lossy(&applied.stdout),
         String::from_utf8_lossy(&applied.stderr)
     );
-    let blocked_before_mutation = output
-        .contains("session authority key missing; run `unpin auth session init`")
-        || output.contains("keychain entry could not be opened:")
-        || output.contains("keychain credential could not be read:")
-        || output.contains("interactive human approval requires a controlling terminal");
-    assert!(blocked_before_mutation, "unexpected output: {output}");
+    assert!(
+        output.contains("interactive human approval requires a controlling terminal"),
+        "unexpected output: {output}"
+    );
     assert!(
         PolicyStore::new(&state)
             .load(&target)
@@ -2600,10 +2598,11 @@ fn tui_headless_renders_inventory_view() {
     assert!(stdout.contains("target enabled: false"));
     assert!(stdout.contains("operation: renamePath"));
     assert!(stdout.contains("writes: no writes were performed"));
-    assert!(stdout.contains("q quit"));
-    assert!(stdout.contains("p provider"));
-    assert!(stdout.contains("l layer"));
-    assert!(stdout.contains("c category"));
+    assert!(stdout.contains("Commands:"));
+    assert!(stdout.contains("[Q]uit"));
+    assert!(stdout.contains("filter: [p]rovider/[l]ayer/[c]ategory"));
+    assert!(stdout.contains("Commands (Groups):"));
+    assert!(stdout.contains("Groups: [P] reach"));
 }
 
 #[test]

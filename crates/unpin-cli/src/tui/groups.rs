@@ -875,6 +875,10 @@ impl GroupWorkflow {
         }
     }
 
+    pub(super) fn can_cycle_draft_scope(&self) -> bool {
+        self.draft.as_ref().is_some_and(|draft| draft.creating)
+    }
+
     pub(super) fn toggle_member(&mut self, item: &DiscoveryItem) -> Result<(), String> {
         if self.screen != GroupScreen::Members {
             return Err("open a group member editor before selecting members".to_string());

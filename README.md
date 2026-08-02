@@ -6,10 +6,12 @@ workflows.
 
 ## Distribution status and quick start
 
-Unpin `0.1.0-beta.11` improves named-group control plans: the `Groups` title is
-consistent, long control content wraps and scrolls, and group identities stay
-legible without duplicated namespaces. It is a program-logic release, so the
-full provider matrix and live-host validation are required before publication.
+Unpin `0.1.0-beta.12` makes TUI commands easier to scan: the interactive
+footer names each available command and underlines its mnemonic, while plain
+headless output brackets the same key. Header and footer content prioritizes
+current state rather than overlapping in narrow or short terminals. It is a
+program-logic release, so
+the full provider matrix and live-host validation are required before publication.
 Its GNU/Linux archive remains built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
 artifacts are
@@ -25,7 +27,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.1.0-beta.11-TARGET.tar.gz \
+gh attestation verify unpin-v0.1.0-beta.12-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -33,7 +35,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.1.0-beta.11-TARGET
+cd unpin-v0.1.0-beta.12-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"

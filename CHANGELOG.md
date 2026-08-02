@@ -7,6 +7,29 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.12] - 2026-08-01
+
+### Changed
+
+- Reworked the terminal command footer into named, underlined mnemonics. The
+  active view now shows every available contextual control without repeating a
+  separate shortcut token; plain headless output marks the same keys in
+  brackets.
+- Let `p`/`l`/`c` narrow member candidates while creating or editing a named
+  group, and prioritized compact header state ahead of wrapped command-footer
+  detail so narrow and short terminals do not overlap or lose their summary.
+- Replaced the action legend with input-specific guidance while search or a
+  group name is being edited, so the footer never advertises keys consumed as text.
+- Updated direct Rust dependencies: `http` 1.5.0, `jsonc-parser` 0.33.1, and
+  `rmcp` 3.0.1.
+
+### Fixed
+
+- Kept the command legend and case-sensitive TUI key bindings aligned, including
+  group reach, scope, rename, restore, approval, definition-save, and export.
+- Reject fully non-interactive live approvals before opening macOS Keychain, so
+  automated applies fail closed instead of waiting for a human prompt.
+
 ## [0.1.0-beta.11] - 2026-08-01
 
 ### Fixed
@@ -144,7 +167,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.11...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.12...HEAD
+
+[0.1.0-beta.12]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.12
 
 [0.1.0-beta.11]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.11
 [0.1.0-beta.10]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.10
