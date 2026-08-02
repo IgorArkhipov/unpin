@@ -3,6 +3,12 @@ use std::{
     error::Error,
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    thread,
     time::Duration,
 };
 
@@ -26,8 +32,9 @@ use unpin_core::control_operation::{
     ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle, DurableControlError,
 };
 use unpin_core::discovery::{
-    DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, DiscoveryOutput,
-    DiscoveryRoots, DiscoveryWarning, ProviderId, discover_all,
+    DiscoveryCategory, DiscoveryError, DiscoveryItem, DiscoveryLayer, DiscoveryMutability,
+    DiscoveryOutput, DiscoveryProgress, DiscoveryProgressPhase, DiscoveryRoots, DiscoveryWarning,
+    ProviderId, discover_all, discover_all_with_progress,
 };
 use unpin_core::groups::{GroupAccessContext, GroupMemberIdentity, GroupOperationLifecycle};
 use unpin_core::mutation::{
@@ -37,6 +44,7 @@ use unpin_core::mutation::{
     load_backup_summaries_authenticated, plan_backup_deletion, plan_toggle,
 };
 use unpin_core::sessions::SessionAuthorityKey;
+
 #[cfg(test)]
 use unpin_core::snapshots::write_discovery_snapshot;
 use unpin_core::snapshots::{SnapshotWriteOptions, write_control_snapshot};
@@ -2290,12 +2298,9 @@ fn render_headless_state(state: &TuiState) -> String {
 }
 
 pub fn run_interactive(
-    discovery: DiscoveryOutput,
     app_state_root: PathBuf,
     project_root: PathBuf,
     discovery_roots: DiscoveryRoots,
-    backup_authentication_key: Option<BackupAuthenticationKey>,
-    session_authority_key: Option<SessionAuthorityKey>,
     fixture_mode: bool,
 ) -> TuiResult<()> {
     enable_raw_mode()?;
@@ -2303,22 +2308,228 @@ pub fn run_interactive(
     execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
-    let mut state = TuiState::new_with_paths_and_roots_and_key(
-        discovery,
-        app_state_root,
-        project_root,
-        discovery_roots,
-        backup_authentication_key,
-        session_authority_key,
-    );
-    state.fixture_mode = fixture_mode;
-
-    let loop_result = run_loop(&mut terminal, &mut state);
+    let loop_result = (|| -> TuiResult<()> {
+        let loading_state = LoadingState::default();
+        terminal.draw(|frame| draw_loading(frame, &loading_state))?;
+        let Some(startup) = run_loading_loop(
+            &mut terminal,
+            &discovery_roots,
+            &app_state_root,
+            fixture_mode,
+        )?
+        else {
+            return Ok(());
+        };
+        let mut state = TuiState::new_with_paths_and_roots_and_key(
+            startup.discovery,
+            app_state_root,
+            project_root,
+            discovery_roots,
+            startup.backup_authentication_key,
+            startup.session_authority_key,
+        );
+        state.fixture_mode = fixture_mode;
+        record_startup_warnings(&mut state, startup.credential_warnings);
+        run_loop(&mut terminal, &mut state)
+    })();
     let restore_result = restore_terminal(&mut terminal);
 
     loop_result?;
     restore_result?;
     Ok(())
+}
+
+#[derive(Default)]
+struct LoadingState {
+    progress: Option<DiscoveryProgress>,
+}
+
+fn draw_loading(frame: &mut Frame, state: &LoadingState) {
+    frame.render_widget(
+        Paragraph::new(vec![
+            Line::from(loading_status(state)),
+            Line::from("Press Q or Esc to cancel."),
+        ])
+        .block(Block::default().borders(Borders::ALL).title("Unpin")),
+        frame.area(),
+    );
+}
+
+fn run_loading_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    discovery_roots: &DiscoveryRoots,
+    app_state_root: &Path,
+    fixture_mode: bool,
+) -> TuiResult<Option<TuiStartup>> {
+    let (receiver, cancellation) = start_discovery(
+        discovery_roots.clone(),
+        app_state_root.to_path_buf(),
+        fixture_mode,
+    );
+    let mut loading_state = LoadingState::default();
+    loop {
+        let previous_progress = loading_state.progress;
+        if let Some(startup) = try_take_startup(&receiver, &mut loading_state)? {
+            return Ok(Some(startup));
+        }
+        if loading_state.progress != previous_progress {
+            terminal.draw(|frame| draw_loading(frame, &loading_state))?;
+        }
+        if !event::poll(Duration::from_millis(200))? {
+            continue;
+        }
+        match loading_event(event::read()?) {
+            LoadingEvent::Redraw => {
+                terminal.draw(|frame| draw_loading(frame, &loading_state))?;
+            }
+            LoadingEvent::Quit => {
+                cancellation.store(true, Ordering::Relaxed);
+                return Ok(None);
+            }
+            LoadingEvent::Ignore => {}
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadingEvent {
+    Redraw,
+    Quit,
+    Ignore,
+}
+
+fn loading_event(event: Event) -> LoadingEvent {
+    match event {
+        Event::Resize(_, _) => LoadingEvent::Redraw,
+        Event::Key(key) if matches!(key.code, KeyCode::Char('q' | 'Q') | KeyCode::Esc) => {
+            LoadingEvent::Quit
+        }
+        _ => LoadingEvent::Ignore,
+    }
+}
+
+struct TuiStartup {
+    discovery: DiscoveryOutput,
+    backup_authentication_key: Option<BackupAuthenticationKey>,
+    session_authority_key: Option<SessionAuthorityKey>,
+    credential_warnings: Vec<String>,
+}
+
+enum TuiStartupEvent {
+    Progress(DiscoveryProgress),
+    Complete(Result<TuiStartup, DiscoveryError>),
+}
+
+fn start_discovery(
+    discovery_roots: DiscoveryRoots,
+    app_state_root: PathBuf,
+    fixture_mode: bool,
+) -> (Receiver<TuiStartupEvent>, Arc<AtomicBool>) {
+    let (sender, receiver) = mpsc::channel();
+    let cancellation = Arc::new(AtomicBool::new(false));
+    let worker_cancellation = Arc::clone(&cancellation);
+    thread::spawn(move || {
+        let result = discover_all_with_progress(&discovery_roots, |progress| {
+            if worker_cancellation.load(Ordering::Relaxed) {
+                return false;
+            }
+            sender.send(TuiStartupEvent::Progress(progress)).is_ok()
+                && !worker_cancellation.load(Ordering::Relaxed)
+        });
+        if worker_cancellation.load(Ordering::Relaxed) {
+            return;
+        }
+        let result = result.map(|discovery| {
+            if worker_cancellation.load(Ordering::Relaxed) {
+                return None;
+            }
+            let (backup_authentication_key, backup_warning) =
+                match credentials::resolve_backup_authentication_key(fixture_mode, &app_state_root)
+                {
+                    Ok(key) => (key, None),
+                    Err(error) => (
+                        None,
+                        Some(format!(
+                            "backup authentication unavailable; writes disabled: {error}"
+                        )),
+                    ),
+                };
+            if worker_cancellation.load(Ordering::Relaxed) {
+                return None;
+            }
+            let (session_authority_key, session_warning) =
+                match credentials::resolve_session_authority_key(fixture_mode, &app_state_root) {
+                    Ok(key) => (key, None),
+                    Err(error) => (
+                        None,
+                        Some(format!(
+                            "session authority unavailable; session controls disabled: {error}"
+                        )),
+                    ),
+                };
+            Some(TuiStartup {
+                discovery,
+                backup_authentication_key,
+                session_authority_key,
+                credential_warnings: [backup_warning, session_warning]
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            })
+        });
+        let result = match result {
+            Ok(Some(startup)) => Ok(startup),
+            Ok(None) => return,
+            Err(error) => Err(error),
+        };
+        if !worker_cancellation.load(Ordering::Relaxed) {
+            let _ = sender.send(TuiStartupEvent::Complete(result));
+        }
+    });
+    (receiver, cancellation)
+}
+
+fn try_take_startup(
+    receiver: &Receiver<TuiStartupEvent>,
+    loading_state: &mut LoadingState,
+) -> TuiResult<Option<TuiStartup>> {
+    loop {
+        match receiver.try_recv() {
+            Ok(TuiStartupEvent::Progress(progress)) => loading_state.progress = Some(progress),
+            Ok(TuiStartupEvent::Complete(Ok(startup))) => return Ok(Some(startup)),
+            Ok(TuiStartupEvent::Complete(Err(error))) => return Err(error),
+            Err(TryRecvError::Empty) => return Ok(None),
+            Err(TryRecvError::Disconnected) => {
+                return Err(io::Error::other("discovery worker stopped before completing").into());
+            }
+        }
+    }
+}
+
+fn loading_status(state: &LoadingState) -> String {
+    match state.progress {
+        Some(DiscoveryProgress {
+            phase: DiscoveryProgressPhase::DiscoveringProvider(provider),
+            completed_providers,
+            provider_count,
+        }) => format!(
+            "Discovering {} configuration and project skills… ({}/{})",
+            provider.as_str(),
+            completed_providers + 1,
+            provider_count,
+        ),
+        Some(DiscoveryProgress {
+            phase: DiscoveryProgressPhase::Finalizing,
+            ..
+        }) => "Finalizing discovery inventory…".to_string(),
+        None => "Preparing configuration discovery…".to_string(),
+    }
+}
+
+fn record_startup_warnings(state: &mut TuiState, credential_warnings: Vec<String>) {
+    if !credential_warnings.is_empty() {
+        state.last_action = Some(TuiActionStatus::Error(credential_warnings.join("; ")));
+    }
 }
 
 fn run_loop(
@@ -3217,6 +3428,7 @@ fn count_provider(items: &[DiscoveryItem], provider: ProviderId) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::backend::TestBackend;
     use std::{fs, path::Path, process::Command as StdCommand};
     use tempfile::TempDir;
     use unpin_core::discovery::{
@@ -3263,6 +3475,200 @@ mod tests {
             code,
             crossterm::event::KeyModifiers::NONE,
         ))
+    }
+
+    #[test]
+    fn loading_view_explains_discovery_and_cancellation() {
+        let backend = TestBackend::new(60, 5);
+        let mut terminal = Terminal::new(backend).expect("loading test terminal");
+        let loading_state = LoadingState::default();
+        terminal
+            .draw(|frame| draw_loading(frame, &loading_state))
+            .expect("draw loading view");
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(ratatui::buffer::Cell::symbol)
+            .collect::<String>();
+        assert!(rendered.contains("Preparing configuration discovery…"));
+        assert!(rendered.contains("Press Q or Esc to cancel."));
+    }
+
+    #[test]
+    fn loading_view_reports_provider_progress() {
+        let state = LoadingState {
+            progress: Some(DiscoveryProgress {
+                phase: DiscoveryProgressPhase::DiscoveringProvider(ProviderId::Codex),
+                completed_providers: 1,
+                provider_count: ProviderId::ALL.len(),
+            }),
+        };
+        assert_eq!(
+            loading_status(&state),
+            "Discovering codex configuration and project skills… (2/6)"
+        );
+
+        let state = LoadingState {
+            progress: Some(DiscoveryProgress {
+                phase: DiscoveryProgressPhase::Finalizing,
+                completed_providers: ProviderId::ALL.len(),
+                provider_count: ProviderId::ALL.len(),
+            }),
+        };
+        assert_eq!(loading_status(&state), "Finalizing discovery inventory…");
+    }
+
+    #[test]
+    fn loading_startup_accepts_discovery_without_waiting_for_input() {
+        let (sender, receiver) = std::sync::mpsc::channel::<TuiStartupEvent>();
+        let mut loading_state = LoadingState::default();
+        assert!(
+            try_take_startup(&receiver, &mut loading_state)
+                .expect("pending discovery is not an error")
+                .is_none()
+        );
+
+        sender
+            .send(TuiStartupEvent::Progress(DiscoveryProgress {
+                phase: DiscoveryProgressPhase::DiscoveringProvider(ProviderId::Codex),
+                completed_providers: 1,
+                provider_count: ProviderId::ALL.len(),
+            }))
+            .expect("send discovery progress");
+        sender
+            .send(TuiStartupEvent::Complete(Ok(TuiStartup {
+                discovery: discovery(vec![item(
+                    "loading-result",
+                    ProviderId::Codex,
+                    DiscoveryLayer::Project,
+                    DiscoveryCategory::Skill,
+                    DiscoveryKind::Skill,
+                )]),
+                backup_authentication_key: None,
+                session_authority_key: None,
+                credential_warnings: Vec::new(),
+            })))
+            .expect("send discovery result");
+
+        let ready = try_take_startup(&receiver, &mut loading_state)
+            .expect("completed discovery is not an error")
+            .expect("completed discovery is available without an input event");
+        assert_eq!(ready.discovery.items.len(), 1);
+        assert_eq!(ready.discovery.items[0].id, "loading-result");
+        assert_eq!(
+            loading_state.progress,
+            Some(DiscoveryProgress {
+                phase: DiscoveryProgressPhase::DiscoveringProvider(ProviderId::Codex),
+                completed_providers: 1,
+                provider_count: ProviderId::ALL.len(),
+            })
+        );
+    }
+
+    #[test]
+    fn loading_event_quits_for_q_and_escape() {
+        for code in [KeyCode::Char('q'), KeyCode::Char('Q'), KeyCode::Esc] {
+            assert_eq!(loading_event(key_event(code)), LoadingEvent::Quit);
+        }
+        assert_eq!(loading_event(Event::Resize(80, 24)), LoadingEvent::Redraw);
+    }
+
+    #[test]
+    fn loading_startup_discovers_fixture_inventory_on_worker() {
+        let app_state = TempDir::new().expect("temporary startup app state");
+        let roots =
+            DiscoveryRoots::fixture_root(fixtures_root()).with_app_state_root(app_state.path());
+        let expected = discover_all(&roots).expect("fixture discovery");
+        let (receiver, _cancellation) =
+            start_discovery(roots, app_state.path().to_path_buf(), true);
+        let mut progress = Vec::new();
+        let startup = loop {
+            match receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("startup worker completes")
+            {
+                TuiStartupEvent::Progress(update) => progress.push(update),
+                TuiStartupEvent::Complete(Ok(startup)) => break startup,
+                TuiStartupEvent::Complete(Err(error)) => {
+                    panic!("fixture discovery succeeds: {error}")
+                }
+            }
+        };
+        assert_eq!(startup.discovery.items, expected.items);
+        assert_eq!(startup.discovery.warnings, expected.warnings);
+        assert_eq!(progress.len(), ProviderId::ALL.len() + 1);
+        for (completed_providers, provider) in ProviderId::ALL.into_iter().enumerate() {
+            assert_eq!(
+                progress[completed_providers],
+                DiscoveryProgress {
+                    phase: DiscoveryProgressPhase::DiscoveringProvider(provider),
+                    completed_providers,
+                    provider_count: ProviderId::ALL.len(),
+                }
+            );
+        }
+        assert_eq!(
+            progress[ProviderId::ALL.len()],
+            DiscoveryProgress {
+                phase: DiscoveryProgressPhase::Finalizing,
+                completed_providers: ProviderId::ALL.len(),
+                provider_count: ProviderId::ALL.len(),
+            }
+        );
+        assert!(startup.backup_authentication_key.is_some());
+        assert!(startup.session_authority_key.is_some());
+        assert!(startup.credential_warnings.is_empty());
+    }
+
+    #[test]
+    fn loading_startup_surfaces_worker_error_and_disconnect() {
+        let (sender, receiver) = std::sync::mpsc::channel::<TuiStartupEvent>();
+        let mut loading_state = LoadingState::default();
+        sender
+            .send(TuiStartupEvent::Complete(Err(io::Error::other(
+                "discovery failed",
+            )
+            .into())))
+            .expect("send worker error");
+        let error = match try_take_startup(&receiver, &mut loading_state) {
+            Err(error) => error,
+            Ok(_) => panic!("worker error is surfaced"),
+        };
+        assert!(error.to_string().contains("discovery failed"));
+
+        let (sender, receiver) = std::sync::mpsc::channel::<TuiStartupEvent>();
+        let mut loading_state = LoadingState::default();
+        drop(sender);
+        let error = match try_take_startup(&receiver, &mut loading_state) {
+            Err(error) => error,
+            Ok(_) => panic!("disconnect is surfaced"),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("discovery worker stopped before completing")
+        );
+    }
+
+    #[test]
+    fn loading_startup_records_credential_warnings() {
+        let mut state = TuiState::new(discovery(Vec::new()));
+        record_startup_warnings(
+            &mut state,
+            vec![
+                "backup authentication unavailable".to_string(),
+                "session authority unavailable".to_string(),
+            ],
+        );
+        assert_eq!(
+            state.last_action,
+            Some(TuiActionStatus::Error(
+                "backup authentication unavailable; session authority unavailable".to_string()
+            ))
+        );
     }
 
     #[test]

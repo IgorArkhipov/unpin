@@ -31,6 +31,30 @@ use crate::{
 
 pub type DiscoveryError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiscoveryProgressPhase {
+    DiscoveringProvider(ProviderId),
+    Finalizing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryProgress {
+    pub phase: DiscoveryProgressPhase,
+    pub completed_providers: usize,
+    pub provider_count: usize,
+}
+
+#[derive(Debug)]
+struct DiscoveryCancelled;
+
+impl std::fmt::Display for DiscoveryCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("discovery cancelled")
+    }
+}
+
+impl std::error::Error for DiscoveryCancelled {}
+
 const CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:@local/";
 const CURSOR_GLOBAL_SKILL_ID_PREFIX: &str = "cursor:global:skill:";
 const CURSOR_PROJECT_SKILL_ID_PREFIX: &str = "cursor:project:skill:";
@@ -414,12 +438,34 @@ struct StoredPiPackageVaultPayload {
 }
 
 pub fn discover_all(roots: &DiscoveryRoots) -> Result<DiscoveryOutput, DiscoveryError> {
+    discover_all_with_progress(roots, |_| true)
+}
+
+pub fn discover_all_with_progress(
+    roots: &DiscoveryRoots,
+    mut report_progress: impl FnMut(DiscoveryProgress) -> bool,
+) -> Result<DiscoveryOutput, DiscoveryError> {
     let mut items = Vec::new();
     let mut warnings = Vec::new();
     let mut shared_skill_views = Vec::new();
+    let descriptors = provider_registry();
 
-    for descriptor in provider_registry() {
+    for (completed_providers, descriptor) in descriptors.iter().enumerate() {
+        if !report_progress(DiscoveryProgress {
+            phase: DiscoveryProgressPhase::DiscoveringProvider(descriptor.id),
+            completed_providers,
+            provider_count: descriptors.len(),
+        }) {
+            return Err(DiscoveryCancelled.into());
+        }
         (descriptor.discoverer)(roots, &mut shared_skill_views, &mut items, &mut warnings)?;
+    }
+    if !report_progress(DiscoveryProgress {
+        phase: DiscoveryProgressPhase::Finalizing,
+        completed_providers: descriptors.len(),
+        provider_count: descriptors.len(),
+    }) {
+        return Err(DiscoveryCancelled.into());
     }
     project_disabled_shared_skill_views(&shared_skill_views, &mut items);
     sort_items(&mut items);

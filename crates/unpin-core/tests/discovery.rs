@@ -6,8 +6,8 @@ use std::{
 
 use rusqlite::Connection;
 use unpin_core::discovery::{
-    DiscoveryCategory, DiscoveryKind, DiscoveryLayer, DiscoveryMutability, DiscoveryRoots,
-    ProviderId, discover_all,
+    DiscoveryCategory, DiscoveryKind, DiscoveryLayer, DiscoveryMutability, DiscoveryProgress,
+    DiscoveryProgressPhase, DiscoveryRoots, ProviderId, discover_all, discover_all_with_progress,
 };
 use unpin_core::hooks::{HookActionType, HookFailurePolicy, HookMatcherMode, HookRouteOwner};
 
@@ -15,6 +15,42 @@ fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
+}
+
+#[test]
+fn discovery_reports_provider_progress_and_honors_cancellation() {
+    let roots = DiscoveryRoots::fixture_root(fixtures_root());
+    let mut progress = Vec::new();
+    let discovery = discover_all_with_progress(&roots, |update| {
+        progress.push(update);
+        true
+    })
+    .expect("fixture discovery succeeds");
+
+    assert!(!discovery.items.is_empty());
+    assert_eq!(progress.len(), ProviderId::ALL.len() + 1);
+    for (completed_providers, provider) in ProviderId::ALL.into_iter().enumerate() {
+        assert_eq!(
+            progress[completed_providers],
+            DiscoveryProgress {
+                phase: DiscoveryProgressPhase::DiscoveringProvider(provider),
+                completed_providers,
+                provider_count: ProviderId::ALL.len(),
+            }
+        );
+    }
+    assert_eq!(
+        progress[ProviderId::ALL.len()],
+        DiscoveryProgress {
+            phase: DiscoveryProgressPhase::Finalizing,
+            completed_providers: ProviderId::ALL.len(),
+            provider_count: ProviderId::ALL.len(),
+        }
+    );
+
+    let error = discover_all_with_progress(&roots, |_| false)
+        .expect_err("cancelling before the first provider stops discovery");
+    assert_eq!(error.to_string(), "discovery cancelled");
 }
 
 #[test]
