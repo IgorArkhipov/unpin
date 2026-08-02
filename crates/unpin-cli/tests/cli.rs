@@ -2653,9 +2653,10 @@ fn tui_headless_renders_backup_summaries() {
     let stdout = String::from_utf8(output.stdout).expect("tui stdout is utf8");
     assert!(stdout.contains("Backups: 1"));
     assert!(stdout.contains("Backup details:"));
-    assert!(
-        stdout.contains("- backup-new created: 2026-06-20T12:00:00Z entries: 1 restorable: true")
-    );
+    assert!(stdout.contains(
+        "- claude project example → disabled created: 2026-06-20T12:00:00Z entries: 1 restorable: true"
+    ));
+    assert!(stdout.contains("id: backup-new"));
 }
 
 #[test]

@@ -4,9 +4,9 @@ use unpin_core::fixture::{FixtureCredentialPurpose, fixture_credential_key};
 use unpin_core::mutation::BackupAuthenticationKey;
 use zeroize::Zeroizing;
 
-use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore};
+use super::{KEYCHAIN_SERVICE, SecretStore, broker};
 
-const BACKUP_AUTHENTICATION_ACCOUNT: &str = "backup-authentication-key-v1";
+pub(super) const BACKUP_AUTHENTICATION_ACCOUNT: &str = "backup-authentication-key-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum BackupAuthenticationState {
@@ -77,7 +77,9 @@ pub(crate) fn resolve_backup_authentication_key(
             FixtureCredentialPurpose::BackupAuthentication,
         )?)));
     }
-    load_backup_authentication_key(&KeychainSecretStore)
+    Ok(broker::resolve_runtime_bundle(app_state_root)?
+        .backup_authentication()
+        .map(BackupAuthenticationKey::new))
 }
 
 fn load_backup_authentication_key(

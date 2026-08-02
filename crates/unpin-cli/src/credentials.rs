@@ -1,6 +1,7 @@
 mod approval;
 pub(crate) use approval::require_live_apply_terminal;
 mod backup_authentication;
+mod broker;
 mod cursor_dashboard;
 mod session_authority;
 
@@ -13,6 +14,7 @@ pub(crate) use backup_authentication::{
     BackupAuthenticationInitialization, BackupAuthenticationState, backup_authentication_status,
     initialize_backup_authentication_key, resolve_backup_authentication_key,
 };
+pub(crate) use broker::run as run_credential_broker;
 pub(crate) use cursor_dashboard::{
     CursorDashboardCredentialRemoval, CursorDashboardCredentialState,
     CursorDashboardCredentialUpdate, MAX_CURSOR_DASHBOARD_COOKIE_BYTES,

@@ -7,6 +7,35 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.13] - 2026-08-01
+
+### Added
+
+- Added a reviewed backup-delete action to Restore Operations: `D` prepares a
+  deletion bound to the manifest shown to the user, `Enter` confirms it, and
+  `A` applies it with audit evidence.
+- Added a macOS local credential broker. It keeps the purpose-separated keys
+  in one idle-expiring process and serves concurrent Unpin CLI/MCP clients over
+  a private same-user socket. Existing keys are bundled into one Keychain item
+  after the first successful broker start, so later starts need one Keychain
+  access.
+
+### Changed
+
+- Backup rows now identify the provider, scope, affected item, requested state,
+  and creation time instead of leading with an opaque backup identifier.
+- All TUI control lists keep their selected row in view. Navigation is now
+  arrow-only, and the command footer uses consistent title case.
+
+### Security
+
+- Backup deletion rechecks the reviewed manifest digest under the mutation lock,
+  rejects symlink/special-file backup trees, and records both request and
+  completion audit events.
+- The credential broker uses a `0700` directory and `0600` Unix socket; it is
+  intentionally scoped to the owning macOS user rather than arbitrary network
+  clients.
+
 ## [0.1.0-beta.12] - 2026-08-01
 
 ### Changed
@@ -167,8 +196,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.12...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.13...HEAD
 
+[0.1.0-beta.13]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.13
 [0.1.0-beta.12]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.12
 
 [0.1.0-beta.11]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.11

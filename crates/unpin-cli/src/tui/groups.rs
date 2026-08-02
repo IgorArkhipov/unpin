@@ -475,7 +475,7 @@ impl GroupWorkflow {
                     .map_or("none", GroupRevision::as_str),
             ));
             details.push(
-                "Use current inventory filters/search, j/k to move, Space to select, w to preview."
+                "Use current inventory filters/search, ↑/↓ to move, Space to select, w to preview."
                     .to_string(),
             );
         }

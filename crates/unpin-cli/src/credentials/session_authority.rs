@@ -4,9 +4,9 @@ use unpin_core::fixture::{FixtureCredentialPurpose, fixture_credential_key};
 use unpin_core::sessions::SessionAuthorityKey;
 use zeroize::Zeroizing;
 
-use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore};
+use super::{KEYCHAIN_SERVICE, SecretStore, broker};
 
-const SESSION_AUTHORITY_ACCOUNT: &str = "session-authority-key-v1";
+pub(super) const SESSION_AUTHORITY_ACCOUNT: &str = "session-authority-key-v1";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SessionAuthorityKeyState {
@@ -74,7 +74,9 @@ pub(crate) fn resolve_session_authority_key(
             FixtureCredentialPurpose::SessionAuthority,
         )?)));
     }
-    load_session_authority_key(&KeychainSecretStore)
+    Ok(broker::resolve_runtime_bundle(app_state_root)?
+        .session_authority()
+        .map(SessionAuthorityKey::new))
 }
 
 fn load_session_authority_key(
