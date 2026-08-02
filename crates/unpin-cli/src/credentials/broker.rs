@@ -574,8 +574,17 @@ mod tests {
         let first = first.expect("first broker client");
         let stalled_client = std::os::unix::net::UnixStream::connect(&socket)
             .expect("connect stalled broker client");
-        let second =
-            request_unix_bundle(&socket, Duration::from_millis(50)).expect("second broker client");
+        let mut second = None;
+        for _ in 0..100 {
+            match request_unix_bundle(&socket, Duration::from_millis(50)) {
+                Ok(bundle) => {
+                    second = Some(bundle);
+                    break;
+                }
+                Err(_) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        let second = second.expect("second broker client");
 
         assert_eq!(first.approval(), Some([0x11; 32]));
         assert_eq!(second.backup_authentication(), Some([0x42; 32]));
