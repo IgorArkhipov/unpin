@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.14] - 2026-08-02
+
+### Changed
+
+- Project-scoped discovery now scans independent provider roots concurrently,
+  while preserving deterministic results and diagnostics.
+- The terminal UI renders a cancellable loading view immediately, then reports
+  provider-by-provider discovery progress while discovery and credential
+  resolution run off the terminal event loop.
+
 ## [0.1.0-beta.13] - 2026-08-01
 
 ### Added
@@ -196,8 +206,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.13...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.14...HEAD
 
+[0.1.0-beta.14]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.14
 [0.1.0-beta.13]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.13
 [0.1.0-beta.12]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.12
 
