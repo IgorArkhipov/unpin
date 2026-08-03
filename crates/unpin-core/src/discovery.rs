@@ -1,10 +1,11 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, btree_map::Entry},
     ffi::OsStr,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
+    sync::Arc,
     thread,
 };
 
@@ -29,10 +30,17 @@ use crate::{
 };
 
 mod project_scopes;
+mod providers;
 
-use project_scopes::scan_project_scope_frontier_with;
+use project_scopes::{
+    scan_project_scope_frontier_accumulating_with, scan_project_scope_frontier_with,
+};
 #[cfg(test)]
-use project_scopes::scan_project_scope_frontier_with_cancellation;
+use project_scopes::{
+    scan_project_scope_frontier_accumulating_with_cancellation,
+    scan_project_scope_frontier_with_cancellation,
+};
+pub(crate) use providers::*;
 #[cfg(test)]
 use std::sync::atomic::Ordering as AtomicOrdering;
 
@@ -452,9 +460,7 @@ pub fn discover_all_with_progress(
     roots: &DiscoveryRoots,
     mut report_progress: impl FnMut(DiscoveryProgress) -> bool,
 ) -> Result<DiscoveryOutput, DiscoveryError> {
-    let mut items = Vec::new();
-    let mut warnings = Vec::new();
-    let mut shared_skill_views = Vec::new();
+    let mut state = DiscoveryState::default();
     let descriptors = provider_registry();
 
     for (completed_providers, descriptor) in descriptors.iter().enumerate() {
@@ -465,7 +471,7 @@ pub fn discover_all_with_progress(
         }) {
             return Err(DiscoveryCancelled.into());
         }
-        (descriptor.discoverer)(roots, &mut shared_skill_views, &mut items, &mut warnings)?;
+        (descriptor.discoverer)(roots, &mut state)?;
     }
     if !report_progress(DiscoveryProgress {
         phase: DiscoveryProgressPhase::Finalizing,
@@ -474,2167 +480,20 @@ pub fn discover_all_with_progress(
     }) {
         return Err(DiscoveryCancelled.into());
     }
+    let DiscoveryState {
+        shared_skill_views,
+        mut items,
+        warnings,
+        ..
+    } = state;
     project_disabled_shared_skill_views(&shared_skill_views, &mut items);
     sort_items(&mut items);
 
     Ok(DiscoveryOutput { items, warnings })
 }
 
-pub(crate) type ProviderDiscoverer = fn(
-    &DiscoveryRoots,
-    &mut Vec<SkillView>,
-    &mut Vec<DiscoveryItem>,
-    &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError>;
-
-pub(crate) fn discover_claude(
-    roots: &DiscoveryRoots,
-    shared_skill_views: &mut Vec<SkillView>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let global_skill_root = roots.claude_global.join("skills");
-    let live_skill_ids = discover_direct_child_skill_dirs(
-        &global_skill_root,
-        ProviderId::Claude,
-        DiscoveryLayer::Global,
-        "claude:global:skill:",
-        DiscoveryMutability::ReadWrite,
-        items,
-    )?;
-    shared_skill_views.push(SkillView::new(
-        ProviderId::Claude,
-        DiscoveryLayer::Global,
-        global_skill_root.clone(),
-        "claude:global:skill:",
-        SkillRootTraversal::Direct,
-    ));
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Claude,
-            layer: DiscoveryLayer::Global,
-            live_ids: &live_skill_ids,
-            allowed_skill_roots: std::slice::from_ref(&global_skill_root),
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-    let project_skills = discover_project_skill_dirs(
-        &roots.claude_project,
-        Path::new(".claude/skills"),
-        SkillDiscoverySpec {
-            provider: ProviderId::Claude,
-            layer: DiscoveryLayer::Project,
-            id_prefix: "claude:project:skill:",
-            mutability: DiscoveryMutability::ReadWrite,
-            traversal: ProjectSkillTraversal::AncestorsAndDescendants,
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        roots.scan_project_scopes,
-        warnings,
-        items,
-    )?;
-    shared_skill_views.extend(project_skills.skill_views.iter().cloned());
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Claude,
-            layer: DiscoveryLayer::Project,
-            live_ids: &project_skills.live_ids,
-            allowed_skill_roots: &project_skills.skill_roots,
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-    let global_agent_root = roots.claude_global.join("agents");
-    let live_agent_ids = discover_agent_files(
-        &global_agent_root,
-        ProviderId::Claude,
-        DiscoveryLayer::Global,
-        "claude:global:agent:",
-        &[AgentFileKind::Markdown],
-        items,
-    )?;
-    discover_vaulted_agent_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Claude,
-        DiscoveryLayer::Global,
-        &live_agent_ids,
-        std::slice::from_ref(&global_agent_root),
-        items,
-        warnings,
-    )?;
-    let project_agent_root = roots.claude_project.join(".claude").join("agents");
-    let live_agent_ids = discover_agent_files(
-        &project_agent_root,
-        ProviderId::Claude,
-        DiscoveryLayer::Project,
-        "claude:project:agent:",
-        &[AgentFileKind::Markdown],
-        items,
-    )?;
-    discover_vaulted_agent_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Claude,
-        DiscoveryLayer::Project,
-        &live_agent_ids,
-        std::slice::from_ref(&project_agent_root),
-        items,
-        warnings,
-    )?;
-
-    let mut live_claude_global_mcp_ids = BTreeSet::new();
-    if let Some(document) = read_json_if_exists::<McpDocument>(
-        &roots.claude_user_state,
-        ProviderId::Claude,
-        Some(DiscoveryLayer::Global),
-        warnings,
-    )? {
-        for (server_id, value) in &document.mcp_servers {
-            if !value.is_object() {
-                warnings.push(DiscoveryWarning {
-                    provider: ProviderId::Claude,
-                    layer: Some(DiscoveryLayer::Global),
-                    code: "json-shape-error".to_string(),
-                    message: format!(
-                        "{} mcpServers.{server_id} must be a JSON object",
-                        roots.claude_user_state.display()
-                    ),
-                });
-                continue;
-            }
-            let id = format!("claude:global:configured-mcp:{server_id}");
-            live_claude_global_mcp_ids.insert(id.clone());
-            let mut item = configured_mcp_item(
-                ProviderId::Claude,
-                DiscoveryLayer::Global,
-                id,
-                server_id,
-                true,
-                &roots.claude_user_state,
-                &roots.claude_user_state,
-            );
-            item.source_fingerprint = Some(json_value_source_fingerprint(value));
-            items.push(item);
-        }
-    }
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Claude,
-            layer: DiscoveryLayer::Global,
-            payload_kind: "json-payload",
-            live_ids: &live_claude_global_mcp_ids,
-            allowed_state_paths: std::slice::from_ref(&roots.claude_user_state),
-            allowed_item_id_prefix: None,
-        },
-        items,
-        warnings,
-    )?;
-    discover_claude_local_configured_mcps(roots, items, warnings)?;
-
-    let mcp_path = roots.claude_project.join(".mcp.json");
-    let settings_path = roots
-        .claude_project
-        .join(".claude")
-        .join("settings.local.json");
-    let project_settings = read_json_if_exists::<ClaudeSettings>(
-        &settings_path,
-        ProviderId::Claude,
-        Some(DiscoveryLayer::Project),
-        warnings,
-    )?;
-
-    if let Some(document) = read_json_if_exists::<McpDocument>(
-        &mcp_path,
-        ProviderId::Claude,
-        Some(DiscoveryLayer::Project),
-        warnings,
-    )? {
-        for (server_id, value) in &document.mcp_servers {
-            let mut item = configured_mcp_item(
-                ProviderId::Claude,
-                DiscoveryLayer::Project,
-                format!("claude:project:configured-mcp:{server_id}"),
-                server_id,
-                project_settings
-                    .as_ref()
-                    .is_none_or(|settings| claude_configured_mcp_enabled(settings, server_id)),
-                &mcp_path,
-                &settings_path,
-            );
-            item.source_fingerprint = Some(json_value_source_fingerprint(value));
-            items.push(item);
-        }
-    }
-
-    if let Some(settings) = project_settings
-        && let Some(enabled) = settings.enable_all_project_mcp_servers
-    {
-        items.push(configured_mcp_item(
-            ProviderId::Claude,
-            DiscoveryLayer::Project,
-            "claude:project:configured-mcp:all-project-mcp-servers".to_string(),
-            "all-project-mcp-servers",
-            enabled,
-            &mcp_path,
-            &settings_path,
-        ));
-    }
-
-    for source in [
-        read_settings_source::<ClaudeSettings>(
-            roots.claude_global.join("settings.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Global,
-            "settings",
-            "settings.json",
-            warnings,
-        )?,
-        read_settings_source::<ClaudeSettings>(
-            roots.claude_global.join("settings.local.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Global,
-            "settings-local",
-            "settings.local.json",
-            warnings,
-        )?,
-        read_settings_source::<ClaudeSettings>(
-            roots.claude_project.join(".claude").join("settings.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Project,
-            "settings",
-            ".claude/settings.json",
-            warnings,
-        )?,
-        read_settings_source::<ClaudeSettings>(
-            roots
-                .claude_project
-                .join(".claude")
-                .join("settings.local.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Project,
-            "settings-local",
-            ".claude/settings.local.json",
-            warnings,
-        )?,
-    ]
-    .into_iter()
-    .flatten()
-    {
-        items.push(provider_setting_item(
-            ProviderId::Claude,
-            source.layer,
-            format!(
-                "claude:{}:setting:{}",
-                source.layer.as_str(),
-                source.source_label
-            ),
-            source.display_name,
-            &source.path,
-        ));
-        items.extend(claude_plugin_config_items(&source));
-        items.extend(claude_hook_items(&source, warnings));
-    }
-
-    Ok(())
-}
-
-fn claude_configured_mcp_enabled(settings: &ClaudeSettings, server_id: &str) -> bool {
-    if settings.disabled_mcpjson_servers.contains_key(server_id) {
-        return false;
-    }
-
-    if settings.enabled_mcpjson_servers.contains_key(server_id) {
-        return true;
-    }
-
-    true
-}
-
-fn discover_claude_local_configured_mcps(
-    roots: &DiscoveryRoots,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let mut live_ids = BTreeSet::new();
-    let requested_project_key = path_string(&roots.claude_project);
-    let mut project_key_candidates = vec![requested_project_key.clone()];
-    if let Ok(canonical_project) = fs::canonicalize(&roots.claude_project) {
-        push_unique_path_string(&mut project_key_candidates, &canonical_project);
-    }
-    let repository_root = find_repository_root(&roots.claude_project);
-    push_unique_path_string(&mut project_key_candidates, &repository_root);
-    if let Ok(canonical_repository_root) = fs::canonicalize(&repository_root) {
-        push_unique_path_string(&mut project_key_candidates, &canonical_repository_root);
-    }
-    let mut selected_project_key = requested_project_key.clone();
-    let document = read_json_if_exists::<serde_json::Value>(
-        &roots.claude_user_state,
-        ProviderId::Claude,
-        Some(DiscoveryLayer::Project),
-        warnings,
-    )?;
-
-    if let Some(document) = document
-        && let Some(projects_value) = document.get("projects")
-    {
-        if let Some(projects) = projects_value.as_object() {
-            let selected = project_key_candidates
-                .iter()
-                .find_map(|key| projects.get_key_value(key));
-
-            if let Some((project_key, project_value)) = selected {
-                selected_project_key = project_key.clone();
-                if let Some(project) = project_value.as_object() {
-                    if let Some(servers_value) = project.get("mcpServers") {
-                        if let Some(servers) = servers_value.as_object() {
-                            let scope_token = claude_local_scope_token(project_key);
-                            for (server_id, value) in servers {
-                                if !value.is_object() {
-                                    warnings.push(DiscoveryWarning {
-                                        provider: ProviderId::Claude,
-                                        layer: Some(DiscoveryLayer::Project),
-                                        code: "json-shape-error".to_string(),
-                                        message: format!(
-                                            "{} selected project mcpServers.{server_id} must be a JSON object",
-                                            roots.claude_user_state.display()
-                                        ),
-                                    });
-                                    continue;
-                                }
-                                let id = format!(
-                                    "{CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX}{scope_token}:{server_id}"
-                                );
-                                live_ids.insert(id.clone());
-                                let mut item = configured_mcp_item(
-                                    ProviderId::Claude,
-                                    DiscoveryLayer::Project,
-                                    id,
-                                    server_id,
-                                    true,
-                                    &roots.claude_user_state,
-                                    &roots.claude_user_state,
-                                );
-                                item.source_fingerprint =
-                                    Some(json_value_source_fingerprint(value));
-                                items.push(item);
-                            }
-                        } else {
-                            warnings.push(DiscoveryWarning {
-                                provider: ProviderId::Claude,
-                                layer: Some(DiscoveryLayer::Project),
-                                code: "json-shape-error".to_string(),
-                                message: format!(
-                                    "{} selected project mcpServers must be a JSON object",
-                                    roots.claude_user_state.display()
-                                ),
-                            });
-                        }
-                    }
-                } else {
-                    warnings.push(DiscoveryWarning {
-                        provider: ProviderId::Claude,
-                        layer: Some(DiscoveryLayer::Project),
-                        code: "json-shape-error".to_string(),
-                        message: format!(
-                            "{} selected projects entry must be a JSON object",
-                            roots.claude_user_state.display()
-                        ),
-                    });
-                }
-            }
-        } else {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::Claude,
-                layer: Some(DiscoveryLayer::Project),
-                code: "json-shape-error".to_string(),
-                message: format!(
-                    "{} projects must be a JSON object",
-                    roots.claude_user_state.display()
-                ),
-            });
-        }
-    }
-
-    let scope_token = claude_local_scope_token(&selected_project_key);
-    let allowed_item_id_prefix = format!("{CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX}{scope_token}:");
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Claude,
-            layer: DiscoveryLayer::Project,
-            payload_kind: "json-payload",
-            live_ids: &live_ids,
-            allowed_state_paths: std::slice::from_ref(&roots.claude_user_state),
-            allowed_item_id_prefix: Some(&allowed_item_id_prefix),
-        },
-        items,
-        warnings,
-    )
-}
-
-pub(crate) fn claude_local_scope_token(project_key: &str) -> String {
-    source_fingerprint(project_key)
-        .strip_prefix("sha256:")
-        .expect("source fingerprints use sha256")
-        .to_string()
-}
-
-fn push_unique_path_string(paths: &mut Vec<String>, path: &Path) {
-    let path = path_string(path);
-    if !paths.contains(&path) {
-        paths.push(path);
-    }
-}
-
-pub(crate) fn discover_codex(
-    roots: &DiscoveryRoots,
-    shared_skill_views: &mut Vec<SkillView>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let config_path = roots.codex_global.join("config.toml");
-    let skill_config_states = if let Some(raw) = read_optional_string(&config_path)? {
-        match parse_codex_skill_config_states(&raw) {
-            Ok(states) => states,
-            Err(error) => {
-                warnings.push(DiscoveryWarning {
-                    provider: ProviderId::Codex,
-                    layer: Some(DiscoveryLayer::Global),
-                    code: "toml-parse-error".to_string(),
-                    message: format!("Codex skills.config could not be read: {error}"),
-                });
-                BTreeMap::new()
-            }
-        }
-    } else {
-        BTreeMap::new()
-    };
-    let skill_item_start = items.len();
-    let shared_global_skill_root = roots.shared_global.join(".agents").join("skills");
-    let global_live_skill_ids = discover_direct_child_skill_dirs(
-        &shared_global_skill_root,
-        ProviderId::Codex,
-        DiscoveryLayer::Global,
-        "codex:global:skill:",
-        DiscoveryMutability::ReadWrite,
-        items,
-    )?;
-    shared_skill_views.push(SkillView::new(
-        ProviderId::Codex,
-        DiscoveryLayer::Global,
-        shared_global_skill_root.clone(),
-        "codex:global:skill:",
-        SkillRootTraversal::Direct,
-    ));
-    discover_direct_child_skill_dirs(
-        &roots.codex_admin.join("skills"),
-        ProviderId::Codex,
-        DiscoveryLayer::Global,
-        "codex:global:skill:admin/",
-        DiscoveryMutability::ReadOnly,
-        items,
-    )?;
-    let project_skills = discover_project_skill_dirs(
-        &roots.shared_project,
-        Path::new(".agents/skills"),
-        SkillDiscoverySpec {
-            provider: ProviderId::Codex,
-            layer: DiscoveryLayer::Project,
-            id_prefix: "codex:project:skill:",
-            mutability: DiscoveryMutability::ReadWrite,
-            traversal: ProjectSkillTraversal::Ancestors,
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        roots.scan_project_scopes,
-        warnings,
-        items,
-    )?;
-    shared_skill_views.extend(project_skills.skill_views.iter().cloned());
-    apply_codex_skill_config_states(
-        &mut items[skill_item_start..],
-        &config_path,
-        &skill_config_states,
-    );
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Codex,
-            layer: DiscoveryLayer::Global,
-            live_ids: &global_live_skill_ids,
-            allowed_skill_roots: std::slice::from_ref(&shared_global_skill_root),
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Codex,
-            layer: DiscoveryLayer::Project,
-            live_ids: &project_skills.live_ids,
-            allowed_skill_roots: &project_skills.skill_roots,
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-    let global_agent_root = roots.codex_global.join("agents");
-    let live_agent_ids = discover_agent_files(
-        &global_agent_root,
-        ProviderId::Codex,
-        DiscoveryLayer::Global,
-        "codex:global:agent:",
-        &[AgentFileKind::Markdown, AgentFileKind::Toml],
-        items,
-    )?;
-    discover_vaulted_agent_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Codex,
-        DiscoveryLayer::Global,
-        &live_agent_ids,
-        std::slice::from_ref(&global_agent_root),
-        items,
-        warnings,
-    )?;
-    let project_agent_root = roots.codex_project.join(".codex").join("agents");
-    let live_agent_ids = discover_agent_files(
-        &project_agent_root,
-        ProviderId::Codex,
-        DiscoveryLayer::Project,
-        "codex:project:agent:",
-        &[AgentFileKind::Markdown, AgentFileKind::Toml],
-        items,
-    )?;
-    discover_vaulted_agent_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Codex,
-        DiscoveryLayer::Project,
-        &live_agent_ids,
-        std::slice::from_ref(&project_agent_root),
-        items,
-        warnings,
-    )?;
-
-    let live_codex_global_mcp_ids = discover_codex_config_file(
-        &config_path,
-        CodexConfigSpec {
-            layer: DiscoveryLayer::Global,
-            id_scope: "",
-            setting_id: "codex:global:setting:config-toml",
-            setting_display_name: "config.toml",
-        },
-        items,
-        warnings,
-    )?;
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Codex,
-            layer: DiscoveryLayer::Global,
-            payload_kind: "text-payload",
-            live_ids: &live_codex_global_mcp_ids,
-            allowed_state_paths: std::slice::from_ref(&config_path),
-            allowed_item_id_prefix: None,
-        },
-        items,
-        warnings,
-    )?;
-
-    discover_json_hooks_file(
-        &roots.codex_global.join("hooks.json"),
-        JsonHooksSpec {
-            provider: ProviderId::Codex,
-            layer: DiscoveryLayer::Global,
-            hook_id_prefix: "codex:global:hook:hooks-json:",
-            setting_id: "codex:global:setting:hooks-json",
-            setting_display_name: "hooks.json",
-            allow_top_level_events: true,
-        },
-        items,
-        warnings,
-    )?;
-
-    let repository_root = if roots.scan_project_scopes {
-        find_repository_root(&roots.codex_project)
-    } else {
-        roots.codex_project.clone()
-    };
-    let mut project_scopes = Vec::new();
-    add_project_ancestors(&roots.codex_project, &repository_root, &mut project_scopes);
-    project_scopes.reverse();
-
-    let mut live_codex_project_mcp_ids = BTreeSet::new();
-    let mut codex_project_config_paths = Vec::new();
-    for scope_root in project_scopes {
-        let relative_scope = scope_root.strip_prefix(&repository_root)?;
-        let id_scope = if relative_scope.as_os_str().is_empty() {
-            String::new()
-        } else {
-            format!("@scope/{}/", skill_id_path(relative_scope))
-        };
-        let setting_id = format!("codex:project:setting:{id_scope}config-toml");
-        let setting_display_name = if relative_scope.as_os_str().is_empty() {
-            ".codex/config.toml".to_string()
-        } else {
-            format!("{}/.codex/config.toml", relative_scope.to_string_lossy())
-        };
-        let scope_config_path = scope_root.join(".codex").join("config.toml");
-        codex_project_config_paths.push(scope_config_path.clone());
-        live_codex_project_mcp_ids.extend(discover_codex_config_file(
-            &scope_config_path,
-            CodexConfigSpec {
-                layer: DiscoveryLayer::Project,
-                id_scope: &id_scope,
-                setting_id: &setting_id,
-                setting_display_name: &setting_display_name,
-            },
-            items,
-            warnings,
-        )?);
-    }
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Codex,
-            layer: DiscoveryLayer::Project,
-            payload_kind: "text-payload",
-            live_ids: &live_codex_project_mcp_ids,
-            allowed_state_paths: &codex_project_config_paths,
-            allowed_item_id_prefix: None,
-        },
-        items,
-        warnings,
-    )?;
-
-    discover_json_hooks_file(
-        &roots.codex_project.join(".codex").join("hooks.json"),
-        JsonHooksSpec {
-            provider: ProviderId::Codex,
-            layer: DiscoveryLayer::Project,
-            hook_id_prefix: "codex:project:hook:hooks-json:",
-            setting_id: "codex:project:setting:hooks-json",
-            setting_display_name: ".codex/hooks.json",
-            allow_top_level_events: true,
-        },
-        items,
-        warnings,
-    )?;
-
-    Ok(())
-}
-
-fn apply_codex_skill_config_states(
-    items: &mut [DiscoveryItem],
-    config_path: &Path,
-    states: &BTreeMap<String, bool>,
-) {
-    let state_path = path_string(config_path);
-    for item in items {
-        if item.provider != ProviderId::Codex || item.category != DiscoveryCategory::Skill {
-            continue;
-        }
-
-        item.enabled = states.get(&item.source_path).copied().unwrap_or(true);
-        item.mutability = DiscoveryMutability::ReadWrite;
-        item.state_path.clone_from(&state_path);
-    }
-}
-
-pub(crate) fn codex_skill_config_enabled(raw: &str, skill_path: &Path) -> Result<bool, String> {
-    Ok(parse_codex_skill_config_states(raw)?
-        .get(&path_string(skill_path))
-        .copied()
-        .unwrap_or(true))
-}
-
-pub(crate) fn codex_skill_config_path(section: &str) -> Result<Option<String>, String> {
-    toml_assignment_value(section, "path")
-        .map(parse_toml_string)
-        .transpose()
-}
-
-fn parse_codex_skill_config_states(raw: &str) -> Result<BTreeMap<String, bool>, String> {
-    let mut states = BTreeMap::new();
-    for section in codex_array_table_sections(raw, "skills.config") {
-        let path = codex_skill_config_path(section)?
-            .ok_or_else(|| "skills.config entry is missing path".to_string())?;
-        let enabled = match toml_assignment_value(section, "enabled") {
-            Some(raw_enabled) => parse_toml_bool(raw_enabled)?,
-            None => true,
-        };
-        if states.insert(path, enabled).is_some() {
-            return Err("duplicate skills.config path".to_string());
-        }
-    }
-    Ok(states)
-}
-
-fn codex_array_table_sections<'a>(raw: &'a str, target: &str) -> Vec<&'a str> {
-    find_array_table_sections(raw, target)
-        .into_iter()
-        .map(|section| section.content)
-        .collect()
-}
-
-fn toml_assignment_value<'a>(section: &'a str, key: &str) -> Option<&'a str> {
-    crate::toml_syntax::top_level_assignment(section, key).map(|assignment| assignment.value)
-}
-
-fn parse_toml_bool(raw: &str) -> Result<bool, String> {
-    match raw.split('#').next().unwrap_or_default().trim() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err("enabled must be true or false".to_string()),
-    }
-}
-
-fn parse_toml_string(raw: &str) -> Result<String, String> {
-    let raw = raw.trim();
-    if let Some(literal) = raw.strip_prefix('\'') {
-        let end = literal
-            .find('\'')
-            .ok_or_else(|| "unterminated TOML literal string".to_string())?;
-        ensure_toml_value_tail(&literal[end + 1..])?;
-        return Ok(literal[..end].to_string());
-    }
-
-    if !raw.starts_with('"') {
-        return Err("path must be a quoted TOML string".to_string());
-    }
-    let mut escaped = false;
-    let mut end = None;
-    for (index, character) in raw.char_indices().skip(1) {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match character {
-            '\\' => escaped = true,
-            '"' => {
-                end = Some(index + character.len_utf8());
-                break;
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| "unterminated TOML basic string".to_string())?;
-    ensure_toml_value_tail(&raw[end..])?;
-    serde_json::from_str(&raw[..end]).map_err(|error| format!("invalid TOML path string: {error}"))
-}
-
-fn ensure_toml_value_tail(tail: &str) -> Result<(), String> {
-    let tail = tail.trim();
-    if tail.is_empty() || tail.starts_with('#') {
-        Ok(())
-    } else {
-        Err("unexpected content after TOML value".to_string())
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CodexConfigSpec<'a> {
-    layer: DiscoveryLayer,
-    id_scope: &'a str,
-    setting_id: &'a str,
-    setting_display_name: &'a str,
-}
-
-fn discover_codex_config_file(
-    config_path: &Path,
-    spec: CodexConfigSpec<'_>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<BTreeSet<String>, DiscoveryError> {
-    let mut live_mcp_ids = BTreeSet::new();
-    let Some(raw) = read_optional_string(config_path)? else {
-        return Ok(live_mcp_ids);
-    };
-    items.push(provider_setting_item(
-        ProviderId::Codex,
-        spec.layer,
-        spec.setting_id.to_string(),
-        spec.setting_display_name,
-        config_path,
-    ));
-    let malformed_table_headers = malformed_table_header_lines(&raw);
-    if !malformed_table_headers.is_empty() {
-        warnings.push(DiscoveryWarning {
-            provider: ProviderId::Codex,
-            layer: Some(spec.layer),
-            code: "invalid-toml-table-header".to_string(),
-            message: format!(
-                "{} contains malformed TOML table headers on lines: {}",
-                config_path.display(),
-                malformed_table_headers
-                    .iter()
-                    .map(usize::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            ),
-        });
-        return Ok(live_mcp_ids);
-    }
-    let duplicate_tables = duplicate_standard_table_names(&raw);
-    if !duplicate_tables.is_empty() {
-        warnings.push(DiscoveryWarning {
-            provider: ProviderId::Codex,
-            layer: Some(spec.layer),
-            code: "duplicate-toml-table".to_string(),
-            message: format!(
-                "{} contains duplicate TOML table declarations: {}",
-                config_path.display(),
-                duplicate_tables.join(", ")
-            ),
-        });
-        return Ok(live_mcp_ids);
-    }
-    let duplicate_enabled_keys = duplicate_top_level_key_tables(&raw, "enabled");
-    if !duplicate_enabled_keys.is_empty() {
-        warnings.push(DiscoveryWarning {
-            provider: ProviderId::Codex,
-            layer: Some(spec.layer),
-            code: "duplicate-toml-key".to_string(),
-            message: format!(
-                "{} contains duplicate enabled keys in TOML tables: {}",
-                config_path.display(),
-                duplicate_enabled_keys.join(", ")
-            ),
-        });
-        return Ok(live_mcp_ids);
-    }
-    items.extend(codex_inline_hook_items(
-        config_path,
-        &raw,
-        spec.layer,
-        spec.id_scope,
-        warnings,
-    ));
-
-    for server_id in parse_codex_section_ids(&raw, "mcp_servers") {
-        let id = format!(
-            "codex:{}:configured-mcp:{}{server_id}",
-            spec.layer.as_str(),
-            spec.id_scope
-        );
-        live_mcp_ids.insert(id.clone());
-        let section = find_table_section(&raw, "mcp_servers", &server_id);
-        let enabled = section
-            .map(|section| codex_section_enabled(section.content))
-            .unwrap_or(true);
-        let mut item = configured_mcp_item(
-            ProviderId::Codex,
-            spec.layer,
-            id,
-            &server_id,
-            enabled,
-            config_path,
-            config_path,
-        );
-        item.source_fingerprint = table_subtree_content(&raw, "mcp_servers", &server_id)
-            .map(|content| source_fingerprint(&content));
-        items.push(item);
-    }
-
-    if spec.layer == DiscoveryLayer::Global {
-        for plugin_id in parse_codex_section_ids(&raw, "plugins") {
-            let section = find_table_section(&raw, "plugins", &plugin_id);
-            let enabled = section
-                .map(|section| codex_section_enabled(section.content))
-                .unwrap_or(true);
-            let mut item = plugin_config_item(
-                ProviderId::Codex,
-                spec.layer,
-                format!("codex:global:plugin-config:config:{plugin_id}"),
-                &plugin_id,
-                enabled,
-                config_path,
-            );
-            item.source_fingerprint = table_subtree_content(&raw, "plugins", &plugin_id)
-                .map(|content| source_fingerprint(&content));
-            items.push(item);
-        }
-    }
-
-    Ok(live_mcp_ids)
-}
-
-fn codex_section_enabled(section: &str) -> bool {
-    toml_assignment_value(section, "enabled")
-        .and_then(|value| parse_toml_bool(value).ok())
-        .unwrap_or(true)
-}
-
-pub(crate) fn discover_cursor(
-    roots: &DiscoveryRoots,
-    shared_skill_views: &mut Vec<SkillView>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let global_skill_root = roots.cursor_config.join("skills");
-    let live_skill_ids = discover_recursive_skill_dirs(
-        &global_skill_root,
-        ProviderId::Cursor,
-        DiscoveryLayer::Global,
-        CURSOR_GLOBAL_SKILL_ID_PREFIX,
-        DiscoveryMutability::ReadWrite,
-        items,
-        warnings,
-    )?;
-    let project_skills = discover_project_skill_dirs(
-        &roots.cursor_project,
-        Path::new(".cursor/skills"),
-        SkillDiscoverySpec {
-            provider: ProviderId::Cursor,
-            layer: DiscoveryLayer::Project,
-            id_prefix: "cursor:project:skill:",
-            mutability: DiscoveryMutability::ReadWrite,
-            traversal: ProjectSkillTraversal::Repository,
-            skill_root_traversal: SkillRootTraversal::Recursive,
-        },
-        roots.scan_project_scopes,
-        warnings,
-        items,
-    )?;
-    let mut cursor_global_live_ids = live_skill_ids;
-    let mut cursor_global_roots = vec![global_skill_root];
-    let mut cursor_project_live_ids = project_skills.live_ids;
-    let mut cursor_project_roots = project_skills.skill_roots;
-    for (global_root, project_root, relative_skill_root, id_namespace) in [
-        (
-            roots.shared_global.join(".agents/skills"),
-            roots.shared_project.as_path(),
-            ".agents/skills",
-            CURSOR_COMPAT_AGENTS_SKILL_NAMESPACE,
-        ),
-        (
-            roots.claude_global.join("skills"),
-            roots.claude_project.as_path(),
-            ".claude/skills",
-            CURSOR_COMPAT_CLAUDE_SKILL_NAMESPACE,
-        ),
-        (
-            roots.codex_global.join("skills"),
-            roots.codex_project.as_path(),
-            ".codex/skills",
-            CURSOR_COMPAT_CODEX_SKILL_NAMESPACE,
-        ),
-    ] {
-        let global_id_prefix = format!("{CURSOR_GLOBAL_SKILL_ID_PREFIX}{id_namespace}");
-        let global_live_ids = discover_recursive_skill_dirs(
-            &global_root,
-            ProviderId::Cursor,
-            DiscoveryLayer::Global,
-            &global_id_prefix,
-            DiscoveryMutability::ReadWrite,
-            items,
-            warnings,
-        )?;
-        shared_skill_views.push(SkillView::new(
-            ProviderId::Cursor,
-            DiscoveryLayer::Global,
-            global_root.clone(),
-            global_id_prefix,
-            SkillRootTraversal::Recursive,
-        ));
-        cursor_global_live_ids.extend(global_live_ids);
-        cursor_global_roots.push(global_root);
-
-        let project_id_prefix = format!("{CURSOR_PROJECT_SKILL_ID_PREFIX}{id_namespace}");
-        let project_skills = discover_project_skill_dirs(
-            project_root,
-            Path::new(relative_skill_root),
-            SkillDiscoverySpec {
-                provider: ProviderId::Cursor,
-                layer: DiscoveryLayer::Project,
-                id_prefix: &project_id_prefix,
-                mutability: DiscoveryMutability::ReadWrite,
-                traversal: ProjectSkillTraversal::Repository,
-                skill_root_traversal: SkillRootTraversal::Recursive,
-            },
-            roots.scan_project_scopes,
-            warnings,
-            items,
-        )?;
-        shared_skill_views.extend(project_skills.skill_views.iter().cloned());
-        cursor_project_live_ids.extend(project_skills.live_ids);
-        for skill_root in project_skills.skill_roots {
-            if !cursor_project_roots.contains(&skill_root) {
-                cursor_project_roots.push(skill_root);
-            }
-        }
-    }
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Cursor,
-            layer: DiscoveryLayer::Global,
-            live_ids: &cursor_global_live_ids,
-            allowed_skill_roots: &cursor_global_roots,
-            skill_root_traversal: SkillRootTraversal::Recursive,
-        },
-        items,
-        warnings,
-    )?;
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Cursor,
-            layer: DiscoveryLayer::Project,
-            live_ids: &cursor_project_live_ids,
-            allowed_skill_roots: &cursor_project_roots,
-            skill_root_traversal: SkillRootTraversal::Recursive,
-        },
-        items,
-        warnings,
-    )?;
-    let global_agent_root = roots.cursor_global.join("agents");
-    let live_agent_ids = discover_agent_files(
-        &global_agent_root,
-        ProviderId::Cursor,
-        DiscoveryLayer::Global,
-        "cursor:global:agent:",
-        &[AgentFileKind::Markdown],
-        items,
-    )?;
-    discover_vaulted_agent_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Cursor,
-        DiscoveryLayer::Global,
-        &live_agent_ids,
-        std::slice::from_ref(&global_agent_root),
-        items,
-        warnings,
-    )?;
-    let project_agent_root = roots.cursor_project.join(".cursor").join("agents");
-    let live_agent_ids = discover_agent_files(
-        &project_agent_root,
-        ProviderId::Cursor,
-        DiscoveryLayer::Project,
-        "cursor:project:agent:",
-        &[AgentFileKind::Markdown],
-        items,
-    )?;
-    discover_vaulted_agent_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Cursor,
-        DiscoveryLayer::Project,
-        &live_agent_ids,
-        std::slice::from_ref(&project_agent_root),
-        items,
-        warnings,
-    )?;
-
-    let mut live_cursor_global_mcp_ids = BTreeSet::new();
-    let workspace_state =
-        load_cursor_workspace_state(&roots.cursor_global, &roots.cursor_project, warnings);
-    let cursor_global_mcp_path = roots.cursor_config.join("mcp.json");
-    discover_cursor_mcp_file(
-        &cursor_global_mcp_path,
-        DiscoveryLayer::Global,
-        Some(&workspace_state),
-        &mut live_cursor_global_mcp_ids,
-        items,
-        warnings,
-    )?;
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Cursor,
-            layer: DiscoveryLayer::Global,
-            payload_kind: "json-payload",
-            live_ids: &live_cursor_global_mcp_ids,
-            allowed_state_paths: std::slice::from_ref(&cursor_global_mcp_path),
-            allowed_item_id_prefix: None,
-        },
-        items,
-        warnings,
-    )?;
-
-    let mut live_cursor_project_mcp_ids = BTreeSet::new();
-    let cursor_project_mcp_path = roots.cursor_project.join(".cursor").join("mcp.json");
-    discover_cursor_mcp_file(
-        &cursor_project_mcp_path,
-        DiscoveryLayer::Project,
-        None,
-        &mut live_cursor_project_mcp_ids,
-        items,
-        warnings,
-    )?;
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Cursor,
-            layer: DiscoveryLayer::Project,
-            payload_kind: "json-payload",
-            live_ids: &live_cursor_project_mcp_ids,
-            allowed_state_paths: std::slice::from_ref(&cursor_project_mcp_path),
-            allowed_item_id_prefix: None,
-        },
-        items,
-        warnings,
-    )?;
-
-    discover_json_hooks_file(
-        &roots.cursor_global.join("hooks.json"),
-        JsonHooksSpec {
-            provider: ProviderId::Cursor,
-            layer: DiscoveryLayer::Global,
-            hook_id_prefix: "cursor:global:hook:hooks-json:",
-            setting_id: "cursor:global:setting:hooks-json",
-            setting_display_name: "hooks.json",
-            allow_top_level_events: false,
-        },
-        items,
-        warnings,
-    )?;
-    discover_setting_files(
-        ProviderId::Cursor,
-        DiscoveryLayer::Global,
-        &[
-            (
-                roots.cursor_global.join("permissions.json"),
-                "cursor:global:setting:permissions-json",
-                "permissions.json",
-            ),
-            (
-                roots.cursor_global.join("sandbox.json"),
-                "cursor:global:setting:sandbox-json",
-                "sandbox.json",
-            ),
-            (
-                roots.cursor_global.join("cli-config.json"),
-                "cursor:global:setting:cli-config-json",
-                "cli-config.json",
-            ),
-        ],
-        items,
-    );
-    discover_json_hooks_file(
-        &roots.cursor_project.join(".cursor").join("hooks.json"),
-        JsonHooksSpec {
-            provider: ProviderId::Cursor,
-            layer: DiscoveryLayer::Project,
-            hook_id_prefix: "cursor:project:hook:hooks-json:",
-            setting_id: "cursor:project:setting:hooks-json",
-            setting_display_name: ".cursor/hooks.json",
-            allow_top_level_events: false,
-        },
-        items,
-        warnings,
-    )?;
-    discover_setting_files(
-        ProviderId::Cursor,
-        DiscoveryLayer::Project,
-        &[
-            (
-                roots
-                    .cursor_project
-                    .join(".cursor")
-                    .join("permissions.json"),
-                "cursor:project:setting:permissions-json",
-                ".cursor/permissions.json",
-            ),
-            (
-                roots.cursor_project.join(".cursor").join("sandbox.json"),
-                "cursor:project:setting:sandbox-json",
-                ".cursor/sandbox.json",
-            ),
-            (
-                roots.cursor_project.join(".cursor").join("cli.json"),
-                "cursor:project:setting:cli-json",
-                ".cursor/cli.json",
-            ),
-        ],
-        items,
-    );
-    let local_plugins_root = roots.cursor_config.join("plugins").join("local");
-    let live_plugin_ids = discover_cursor_plugin_manifests(&local_plugins_root, items, warnings)?;
-    discover_vaulted_cursor_plugin_items(
-        roots.app_state_root.as_deref(),
-        &live_plugin_ids,
-        &local_plugins_root,
-        items,
-        warnings,
-    )?;
-    discover_cursor_marketplace_plugins(
-        &roots.cursor_global,
-        &roots.cursor_project,
-        items,
-        warnings,
-    );
-    Ok(())
-}
-
-fn discover_cursor_mcp_file(
-    path: &Path,
-    layer: DiscoveryLayer,
-    workspace_state: Option<&CursorWorkspaceState>,
-    live_ids: &mut BTreeSet<String>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let Some(document) =
-        read_json_if_exists::<McpDocument>(path, ProviderId::Cursor, Some(layer), warnings)?
-    else {
-        return Ok(());
-    };
-
-    for (server_id, value) in &document.mcp_servers {
-        if !value.is_object() {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::Cursor,
-                layer: Some(layer),
-                code: "invalid-shape".to_string(),
-                message: format!(
-                    "{} mcpServers.{server_id} must be a JSON object",
-                    path.display()
-                ),
-            });
-            continue;
-        }
-
-        let id = format!("cursor:{}:configured-mcp:{server_id}", layer.as_str());
-        if live_ids.contains(&id) {
-            continue;
-        }
-
-        let workspace_disabled = workspace_state.is_some_and(|workspace_state| {
-            cursor_workspace_server_is_disabled(workspace_state, server_id)
-        });
-        let state_path = match (workspace_state, workspace_disabled) {
-            (Some(CursorWorkspaceState::Ok { database_path, .. }), true) => database_path,
-            _ => path,
-        };
-        live_ids.insert(id.clone());
-        let mut item = configured_mcp_item(
-            ProviderId::Cursor,
-            layer,
-            id,
-            server_id,
-            !cursor_mcp_server_is_disabled(value) && !workspace_disabled,
-            path,
-            state_path,
-        );
-        item.source_fingerprint = Some(json_value_source_fingerprint(value));
-        items.push(item);
-    }
-
-    Ok(())
-}
-
-pub(crate) fn discover_pi(
-    roots: &DiscoveryRoots,
-    shared_skill_views: &mut Vec<SkillView>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let native_global_root = roots.pi_global.join("skills");
-    let shared_global_root = roots.shared_global.join(".agents").join("skills");
-    let mut global_live_ids = discover_recursive_skill_dirs(
-        &native_global_root,
-        ProviderId::Pi,
-        DiscoveryLayer::Global,
-        PI_GLOBAL_SKILL_ID_PREFIX,
-        DiscoveryMutability::ReadWrite,
-        items,
-        warnings,
-    )?;
-    let global_file_skill_ids = discover_direct_skill_markdown_files(
-        &native_global_root,
-        ProviderId::Pi,
-        DiscoveryLayer::Global,
-        &format!("{PI_GLOBAL_SKILL_ID_PREFIX}@file/"),
-        DiscoveryMutability::ReadWrite,
-        items,
-    )?;
-    global_live_ids.extend(global_file_skill_ids.iter().cloned());
-    let shared_global_id_prefix =
-        format!("{PI_GLOBAL_SKILL_ID_PREFIX}{PI_COMPAT_AGENTS_SKILL_NAMESPACE}");
-    global_live_ids.extend(discover_recursive_skill_dirs(
-        &shared_global_root,
-        ProviderId::Pi,
-        DiscoveryLayer::Global,
-        &shared_global_id_prefix,
-        DiscoveryMutability::ReadWrite,
-        items,
-        warnings,
-    )?);
-    shared_skill_views.push(SkillView::new(
-        ProviderId::Pi,
-        DiscoveryLayer::Global,
-        shared_global_root.clone(),
-        shared_global_id_prefix,
-        SkillRootTraversal::Recursive,
-    ));
-    let global_skill_roots = [native_global_root, shared_global_root];
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Pi,
-            layer: DiscoveryLayer::Global,
-            live_ids: &global_live_ids,
-            allowed_skill_roots: &global_skill_roots,
-            skill_root_traversal: SkillRootTraversal::Recursive,
-        },
-        items,
-        warnings,
-    )?;
-    discover_vaulted_skill_file_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Pi,
-        DiscoveryLayer::Global,
-        &global_live_ids,
-        std::slice::from_ref(&global_skill_roots[0]),
-        items,
-        warnings,
-    )?;
-
-    let native_project_skills = discover_project_skill_dirs(
-        &roots.pi_project,
-        Path::new(".pi/skills"),
-        SkillDiscoverySpec {
-            provider: ProviderId::Pi,
-            layer: DiscoveryLayer::Project,
-            id_prefix: PI_PROJECT_SKILL_ID_PREFIX,
-            mutability: DiscoveryMutability::ReadWrite,
-            traversal: ProjectSkillTraversal::Selected,
-            skill_root_traversal: SkillRootTraversal::Recursive,
-        },
-        roots.scan_project_scopes,
-        warnings,
-        items,
-    )?;
-    let shared_project_id_prefix =
-        format!("{PI_PROJECT_SKILL_ID_PREFIX}{PI_COMPAT_AGENTS_SKILL_NAMESPACE}");
-    let shared_project_skills = discover_project_skill_dirs(
-        &roots.shared_project,
-        Path::new(".agents/skills"),
-        SkillDiscoverySpec {
-            provider: ProviderId::Pi,
-            layer: DiscoveryLayer::Project,
-            id_prefix: &shared_project_id_prefix,
-            mutability: DiscoveryMutability::ReadWrite,
-            traversal: ProjectSkillTraversal::Ancestors,
-            skill_root_traversal: SkillRootTraversal::Recursive,
-        },
-        roots.scan_project_scopes,
-        warnings,
-        items,
-    )?;
-    shared_skill_views.extend(shared_project_skills.skill_views.iter().cloned());
-    let mut project_live_ids = native_project_skills.live_ids;
-    project_live_ids.extend(shared_project_skills.live_ids);
-    let mut project_skill_roots = native_project_skills.skill_roots;
-    project_skill_roots.extend(shared_project_skills.skill_roots);
-    let native_project_skill_root = roots.pi_project.join(".pi").join("skills");
-    project_live_ids.extend(discover_direct_skill_markdown_files(
-        &native_project_skill_root,
-        ProviderId::Pi,
-        DiscoveryLayer::Project,
-        &format!("{PI_PROJECT_SKILL_ID_PREFIX}@file/"),
-        DiscoveryMutability::ReadWrite,
-        items,
-    )?);
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Pi,
-            layer: DiscoveryLayer::Project,
-            live_ids: &project_live_ids,
-            allowed_skill_roots: &project_skill_roots,
-            skill_root_traversal: SkillRootTraversal::Recursive,
-        },
-        items,
-        warnings,
-    )?;
-    discover_vaulted_skill_file_items(
-        roots.app_state_root.as_deref(),
-        ProviderId::Pi,
-        DiscoveryLayer::Project,
-        &project_live_ids,
-        std::slice::from_ref(&native_project_skill_root),
-        items,
-        warnings,
-    )?;
-
-    discover_pi_settings(
-        &roots.pi_global.join("settings.json"),
-        DiscoveryLayer::Global,
-        "settings.json",
-        roots.app_state_root.as_deref(),
-        items,
-        warnings,
-    )?;
-    discover_pi_settings(
-        &roots.pi_project.join(".pi").join("settings.json"),
-        DiscoveryLayer::Project,
-        ".pi/settings.json",
-        roots.app_state_root.as_deref(),
-        items,
-        warnings,
-    )?;
-
-    Ok(())
-}
-
-fn discover_pi_settings(
-    path: &Path,
-    layer: DiscoveryLayer,
-    display_name: &str,
-    app_state_root: Option<&Path>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    if !path.exists() {
-        return Ok(());
-    }
-    items.push(provider_setting_item(
-        ProviderId::Pi,
-        layer,
-        format!("pi:{}:setting:settings-json", layer.as_str()),
-        display_name,
-        path,
-    ));
-
-    let Some(document) =
-        read_json_if_exists::<serde_json::Value>(path, ProviderId::Pi, Some(layer), warnings)?
-    else {
-        return Ok(());
-    };
-    let Some(document) = document.as_object() else {
-        warnings.push(DiscoveryWarning {
-            provider: ProviderId::Pi,
-            layer: Some(layer),
-            code: "invalid-shape".to_string(),
-            message: format!("{} must contain a JSON object", path.display()),
-        });
-        return Ok(());
-    };
-    let Some(packages) = document
-        .get("packages")
-        .and_then(serde_json::Value::as_array)
-    else {
-        warnings.push(DiscoveryWarning {
-            provider: ProviderId::Pi,
-            layer: Some(layer),
-            code: "invalid-shape".to_string(),
-            message: format!("{} packages must be an array", path.display()),
-        });
-        return Ok(());
-    };
-
-    let package_item_start = items.len();
-    let mut validated_sources = BTreeSet::new();
-    let mutability = if packages.iter().all(|package| {
-        pi_package_extension_state(package)
-            .ok()
-            .is_some_and(|(source, _)| validated_sources.insert(source.to_string()))
-    }) {
-        DiscoveryMutability::ReadWrite
-    } else {
-        DiscoveryMutability::ReadOnly
-    };
-    let id_prefix = match layer {
-        DiscoveryLayer::Global => PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX,
-        DiscoveryLayer::Project => PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX,
-    };
-    let mut item_ids = BTreeSet::new();
-    for (index, package) in packages.iter().enumerate() {
-        let (source, enabled) = match pi_package_extension_state(package) {
-            Ok(state) => state,
-            Err(reason) => {
-                warnings.push(DiscoveryWarning {
-                    provider: ProviderId::Pi,
-                    layer: Some(layer),
-                    code: "invalid-shape".to_string(),
-                    message: format!("{} packages[{index}] {reason}", path.display()),
-                });
-                continue;
-            }
-        };
-        let item_id = format!("{id_prefix}{source}");
-        if !item_ids.insert(item_id.clone()) {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::Pi,
-                layer: Some(layer),
-                code: "duplicate-id".to_string(),
-                message: format!(
-                    "{} packages contains duplicate source {source}",
-                    path.display()
-                ),
-            });
-            continue;
-        }
-        let mut item = plugin_config_item(ProviderId::Pi, layer, item_id, source, enabled, path);
-        item.mutability = mutability;
-        item.source_fingerprint = Some(json_value_source_fingerprint(package));
-        items.push(item);
-    }
-    validate_pi_package_vaults(
-        app_state_root,
-        path,
-        layer,
-        &mut items[package_item_start..],
-        warnings,
-    )?;
-    Ok(())
-}
-
-fn validate_pi_package_vaults(
-    app_state_root: Option<&Path>,
-    settings_path: &Path,
-    layer: DiscoveryLayer,
-    package_items: &mut [DiscoveryItem],
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let Some(app_state_root) = app_state_root else {
-        return Ok(());
-    };
-    let provider = ProviderId::Pi;
-    let vault_root = app_state_root
-        .join("vault")
-        .join(provider.as_str())
-        .join(layer.as_str())
-        .join("plugin");
-    match fs::symlink_metadata(&vault_root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(error) => return Err(error.into()),
-        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
-            push_invalid_vault_entry_warning(
-                warnings,
-                provider,
-                layer,
-                &vault_root,
-                "Pi plugin vault root must be a regular directory",
-            );
-            for item in package_items {
-                item.mutability = DiscoveryMutability::ReadOnly;
-            }
-            return Ok(());
-        }
-        Ok(_) => {}
-    }
-    let mut entries = fs::read_dir(vault_root)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    let expected_id_prefix = match layer {
-        DiscoveryLayer::Global => PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX,
-        DiscoveryLayer::Project => PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX,
-    };
-
-    for entry in entries {
-        let warning_count = warnings.len();
-        let Some((entry_path, vault_entry)) = read_stored_vault_entry(
-            &entry,
-            provider,
-            layer,
-            "plugin",
-            "json-payload",
-            expected_id_prefix,
-            warnings,
-        ) else {
-            if warnings.len() > warning_count {
-                for item in package_items.iter_mut() {
-                    item.mutability = DiscoveryMutability::ReadOnly;
-                }
-            }
-            continue;
-        };
-        let package_source = vault_entry
-            .item_id
-            .strip_prefix(expected_id_prefix)
-            .expect("stored Pi vault id prefix validated");
-        let Some(item) = package_items
-            .iter_mut()
-            .find(|item| item.id == vault_entry.item_id)
-        else {
-            push_invalid_vault_entry_warning(
-                warnings,
-                provider,
-                layer,
-                &entry_path,
-                "vaulted package is missing from the live Pi settings packages array",
-            );
-            continue;
-        };
-        let expected_payload = entry.path().join("payload.json");
-        let invalid_reason = if Path::new(&vault_entry.original_path) != settings_path {
-            Some("originalPath does not match the discovered Pi settings path")
-        } else if !vault_payload_path_matches(
-            Path::new(&vault_entry.vaulted_path),
-            &expected_payload,
-        ) {
-            Some("vaultedPath does not match the entry payload path")
-        } else if !fs::symlink_metadata(&vault_entry.vaulted_path)
-            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
-        {
-            Some("vaultedPath is not a regular file")
-        } else if item.enabled {
-            Some("vault exists but the live Pi package extensions are enabled")
-        } else {
-            let payload_matches = fs::read_to_string(&vault_entry.vaulted_path)
-                .ok()
-                .and_then(|raw| serde_json::from_str::<StoredPiPackageVaultPayload>(&raw).ok())
-                .is_some_and(|payload| {
-                    let original_matches =
-                        serde_json::from_str::<serde_json::Value>(&payload.original_raw)
-                            .is_ok_and(|original_raw| original_raw == payload.original_entry);
-                    let disabled_matches = pi_disabled_package_entry(&payload.original_entry)
-                        .ok()
-                        .flatten()
-                        .is_some_and(|disabled| {
-                            payload.disabled_entry_fingerprint
-                                == json_value_source_fingerprint(&disabled)
-                        });
-                    payload.package_source == package_source
-                        && original_matches
-                        && disabled_matches
-                        && item.source_fingerprint.as_deref()
-                            == Some(payload.disabled_entry_fingerprint.as_str())
-                        && vault_entry.display_name == package_source
-                });
-            if payload_matches {
-                None
-            } else {
-                Some("vault payload does not match the Pi package identity or disabled state")
-            }
-        };
-        if let Some(reason) = invalid_reason {
-            item.mutability = DiscoveryMutability::ReadOnly;
-            push_invalid_vault_entry_warning(warnings, provider, layer, &entry_path, reason);
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn discover_opencode(
-    roots: &DiscoveryRoots,
-    shared_skill_views: &mut Vec<SkillView>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let native_global_root = roots.opencode_global.join("skills");
-    let agents_global_root = roots.shared_global.join(".agents").join("skills");
-    let claude_global_root = roots.claude_global.join("skills");
-    let mut global_live_ids = discover_direct_child_skill_dirs(
-        &native_global_root,
-        ProviderId::OpenCode,
-        DiscoveryLayer::Global,
-        OPENCODE_GLOBAL_SKILL_ID_PREFIX,
-        DiscoveryMutability::ReadWrite,
-        items,
-    )?;
-    for (root, namespace) in [
-        (&agents_global_root, OPENCODE_COMPAT_AGENTS_SKILL_NAMESPACE),
-        (&claude_global_root, OPENCODE_COMPAT_CLAUDE_SKILL_NAMESPACE),
-    ] {
-        let id_prefix = format!("{OPENCODE_GLOBAL_SKILL_ID_PREFIX}{namespace}");
-        global_live_ids.extend(discover_direct_child_skill_dirs(
-            root,
-            ProviderId::OpenCode,
-            DiscoveryLayer::Global,
-            &id_prefix,
-            DiscoveryMutability::ReadWrite,
-            items,
-        )?);
-        shared_skill_views.push(SkillView::new(
-            ProviderId::OpenCode,
-            DiscoveryLayer::Global,
-            root.clone(),
-            id_prefix,
-            SkillRootTraversal::Direct,
-        ));
-    }
-    let global_skill_roots = [native_global_root, agents_global_root, claude_global_root];
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::OpenCode,
-            layer: DiscoveryLayer::Global,
-            live_ids: &global_live_ids,
-            allowed_skill_roots: &global_skill_roots,
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-
-    let mut project_live_ids = BTreeSet::new();
-    let mut project_skill_roots = Vec::new();
-    for (project_root, relative_root, namespace) in [
-        (
-            roots.opencode_project.as_path(),
-            Path::new(".opencode/skills"),
-            None,
-        ),
-        (
-            roots.shared_project.as_path(),
-            Path::new(".agents/skills"),
-            Some(OPENCODE_COMPAT_AGENTS_SKILL_NAMESPACE),
-        ),
-        (
-            roots.claude_project.as_path(),
-            Path::new(".claude/skills"),
-            Some(OPENCODE_COMPAT_CLAUDE_SKILL_NAMESPACE),
-        ),
-    ] {
-        let id_prefix = namespace.map_or_else(
-            || OPENCODE_PROJECT_SKILL_ID_PREFIX.to_string(),
-            |namespace| format!("{OPENCODE_PROJECT_SKILL_ID_PREFIX}{namespace}"),
-        );
-        let discovered = discover_project_skill_dirs(
-            project_root,
-            relative_root,
-            SkillDiscoverySpec {
-                provider: ProviderId::OpenCode,
-                layer: DiscoveryLayer::Project,
-                id_prefix: &id_prefix,
-                mutability: DiscoveryMutability::ReadWrite,
-                traversal: ProjectSkillTraversal::Ancestors,
-                skill_root_traversal: SkillRootTraversal::Direct,
-            },
-            roots.scan_project_scopes,
-            warnings,
-            items,
-        )?;
-        if namespace.is_some() {
-            shared_skill_views.extend(discovered.skill_views.iter().cloned());
-        }
-        project_live_ids.extend(discovered.live_ids);
-        project_skill_roots.extend(discovered.skill_roots);
-    }
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::OpenCode,
-            layer: DiscoveryLayer::Project,
-            live_ids: &project_live_ids,
-            allowed_skill_roots: &project_skill_roots,
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-
-    let global_config_path = preferred_opencode_config_path(&roots.opencode_global);
-    let global_plugin_ids =
-        discover_opencode_config(&global_config_path, DiscoveryLayer::Global, items, warnings)?;
-    discover_vaulted_opencode_plugin_config_items(
-        roots.app_state_root.as_deref(),
-        DiscoveryLayer::Global,
-        &global_plugin_ids,
-        std::slice::from_ref(&global_config_path),
-        items,
-        warnings,
-    )?;
-    let project_config_path =
-        opencode_project_config_path(&roots.opencode_project, roots.scan_project_scopes);
-    let project_plugin_ids = discover_opencode_config(
-        &project_config_path,
-        DiscoveryLayer::Project,
-        items,
-        warnings,
-    )?;
-    discover_vaulted_opencode_plugin_config_items(
-        roots.app_state_root.as_deref(),
-        DiscoveryLayer::Project,
-        &project_plugin_ids,
-        std::slice::from_ref(&project_config_path),
-        items,
-        warnings,
-    )?;
-
-    discover_opencode_local_plugins(
-        &roots.opencode_global.join("plugins"),
-        DiscoveryLayer::Global,
-        items,
-    )?;
-    discover_opencode_local_plugins(
-        &roots.opencode_project.join(".opencode").join("plugins"),
-        DiscoveryLayer::Project,
-        items,
-    )?;
-
-    Ok(())
-}
-
-fn preferred_opencode_config_path(root: &Path) -> PathBuf {
-    let jsonc = root.join("opencode.jsonc");
-    if jsonc.is_file() {
-        jsonc
-    } else {
-        root.join("opencode.json")
-    }
-}
-
-fn opencode_project_config_path(project_root: &Path, scan_project_scopes: bool) -> PathBuf {
-    if !scan_project_scopes {
-        return preferred_opencode_config_path(project_root);
-    }
-
-    let repository_root = find_repository_root(project_root);
-    project_root
-        .ancestors()
-        .take_while(|ancestor| ancestor.starts_with(&repository_root))
-        .map(preferred_opencode_config_path)
-        .find(|path| path.is_file())
-        .unwrap_or_else(|| project_root.join("opencode.json"))
-}
-
-fn discover_opencode_config(
-    path: &Path,
-    layer: DiscoveryLayer,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<BTreeSet<String>, DiscoveryError> {
-    let Some(document) =
-        read_jsonc_if_exists::<OpenCodeConfig>(path, ProviderId::OpenCode, Some(layer), warnings)?
-    else {
-        return Ok(BTreeSet::new());
-    };
-
-    let display_name = path
-        .file_name()
-        .and_then(OsStr::to_str)
-        .unwrap_or("opencode.json");
-    items.push(provider_setting_item(
-        ProviderId::OpenCode,
-        layer,
-        format!("opencode:{}:setting:{display_name}", layer.as_str()),
-        display_name,
-        path,
-    ));
-
-    let mcp_id_prefix = match layer {
-        DiscoveryLayer::Global => OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX,
-        DiscoveryLayer::Project => OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX,
-    };
-    for (server_id, value) in document.mcp {
-        let Some(server) = value.as_object() else {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::OpenCode,
-                layer: Some(layer),
-                code: "invalid-shape".to_string(),
-                message: format!("{} mcp.{server_id} must be a JSON object", path.display()),
-            });
-            continue;
-        };
-        if server
-            .get("enabled")
-            .is_some_and(|value| !value.is_boolean())
-        {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::OpenCode,
-                layer: Some(layer),
-                code: "invalid-shape".to_string(),
-                message: format!(
-                    "{} mcp.{server_id}.enabled must be a boolean",
-                    path.display()
-                ),
-            });
-            continue;
-        }
-        let mut item = configured_mcp_item(
-            ProviderId::OpenCode,
-            layer,
-            format!("{mcp_id_prefix}{server_id}"),
-            &server_id,
-            server
-                .get("enabled")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(true),
-            path,
-            path,
-        );
-        item.source_fingerprint = Some(json_value_source_fingerprint(&value));
-        items.push(item);
-    }
-
-    let plugin_id_prefix = format!("opencode:{}:plugin-config:npm:", layer.as_str());
-    let mut validated_plugin_ids = BTreeSet::new();
-    let plugin_mutability = if document.plugin.iter().all(|plugin| {
-        plugin
-            .as_str()
-            .filter(|plugin_id| !plugin_id.is_empty())
-            .is_some_and(|plugin_id| validated_plugin_ids.insert(plugin_id.to_string()))
-    }) {
-        DiscoveryMutability::ReadWrite
-    } else {
-        DiscoveryMutability::ReadOnly
-    };
-    let mut plugin_ids = BTreeSet::new();
-    for plugin in document.plugin {
-        let Some(plugin_id) = plugin.as_str() else {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::OpenCode,
-                layer: Some(layer),
-                code: "invalid-shape".to_string(),
-                message: format!("{} plugin entries must be strings", path.display()),
-            });
-            continue;
-        };
-        if plugin_id.is_empty() {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::OpenCode,
-                layer: Some(layer),
-                code: "invalid-shape".to_string(),
-                message: format!(
-                    "{} plugin entries must be non-empty strings",
-                    path.display()
-                ),
-            });
-            continue;
-        }
-        let item_id = format!("{plugin_id_prefix}{plugin_id}");
-        if !plugin_ids.insert(item_id.clone()) {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::OpenCode,
-                layer: Some(layer),
-                code: "duplicate-id".to_string(),
-                message: format!(
-                    "{} plugin contains duplicate reference {plugin_id}",
-                    path.display()
-                ),
-            });
-            continue;
-        }
-        let mut item =
-            plugin_config_item(ProviderId::OpenCode, layer, item_id, plugin_id, true, path);
-        item.mutability = plugin_mutability;
-        item.source_fingerprint = Some(json_value_source_fingerprint(&plugin));
-        items.push(item);
-    }
-
-    Ok(plugin_ids)
-}
-
-fn discover_opencode_local_plugins(
-    root: &Path,
-    layer: DiscoveryLayer,
-    items: &mut Vec<DiscoveryItem>,
-) -> Result<(), DiscoveryError> {
-    if !root.exists() {
-        return Ok(());
-    }
-    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
-    entries.sort_by_key(|entry| entry.file_name());
-    for entry in entries {
-        let path = entry.path();
-        if !path.is_file() || !matches!(path.extension().and_then(OsStr::to_str), Some("js" | "ts"))
-        {
-            continue;
-        }
-        let Some(file_name) = path.file_name().and_then(OsStr::to_str) else {
-            continue;
-        };
-        items.push(DiscoveryItem {
-            provider: ProviderId::OpenCode,
-            kind: DiscoveryKind::Plugin,
-            category: DiscoveryCategory::PluginManifest,
-            layer,
-            id: format!(
-                "opencode:{}:plugin-manifest:local:{file_name}",
-                layer.as_str()
-            ),
-            display_name: file_name.to_string(),
-            enabled: true,
-            mutability: DiscoveryMutability::ReadOnly,
-            source_path: path_string(&path),
-            state_path: path_string(&path),
-            source_fingerprint: fs::read_to_string(&path)
-                .ok()
-                .map(|raw| source_fingerprint(&raw)),
-            hook: None,
-        });
-    }
-    Ok(())
-}
-
-pub(crate) fn discover_zed(
-    roots: &DiscoveryRoots,
-    shared_skill_views: &mut Vec<SkillView>,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<(), DiscoveryError> {
-    let global_skill_root = roots.shared_global.join(".agents").join("skills");
-    let global_live_skill_ids = discover_direct_child_skill_dirs(
-        &global_skill_root,
-        ProviderId::Zed,
-        DiscoveryLayer::Global,
-        "zed:global:skill:",
-        DiscoveryMutability::ReadWrite,
-        items,
-    )?;
-    shared_skill_views.push(SkillView::new(
-        ProviderId::Zed,
-        DiscoveryLayer::Global,
-        global_skill_root.clone(),
-        "zed:global:skill:",
-        SkillRootTraversal::Direct,
-    ));
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Zed,
-            layer: DiscoveryLayer::Global,
-            live_ids: &global_live_skill_ids,
-            allowed_skill_roots: std::slice::from_ref(&global_skill_root),
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-
-    let project_skill_root = roots.shared_project.join(".agents").join("skills");
-    let project_live_skill_ids = discover_direct_child_skill_dirs(
-        &project_skill_root,
-        ProviderId::Zed,
-        DiscoveryLayer::Project,
-        "zed:project:skill:",
-        DiscoveryMutability::ReadWrite,
-        items,
-    )?;
-    shared_skill_views.push(SkillView::new(
-        ProviderId::Zed,
-        DiscoveryLayer::Project,
-        project_skill_root.clone(),
-        "zed:project:skill:",
-        SkillRootTraversal::Direct,
-    ));
-    discover_vaulted_skill_items(
-        roots.app_state_root.as_deref(),
-        VaultedSkillDiscoverySpec {
-            provider: ProviderId::Zed,
-            layer: DiscoveryLayer::Project,
-            live_ids: &project_live_skill_ids,
-            allowed_skill_roots: std::slice::from_ref(&project_skill_root),
-            skill_root_traversal: SkillRootTraversal::Direct,
-        },
-        items,
-        warnings,
-    )?;
-
-    discover_setting_files(
-        ProviderId::Zed,
-        DiscoveryLayer::Global,
-        &[(
-            roots.zed_global.join("AGENTS.md"),
-            "zed:global:setting:agents-md",
-            "AGENTS.md",
-        )],
-        items,
-    );
-    discover_setting_files(
-        ProviderId::Zed,
-        DiscoveryLayer::Project,
-        &[(
-            roots.zed_project.join("AGENTS.md"),
-            "zed:project:setting:agents-md",
-            "AGENTS.md",
-        )],
-        items,
-    );
-
-    let global_settings_path = roots.zed_global.join("settings.json");
-    let live_zed_global_mcp_ids = discover_zed_settings(
-        &global_settings_path,
-        DiscoveryLayer::Global,
-        "zed:global:setting:settings-json",
-        "settings.json",
-        items,
-        warnings,
-    )?;
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Zed,
-            layer: DiscoveryLayer::Global,
-            payload_kind: "json-payload",
-            live_ids: &live_zed_global_mcp_ids,
-            allowed_state_paths: std::slice::from_ref(&global_settings_path),
-            allowed_item_id_prefix: None,
-        },
-        items,
-        warnings,
-    )?;
-
-    let project_settings_path = roots.zed_project.join(".zed").join("settings.json");
-    let live_zed_project_mcp_ids = discover_zed_settings(
-        &project_settings_path,
-        DiscoveryLayer::Project,
-        "zed:project:setting:settings-json",
-        ".zed/settings.json",
-        items,
-        warnings,
-    )?;
-    discover_vaulted_configured_mcp_items(
-        roots.app_state_root.as_deref(),
-        ConfiguredMcpVaultSpec {
-            provider: ProviderId::Zed,
-            layer: DiscoveryLayer::Project,
-            payload_kind: "json-payload",
-            live_ids: &live_zed_project_mcp_ids,
-            allowed_state_paths: std::slice::from_ref(&project_settings_path),
-            allowed_item_id_prefix: None,
-        },
-        items,
-        warnings,
-    )?;
-
-    Ok(())
-}
-
-fn discover_zed_settings(
-    path: &Path,
-    layer: DiscoveryLayer,
-    setting_id: &'static str,
-    setting_display_name: &'static str,
-    items: &mut Vec<DiscoveryItem>,
-    warnings: &mut Vec<DiscoveryWarning>,
-) -> Result<BTreeSet<String>, DiscoveryError> {
-    let mut live_ids = BTreeSet::new();
-    let Some(document) =
-        read_jsonc_if_exists::<ZedSettings>(path, ProviderId::Zed, Some(layer), warnings)?
-    else {
-        return Ok(live_ids);
-    };
-
-    items.push(provider_setting_item(
-        ProviderId::Zed,
-        layer,
-        setting_id.to_string(),
-        setting_display_name,
-        path,
-    ));
-
-    for (server_id, value) in &document.context_servers {
-        if !value.is_object() {
-            warnings.push(DiscoveryWarning {
-                provider: ProviderId::Zed,
-                layer: Some(layer),
-                code: "invalid-shape".to_string(),
-                message: format!(
-                    "{} context_servers.{server_id} must be a JSON object",
-                    path.display()
-                ),
-            });
-            continue;
-        }
-
-        let id = format!("zed:{}:configured-mcp:{server_id}", layer.as_str());
-        live_ids.insert(id.clone());
-        let mut item = configured_mcp_item(ProviderId::Zed, layer, id, server_id, true, path, path);
-        item.source_fingerprint = Some(json_value_source_fingerprint(value));
-        items.push(item);
-    }
-
-    Ok(live_ids)
-}
+pub(crate) type ProviderDiscoverer =
+    fn(&DiscoveryRoots, &mut DiscoveryState) -> Result<(), DiscoveryError>;
 
 fn read_settings_source<T>(
     path: PathBuf,
@@ -2771,7 +630,7 @@ enum SkillRootTraversal {
     Recursive,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProjectSkillTraversal {
     Selected,
     Ancestors,
@@ -2785,9 +644,121 @@ struct ProjectSkillDiscovery {
     skill_views: Vec<SkillView>,
 }
 
+#[derive(Clone)]
 struct ProjectSkillScopeRoots {
     roots: BTreeSet<PathBuf>,
     skipped_directories: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ProjectScopeCacheKey {
+    project_root: PathBuf,
+    repository_root: PathBuf,
+    relative_skill_root: PathBuf,
+    traversal: ProjectSkillTraversal,
+    scan_project_scopes: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct ProjectScopeCache {
+    scopes: BTreeMap<ProjectScopeCacheKey, Arc<ProjectSkillScopeRoots>>,
+}
+
+#[derive(Default)]
+pub(crate) struct DiscoveryState {
+    project_scope_cache: ProjectScopeCache,
+    shared_skill_views: Vec<SkillView>,
+    items: Vec<DiscoveryItem>,
+    warnings: Vec<DiscoveryWarning>,
+}
+
+impl ProjectScopeCache {
+    fn get_or_discover(
+        &mut self,
+        project_root: &Path,
+        repository_root: &Path,
+        relative_skill_root: &Path,
+        traversal: ProjectSkillTraversal,
+        scan_project_scopes: bool,
+        discover: impl FnOnce() -> Result<ProjectSkillScopeRoots, DiscoveryError>,
+    ) -> Result<&ProjectSkillScopeRoots, DiscoveryError> {
+        let key = ProjectScopeCacheKey {
+            project_root: project_root.to_path_buf(),
+            repository_root: repository_root.to_path_buf(),
+            relative_skill_root: relative_skill_root.to_path_buf(),
+            traversal,
+            scan_project_scopes,
+        };
+        let scope_roots = match self.scopes.entry(key) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => entry.insert(Arc::new(discover()?)),
+        };
+        Ok(Arc::as_ref(scope_roots))
+    }
+}
+
+fn prepopulate_cursor_repository_scopes(
+    roots: &DiscoveryRoots,
+    project_scope_cache: &mut ProjectScopeCache,
+) -> Result<(), DiscoveryError> {
+    let requests = [
+        (roots.cursor_project.as_path(), Path::new(".cursor/skills")),
+        (roots.shared_project.as_path(), Path::new(".agents/skills")),
+        (roots.claude_project.as_path(), Path::new(".claude/skills")),
+        (roots.codex_project.as_path(), Path::new(".codex/skills")),
+    ];
+    prepopulate_repository_project_scopes(project_scope_cache, &requests, roots.scan_project_scopes)
+}
+
+fn prepopulate_repository_project_scopes(
+    project_scope_cache: &mut ProjectScopeCache,
+    requests: &[(&Path, &Path)],
+    scan_project_scopes: bool,
+) -> Result<(), DiscoveryError> {
+    if !scan_project_scopes || requests.is_empty() {
+        return Ok(());
+    }
+
+    let Some(repository_root) = enclosing_repository_root(requests[0].0) else {
+        return Ok(());
+    };
+    if !requests.iter().all(|(project_root, _)| {
+        enclosing_repository_root(project_root).as_ref() == Some(&repository_root)
+    }) {
+        return Ok(());
+    }
+
+    let relative_skill_roots = requests
+        .iter()
+        .map(|(_, relative_skill_root)| (*relative_skill_root).to_path_buf())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let scope_roots = project_repository_scope_roots(&repository_root, &relative_skill_roots)?
+        .into_iter()
+        .map(|(relative_skill_root, scope_roots)| (relative_skill_root, Arc::new(scope_roots)))
+        .collect::<BTreeMap<_, _>>();
+
+    for (project_root, relative_skill_root) in requests {
+        let key = ProjectScopeCacheKey {
+            project_root: (*project_root).to_path_buf(),
+            repository_root: repository_root.clone(),
+            relative_skill_root: (*relative_skill_root).to_path_buf(),
+            traversal: ProjectSkillTraversal::Repository,
+            scan_project_scopes: true,
+        };
+        if project_scope_cache.scopes.contains_key(&key) {
+            continue;
+        }
+        let scope_roots = Arc::clone(
+            scope_roots
+                .get(*relative_skill_root)
+                .expect("every requested relative skill root is scanned"),
+        );
+        project_scope_cache.scopes.insert(key, scope_roots);
+    }
+
+    Ok(())
 }
 
 fn skill_path_mutability(
@@ -2825,6 +796,7 @@ fn discover_project_skill_dirs(
     relative_skill_root: &Path,
     spec: SkillDiscoverySpec<'_>,
     scan_project_scopes: bool,
+    project_scope_cache: &mut ProjectScopeCache,
     warnings: &mut Vec<DiscoveryWarning>,
     items: &mut Vec<DiscoveryItem>,
 ) -> Result<ProjectSkillDiscovery, DiscoveryError> {
@@ -2833,12 +805,21 @@ fn discover_project_skill_dirs(
         .flatten();
     let scan_project_scopes = repository_root.is_some();
     let repository_root = repository_root.unwrap_or_else(|| project_root.to_path_buf());
-    let scope_discovery = project_skill_scope_roots(
+    let scope_discovery = project_scope_cache.get_or_discover(
         project_root,
         &repository_root,
         relative_skill_root,
         spec.traversal,
         scan_project_scopes,
+        || {
+            project_skill_scope_roots(
+                project_root,
+                &repository_root,
+                relative_skill_root,
+                spec.traversal,
+                scan_project_scopes,
+            )
+        },
     )?;
     if scope_discovery.skipped_directories > 0 {
         warnings.push(DiscoveryWarning {
@@ -2856,7 +837,7 @@ fn discover_project_skill_dirs(
     let mut skill_roots = Vec::with_capacity(scope_discovery.roots.len());
     let mut skill_views = Vec::with_capacity(scope_discovery.roots.len());
 
-    for scope_root in scope_discovery.roots {
+    for scope_root in &scope_discovery.roots {
         let relative_scope = scope_root.strip_prefix(&repository_root)?;
         let scoped_prefix = if relative_scope.as_os_str().is_empty() {
             spec.id_prefix.to_string()
@@ -2985,6 +966,12 @@ struct ProjectScopeScan {
     skipped_directories: usize,
 }
 
+#[derive(Default)]
+struct ProjectScopeMultiScan {
+    scope_roots: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    skipped_directories: usize,
+}
+
 struct ProjectScopeDirectoryScan {
     scope_root: Option<PathBuf>,
     child_directories: Vec<PathBuf>,
@@ -3051,6 +1038,155 @@ fn add_descendant_skill_scopes_with_worker_limit(
 fn project_scope_scan_worker_limit() -> usize {
     thread::available_parallelism()
         .map_or(1, |count| count.get().min(MAX_PROJECT_SCOPE_SCAN_WORKERS))
+}
+
+fn project_repository_scope_roots(
+    repository_root: &Path,
+    relative_skill_roots: &[PathBuf],
+) -> Result<BTreeMap<PathBuf, ProjectSkillScopeRoots>, DiscoveryError> {
+    let Some(primary_relative_skill_root) = relative_skill_roots.first() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut scan = ProjectScopeMultiScan::default();
+    for relative_skill_root in relative_skill_roots {
+        scan.scope_roots
+            .entry(relative_skill_root.clone())
+            .or_default();
+    }
+    if !repository_root.is_dir() {
+        return Ok(project_skill_scope_roots_from_multi_scan(
+            scan,
+            relative_skill_roots,
+        ));
+    }
+
+    let worker_limit = project_scope_scan_worker_limit();
+    let mut frontier = vec![repository_root.to_path_buf()];
+    while frontier.len() < worker_limit {
+        let Some(directory) = frontier.pop() else {
+            break;
+        };
+        let directory_scan = scan_project_scope_directory(
+            &directory,
+            repository_root,
+            repository_root,
+            primary_relative_skill_root,
+        )?;
+        extend_project_scope_multi_scan(
+            &mut scan,
+            &directory,
+            relative_skill_roots,
+            &directory_scan,
+        );
+        frontier.extend(directory_scan.child_directories);
+    }
+
+    for subtree_scan in scan_project_scope_frontier_accumulating_with(
+        &frontier,
+        worker_limit,
+        |directory| {
+            scan_project_scope_multi_subtree(directory, repository_root, relative_skill_roots)
+        },
+        merge_project_scope_multi_scan,
+    )? {
+        merge_project_scope_multi_scan(&mut scan, subtree_scan);
+    }
+
+    Ok(project_skill_scope_roots_from_multi_scan(
+        scan,
+        relative_skill_roots,
+    ))
+}
+
+fn project_skill_scope_roots_from_multi_scan(
+    scan: ProjectScopeMultiScan,
+    relative_skill_roots: &[PathBuf],
+) -> BTreeMap<PathBuf, ProjectSkillScopeRoots> {
+    relative_skill_roots
+        .iter()
+        .map(|relative_skill_root| {
+            (
+                relative_skill_root.clone(),
+                ProjectSkillScopeRoots {
+                    roots: scan
+                        .scope_roots
+                        .get(relative_skill_root)
+                        .cloned()
+                        .unwrap_or_default(),
+                    skipped_directories: scan.skipped_directories,
+                },
+            )
+        })
+        .collect()
+}
+
+fn scan_project_scope_multi_subtree(
+    start: &Path,
+    repository_root: &Path,
+    relative_skill_roots: &[PathBuf],
+) -> Result<ProjectScopeMultiScan, DiscoveryError> {
+    let primary_relative_skill_root = relative_skill_roots
+        .first()
+        .expect("repository scope scans include a relative skill root");
+    let mut scan = ProjectScopeMultiScan::default();
+    let mut pending = vec![start.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        let directory_scan = scan_project_scope_directory(
+            &directory,
+            repository_root,
+            repository_root,
+            primary_relative_skill_root,
+        )?;
+        extend_project_scope_multi_scan(
+            &mut scan,
+            &directory,
+            relative_skill_roots,
+            &directory_scan,
+        );
+        pending.extend(directory_scan.child_directories);
+    }
+    Ok(scan)
+}
+
+fn extend_project_scope_multi_scan(
+    scan: &mut ProjectScopeMultiScan,
+    directory: &Path,
+    relative_skill_roots: &[PathBuf],
+    directory_scan: &ProjectScopeDirectoryScan,
+) {
+    let Some((primary_relative_skill_root, additional_relative_skill_roots)) =
+        relative_skill_roots.split_first()
+    else {
+        return;
+    };
+    if directory_scan.scope_root.is_some() {
+        scan.scope_roots
+            .entry(primary_relative_skill_root.clone())
+            .or_default()
+            .insert(directory.to_path_buf());
+    }
+    for relative_skill_root in additional_relative_skill_roots {
+        if directory.join(relative_skill_root).is_dir() {
+            scan.scope_roots
+                .entry(relative_skill_root.clone())
+                .or_default()
+                .insert(directory.to_path_buf());
+        }
+    }
+    scan.skipped_directories += directory_scan.skipped_directories;
+}
+
+fn merge_project_scope_multi_scan(
+    scan: &mut ProjectScopeMultiScan,
+    subtree_scan: ProjectScopeMultiScan,
+) {
+    for (relative_skill_root, scope_roots) in subtree_scan.scope_roots {
+        scan.scope_roots
+            .entry(relative_skill_root)
+            .or_default()
+            .extend(scope_roots);
+    }
+    scan.skipped_directories += subtree_scan.skipped_directories;
 }
 
 fn scan_project_scope_frontier(
@@ -5264,6 +3400,7 @@ mod tests {
         );
         let mut warnings = Vec::new();
         let mut items = Vec::new();
+        let mut project_scope_cache = ProjectScopeCache::default();
 
         let discovery = discover_project_skill_dirs(
             project_root,
@@ -5277,6 +3414,7 @@ mod tests {
                 skill_root_traversal: SkillRootTraversal::Recursive,
             },
             true,
+            &mut project_scope_cache,
             &mut warnings,
             &mut items,
         )
@@ -5288,6 +3426,269 @@ mod tests {
         assert_eq!(
             discovery.skill_roots,
             vec![project_root.join(".cursor").join("skills")]
+        );
+    }
+
+    #[test]
+    fn project_scope_cache_reuses_matching_scope_discovery() {
+        let project_root = Path::new("/project");
+        let relative_skill_root = Path::new(".agents/skills");
+        let expected_roots = BTreeSet::from([project_root.to_path_buf()]);
+        let mut cache = ProjectScopeCache::default();
+        let mut calls = 0;
+
+        let first = cache
+            .get_or_discover(
+                project_root,
+                project_root,
+                relative_skill_root,
+                ProjectSkillTraversal::Ancestors,
+                true,
+                || {
+                    calls += 1;
+                    Ok(ProjectSkillScopeRoots {
+                        roots: expected_roots.clone(),
+                        skipped_directories: 2,
+                    })
+                },
+            )
+            .expect("first cache lookup")
+            .clone();
+        let second = cache
+            .get_or_discover(
+                project_root,
+                project_root,
+                relative_skill_root,
+                ProjectSkillTraversal::Ancestors,
+                true,
+                || {
+                    calls += 1;
+                    Ok(ProjectSkillScopeRoots {
+                        roots: BTreeSet::new(),
+                        skipped_directories: 0,
+                    })
+                },
+            )
+            .expect("second cache lookup")
+            .clone();
+        let distinct_relative_root = cache
+            .get_or_discover(
+                project_root,
+                project_root,
+                Path::new(".claude/skills"),
+                ProjectSkillTraversal::Ancestors,
+                true,
+                || {
+                    calls += 1;
+                    Ok(ProjectSkillScopeRoots {
+                        roots: BTreeSet::new(),
+                        skipped_directories: 0,
+                    })
+                },
+            )
+            .expect("distinct cache lookup")
+            .clone();
+
+        let distinct_project_root = cache
+            .get_or_discover(
+                Path::new("/other-project"),
+                project_root,
+                relative_skill_root,
+                ProjectSkillTraversal::Ancestors,
+                true,
+                || {
+                    calls += 1;
+                    Ok(ProjectSkillScopeRoots {
+                        roots: BTreeSet::new(),
+                        skipped_directories: 0,
+                    })
+                },
+            )
+            .expect("distinct project root cache lookup")
+            .clone();
+        let distinct_repository_root = cache
+            .get_or_discover(
+                project_root,
+                Path::new("/other-repository"),
+                relative_skill_root,
+                ProjectSkillTraversal::Ancestors,
+                true,
+                || {
+                    calls += 1;
+                    Ok(ProjectSkillScopeRoots {
+                        roots: BTreeSet::new(),
+                        skipped_directories: 0,
+                    })
+                },
+            )
+            .expect("distinct repository root cache lookup")
+            .clone();
+        let distinct_traversal = cache
+            .get_or_discover(
+                project_root,
+                project_root,
+                relative_skill_root,
+                ProjectSkillTraversal::Repository,
+                true,
+                || {
+                    calls += 1;
+                    Ok(ProjectSkillScopeRoots {
+                        roots: BTreeSet::new(),
+                        skipped_directories: 0,
+                    })
+                },
+            )
+            .expect("distinct traversal cache lookup")
+            .clone();
+        let distinct_scope_scan = cache
+            .get_or_discover(
+                project_root,
+                project_root,
+                relative_skill_root,
+                ProjectSkillTraversal::Ancestors,
+                false,
+                || {
+                    calls += 1;
+                    Ok(ProjectSkillScopeRoots {
+                        roots: BTreeSet::new(),
+                        skipped_directories: 0,
+                    })
+                },
+            )
+            .expect("distinct scope-scan cache lookup")
+            .clone();
+
+        assert_eq!(calls, 6);
+        assert_eq!(first.roots, expected_roots);
+        assert_eq!(second.roots, expected_roots);
+        assert_eq!(second.skipped_directories, 2);
+        assert!(distinct_relative_root.roots.is_empty());
+        assert!(distinct_project_root.roots.is_empty());
+        assert!(distinct_repository_root.roots.is_empty());
+        assert!(distinct_traversal.roots.is_empty());
+        assert!(distinct_scope_scan.roots.is_empty());
+    }
+
+    #[test]
+    fn repository_scope_prepopulation_caches_cursor_skill_roots() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path().join("repository");
+        let project_root = repository_root.join("workspace").join("app");
+        write_test_file(&repository_root.join(".git"));
+        let relative_skill_roots = [
+            Path::new(".cursor/skills"),
+            Path::new(".agents/skills"),
+            Path::new(".claude/skills"),
+            Path::new(".codex/skills"),
+        ];
+        for (index, relative_skill_root) in relative_skill_roots.iter().enumerate() {
+            write_test_file(
+                &repository_root
+                    .join(format!("package-{index}"))
+                    .join(relative_skill_root)
+                    .join("example")
+                    .join("SKILL.md"),
+            );
+        }
+        let requests = relative_skill_roots
+            .iter()
+            .map(|relative_skill_root| (project_root.as_path(), *relative_skill_root))
+            .collect::<Vec<_>>();
+        let mut cache = ProjectScopeCache::default();
+
+        prepopulate_repository_project_scopes(&mut cache, &requests, true)
+            .expect("scope prepopulation");
+
+        for (index, relative_skill_root) in relative_skill_roots.iter().enumerate() {
+            let scope_roots = cache
+                .get_or_discover(
+                    &project_root,
+                    &repository_root,
+                    relative_skill_root,
+                    ProjectSkillTraversal::Repository,
+                    true,
+                    || -> Result<ProjectSkillScopeRoots, DiscoveryError> {
+                        panic!("prepopulated scope should be cached")
+                    },
+                )
+                .expect("cached scope roots");
+            assert!(
+                scope_roots
+                    .roots
+                    .contains(&repository_root.join(format!("package-{index}")))
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_discovery_consumes_prepopulated_repository_scopes() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary Cursor repository");
+        let repository_root = temporary_root.path().join("repository");
+        let project_root = repository_root.join("workspace").join("app");
+        let home_root = temporary_root.path().join("home");
+        let cursor_root = temporary_root.path().join("cursor");
+        fs::create_dir_all(&project_root).expect("create Cursor project root");
+        write_test_file(&repository_root.join(".git"));
+
+        let skill_files = [
+            repository_root
+                .join("cursor-package")
+                .join(".cursor/skills/example/SKILL.md"),
+            repository_root
+                .join("agents-package")
+                .join(".agents/skills/example/SKILL.md"),
+            repository_root
+                .join("claude-package")
+                .join(".claude/skills/example/SKILL.md"),
+            repository_root
+                .join("codex-package")
+                .join(".codex/skills/example/SKILL.md"),
+        ];
+        for skill_file in &skill_files {
+            write_test_file(skill_file);
+        }
+
+        let roots = DiscoveryRoots::from_locations(&home_root, &project_root, &cursor_root);
+        let mut state = DiscoveryState::default();
+        discover_cursor(&roots, &mut state).expect("Cursor discovery");
+
+        assert_eq!(
+            state.project_scope_cache.scopes.len(),
+            4,
+            "Cursor should consume the four scopes prepopulated for its repository traversal"
+        );
+        for skill_file in skill_files {
+            assert!(
+                state
+                    .items
+                    .iter()
+                    .any(|item| item.source_path == path_string(&skill_file)),
+                "Cursor should discover {} through the prepopulated scope",
+                skill_file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn repository_scope_multi_scan_reuses_duplicate_relative_root_results() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path();
+        let skill_root = repository_root.join("package").join(".agents/skills");
+        write_test_file(&skill_root.join("example/SKILL.md"));
+
+        let relative_skill_root = PathBuf::from(".agents/skills");
+        let scope_roots = project_repository_scope_roots(
+            repository_root,
+            &[relative_skill_root.clone(), relative_skill_root.clone()],
+        )
+        .expect("multi-root scope scan");
+
+        assert_eq!(
+            scope_roots
+                .get(&relative_skill_root)
+                .expect("duplicate scope root result")
+                .roots,
+            BTreeSet::from([repository_root.join("package")])
         );
     }
 
@@ -5498,6 +3899,106 @@ mod tests {
             0,
             "no worker should dequeue a new subtree after a sibling fails"
         );
+    }
+
+    #[test]
+    fn accumulating_project_scope_scan_stops_dequeuing_after_worker_error() {
+        let failing_directory = PathBuf::from("failing");
+        let slow_directory = PathBuf::from("slow");
+        let unstarted_directory = PathBuf::from("unstarted");
+        let workers_started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unstarted_scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deadline =
+            std::sync::Arc::new(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let error = match scan_project_scope_frontier_accumulating_with_cancellation(
+            &[
+                failing_directory.clone(),
+                slow_directory.clone(),
+                unstarted_directory.clone(),
+            ],
+            2,
+            &cancellation,
+            {
+                let workers_started = std::sync::Arc::clone(&workers_started);
+                let cancellation = std::sync::Arc::clone(&cancellation);
+                let unstarted_scans = std::sync::Arc::clone(&unstarted_scans);
+                let deadline = std::sync::Arc::clone(&deadline);
+                move |directory| -> Result<usize, DiscoveryError> {
+                    if directory == failing_directory {
+                        workers_started.fetch_add(1, AtomicOrdering::Release);
+                        while workers_started.load(AtomicOrdering::Acquire) < 2 {
+                            assert!(
+                                std::time::Instant::now() < *deadline,
+                                "two workers must start before the failure is returned"
+                            );
+                            thread::yield_now();
+                        }
+                        return Err(std::io::Error::other("synthetic project scan failure").into());
+                    }
+                    if directory == slow_directory {
+                        workers_started.fetch_add(1, AtomicOrdering::Release);
+                        while !cancellation.load(AtomicOrdering::Acquire) {
+                            assert!(
+                                std::time::Instant::now() < *deadline,
+                                "a sibling failure must set cancellation"
+                            );
+                            thread::yield_now();
+                        }
+                        return Ok(1);
+                    }
+                    if directory == unstarted_directory {
+                        unstarted_scans.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    Ok(1)
+                }
+            },
+            |total, next| *total += next,
+        ) {
+            Ok(_) => panic!("worker failure must stop queued project scans"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "synthetic project scan failure");
+        assert_eq!(
+            unstarted_scans.load(AtomicOrdering::Relaxed),
+            0,
+            "no worker should dequeue a new subtree after a sibling fails"
+        );
+    }
+
+    #[test]
+    fn accumulating_project_scope_scan_with_one_worker_merges_each_subtree() {
+        let scans = scan_project_scope_frontier_accumulating_with(
+            &[
+                PathBuf::from("one"),
+                PathBuf::from("two"),
+                PathBuf::from("three"),
+            ],
+            1,
+            |_| Ok::<_, DiscoveryError>(1usize),
+            |total, next| *total += next,
+        )
+        .expect("single-worker accumulating project scope scan");
+
+        assert_eq!(scans, vec![3]);
+    }
+
+    #[test]
+    fn cancelled_accumulating_project_scope_scan_does_not_start_a_subtree() {
+        let cancellation = std::sync::atomic::AtomicBool::new(true);
+        let error = scan_project_scope_frontier_accumulating_with_cancellation(
+            &[PathBuf::from("unstarted")],
+            1,
+            &cancellation,
+            |_| -> Result<usize, DiscoveryError> {
+                panic!("a cancelled accumulating scan must not start a subtree")
+            },
+            |total, next| *total += next,
+        )
+        .expect_err("cancelled accumulating project scope scan must return an error");
+
+        assert_eq!(error.to_string(), "project scope scan cancelled");
     }
 
     fn write_test_file(path: &Path) {
