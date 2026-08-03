@@ -7,6 +7,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-08-03
+
+### Changed
+
+- Discovery is split into provider-focused modules while preserving the public
+  discovery registry and fixture-backed provider behavior.
+- Cursor-compatible repository skill roots share one multi-root scope
+  traversal for each discovery run. The result is cached by root, traversal,
+  and scope mode, so compatible roots reuse the discovery work without sharing
+  results across different projects or traversal modes.
+
 ## [0.5.0] - 2026-08-02
 
 ### Added
