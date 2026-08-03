@@ -21,12 +21,35 @@ pub(super) fn scan_project_scope_frontier_with(
     )
 }
 
-pub(super) fn scan_project_scope_frontier_with_cancellation(
+pub(super) fn scan_project_scope_frontier_accumulating_with<T>(
+    frontier: &[PathBuf],
+    worker_limit: usize,
+    scan_subtree: impl Fn(&Path) -> Result<T, DiscoveryError> + Sync,
+    merge: impl Fn(&mut T, T) + Sync,
+) -> Result<Vec<T>, DiscoveryError>
+where
+    T: Default + Send,
+{
+    let cancellation = AtomicBool::new(false);
+    scan_project_scope_frontier_accumulating_with_cancellation(
+        frontier,
+        worker_limit,
+        &cancellation,
+        scan_subtree,
+        merge,
+    )
+}
+
+pub(super) fn scan_project_scope_frontier_accumulating_with_cancellation<T>(
     frontier: &[PathBuf],
     worker_limit: usize,
     cancellation: &AtomicBool,
-    scan_subtree: impl Fn(&Path) -> Result<ProjectScopeScan, DiscoveryError> + Sync,
-) -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
+    scan_subtree: impl Fn(&Path) -> Result<T, DiscoveryError> + Sync,
+    merge: impl Fn(&mut T, T) + Sync,
+) -> Result<Vec<T>, DiscoveryError>
+where
+    T: Default + Send,
+{
     if cancellation.load(AtomicOrdering::Acquire) {
         return Err(project_scope_scan_cancelled_error());
     }
@@ -35,16 +58,30 @@ pub(super) fn scan_project_scope_frontier_with_cancellation(
         return Ok(Vec::new());
     }
     if worker_count == 1 {
-        return Ok(vec![scan_subtree(&frontier[0])?]);
+        let mut scan = T::default();
+        for directory in frontier {
+            if cancellation.load(AtomicOrdering::Acquire) {
+                return Err(project_scope_scan_cancelled_error());
+            }
+            let subtree_scan = match scan_subtree(directory) {
+                Ok(scan) => scan,
+                Err(error) => {
+                    cancellation.store(true, AtomicOrdering::Release);
+                    return Err(error);
+                }
+            };
+            merge(&mut scan, subtree_scan);
+        }
+        return Ok(vec![scan]);
     }
 
     let next_directory = AtomicUsize::new(0);
-    thread::scope(|scope| -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
+    thread::scope(|scope| -> Result<Vec<T>, DiscoveryError> {
         let handles = (0..worker_count)
             .map(|_| {
-                scope.spawn(|| -> Result<ProjectScopeScan, DiscoveryError> {
+                scope.spawn(|| -> Result<T, DiscoveryError> {
                     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        let mut scan = ProjectScopeScan::default();
+                        let mut scan = T::default();
                         loop {
                             if cancellation.load(AtomicOrdering::Acquire) {
                                 break;
@@ -63,7 +100,7 @@ pub(super) fn scan_project_scope_frontier_with_cancellation(
                                     return Err(error);
                                 }
                             };
-                            merge_project_scope_scan(&mut scan, subtree_scan);
+                            merge(&mut scan, subtree_scan);
                         }
                         Ok(scan)
                     }));
@@ -101,6 +138,21 @@ pub(super) fn scan_project_scope_frontier_with_cancellation(
         }
         worker_panic.or(first_error).map_or_else(|| Ok(scans), Err)
     })
+}
+
+pub(super) fn scan_project_scope_frontier_with_cancellation(
+    frontier: &[PathBuf],
+    worker_limit: usize,
+    cancellation: &AtomicBool,
+    scan_subtree: impl Fn(&Path) -> Result<ProjectScopeScan, DiscoveryError> + Sync,
+) -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
+    scan_project_scope_frontier_accumulating_with_cancellation(
+        frontier,
+        worker_limit,
+        cancellation,
+        scan_subtree,
+        merge_project_scope_scan,
+    )
 }
 
 fn project_scope_scan_cancelled_error() -> DiscoveryError {
