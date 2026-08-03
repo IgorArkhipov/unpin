@@ -1,12 +1,10 @@
 use std::{
-    any::Any,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicUsize, Ordering as AtomicOrdering},
     thread,
 };
 
@@ -29,6 +27,14 @@ use crate::{
         table_child_ids, table_subtree_content,
     },
 };
+
+mod project_scopes;
+
+use project_scopes::scan_project_scope_frontier_with;
+#[cfg(test)]
+use project_scopes::scan_project_scope_frontier_with_cancellation;
+#[cfg(test)]
+use std::sync::atomic::Ordering as AtomicOrdering;
 
 pub type DiscoveryError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
@@ -3056,66 +3062,6 @@ fn scan_project_scope_frontier(
     })
 }
 
-fn scan_project_scope_frontier_with(
-    frontier: &[PathBuf],
-    worker_limit: usize,
-    scan_subtree: impl Fn(&Path) -> Result<ProjectScopeScan, DiscoveryError> + Sync,
-) -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
-    let worker_count = frontier.len().min(worker_limit);
-    if worker_count == 0 {
-        return Ok(Vec::new());
-    }
-    if worker_count == 1 {
-        return Ok(vec![scan_subtree(&frontier[0])?]);
-    }
-
-    let next_directory = AtomicUsize::new(0);
-    thread::scope(|scope| -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
-        let handles = (0..worker_count)
-            .map(|_| {
-                scope.spawn(|| -> Result<ProjectScopeScan, DiscoveryError> {
-                    let mut scan = ProjectScopeScan::default();
-                    loop {
-                        let index = next_directory.fetch_add(1, AtomicOrdering::Relaxed);
-                        let Some(directory) = frontier.get(index) else {
-                            break;
-                        };
-                        let subtree_scan = scan_subtree(directory)?;
-                        merge_project_scope_scan(&mut scan, subtree_scan);
-                    }
-                    Ok(scan)
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let mut scans = Vec::with_capacity(worker_count);
-        let mut first_error = None;
-        let mut worker_panic = None;
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(scan)) => scans.push(scan),
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(error);
-                }
-                Err(payload) => {
-                    worker_panic
-                        .get_or_insert_with(|| project_scope_scan_worker_panic_error(payload));
-                }
-            }
-        }
-        worker_panic.or(first_error).map_or_else(|| Ok(scans), Err)
-    })
-}
-
-fn project_scope_scan_worker_panic_error(payload: Box<dyn Any + Send>) -> DiscoveryError {
-    let details = payload
-        .downcast_ref::<&str>()
-        .map(|message| (*message).to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "non-string panic payload".to_string());
-    std::io::Error::other(format!("project scope scan worker panicked: {details}")).into()
-}
-
 fn merge_project_scope_scan(scan: &mut ProjectScopeScan, subtree_scan: ProjectScopeScan) {
     scan.scope_roots.extend(subtree_scan.scope_roots);
     scan.skipped_directories += subtree_scan.skipped_directories;
@@ -5424,6 +5370,89 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "project scope scan worker panicked: deliberate project scope scan worker panic"
+        );
+    }
+
+    #[test]
+    fn cancelled_project_scope_scan_does_not_start_a_subtree() {
+        let cancellation = std::sync::atomic::AtomicBool::new(true);
+        let error = match scan_project_scope_frontier_with_cancellation(
+            &[PathBuf::from("unstarted")],
+            1,
+            &cancellation,
+            |_| -> Result<ProjectScopeScan, DiscoveryError> {
+                panic!("a cancelled scan must not start a subtree")
+            },
+        ) {
+            Ok(_) => panic!("cancelled project scope scan must return an error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "project scope scan cancelled");
+    }
+
+    #[test]
+    fn parallel_project_scope_scan_stops_dequeuing_after_worker_error() {
+        let failing_directory = PathBuf::from("failing");
+        let slow_directory = PathBuf::from("slow");
+        let unstarted_directory = PathBuf::from("unstarted");
+        let workers_started = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cancellation = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let unstarted_scans = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let deadline =
+            std::sync::Arc::new(std::time::Instant::now() + std::time::Duration::from_secs(5));
+        let error = match scan_project_scope_frontier_with_cancellation(
+            &[
+                failing_directory.clone(),
+                slow_directory.clone(),
+                unstarted_directory.clone(),
+            ],
+            2,
+            &cancellation,
+            {
+                let workers_started = std::sync::Arc::clone(&workers_started);
+                let cancellation = std::sync::Arc::clone(&cancellation);
+                let unstarted_scans = std::sync::Arc::clone(&unstarted_scans);
+                let deadline = std::sync::Arc::clone(&deadline);
+                move |directory| -> Result<ProjectScopeScan, DiscoveryError> {
+                    if directory == failing_directory {
+                        workers_started.fetch_add(1, AtomicOrdering::Release);
+                        while workers_started.load(AtomicOrdering::Acquire) < 2 {
+                            assert!(
+                                std::time::Instant::now() < *deadline,
+                                "two workers must start before the failure is returned"
+                            );
+                            thread::yield_now();
+                        }
+                        return Err(std::io::Error::other("synthetic project scan failure").into());
+                    }
+                    if directory == slow_directory {
+                        workers_started.fetch_add(1, AtomicOrdering::Release);
+                        while !cancellation.load(AtomicOrdering::Acquire) {
+                            assert!(
+                                std::time::Instant::now() < *deadline,
+                                "a sibling failure must set cancellation"
+                            );
+                            thread::yield_now();
+                        }
+                        return Ok(ProjectScopeScan::default());
+                    }
+                    if directory == unstarted_directory {
+                        unstarted_scans.fetch_add(1, AtomicOrdering::Relaxed);
+                    }
+                    Ok(ProjectScopeScan::default())
+                }
+            },
+        ) {
+            Ok(_) => panic!("worker failure must stop queued project scans"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.to_string(), "synthetic project scan failure");
+        assert_eq!(
+            unstarted_scans.load(AtomicOrdering::Relaxed),
+            0,
+            "no worker should dequeue a new subtree after a sibling fails"
         );
     }
 

@@ -58,6 +58,9 @@ mod groups;
 mod hooks;
 mod profiles;
 mod sessions;
+mod startup;
+
+use startup::{StartupCredentials, finish_after_terminal_run, resolve_startup_credentials};
 
 type TuiResult<T> = Result<T, Box<dyn Error>>;
 
@@ -2325,18 +2328,14 @@ pub fn run_interactive(
             app_state_root,
             project_root,
             discovery_roots,
-            startup.backup_authentication_key,
-            startup.session_authority_key,
+            startup.credentials.backup_authentication_key,
+            startup.credentials.session_authority_key,
         );
         state.fixture_mode = fixture_mode;
-        record_startup_warnings(&mut state, startup.credential_warnings);
+        record_startup_warnings(&mut state, startup.credentials.warnings);
         run_loop(&mut terminal, &mut state)
     })();
-    let restore_result = restore_terminal(&mut terminal);
-
-    loop_result?;
-    restore_result?;
-    Ok(())
+    finish_after_terminal_run(loop_result, || restore_terminal(&mut terminal))
 }
 
 #[derive(Default)]
@@ -2410,9 +2409,7 @@ fn loading_event(event: Event) -> LoadingEvent {
 
 struct TuiStartup {
     discovery: DiscoveryOutput,
-    backup_authentication_key: Option<BackupAuthenticationKey>,
-    session_authority_key: Option<SessionAuthorityKey>,
-    credential_warnings: Vec<String>,
+    credentials: StartupCredentials,
 }
 
 enum TuiStartupEvent {
@@ -2448,37 +2445,16 @@ fn start_discovery(
             return Ok(None);
         }
         let discovery = discovery?;
-        let (backup_authentication_key, backup_warning) =
-            match credentials::resolve_backup_authentication_key(fixture_mode, &app_state_root) {
-                Ok(key) => (key, None),
-                Err(error) => (
-                    None,
-                    Some(format!(
-                        "backup authentication unavailable; writes disabled: {error}"
-                    )),
-                ),
-            };
-        if discovery_cancellation.load(Ordering::Relaxed) {
+        let Some(startup_credentials) = resolve_startup_credentials(
+            || credentials::resolve_backup_authentication_key(fixture_mode, &app_state_root),
+            || discovery_cancellation.load(Ordering::Relaxed),
+            || credentials::resolve_session_authority_key(fixture_mode, &app_state_root),
+        ) else {
             return Ok(None);
-        }
-        let (session_authority_key, session_warning) =
-            match credentials::resolve_session_authority_key(fixture_mode, &app_state_root) {
-                Ok(key) => (key, None),
-                Err(error) => (
-                    None,
-                    Some(format!(
-                        "session authority unavailable; session controls disabled: {error}"
-                    )),
-                ),
-            };
+        };
         Ok(Some(TuiStartup {
             discovery,
-            backup_authentication_key,
-            session_authority_key,
-            credential_warnings: [backup_warning, session_warning]
-                .into_iter()
-                .flatten()
-                .collect(),
+            credentials: startup_credentials,
         }))
     });
     (receiver, cancellation)
@@ -3596,9 +3572,11 @@ mod tests {
                     DiscoveryCategory::Skill,
                     DiscoveryKind::Skill,
                 )]),
-                backup_authentication_key: None,
-                session_authority_key: None,
-                credential_warnings: Vec::new(),
+                credentials: StartupCredentials {
+                    backup_authentication_key: None,
+                    session_authority_key: None,
+                    warnings: Vec::new(),
+                },
             })))
             .expect("send discovery result");
 
@@ -3781,9 +3759,9 @@ mod tests {
                 provider_count: ProviderId::ALL.len(),
             }
         );
-        assert!(startup.backup_authentication_key.is_some());
-        assert!(startup.session_authority_key.is_some());
-        assert!(startup.credential_warnings.is_empty());
+        assert!(startup.credentials.backup_authentication_key.is_some());
+        assert!(startup.credentials.session_authority_key.is_some());
+        assert!(startup.credentials.warnings.is_empty());
     }
 
     #[test]
