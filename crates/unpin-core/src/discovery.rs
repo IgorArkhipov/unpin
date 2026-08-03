@@ -2828,11 +2828,11 @@ fn discover_project_skill_dirs(
     warnings: &mut Vec<DiscoveryWarning>,
     items: &mut Vec<DiscoveryItem>,
 ) -> Result<ProjectSkillDiscovery, DiscoveryError> {
-    let repository_root = if scan_project_scopes {
-        find_repository_root(project_root)
-    } else {
-        project_root.to_path_buf()
-    };
+    let repository_root = scan_project_scopes
+        .then(|| enclosing_repository_root(project_root))
+        .flatten();
+    let scan_project_scopes = repository_root.is_some();
+    let repository_root = repository_root.unwrap_or_else(|| project_root.to_path_buf());
     let scope_discovery = project_skill_scope_roots(
         project_root,
         &repository_root,
@@ -2905,11 +2905,14 @@ fn discover_project_skill_dirs(
 }
 
 fn find_repository_root(project_root: &Path) -> PathBuf {
+    enclosing_repository_root(project_root).unwrap_or_else(|| project_root.to_path_buf())
+}
+
+fn enclosing_repository_root(project_root: &Path) -> Option<PathBuf> {
     project_root
         .ancestors()
         .find(|ancestor| ancestor.join(".git").exists())
-        .unwrap_or(project_root)
-        .to_path_buf()
+        .map(Path::to_path_buf)
 }
 
 fn project_skill_scope_roots(
@@ -5245,6 +5248,47 @@ mod tests {
 
         assert!(read_cursor_workspace_disabled_server_ids(&database_path).is_err());
         assert!(!database_path.exists());
+    }
+
+    #[test]
+    fn non_repository_project_skill_discovery_does_not_scan_descendants() {
+        let temp = tempfile::TempDir::new().expect("temporary non-repository project root");
+        let project_root = temp.path();
+        write_test_file(
+            &project_root
+                .join("nested")
+                .join(".cursor")
+                .join("skills")
+                .join("unrelated")
+                .join("SKILL.md"),
+        );
+        let mut warnings = Vec::new();
+        let mut items = Vec::new();
+
+        let discovery = discover_project_skill_dirs(
+            project_root,
+            Path::new(".cursor/skills"),
+            SkillDiscoverySpec {
+                provider: ProviderId::Cursor,
+                layer: DiscoveryLayer::Project,
+                id_prefix: CURSOR_PROJECT_SKILL_ID_PREFIX,
+                mutability: DiscoveryMutability::ReadWrite,
+                traversal: ProjectSkillTraversal::Repository,
+                skill_root_traversal: SkillRootTraversal::Recursive,
+            },
+            true,
+            &mut warnings,
+            &mut items,
+        )
+        .expect("project skill discovery");
+
+        assert!(discovery.live_ids.is_empty());
+        assert!(items.is_empty());
+        assert!(warnings.is_empty());
+        assert_eq!(
+            discovery.skill_roots,
+            vec![project_root.join(".cursor").join("skills")]
+        );
     }
 
     #[test]
