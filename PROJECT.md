@@ -15,7 +15,7 @@ audit evidence, and explicit recovery outcomes.
 
 ## Current status
 
-- Version: `0.1.0-beta.13` public-beta release candidate.
+- Version: `0.1.0-beta.14` public-beta release candidate.
 - Canonical repository: `https://github.com/IgorArkhipov/unpin`.
 - License: MIT, copyright Igor Arkhipov.
 - Distribution: GitHub release archives for Apple Silicon macOS, Intel macOS,
@@ -46,7 +46,7 @@ SBOM generation, provenance attestation, checksums, and a draft-only release
 workflow. crates.io, Homebrew, Linux ARM64, Windows, and platform code signing
 remain deferred.
 
-Publishing `v0.1.0-beta.13` is gated on required CI, workflow lint, locked
+Publishing `v0.1.0-beta.14` is gated on required CI, workflow lint, locked
 package metadata, version smoke, Linux artifact verification on an exact clean
 release commit (a `GLIBC_2.35`-or-older symbol ceiling and Debian 12 smoke),
 generated checksums attached to the draft, enabled branch protection,

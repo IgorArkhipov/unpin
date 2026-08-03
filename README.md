@@ -6,12 +6,11 @@ workflows.
 
 ## Distribution status and quick start
 
-Unpin `0.1.0-beta.13` makes backups understandable and manageable in the TUI:
-Restore Operations identifies the provider, scope, affected item, state, and
-creation time, keeps the selected row visible, and offers a reviewed delete
-flow. On macOS, concurrent CLI/MCP clients reuse an idle-expiring local
-credential broker instead of repeatedly opening Keychain. It is a program-logic release, so
-the full provider matrix and live-host validation are required before publication.
+Unpin `0.1.0-beta.14` keeps the terminal responsive while it discovers large
+repository configurations: independent project scopes scan concurrently, and
+the TUI draws a cancellable loading view with provider-by-provider progress
+before credential resolution completes. It is a program-logic release, so the
+full provider matrix and live-host validation are required before publication.
 Its GNU/Linux archive remains built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
 artifacts are
@@ -27,7 +26,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.1.0-beta.13-TARGET.tar.gz \
+gh attestation verify unpin-v0.1.0-beta.14-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -35,7 +34,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.1.0-beta.13-TARGET
+cd unpin-v0.1.0-beta.14-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"

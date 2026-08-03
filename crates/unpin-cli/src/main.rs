@@ -1125,18 +1125,18 @@ fn main() -> ExitCode {
             match resolve_discovery_roots_with_config(&roots, &config) {
                 Ok(roots) => {
                     let discovery_roots = roots.with_app_state_root(&config.app_state_root);
-                    match discover_all(&discovery_roots) {
-                        Ok(discovery) => {
-                            let backup_authentication_key =
-                                resolve_optional_backup_authentication_key(
+                    if headless {
+                        match discover_all(&discovery_roots) {
+                            Ok(discovery) => {
+                                let backup_authentication_key =
+                                    resolve_optional_backup_authentication_key(
+                                        fixture_mode,
+                                        &config.app_state_root,
+                                    );
+                                let session_authority_key = resolve_optional_session_authority_key(
                                     fixture_mode,
                                     &config.app_state_root,
                                 );
-                            let session_authority_key = resolve_optional_session_authority_key(
-                                fixture_mode,
-                                &config.app_state_root,
-                            );
-                            if headless {
                                 println!(
                                     "{}",
                                     tui::render_headless_with_paths(
@@ -1148,27 +1148,24 @@ fn main() -> ExitCode {
                                     )
                                 );
                                 ExitCode::SUCCESS
-                            } else {
-                                match tui::run_interactive(
-                                    discovery,
-                                    config.app_state_root,
-                                    config.project_root,
-                                    discovery_roots,
-                                    backup_authentication_key,
-                                    session_authority_key,
-                                    fixture_mode,
-                                ) {
-                                    Ok(()) => ExitCode::SUCCESS,
-                                    Err(error) => {
-                                        eprintln!("tui failed: {error}");
-                                        ExitCode::FAILURE
-                                    }
-                                }
+                            }
+                            Err(error) => {
+                                eprintln!("discovery failed: {error}");
+                                ExitCode::FAILURE
                             }
                         }
-                        Err(error) => {
-                            eprintln!("discovery failed: {error}");
-                            ExitCode::FAILURE
+                    } else {
+                        match tui::run_interactive(
+                            config.app_state_root,
+                            config.project_root,
+                            discovery_roots,
+                            fixture_mode,
+                        ) {
+                            Ok(()) => ExitCode::SUCCESS,
+                            Err(error) => {
+                                eprintln!("tui failed: {error}");
+                                ExitCode::FAILURE
+                            }
                         }
                     }
                 }

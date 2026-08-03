@@ -3,7 +3,7 @@ members = ["crates/unpin-core", "crates/unpin-cli"]
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0-beta.13"
+version = "0.1.0-beta.14"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
@@ -17,7 +17,7 @@ categories = ["command-line-utilities", "config", "development-tools"]
 publish = false
 
 [workspace.dependencies]
-unpin-core = { path = "crates/unpin-core", version = "=0.1.0-beta.13" }
+unpin-core = { path = "crates/unpin-core", version = "=0.1.0-beta.14" }
 assert_cmd = "2.2.2"
 clap = { version = "4.6.4", features = ["derive"] }
 crossterm = "0.29.0"
