@@ -10,7 +10,9 @@ use crate::{
         get_approval_nonce_ledger_path, get_approval_nonce_ledger_shard_path,
         get_approval_nonce_path,
     },
-    state::atomic_json::{AtomicJsonStore, OwnerGeneration, StateError, StateSnapshot},
+    state::atomic_json::{
+        AtomicJsonStore, OwnerGeneration, StateError, StateResourceLock, StateSnapshot,
+    },
 };
 
 const APPROVAL_RECEIPT_VERSION: u32 = 1;
@@ -547,6 +549,13 @@ impl ApprovalNonceStore {
             return Err(ApprovalError::Expired);
         }
         let nonce_digest = crate::encode_lower_hex(&Sha256::digest(approval.nonce.as_bytes()));
+        // Recovery is intentionally persisted before active reservation so an
+        // active-ledger capacity failure retains authoritative evidence. The two
+        // stores have independent locks, so serialize this multi-store sequence:
+        // otherwise another process can observe that provisional recovery record
+        // and both callers report an attachment. This shared lock deliberately
+        // avoids reintroducing unbounded per-nonce state files.
+        let _nonce_lock = StateResourceLock::acquire(self.consumption_lock_path())?;
         let record = ConsumedNonce {
             operation_id: approval.operation_id.clone(),
             decision_digest: approval.decision_digest.clone(),
@@ -828,6 +837,10 @@ impl ApprovalNonceStore {
         )
     }
 
+    fn consumption_lock_path(&self) -> PathBuf {
+        get_approval_nonce_ledger_path(&self.app_state_root).with_extension("consume")
+    }
+
     fn legacy_nonce(
         &self,
         nonce_digest: &str,
@@ -1063,3 +1076,79 @@ impl fmt::Display for ApprovalError {
 }
 
 impl std::error::Error for ApprovalError {}
+
+#[cfg(test)]
+mod tests {
+    use std::{sync::mpsc, thread, time::Duration};
+
+    use super::{ApprovalNonceStore, NonceConsumption, VerifiedApproval, nonce_ledger_shard};
+    use crate::{
+        config::get_approval_nonce_ledger_shard_path,
+        state::atomic_json::{OwnerGeneration, StateResourceLock},
+    };
+    use sha2::{Digest, Sha256};
+
+    #[test]
+    fn nonce_consumption_waits_for_the_ledger_transaction_lock() {
+        let temp = tempfile::tempdir().expect("temporary state directory");
+        let state_root = std::fs::canonicalize(temp.path()).expect("canonical state directory");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            std::fs::set_permissions(&state_root, std::fs::Permissions::from_mode(0o700))
+                .expect("private state directory");
+        }
+
+        let store = ApprovalNonceStore::new(&state_root);
+        let transaction_lock = StateResourceLock::acquire(store.consumption_lock_path())
+            .expect("hold nonce transaction lock");
+        let approval = VerifiedApproval {
+            nonce: "nonce-transaction-lock".to_string(),
+            operation_id: "operation-transaction-lock".to_string(),
+            decision_digest: "decision-transaction-lock".to_string(),
+            issued_at_unix: 1_000,
+            expires_at_unix: 1_100,
+        };
+        let nonce_digest = crate::encode_lower_hex(&Sha256::digest(approval.nonce.as_bytes()));
+        let recovery_path = get_approval_nonce_ledger_shard_path(
+            &state_root,
+            nonce_ledger_shard(&nonce_digest).expect("nonce ledger shard"),
+        );
+        let (started_tx, started_rx) = mpsc::channel();
+        let (result_tx, result_rx) = mpsc::channel();
+        let worker_store = store.clone();
+        let worker = thread::spawn(move || {
+            started_tx.send(()).expect("worker started");
+            result_tx
+                .send(worker_store.consume_or_attach(
+                    &approval,
+                    1_050,
+                    OwnerGeneration::new("approval-lock-test", 1).expect("valid owner"),
+                ))
+                .expect("worker result sent");
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("worker begins nonce consumption");
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        assert!(
+            !recovery_path.exists(),
+            "recovery persistence must wait for the shared transaction lock"
+        );
+
+        drop(transaction_lock);
+        assert_eq!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("worker completes after lock release")
+                .expect("nonce consumption"),
+            NonceConsumption::Consumed
+        );
+        worker.join().expect("nonce worker");
+    }
+}
