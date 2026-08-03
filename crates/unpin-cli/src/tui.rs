@@ -2428,65 +2428,114 @@ fn start_discovery(
     let (sender, receiver) = mpsc::channel();
     let cancellation = Arc::new(AtomicBool::new(false));
     let worker_cancellation = Arc::clone(&cancellation);
-    thread::spawn(move || {
-        let result = discover_all_with_progress(&discovery_roots, |progress| {
-            if worker_cancellation.load(Ordering::Relaxed) {
+    let discovery_cancellation = Arc::clone(&cancellation);
+    let progress_sender = sender.clone();
+    start_discovery_worker(sender, worker_cancellation, move || {
+        let discovery = discover_all_with_progress(&discovery_roots, |progress| {
+            if discovery_cancellation.load(Ordering::Relaxed) {
                 return false;
             }
-            sender.send(TuiStartupEvent::Progress(progress)).is_ok()
-                && !worker_cancellation.load(Ordering::Relaxed)
+            let sent_progress = progress_sender
+                .send(TuiStartupEvent::Progress(progress))
+                .is_ok();
+            #[cfg(test)]
+            if sent_progress {
+                wait_for_startup_progress_test_pause(&app_state_root);
+            }
+            sent_progress && !discovery_cancellation.load(Ordering::Relaxed)
         });
-        if worker_cancellation.load(Ordering::Relaxed) {
-            return;
+        if discovery_cancellation.load(Ordering::Relaxed) {
+            return Ok(None);
         }
-        let result = result.map(|discovery| {
-            if worker_cancellation.load(Ordering::Relaxed) {
-                return None;
-            }
-            let (backup_authentication_key, backup_warning) =
-                match credentials::resolve_backup_authentication_key(fixture_mode, &app_state_root)
-                {
-                    Ok(key) => (key, None),
-                    Err(error) => (
-                        None,
-                        Some(format!(
-                            "backup authentication unavailable; writes disabled: {error}"
-                        )),
-                    ),
+        let discovery = discovery?;
+        let (backup_authentication_key, backup_warning) =
+            match credentials::resolve_backup_authentication_key(fixture_mode, &app_state_root) {
+                Ok(key) => (key, None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "backup authentication unavailable; writes disabled: {error}"
+                    )),
+                ),
+            };
+        if discovery_cancellation.load(Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let (session_authority_key, session_warning) =
+            match credentials::resolve_session_authority_key(fixture_mode, &app_state_root) {
+                Ok(key) => (key, None),
+                Err(error) => (
+                    None,
+                    Some(format!(
+                        "session authority unavailable; session controls disabled: {error}"
+                    )),
+                ),
+            };
+        Ok(Some(TuiStartup {
+            discovery,
+            backup_authentication_key,
+            session_authority_key,
+            credential_warnings: [backup_warning, session_warning]
+                .into_iter()
+                .flatten()
+                .collect(),
+        }))
+    });
+    (receiver, cancellation)
+}
+
+fn start_discovery_worker(
+    sender: mpsc::Sender<TuiStartupEvent>,
+    cancellation: Arc<AtomicBool>,
+    work: impl FnOnce() -> Result<Option<TuiStartup>, DiscoveryError> + Send + 'static,
+) {
+    thread::spawn(move || {
+        let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(work)) {
+            Ok(result) => result,
+            Err(payload) => {
+                let message = if let Some(message) = payload.downcast_ref::<&str>() {
+                    (*message).to_string()
+                } else if let Some(message) = payload.downcast_ref::<String>() {
+                    message.clone()
+                } else {
+                    "non-string panic payload".to_string()
                 };
-            if worker_cancellation.load(Ordering::Relaxed) {
-                return None;
+                Err(
+                    io::Error::other(format!("startup discovery worker panicked: {message}"))
+                        .into(),
+                )
             }
-            let (session_authority_key, session_warning) =
-                match credentials::resolve_session_authority_key(fixture_mode, &app_state_root) {
-                    Ok(key) => (key, None),
-                    Err(error) => (
-                        None,
-                        Some(format!(
-                            "session authority unavailable; session controls disabled: {error}"
-                        )),
-                    ),
-                };
-            Some(TuiStartup {
-                discovery,
-                backup_authentication_key,
-                session_authority_key,
-                credential_warnings: [backup_warning, session_warning]
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-            })
-        });
+        };
         let result = match result {
             Ok(Some(startup)) => Ok(startup),
             Ok(None) => return,
             Err(error) => Err(error),
         };
-        if !worker_cancellation.load(Ordering::Relaxed) {
+        if !cancellation.load(Ordering::Relaxed) {
             let _ = sender.send(TuiStartupEvent::Complete(result));
         }
     });
-    (receiver, cancellation)
+}
+
+#[cfg(test)]
+fn startup_progress_test_pauses()
+-> &'static std::sync::Mutex<std::collections::BTreeMap<PathBuf, mpsc::SyncSender<()>>> {
+    static PAUSES: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<PathBuf, mpsc::SyncSender<()>>>,
+    > = std::sync::OnceLock::new();
+    PAUSES.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
+#[cfg(test)]
+fn wait_for_startup_progress_test_pause(app_state_root: &Path) {
+    let pause = startup_progress_test_pauses()
+        .lock()
+        .expect("startup progress test pauses lock")
+        .get(app_state_root)
+        .cloned();
+    if let Some(pause) = pause {
+        let _ = pause.send(());
+    }
 }
 
 fn try_take_startup(
@@ -3581,7 +3630,6 @@ mod tests {
         let app_state = TempDir::new().expect("temporary startup app state");
         let roots =
             DiscoveryRoots::fixture_root(fixtures_root()).with_app_state_root(app_state.path());
-        let expected = discover_all(&roots).expect("fixture discovery");
         let (receiver, _cancellation) =
             start_discovery(roots, app_state.path().to_path_buf(), true);
         let mut progress = Vec::new();
@@ -3597,8 +3645,123 @@ mod tests {
                 }
             }
         };
-        assert_eq!(startup.discovery.items, expected.items);
-        assert_eq!(startup.discovery.warnings, expected.warnings);
+        let mut inventory = startup
+            .discovery
+            .items
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}|{}|{}|{}|{}",
+                    item.id,
+                    item.provider.as_str(),
+                    item.layer.as_str(),
+                    item.kind.as_str(),
+                    item.enabled
+                )
+            })
+            .collect::<Vec<_>>();
+        inventory.sort_unstable();
+        let expected = [
+            "claude:global:agent:claude-global-reviewer|claude|global|agent|true",
+            "claude:global:configured-mcp:global-docs|claude|global|mcp|true",
+            "claude:global:hook:settings:PreToolUse:b0d4bd3ac8311f87:0|claude|global|hook|true",
+            "claude:global:hook:settings:PreToolUse:d465dcd66d4f095b:0|claude|global|hook|true",
+            "claude:global:setting:settings-local|claude|global|setting|true",
+            "claude:global:setting:settings|claude|global|setting|true",
+            "claude:global:skill:example-claude-global-skill|claude|global|skill|true",
+            "claude:global:tool:settings-local:project-auditor|claude|global|plugin|true",
+            "claude:global:tool:settings:connector-kit@example-marketplace|claude|global|plugin|true",
+            "claude:global:tool:settings:demo-formatter|claude|global|plugin|false",
+            "claude:global:tool:settings:safe-shell|claude|global|plugin|true",
+            "claude:project:agent:claude-project-helper|claude|project|agent|true",
+            "claude:project:configured-mcp:all-project-mcp-servers|claude|project|mcp|false",
+            "claude:project:configured-mcp:github|claude|project|mcp|true",
+            "claude:project:hook:settings-local:PostToolUse:082f8bb906aaa448:0|claude|project|hook|true",
+            "claude:project:setting:settings-local|claude|project|setting|true",
+            "claude:project:setting:settings|claude|project|setting|true",
+            "claude:project:skill:example-claude-skill|claude|project|skill|true",
+            "claude:project:tool:settings-local:local-shell|claude|project|plugin|false",
+            "claude:project:tool:settings:github|claude|project|plugin|true",
+            "codex:global:agent:codex-global-reviewer|codex|global|agent|true",
+            "codex:global:configured-mcp:disabled-docs|codex|global|mcp|false",
+            "codex:global:configured-mcp:github|codex|global|mcp|true",
+            "codex:global:hook:config-toml:PreToolUse:da4582ee1ce6bf1e:0|codex|global|hook|true",
+            "codex:global:hook:hooks-json:PostToolUse:d2b77d0f04613c78:0|codex|global|hook|true",
+            "codex:global:hook:hooks-json:PostToolUse:f792360f58824223:0|codex|global|hook|true",
+            "codex:global:plugin-config:config:connector-kit@example-marketplace|codex|global|plugin|true",
+            "codex:global:plugin-config:config:disabled-helper|codex|global|plugin|false",
+            "codex:global:plugin-config:config:safe-shell|codex|global|plugin|true",
+            "codex:global:setting:config-toml|codex|global|setting|true",
+            "codex:global:setting:hooks-json|codex|global|setting|true",
+            "codex:global:skill:admin/example-codex-admin-skill|codex|global|skill|true",
+            "codex:global:skill:example-shared-global-skill|codex|global|skill|true",
+            "codex:project:agent:codex-project-helper|codex|project|agent|true",
+            "codex:project:configured-mcp:project-docs|codex|project|mcp|false",
+            "codex:project:hook:config-toml:ProjectStart:dca1d74aec19cb71:0|codex|project|hook|true",
+            "codex:project:hook:hooks-json:ProjectStop:79e06e4de1bb408a:0|codex|project|hook|true",
+            "codex:project:setting:config-toml|codex|project|setting|true",
+            "codex:project:setting:hooks-json|codex|project|setting|true",
+            "codex:project:skill:example-shared-project-skill|codex|project|skill|true",
+            "cursor:global:agent:cursor-global-reviewer|cursor|global|agent|true",
+            "cursor:global:configured-mcp:modern-global|cursor|global|mcp|true",
+            "cursor:global:hook:hooks-json:BeforeShellExecution:8bfd0e74a63e361e:0|cursor|global|hook|true",
+            "cursor:global:plugin-manifest:local:claude-compatible|cursor|global|plugin|true",
+            "cursor:global:plugin-manifest:local:example-plugin|cursor|global|plugin|true",
+            "cursor:global:setting:cli-config-json|cursor|global|setting|true",
+            "cursor:global:setting:hooks-json|cursor|global|setting|true",
+            "cursor:global:setting:permissions-json|cursor|global|setting|true",
+            "cursor:global:setting:sandbox-json|cursor|global|setting|true",
+            "cursor:global:skill:@compat/agents/example-shared-global-skill|cursor|global|skill|true",
+            "cursor:global:skill:@compat/claude/example-claude-global-skill|cursor|global|skill|true",
+            "cursor:global:skill:example-cursor-skill|cursor|global|skill|true",
+            "cursor:project:agent:cursor-project-helper|cursor|project|agent|true",
+            "cursor:project:configured-mcp:project-docs|cursor|project|mcp|true",
+            "cursor:project:hook:hooks-json:AfterFileEdit:0c581592ab0e1948:0|cursor|project|hook|true",
+            "cursor:project:setting:cli-json|cursor|project|setting|true",
+            "cursor:project:setting:hooks-json|cursor|project|setting|true",
+            "cursor:project:setting:permissions-json|cursor|project|setting|true",
+            "cursor:project:setting:sandbox-json|cursor|project|setting|true",
+            "cursor:project:skill:@compat/agents/example-shared-project-skill|cursor|project|skill|true",
+            "cursor:project:skill:@compat/claude/example-claude-skill|cursor|project|skill|true",
+            "cursor:project:skill:example-cursor-project-skill|cursor|project|skill|true",
+            "opencode:global:configured-mcp:example-global|opencode|global|mcp|true",
+            "opencode:global:plugin-config:npm:example-opencode-connector|opencode|global|plugin|true",
+            "opencode:global:plugin-manifest:local:example-local.ts|opencode|global|plugin|true",
+            "opencode:global:setting:opencode.jsonc|opencode|global|setting|true",
+            "opencode:global:skill:@compat/agents/example-shared-global-skill|opencode|global|skill|true",
+            "opencode:global:skill:@compat/claude/example-claude-global-skill|opencode|global|skill|true",
+            "opencode:global:skill:example-opencode-global-skill|opencode|global|skill|true",
+            "opencode:project:configured-mcp:example-project|opencode|project|mcp|false",
+            "opencode:project:plugin-config:npm:example-opencode-project-connector|opencode|project|plugin|true",
+            "opencode:project:plugin-manifest:local:example-project.js|opencode|project|plugin|true",
+            "opencode:project:setting:opencode.json|opencode|project|setting|true",
+            "opencode:project:skill:@compat/agents/example-shared-project-skill|opencode|project|skill|true",
+            "opencode:project:skill:@compat/claude/example-claude-skill|opencode|project|skill|true",
+            "opencode:project:skill:example-opencode-project-skill|opencode|project|skill|true",
+            "pi:global:plugin-config:package-extensions:npm:example-pi-connector|pi|global|plugin|true",
+            "pi:global:setting:settings-json|pi|global|setting|true",
+            "pi:global:skill:@compat/agents/example-shared-global-skill|pi|global|skill|true",
+            "pi:global:skill:@file/example-pi-file-skill|pi|global|skill|true",
+            "pi:global:skill:workflows/example-pi-global-skill|pi|global|skill|true",
+            "pi:project:plugin-config:package-extensions:npm:example-pi-project-connector|pi|project|plugin|true",
+            "pi:project:setting:settings-json|pi|project|setting|true",
+            "pi:project:skill:@compat/agents/example-shared-project-skill|pi|project|skill|true",
+            "pi:project:skill:@file/example-pi-project-file-skill|pi|project|skill|true",
+            "pi:project:skill:example-pi-project-skill|pi|project|skill|true",
+            "zed:global:configured-mcp:github|zed|global|mcp|true",
+            "zed:global:setting:agents-md|zed|global|setting|true",
+            "zed:global:setting:settings-json|zed|global|setting|true",
+            "zed:global:skill:example-shared-global-skill|zed|global|skill|true",
+            "zed:project:configured-mcp:local-docs|zed|project|mcp|true",
+            "zed:project:setting:agents-md|zed|project|setting|true",
+            "zed:project:setting:settings-json|zed|project|setting|true",
+            "zed:project:skill:example-shared-project-skill|zed|project|skill|true",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+        assert_eq!(inventory, expected);
+        assert_eq!(startup.discovery.warnings, Vec::new());
         assert_eq!(progress.len(), ProviderId::ALL.len() + 1);
         for (completed_providers, provider) in ProviderId::ALL.into_iter().enumerate() {
             assert_eq!(
@@ -3651,6 +3814,72 @@ mod tests {
                 .to_string()
                 .contains("discovery worker stopped before completing")
         );
+    }
+
+    #[test]
+    fn loading_startup_surfaces_worker_panic() {
+        let (sender, receiver) = std::sync::mpsc::channel::<TuiStartupEvent>();
+        let cancellation = Arc::new(AtomicBool::new(false));
+        start_discovery_worker(sender, cancellation, || panic!("synthetic startup panic"));
+
+        let mut loading_state = LoadingState::default();
+        for _ in 0..100 {
+            match try_take_startup(&receiver, &mut loading_state) {
+                Err(error) => {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("startup discovery worker panicked: synthetic startup panic")
+                    );
+                    return;
+                }
+                Ok(Some(_)) => panic!("panic cannot complete startup successfully"),
+                Ok(None) => thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        panic!("worker panic is surfaced through loading error handling");
+    }
+
+    #[test]
+    fn loading_startup_cancellation_after_progress_does_not_complete_successfully() {
+        let app_state = TempDir::new().expect("temporary startup app state");
+        let (pause_started, pause_release) = std::sync::mpsc::sync_channel(0);
+        assert!(
+            startup_progress_test_pauses()
+                .lock()
+                .expect("startup progress test pauses lock")
+                .insert(app_state.path().to_path_buf(), pause_started)
+                .is_none()
+        );
+        let roots =
+            DiscoveryRoots::fixture_root(fixtures_root()).with_app_state_root(app_state.path());
+        let (receiver, cancellation) = start_discovery(roots, app_state.path().to_path_buf(), true);
+
+        match receiver
+            .recv_timeout(Duration::from_secs(5))
+            .expect("receive initial progress")
+        {
+            TuiStartupEvent::Progress(progress) => {
+                assert_eq!(progress.completed_providers, 0);
+            }
+            TuiStartupEvent::Complete(Ok(_)) => panic!("startup cannot complete before progress"),
+            TuiStartupEvent::Complete(Err(error)) => {
+                panic!("startup worker succeeds before cancellation: {error}")
+            }
+        }
+        cancellation.store(true, Ordering::Relaxed);
+        pause_release
+            .recv_timeout(Duration::from_secs(5))
+            .expect("release worker after cancellation");
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_secs(5)),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+        ));
+        startup_progress_test_pauses()
+            .lock()
+            .expect("startup progress test pauses lock")
+            .remove(app_state.path());
     }
 
     #[test]

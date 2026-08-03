@@ -51,6 +51,12 @@ fn discovery_reports_provider_progress_and_honors_cancellation() {
     let error = discover_all_with_progress(&roots, |_| false)
         .expect_err("cancelling before the first provider stops discovery");
     assert_eq!(error.to_string(), "discovery cancelled");
+
+    let error = discover_all_with_progress(&roots, |update| {
+        update.phase != DiscoveryProgressPhase::Finalizing
+    })
+    .expect_err("cancelling while finalizing stops discovery");
+    assert_eq!(error.to_string(), "discovery cancelled");
 }
 
 #[test]

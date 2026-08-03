@@ -1,4 +1,5 @@
 use std::{
+    any::Any,
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     ffi::OsStr,
@@ -3031,8 +3032,7 @@ fn add_descendant_skill_scopes_with_worker_limit(
         relative_skill_root,
         worker_limit,
     )? {
-        scan.scope_roots.extend(subtree_scan.scope_roots);
-        scan.skipped_directories += subtree_scan.skipped_directories;
+        merge_project_scope_scan(&mut scan, subtree_scan);
     }
 
     scope_roots.extend(scan.scope_roots);
@@ -3051,17 +3051,22 @@ fn scan_project_scope_frontier(
     relative_skill_root: &Path,
     worker_limit: usize,
 ) -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
+    scan_project_scope_frontier_with(frontier, worker_limit, |directory| {
+        scan_project_scope_subtree(directory, search_root, repository_root, relative_skill_root)
+    })
+}
+
+fn scan_project_scope_frontier_with(
+    frontier: &[PathBuf],
+    worker_limit: usize,
+    scan_subtree: impl Fn(&Path) -> Result<ProjectScopeScan, DiscoveryError> + Sync,
+) -> Result<Vec<ProjectScopeScan>, DiscoveryError> {
     let worker_count = frontier.len().min(worker_limit);
     if worker_count == 0 {
         return Ok(Vec::new());
     }
     if worker_count == 1 {
-        return Ok(vec![scan_project_scope_subtree(
-            &frontier[0],
-            search_root,
-            repository_root,
-            relative_skill_root,
-        )?]);
+        return Ok(vec![scan_subtree(&frontier[0])?]);
     }
 
     let next_directory = AtomicUsize::new(0);
@@ -3075,14 +3080,8 @@ fn scan_project_scope_frontier(
                         let Some(directory) = frontier.get(index) else {
                             break;
                         };
-                        let subtree_scan = scan_project_scope_subtree(
-                            directory,
-                            search_root,
-                            repository_root,
-                            relative_skill_root,
-                        )?;
-                        scan.scope_roots.extend(subtree_scan.scope_roots);
-                        scan.skipped_directories += subtree_scan.skipped_directories;
+                        let subtree_scan = scan_subtree(directory)?;
+                        merge_project_scope_scan(&mut scan, subtree_scan);
                     }
                     Ok(scan)
                 })
@@ -3090,11 +3089,36 @@ fn scan_project_scope_frontier(
             .collect::<Vec<_>>();
 
         let mut scans = Vec::with_capacity(worker_count);
+        let mut first_error = None;
+        let mut worker_panic = None;
         for handle in handles {
-            scans.push(handle.join().expect("project scope scan worker panicked")?);
+            match handle.join() {
+                Ok(Ok(scan)) => scans.push(scan),
+                Ok(Err(error)) => {
+                    first_error.get_or_insert(error);
+                }
+                Err(payload) => {
+                    worker_panic
+                        .get_or_insert_with(|| project_scope_scan_worker_panic_error(payload));
+                }
+            }
         }
-        Ok(scans)
+        worker_panic.or(first_error).map_or_else(|| Ok(scans), Err)
     })
+}
+
+fn project_scope_scan_worker_panic_error(payload: Box<dyn Any + Send>) -> DiscoveryError {
+    let details = payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_string());
+    std::io::Error::other(format!("project scope scan worker panicked: {details}")).into()
+}
+
+fn merge_project_scope_scan(scan: &mut ProjectScopeScan, subtree_scan: ProjectScopeScan) {
+    scan.scope_roots.extend(subtree_scan.scope_roots);
+    scan.skipped_directories += subtree_scan.skipped_directories;
 }
 
 fn scan_project_scope_subtree(
@@ -5337,6 +5361,70 @@ mod tests {
         assert_eq!(serial_scopes, expected);
         assert_eq!(parallel_scopes, serial_scopes);
         assert_eq!(parallel_skipped, serial_skipped);
+
+        let skipped_scope_roots = expected.iter().take(3).cloned().collect::<BTreeSet<_>>();
+        let scan_subtree = |directory: &Path| -> Result<ProjectScopeScan, DiscoveryError> {
+            let (scope_roots, skipped_directories) = if directory == repository_root {
+                (expected.clone(), skipped_scope_roots.len())
+            } else {
+                (
+                    BTreeSet::from([directory.to_path_buf()]),
+                    usize::from(skipped_scope_roots.contains(directory)),
+                )
+            };
+            Ok(ProjectScopeScan {
+                scope_roots,
+                skipped_directories,
+            })
+        };
+        let serial_reference =
+            scan_project_scope_frontier_with(&[repository_root.to_path_buf()], 1, scan_subtree)
+                .expect("serial reference scan")
+                .pop()
+                .expect("serial reference result");
+        let mut parallel_reference = ProjectScopeScan::default();
+        for subtree_scan in scan_project_scope_frontier_with(
+            &expected.iter().cloned().collect::<Vec<_>>(),
+            4,
+            scan_subtree,
+        )
+        .expect("parallel reference scan")
+        {
+            merge_project_scope_scan(&mut parallel_reference, subtree_scan);
+        }
+
+        assert_eq!(parallel_reference.scope_roots, serial_reference.scope_roots);
+        assert_eq!(
+            parallel_reference.skipped_directories,
+            serial_reference.skipped_directories
+        );
+        assert_eq!(
+            parallel_reference.skipped_directories,
+            skipped_scope_roots.len()
+        );
+    }
+
+    #[test]
+    fn parallel_project_scope_scan_worker_panic_returns_discovery_error() {
+        let panic_directory = PathBuf::from("panic");
+        let error = match scan_project_scope_frontier_with(
+            &[panic_directory.clone(), PathBuf::from("complete")],
+            2,
+            |directory| -> Result<ProjectScopeScan, DiscoveryError> {
+                if directory == panic_directory {
+                    panic!("deliberate project scope scan worker panic");
+                }
+                Ok(ProjectScopeScan::default())
+            },
+        ) {
+            Ok(_) => panic!("worker panic must become a discovery error"),
+            Err(error) => error,
+        };
+
+        assert_eq!(
+            error.to_string(),
+            "project scope scan worker panicked: deliberate project scope scan worker panic"
+        );
     }
 
     fn write_test_file(path: &Path) {
