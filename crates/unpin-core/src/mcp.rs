@@ -105,9 +105,21 @@ pub const UNPIN_MCP_TOOL_NAMES: &[&str] = &[
 ];
 pub const UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME: &str = "unpin_apply_inventory_group";
 
-const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] =
+const MODERN_MCP_PROTOCOL_VERSION: &str = "2026-07-28";
+const LEGACY_MCP_PROTOCOL_VERSIONS: &[&str] =
     &["2025-11-25", "2025-06-18", "2025-03-26", "2024-11-05"];
-const LATEST_MCP_PROTOCOL_VERSION: &str = SUPPORTED_MCP_PROTOCOL_VERSIONS[0];
+const SUPPORTED_MCP_PROTOCOL_VERSIONS: &[&str] = &[
+    MODERN_MCP_PROTOCOL_VERSION,
+    "2025-11-25",
+    "2025-06-18",
+    "2025-03-26",
+    "2024-11-05",
+];
+const LATEST_LEGACY_MCP_PROTOCOL_VERSION: &str = LEGACY_MCP_PROTOCOL_VERSIONS[0];
+const MCP_PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const MCP_CLIENT_CAPABILITIES_META_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+const MCP_SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+const MCP_TOOLS_LIST_TTL_MS: u64 = 0;
 const ADOPTION_APPROVAL_ISSUER: &str = "unpin-cli-human";
 const ADOPTION_APPROVAL_AUDIENCE: &str = "unpin-core-transition";
 const HOOK_TRUST_APPROVAL_ISSUER: &str = "unpin-cli-human";
@@ -549,45 +561,30 @@ pub fn handle_mcp_request(context: &McpContext, request: &Value) -> Value {
     let Some(method) = request.get("method").and_then(Value::as_str) else {
         return error_response(id, -32600, "missing method");
     };
+    let modern = method == "server/discover" || request_declares_modern_protocol_version(request);
+
+    if modern && let Some(error) = modern_request_error(id.clone(), request) {
+        return error;
+    }
 
     match method {
-        "initialize" => {
-            let mut control = json!({
-                "version": UNPIN_CONTROL_CONTRACT_VERSION,
-                "mutation": "human-handoff-only",
-                "providerScope": context.provider_scope.as_str()
-            });
-            if context.approved_group_apply.is_some() {
-                control["conditionalGroupApply"] = json!("approved-group-apply-v1");
-                control["unattendedWritesEnabled"] = json!(false);
-                control["conditionalProviderWritesEnabled"] = json!(true);
-                control["challengeStoreWrites"] = json!(false);
-                control["sessionLeaseWrites"] = json!(true);
-                control["approvalArtifactRequired"] = json!(true);
-                control["canMintApproval"] = json!(false);
-                control["requiresPersistentSession"] = json!(true);
-            }
-            result_response(
-                id,
-                json!({
-                    "protocolVersion": negotiated_protocol_version(request),
-                    "serverInfo": {
-                        "name": "unpin",
-                        "version": env!("CARGO_PKG_VERSION"),
-                    },
-                    "capabilities": {
-                        "tools": {},
-                        "experimental": {
-                            "unpinControl": control
-                        }
-                    }
-                }),
-            )
+        "initialize" if modern => error_response(id, -32601, "unsupported method: initialize"),
+        "initialize" => result_response(
+            id,
+            json!({
+                "protocolVersion": negotiated_protocol_version(request),
+                "serverInfo": server_info(),
+                "capabilities": server_capabilities(context)
+            }),
+        ),
+        "notifications/initialized" if modern => {
+            error_response(id, -32601, "unsupported method: notifications/initialized")
         }
         "notifications/initialized" => result_response(id, json!({})),
-        "tools/list" => result_response(id, json!({ "tools": tool_descriptors(context) })),
+        "server/discover" => modern_result_response(id, server_discovery(context)),
+        "tools/list" => request_result_response(id, tools_list_result(context, modern), modern),
         "tools/call" => match handle_tool_call(context, request) {
-            Ok(result) => result_response(id, result),
+            Ok(result) => request_result_response(id, result, modern),
             Err(message) => error_response(id, -32000, message),
         },
         _ => error_response(id, -32601, format!("unsupported method: {method}")),
@@ -600,11 +597,132 @@ fn negotiated_protocol_version(request: &Value) -> &'static str {
         .and_then(|params| params.get("protocolVersion"))
         .and_then(Value::as_str);
 
-    SUPPORTED_MCP_PROTOCOL_VERSIONS
+    LEGACY_MCP_PROTOCOL_VERSIONS
         .iter()
         .copied()
         .find(|supported| Some(*supported) == requested)
-        .unwrap_or(LATEST_MCP_PROTOCOL_VERSION)
+        .unwrap_or(LATEST_LEGACY_MCP_PROTOCOL_VERSION)
+}
+
+fn request_declares_modern_protocol_version(request: &Value) -> bool {
+    request
+        .get("params")
+        .and_then(|params| params.get("_meta"))
+        .and_then(|metadata| metadata.get(MCP_PROTOCOL_VERSION_META_KEY))
+        .is_some()
+}
+
+fn modern_request_error(id: Value, request: &Value) -> Option<Value> {
+    let Some(metadata) = request.get("params").and_then(|params| params.get("_meta")) else {
+        return Some(error_response(id, -32602, "missing MCP protocol metadata"));
+    };
+    let Some(protocol_version) = metadata
+        .get(MCP_PROTOCOL_VERSION_META_KEY)
+        .and_then(Value::as_str)
+    else {
+        return Some(error_response(
+            id,
+            -32602,
+            "missing MCP protocol version metadata",
+        ));
+    };
+    if protocol_version != MODERN_MCP_PROTOCOL_VERSION {
+        return Some(unsupported_protocol_version_response(id, protocol_version));
+    }
+    if !metadata
+        .get(MCP_CLIENT_CAPABILITIES_META_KEY)
+        .is_some_and(Value::is_object)
+    {
+        return Some(error_response(
+            id,
+            -32602,
+            "missing MCP client capabilities metadata",
+        ));
+    }
+    None
+}
+
+fn unsupported_protocol_version_response(id: Value, requested: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": -32022,
+            "message": "Unsupported protocol version",
+            "data": {
+                "supported": SUPPORTED_MCP_PROTOCOL_VERSIONS,
+                "requested": requested
+            }
+        }
+    })
+}
+
+fn server_info() -> Value {
+    json!({
+        "name": "unpin",
+        "version": env!("CARGO_PKG_VERSION"),
+    })
+}
+
+fn server_capabilities(context: &McpContext) -> Value {
+    let mut control = json!({
+        "version": UNPIN_CONTROL_CONTRACT_VERSION,
+        "mutation": "human-handoff-only",
+        "providerScope": context.provider_scope.as_str()
+    });
+    if context.approved_group_apply.is_some() {
+        control["conditionalGroupApply"] = json!("approved-group-apply-v1");
+        control["unattendedWritesEnabled"] = json!(false);
+        control["conditionalProviderWritesEnabled"] = json!(true);
+        control["challengeStoreWrites"] = json!(false);
+        control["sessionLeaseWrites"] = json!(true);
+        control["approvalArtifactRequired"] = json!(true);
+        control["canMintApproval"] = json!(false);
+        control["requiresPersistentSession"] = json!(true);
+    }
+    json!({
+        "tools": {},
+        "experimental": {
+            "unpinControl": control
+        }
+    })
+}
+
+fn server_discovery(context: &McpContext) -> Value {
+    json!({
+        "protocolVersions": SUPPORTED_MCP_PROTOCOL_VERSIONS,
+        "serverInfo": server_info(),
+        "capabilities": server_capabilities(context)
+    })
+}
+
+fn tools_list_result(context: &McpContext, modern: bool) -> Value {
+    let mut result = json!({ "tools": tool_descriptors(context) });
+    if modern {
+        result["ttlMs"] = json!(MCP_TOOLS_LIST_TTL_MS);
+        result["cacheScope"] = json!("private");
+    }
+    result
+}
+
+fn request_result_response(id: Value, result: Value, modern: bool) -> Value {
+    if modern {
+        modern_result_response(id, result)
+    } else {
+        result_response(id, result)
+    }
+}
+
+fn modern_result_response(id: Value, mut result: Value) -> Value {
+    let result_object = result
+        .as_object_mut()
+        .expect("all Unpin MCP success results are objects");
+    result_object.insert("resultType".to_string(), json!("complete"));
+    result_object.insert(
+        "_meta".to_string(),
+        json!({ MCP_SERVER_INFO_META_KEY: server_info() }),
+    );
+    result_response(id, result)
 }
 
 pub fn handle_stdio_request_once(
