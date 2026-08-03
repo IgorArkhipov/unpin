@@ -70,7 +70,7 @@ jobs:
           target/x86_64-unknown-linux-gnu/release/unpin
 
       - name: Install SBOM generator
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
         with:
           tool: cargo-cyclonedx@0.5.9
 
@@ -107,12 +107,12 @@ jobs:
           printf 'sbom=%s\n' "${sbom_output}" >> "${GITHUB_OUTPUT}"
 
       - name: Attest build provenance
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
           subject-path: ${{ steps.package.outputs.archive }}
 
       - name: Attest archive SBOM
-        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
         with:
           subject-path: ${{ steps.package.outputs.archive }}
           sbom-path: ${{ steps.package.outputs.sbom }}
