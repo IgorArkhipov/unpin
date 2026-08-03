@@ -6,18 +6,15 @@ workflows.
 
 ## Distribution status and quick start
 
-Unpin `0.1.0-beta.15` keeps the terminal responsive while it discovers large
-repository configurations. Project-scope discovery now recurses only under an
-actual Git root, so launching from a non-repository directory does not walk
-unrelated descendant Cursor roots. The TUI keeps credential resolution and
-terminal cleanup on a cancellation-safe startup lifecycle. It is a
-program-logic release, so the full provider matrix and live-host validation are
-required before publication.
-Its GNU/Linux archive remains built on
+Unpin `0.5.0` is the non-prerelease release channel. Its public stdio MCP
+server supports the stateless 2026-07-28 protocol edition while retaining
+legacy MCP host compatibility; this does not expand its plan-first mutation
+authority. It is a program-logic release, so the full provider matrix and
+live-host validation are required before publication. Its GNU/Linux archive is
+built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
-artifacts are
-published only after required CI and release-specific evidence are complete.
-GitHub Releases then provides
+artifacts are published only after required CI and release-specific evidence
+are complete. GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
 GNU/Linux, together with CycloneDX SBOM attestations, SHA-256 checksums, and
 approved release evidence. The binaries are not Apple-notarized or
@@ -28,7 +25,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.1.0-beta.15-TARGET.tar.gz \
+gh attestation verify unpin-v0.5.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -36,7 +33,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.1.0-beta.15-TARGET
+cd unpin-v0.5.0-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"

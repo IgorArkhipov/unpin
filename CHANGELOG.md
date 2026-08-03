@@ -7,6 +7,21 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-08-02
+
+### Added
+
+- The public stdio MCP server now supports the stateless 2026-07-28 protocol
+  edition, including `server/discover`, per-request protocol metadata,
+  `resultType`, server identity metadata, and cache declarations for
+  `tools/list`.
+
+### Changed
+
+- Unpin is promoted to the non-prerelease `0.5.0` release channel. Release
+  tags with a prerelease suffix remain GitHub prereleases; final version tags
+  create stable draft releases.
+
 ## [0.1.0-beta.15] - 2026-08-02
 
 ### Fixed
@@ -216,8 +231,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.15...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.5.0...HEAD
 
+[0.5.0]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.5.0
 [0.1.0-beta.15]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.15
 [0.1.0-beta.14]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.14
 [0.1.0-beta.13]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.13
