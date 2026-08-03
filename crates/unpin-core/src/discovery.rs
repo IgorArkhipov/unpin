@@ -1243,6 +1243,13 @@ fn scan_project_scope_directory(
     repository_root: &Path,
     relative_skill_root: &Path,
 ) -> Result<ProjectScopeDirectoryScan, DiscoveryError> {
+    if is_inactive_repository_root(repository_root, directory) {
+        return Ok(ProjectScopeDirectoryScan {
+            scope_root: None,
+            child_directories: Vec::new(),
+            skipped_directories: 0,
+        });
+    }
     let scope_root = directory
         .join(relative_skill_root)
         .is_dir()
@@ -1318,10 +1325,19 @@ fn should_skip_project_scope_dir(name: &OsStr) -> bool {
                 | ".opencode"
                 | ".pi"
                 | ".svn"
+                | ".worktrees"
+                | "fixture"
+                | "fixtures"
                 | "node_modules"
                 | "target"
+                | "test"
+                | "tests"
         )
     )
+}
+
+fn is_inactive_repository_root(active_repository_root: &Path, directory: &Path) -> bool {
+    directory != active_repository_root && directory.join(".git").exists()
 }
 
 fn is_repository_tmp_dir(repository_root: &Path, directory: &Path) -> bool {
@@ -3793,6 +3809,63 @@ mod tests {
             parallel_reference.skipped_directories,
             skipped_scope_roots.len()
         );
+    }
+
+    #[test]
+    fn project_scope_scan_excludes_test_fixture_and_inactive_worktree_subtrees() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path();
+        let live_scope = repository_root.join("packages/live-agent");
+        let inactive_worktree_scope = repository_root.join("alternate-worktree");
+        let ignored_scopes = [
+            repository_root.join(".worktrees/feature-agent"),
+            repository_root.join("test/example"),
+            repository_root.join("tests/example"),
+            repository_root.join("fixture/example"),
+            repository_root.join("fixtures/example"),
+            repository_root.join("crates/unpin-core/tests/fixtures/example"),
+        ];
+
+        write_test_file(&live_scope.join(".claude/skills/review/SKILL.md"));
+        write_test_file(&inactive_worktree_scope.join(".git"));
+        write_test_file(&inactive_worktree_scope.join(".claude/skills/review/SKILL.md"));
+        for scope in ignored_scopes {
+            write_test_file(&scope.join(".claude/skills/review/SKILL.md"));
+        }
+
+        let mut scope_roots = BTreeSet::new();
+        add_descendant_skill_scopes_with_worker_limit(
+            repository_root,
+            repository_root,
+            Path::new(".claude/skills"),
+            &mut scope_roots,
+            4,
+        )
+        .expect("project scope scan");
+
+        assert_eq!(scope_roots, BTreeSet::from([live_scope]));
+    }
+
+    #[test]
+    fn active_worktree_scope_does_not_scan_sibling_worktrees() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary checkout root");
+        let main_checkout = temporary_root.path().join("main");
+        let active_worktree = main_checkout.join(".worktrees/active");
+        let sibling_worktree = main_checkout.join(".worktrees/sibling");
+        write_test_file(&active_worktree.join(".git"));
+        write_test_file(&active_worktree.join(".claude/skills/review/SKILL.md"));
+        write_test_file(&sibling_worktree.join(".claude/skills/review/SKILL.md"));
+
+        let scope_roots = project_skill_scope_roots(
+            &active_worktree,
+            &find_repository_root(&active_worktree),
+            Path::new(".claude/skills"),
+            ProjectSkillTraversal::Repository,
+            true,
+        )
+        .expect("active worktree scope scan");
+
+        assert_eq!(scope_roots.roots, BTreeSet::from([active_worktree]));
     }
 
     #[test]
