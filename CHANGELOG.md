@@ -7,6 +7,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-08-03
+
+### Fixed
+
+- Project-scope skill discovery now stays within the checkout selected for the
+  run. It excludes inactive nested worktrees and conventional test and fixture
+  subtrees, preventing repository fixtures from appearing as mutable items.
+
 ## [0.6.0] - 2026-08-03
 
 ### Changed
@@ -242,7 +250,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.6.1...HEAD
+
+[0.6.1]: https://github.com/IgorArkhipov/unpin/compare/v0.6.0...v0.6.1
+[0.6.0]: https://github.com/IgorArkhipov/unpin/compare/v0.5.0...v0.6.0
 
 [0.5.0]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.5.0
 [0.1.0-beta.15]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.15
