@@ -125,7 +125,7 @@ jobs:
           if-no-files-found: error
 
   draft:
-    name: Create draft prerelease
+    name: Create draft release
     needs: build
     runs-on: ubuntu-24.04
     permissions:
@@ -172,11 +172,15 @@ jobs:
               --repo "${GITHUB_REPOSITORY}" \
               --clobber
           else
+            prerelease_args=()
+            if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
+              prerelease_args+=(--prerelease)
+            fi
             gh release create "${GITHUB_REF_NAME}" dist/* \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
               --draft \
-              --prerelease \
+              "${prerelease_args[@]}" \
               --title "Unpin ${GITHUB_REF_NAME}" \
               --notes-file "${notes}"
           fi

@@ -24,18 +24,15 @@ configuration for Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It
 normalizes provider-specific skills, MCP servers, plugins, hooks, agents, and
 settings into one inventory.
 
-Unpin `0.1.0-beta.15` keeps the terminal responsive while it discovers large
-repository configurations. Project-scope discovery now recurses only under an
-actual Git root, so launching from a non-repository directory does not walk
-unrelated descendant Cursor roots. The TUI keeps credential resolution and
-terminal cleanup on a cancellation-safe startup lifecycle. It is a
-program-logic release, so the full provider matrix and live-host validation are
-required before publication.
-Its GNU/Linux archive remains built on
+Unpin `0.5.0` is the non-prerelease release channel. Its public stdio MCP
+server supports the stateless 2026-07-28 protocol edition while retaining
+legacy MCP host compatibility; this does not expand its plan-first mutation
+authority. It is a program-logic release, so the full provider matrix and
+live-host validation are required before publication. Its GNU/Linux archive is
+built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
-artifacts are
-published only after required CI and release-specific evidence are complete.
-GitHub Releases then provides
+artifacts are published only after required CI and release-specific evidence
+are complete. GitHub Releases then provides
 provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
 GNU/Linux. crates.io, package-manager distribution, and platform code signing
 are deferred. The full fixture-backed matrix and available-host validation run

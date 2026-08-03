@@ -15,7 +15,7 @@ audit evidence, and explicit recovery outcomes.
 
 ## Current status
 
-- Version: `0.1.0-beta.15` public-beta release candidate.
+- Version: `0.5.0` stable release candidate.
 - Canonical repository: `https://github.com/IgorArkhipov/unpin`.
 - License: MIT, copyright Igor Arkhipov.
 - Distribution: GitHub release archives for Apple Silicon macOS, Intel macOS,
@@ -32,7 +32,7 @@ audit evidence, and explicit recovery outcomes.
 - Native MCP-reference lifecycle and strict live provider attachment remain
   explicit gateway limitations rather than inferred support.
 
-The pre-release baseline matrix run `2026-07-24-184505-local-matrix` passed 31
+The release baseline matrix run `2026-07-24-184505-local-matrix` passed 31
 CLI, 31 real-PTY TUI, and 31 persistent MCP scenarios. It also passed 620 Rust
 tests, inventoried 938 live items without persisting private names, and verified
 that live provider state did not change. Release-specific evidence is rerun from
@@ -46,7 +46,7 @@ SBOM generation, provenance attestation, checksums, and a draft-only release
 workflow. crates.io, Homebrew, Linux ARM64, Windows, and platform code signing
 remain deferred.
 
-Publishing `v0.1.0-beta.15` is gated on required CI, workflow lint, locked
+Publishing `v0.5.0` is gated on required CI, workflow lint, locked
 package metadata, version smoke, Linux artifact verification on an exact clean
 release commit (a `GLIBC_2.35`-or-older symbol ceiling and Debian 12 smoke),
 generated checksums attached to the draft, enabled branch protection,

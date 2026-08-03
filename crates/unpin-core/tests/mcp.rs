@@ -484,6 +484,137 @@ fn handles_multiple_stdio_messages_until_eof() {
 }
 
 #[test]
+fn handles_stateless_modern_stdio_requests() {
+    let metadata = json!({
+        "_meta": {
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientCapabilities": {},
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "unpin-fixture",
+                "version": "1"
+            }
+        }
+    });
+    let mut input = Vec::new();
+    input.extend(line_request(json!({
+        "jsonrpc": "2.0",
+        "id": "discover",
+        "method": "server/discover",
+        "params": metadata,
+    })));
+    input.extend(line_request(json!({
+        "jsonrpc": "2.0",
+        "id": "tools",
+        "method": "tools/list",
+        "params": metadata,
+    })));
+    input.extend(line_request(json!({
+        "jsonrpc": "2.0",
+        "id": "summary",
+        "method": "tools/call",
+        "params": {
+            "name": "unpin_get_inventory_summary",
+            "arguments": {},
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    })));
+    let mut output = Vec::new();
+
+    handle_stdio_requests(&context(), input.as_slice(), &mut output).expect("stdio loop");
+
+    let bodies = response_bodies(&output);
+    assert_eq!(bodies.len(), 3);
+    assert_eq!(bodies[0]["id"], "discover");
+    assert_eq!(bodies[0]["result"]["resultType"], "complete");
+    assert_eq!(bodies[0]["result"]["protocolVersions"][0], "2026-07-28");
+    assert_eq!(
+        bodies[0]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "unpin"
+    );
+    assert_eq!(bodies[1]["id"], "tools");
+    assert_eq!(bodies[1]["result"]["resultType"], "complete");
+    assert_eq!(bodies[1]["result"]["ttlMs"], 0);
+    assert_eq!(bodies[1]["result"]["cacheScope"], "private");
+    assert_eq!(
+        bodies[1]["result"]["tools"][0]["name"],
+        "unpin_get_inventory_summary"
+    );
+    assert_eq!(bodies[2]["id"], "summary");
+    assert_eq!(bodies[2]["result"]["resultType"], "complete");
+    assert_eq!(
+        bodies[2]["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
+        "unpin"
+    );
+}
+
+#[test]
+fn rejects_unsupported_modern_protocol_versions() {
+    let response = handle_mcp_request(
+        &context(),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2099-01-01",
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        }),
+    );
+
+    assert_eq!(response["error"]["code"], -32022);
+    assert_eq!(response["error"]["message"], "Unsupported protocol version");
+    assert_eq!(response["error"]["data"]["requested"], "2099-01-01");
+    assert_eq!(response["error"]["data"]["supported"][0], "2026-07-28");
+}
+
+#[test]
+fn requires_modern_metadata_for_server_discovery() {
+    let response = handle_mcp_request(
+        &context(),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "discover",
+            "method": "server/discover"
+        }),
+    );
+
+    assert_eq!(response["error"]["code"], -32602);
+    assert_eq!(
+        response["error"]["message"],
+        "missing MCP protocol metadata"
+    );
+}
+
+#[test]
+fn preserves_legacy_request_metadata() {
+    let response = handle_mcp_request(
+        &context(),
+        &json!({
+            "jsonrpc": "2.0",
+            "id": "tools",
+            "method": "tools/list",
+            "params": {
+                "_meta": {
+                    "progressToken": "legacy-progress"
+                }
+            }
+        }),
+    );
+
+    assert_eq!(
+        response["result"]["tools"][0]["name"],
+        "unpin_get_inventory_summary"
+    );
+    assert!(response["result"].get("resultType").is_none());
+}
+
+#[test]
 fn handles_malformed_once_request_as_json_rpc_parse_error() {
     let output = handle_stdio_request_once(&context(), b"{ invalid json\n".as_slice())
         .expect("malformed request should produce a response");

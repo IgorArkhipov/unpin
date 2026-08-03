@@ -1,15 +1,16 @@
 # Releasing Unpin
 
-Unpin prereleases are built by GitHub Actions and published only after either
+Unpin releases are built by GitHub Actions and published only after either
 local provider-matrix evidence or the focused delivery-only artifact evidence
 defined below is verified and attached. The release workflow creates a draft
-prerelease; it never publishes directly.
+release; it never publishes directly. Tags with a prerelease suffix create a
+draft prerelease; final version tags create a stable draft release.
 
 ## Release contract
 
 - Canonical repository: `IgorArkhipov/unpin`
-- Version format: semantic version with a prerelease suffix
-- Supported beta artifacts:
+- Version format: semantic version, with an optional prerelease suffix
+- Supported release artifacts:
   - `aarch64-apple-darwin`
   - `x86_64-apple-darwin`
   - `x86_64-unknown-linux-gnu`
@@ -72,7 +73,9 @@ git push origin vVERSION
 ```
 
 The tag workflow builds and attests all supported targets, generates CycloneDX
-SBOMs and `SHA256SUMS`, and creates a draft prerelease. Do not publish it yet.
+SBOMs and `SHA256SUMS`, and creates a draft release. A tag with a prerelease
+suffix creates a draft prerelease; a final version tag creates a stable draft
+release. Do not publish it yet.
 
 ## Add evidence and checksums
 
@@ -172,8 +175,7 @@ checksum and require the draft's exact asset-name set to equal the names in
   printf 'draft verification passed; publishing vVERSION\n'
   gh release edit vVERSION \
     --repo IgorArkhipov/unpin \
-    --draft=false \
-    --prerelease
+    --draft=false
 )
 ```
 

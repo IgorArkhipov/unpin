@@ -6,6 +6,21 @@ This lets an agent inspect Unpin's normalized inventory, review capability
 state, and prepare exact toggle or restore plans without driving the terminal
 UI directly.
 
+## Protocol compatibility
+
+Unpin supports both the stateless MCP `2026-07-28` edition and the legacy
+initialization-based editions through `2024-11-05`. Modern clients should call
+`server/discover`, then include `io.modelcontextprotocol/protocolVersion` set
+to `2026-07-28` and an object-valued
+`io.modelcontextprotocol/clientCapabilities` in every request's `params._meta`.
+Responses include `resultType: "complete"` and server identity in `_meta`.
+
+`tools/list` is deliberately declared `cacheScope: "private"` with `ttlMs: 0`:
+the host may retain no freshness window for a tool list whose safety boundary
+depends on the current Unpin process and provider scope. Existing hosts may
+continue to use `initialize` and `notifications/initialized`; no session ID or
+additional mutation permission is introduced by the newer protocol edition.
+
 ## Safety boundary
 
 An MCP-connected agent can:
@@ -305,7 +320,8 @@ through the same MCP control plane.
 
 ## Typical MCP workflow
 
-1. The host initializes the server and discovers its tools.
+1. Modern hosts call `server/discover`; legacy hosts initialize the server;
+   both then discover its tools.
 2. Call `unpin_get_inventory_summary` and confirm the expected project,
    `providerScope`, backup-authentication state, and `humanApproval` boundary.
 3. Call `unpin_list_items` with provider, kind, and layer filters.
