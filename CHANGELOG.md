@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [0.1.0-beta.15] - 2026-08-02
+
+### Fixed
+
+- Cursor project-scope discovery now recurses only below an actual enclosing
+  Git root, preventing a non-repository launch directory such as `$HOME` from
+  causing an inflated inventory and delayed TUI startup.
+- Project-scope workers stop dequeuing new subtrees after a sibling error or
+  cancellation, and terminal cleanup remains reliable when startup exits.
+
 ## [0.1.0-beta.14] - 2026-08-02
 
 ### Changed
@@ -206,8 +216,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.14...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.1.0-beta.15...HEAD
 
+[0.1.0-beta.15]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.15
 [0.1.0-beta.14]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.14
 [0.1.0-beta.13]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.13
 [0.1.0-beta.12]: https://github.com/IgorArkhipov/unpin/releases/tag/v0.1.0-beta.12
