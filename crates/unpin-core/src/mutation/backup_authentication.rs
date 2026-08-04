@@ -99,16 +99,23 @@ pub(super) fn write_authenticated_backup_manifest(
 ) -> Result<(), io::Error> {
     validate_backup_payload_evidence(backup_root, manifest).map_err(io::Error::other)?;
     let payload_digests = calculate_backup_payload_digests(backup_root, manifest)?;
-    let post_state_fingerprint = manifest
-        .authenticity
-        .as_ref()
-        .and_then(|authenticity| authenticity.post_state_fingerprint.clone());
+    let existing_authenticity = manifest.authenticity.as_ref();
+    let post_state_fingerprint =
+        existing_authenticity.and_then(|authenticity| authenticity.post_state_fingerprint.clone());
+    let retired_backup_ids = existing_authenticity
+        .map(|authenticity| authenticity.retired_backup_ids.clone())
+        .unwrap_or_default();
+    let source_selections = existing_authenticity
+        .map(|authenticity| authenticity.source_selections.clone())
+        .unwrap_or_default();
     manifest.version = BACKUP_MANIFEST_VERSION;
     manifest.authenticity = Some(BackupAuthenticity {
         algorithm: BACKUP_AUTHENTICATION_ALGORITHM.to_string(),
         key_id: backup_authentication_key.key_id(),
         payload_digests,
         post_state_fingerprint,
+        retired_backup_ids,
+        source_selections,
         tag: String::new(),
     });
 

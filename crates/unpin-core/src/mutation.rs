@@ -196,8 +196,19 @@ pub struct BackupSummary {
     pub paths: Vec<String>,
     pub restorable: bool,
     pub authentication: BackupAuthenticationStatus,
+    /// The first source selection, retained as a representative for existing
+    /// callers. `providers` and `layers` describe the complete bundle.
     pub selection: DiscoveryItem,
     pub target_enabled: bool,
+}
+
+impl BackupSummary {
+    #[must_use]
+    pub fn includes_provider(&self, provider: ProviderId) -> bool {
+        self.providers
+            .iter()
+            .any(|summary_provider| summary_provider == provider.as_str())
+    }
 }
 
 /// A reviewed backup deletion bound to the exact manifest bytes that were shown
@@ -1440,6 +1451,151 @@ fn native_toggle_post_state_fingerprint(manifest: &BackupManifest) -> Result<Str
     Ok(transition_digest(&encoded))
 }
 
+/// Consolidate the native before-images produced by one successful bulk
+/// operation into its first backup directory. Entries are retained in apply
+/// order, so when multiple items rewrite one physical resource the bundle
+/// contains the pre-batch image rather than an intermediate state.
+pub(super) fn consolidate_bulk_backup_bundle(
+    app_state_root: &Path,
+    backup_ids: &[String],
+    backup_authentication_key: &BackupAuthenticationKey,
+) -> Result<String, String> {
+    let _lock = acquire_mutation_lock(app_state_root)?;
+    let Some(bundle_backup_id) = backup_ids.first() else {
+        return Err("bulk backup bundle has no native backup evidence".to_string());
+    };
+    if backup_ids
+        .iter()
+        .any(|backup_id| !valid_backup_id(backup_id))
+    {
+        return Err("bulk backup bundle contains an invalid backup id".to_string());
+    }
+    if backup_ids.iter().collect::<BTreeSet<_>>().len() != backup_ids.len() {
+        return Err("bulk backup bundle contains duplicate native backup ids".to_string());
+    }
+
+    let bundle_root = app_state_root.join("backups").join(bundle_backup_id);
+    let mut bundle_manifest = load_backup_manifest(
+        app_state_root,
+        bundle_backup_id,
+        Some(backup_authentication_key),
+    )?;
+    let target_enabled = bundle_manifest.target_enabled;
+    let mut resources = BTreeSet::new();
+    let mut affected_targets = Vec::new();
+    let mut source_selections = Vec::new();
+    let mut entries = Vec::new();
+
+    for backup_id in backup_ids {
+        let manifest = if backup_id == bundle_backup_id {
+            bundle_manifest.clone()
+        } else {
+            load_backup_manifest(app_state_root, backup_id, Some(backup_authentication_key))?
+        };
+        if manifest.target_enabled != target_enabled {
+            return Err("bulk backup bundle mixes incompatible target states".to_string());
+        }
+        for selection in backup_manifest_selections(&manifest) {
+            if !source_selections.contains(selection) {
+                source_selections.push(selection.clone());
+            }
+        }
+        for target in &manifest.affected_targets {
+            push_unique_mutation_target(&mut affected_targets, target.clone());
+        }
+
+        for entry in manifest.entries {
+            let resource = backup_resource_key(&entry.target);
+            if !resources.insert(resource) {
+                continue;
+            }
+            push_unique_mutation_target(&mut affected_targets, entry.target.clone());
+
+            let entry_id = format!("entry-{}", entries.len() + 1);
+            let mut bundled_entry = entry;
+            if bundled_entry.existed {
+                let source_root = app_state_root.join("backups").join(backup_id);
+                let source_payload = bundled_entry.payload.as_ref().ok_or_else(|| {
+                    format!("backup entry {} payload is missing", bundled_entry.entry_id)
+                })?;
+                let source_payload = backup_payload_path(&source_root, source_payload)?;
+                let destination_payload = bundle_root.join(entry_payload_path(&entry_id));
+                if source_payload != destination_payload {
+                    copy_backup_payload(&source_payload, &destination_payload)
+                        .map_err(|error| error.to_string())?;
+                }
+                bundled_entry.payload = Some(BackupPayload {
+                    storage: "path".to_string(),
+                    path: entry_payload_path(&entry_id),
+                });
+            }
+            bundled_entry.entry_id = entry_id;
+            entries.push(bundled_entry);
+        }
+    }
+
+    if entries.is_empty() {
+        return Err("bulk backup bundle has no restorable entries".to_string());
+    }
+    bundle_manifest.affected_targets = affected_targets;
+    bundle_manifest.entries = entries;
+    let post_state_fingerprint = native_toggle_post_state_fingerprint(&bundle_manifest)?;
+    let authenticity = bundle_manifest
+        .authenticity
+        .as_mut()
+        .ok_or_else(|| "bulk backup bundle authenticity is missing".to_string())?;
+    authenticity.post_state_fingerprint = Some(post_state_fingerprint);
+    authenticity.source_selections = source_selections;
+    let mut retired_backup_ids = authenticity
+        .retired_backup_ids
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    retired_backup_ids.extend(backup_ids.iter().skip(1).cloned());
+    authenticity.retired_backup_ids = retired_backup_ids.into_iter().collect();
+    write_authenticated_backup_manifest(
+        &bundle_root,
+        &mut bundle_manifest,
+        backup_authentication_key,
+    )
+    .map_err(|error| error.to_string())?;
+
+    for backup_id in backup_ids.iter().skip(1) {
+        fs::remove_dir_all(app_state_root.join("backups").join(backup_id))
+            .map_err(|error| format!("could not retire nested bulk backup {backup_id}: {error}"))?;
+    }
+    Ok(bundle_backup_id.clone())
+}
+
+fn backup_resource_key(target: &MutationTarget) -> String {
+    format!(
+        "{}\0{}",
+        target.target_type,
+        canonical_existing_root(Path::new(&target.path)).display()
+    )
+}
+
+fn copy_backup_payload(source: &Path, destination: &Path) -> Result<(), io::Error> {
+    let metadata = fs::symlink_metadata(source)?;
+    if metadata.file_type().is_symlink() {
+        return copy_symlink(source, destination);
+    }
+    if metadata.is_file() {
+        if let Some(parent) = destination.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(source, destination)?;
+        return Ok(());
+    }
+    if metadata.is_dir() {
+        return copy_dir_all_preserving_symlinks(source, destination);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        "backup payload is not a file, directory, or symlink",
+    ))
+}
+
 fn native_toggle_recovery_required(
     mut preview: ToggleResult,
     reason: impl Into<String>,
@@ -1748,6 +1904,16 @@ pub fn load_backup_summaries_authenticated(
         let Some(backup_dir_name) = backup_dir_name.to_str() else {
             continue;
         };
+        if valid_backup_id(backup_dir_name) {
+            let Ok(resolved_backup_id) =
+                resolve_backup_id(app_state_root, backup_dir_name, backup_authentication_key)
+            else {
+                continue;
+            };
+            if resolved_backup_id != backup_dir_name {
+                continue;
+            }
+        }
 
         let manifest_path = path.join("manifest.json");
         let Ok(raw) = fs::read_to_string(manifest_path) else {
@@ -1779,17 +1945,16 @@ pub fn load_backup_summary_authenticated(
     backup_id: &str,
     backup_authentication_key: Option<&BackupAuthenticationKey>,
 ) -> Option<BackupSummary> {
-    if !valid_backup_id(backup_id) {
-        return None;
-    }
-    let backup_root = app_state_root.join("backups").join(backup_id);
+    let resolved_backup_id =
+        resolve_backup_id(app_state_root, backup_id, backup_authentication_key).ok()?;
+    let backup_root = app_state_root.join("backups").join(&resolved_backup_id);
     if !backup_root.is_dir() {
         return None;
     }
     let raw = fs::read_to_string(backup_root.join("manifest.json")).ok()?;
     let manifest = serde_json::from_str::<BackupManifest>(&raw).ok()?;
     Some(backup_summary_from_manifest(
-        backup_id,
+        &resolved_backup_id,
         &backup_root,
         manifest,
         backup_authentication_key,
@@ -1949,8 +2114,19 @@ fn backup_summary_from_manifest(
         backup_authentication_key,
     );
     let restorable = authentication == BackupAuthenticationStatus::Verified;
-    let providers = vec![manifest.selection.provider.as_str().to_string()];
-    let layers = vec![manifest.selection.layer.as_str().to_string()];
+    let selections = backup_manifest_selections(&manifest);
+    let mut providers = selections
+        .iter()
+        .map(|selection| selection.provider.as_str().to_string())
+        .collect::<Vec<_>>();
+    providers.sort();
+    providers.dedup();
+    let mut layers = selections
+        .iter()
+        .map(|selection| selection.layer.as_str().to_string())
+        .collect::<Vec<_>>();
+    layers.sort();
+    layers.dedup();
     let mut paths = manifest
         .affected_targets
         .iter()
@@ -2030,6 +2206,20 @@ fn validate_backup_manifest_structure(
             "backup manifest id mismatch: expected {backup_dir_name}, found {}",
             manifest.backup_id
         ));
+    }
+    if let Some(authenticity) = &manifest.authenticity {
+        let mut retired_backup_ids = BTreeSet::new();
+        for retired_backup_id in &authenticity.retired_backup_ids {
+            if !valid_backup_id(retired_backup_id) {
+                return Err(format!("invalid retired backup id: {retired_backup_id}"));
+            }
+            if retired_backup_id == &manifest.backup_id {
+                return Err("backup manifest cannot retire itself".to_string());
+            }
+            if !retired_backup_ids.insert(retired_backup_id) {
+                return Err(format!("duplicate retired backup id: {retired_backup_id}"));
+            }
+        }
     }
     if manifest.entries.is_empty() {
         return Err("backup manifest has no entries".to_string());
@@ -2236,17 +2426,20 @@ fn validate_backup_restore_target_allowlist(
         .iter()
         .map(|target| canonical_existing_root(Path::new(&target.path)))
         .collect::<BTreeSet<_>>();
-    let vault_root = vault_root_path(app_state_root, &manifest.selection);
-    let mut internal_paths = ["entry.json", "payload", "payload.json"]
-        .map(|name| canonical_existing_root(&vault_root.join(name)))
-        .into_iter()
-        .collect::<BTreeSet<_>>();
+    let mut internal_paths = BTreeSet::new();
     let app_vault_root = canonical_existing_root(&app_state_root.join("vault"));
-    let selection_state_path = canonical_existing_root(Path::new(&manifest.selection.state_path));
-    if selection_state_path.file_name() == Some(std::ffi::OsStr::new("entry.json"))
-        && selection_state_path.starts_with(&app_vault_root)
-    {
-        internal_paths.insert(selection_state_path);
+    for selection in backup_manifest_selections(manifest) {
+        let vault_root = vault_root_path(app_state_root, selection);
+        internal_paths.extend(
+            ["entry.json", "payload", "payload.json"]
+                .map(|name| canonical_existing_root(&vault_root.join(name))),
+        );
+        let selection_state_path = canonical_existing_root(Path::new(&selection.state_path));
+        if selection_state_path.file_name() == Some(std::ffi::OsStr::new("entry.json"))
+            && selection_state_path.starts_with(&app_vault_root)
+        {
+            internal_paths.insert(selection_state_path);
+        }
     }
 
     for entry in &manifest.entries {
@@ -2399,11 +2592,11 @@ pub(crate) fn restore_backup_locked(
     match restore_result {
         Ok(warning) => RestoreResult {
             status: RestoreStatus::Restored,
-            backup_id: input.backup_id,
+            backup_id: manifest.backup_id.clone(),
             affected_targets: manifest.affected_targets,
             reason: warning,
         },
-        Err(reason) => restore_failed(input.backup_id, manifest.affected_targets, reason),
+        Err(reason) => restore_failed(manifest.backup_id, manifest.affected_targets, reason),
     }
 }
 
@@ -7318,6 +7511,15 @@ struct BackupAuthenticity {
     payload_digests: Vec<BackupPayloadDigest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     post_state_fingerprint: Option<String>,
+    /// Authenticated redirects for native child backups folded into this
+    /// transaction bundle. They keep durable child journals and apply audits
+    /// resolvable after their standalone backup directories are retired.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retired_backup_ids: Vec<String>,
+    /// Authenticated restore metadata for every child folded into a bulk
+    /// transaction. Empty preserves the single-selection legacy behavior.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    source_selections: Vec<DiscoveryItem>,
     tag: String,
 }
 
@@ -8079,20 +8281,22 @@ fn load_backup_manifest(
     backup_id: &str,
     backup_authentication_key: Option<&BackupAuthenticationKey>,
 ) -> Result<BackupManifest, String> {
-    let backup_root = app_state_root.join("backups").join(backup_id);
+    let resolved_backup_id =
+        resolve_backup_id(app_state_root, backup_id, backup_authentication_key)?;
+    let backup_root = app_state_root.join("backups").join(&resolved_backup_id);
     let manifest_path = backup_root.join("manifest.json");
 
     let raw = read_optional_string(&manifest_path)
         .map_err(|error| error.to_string())?
         .ok_or_else(|| format!("backup manifest not found for {backup_id}"))?;
     let manifest: BackupManifest = serde_json::from_str(&raw).map_err(|error| error.to_string())?;
-    if manifest.backup_id != backup_id {
+    if manifest.backup_id != resolved_backup_id {
         return Err(format!(
-            "backup manifest id mismatch: expected {backup_id}, found {}",
+            "backup manifest id mismatch: expected {resolved_backup_id}, found {}",
             manifest.backup_id
         ));
     }
-    validate_backup_manifest_structure(backup_id, &manifest)?;
+    validate_backup_manifest_structure(&resolved_backup_id, &manifest)?;
     validate_backup_payload_evidence(&backup_root, &manifest)?;
     if manifest.version == 1 {
         return Err("legacy backup is unauthenticated; restore is blocked".to_string());
@@ -8102,6 +8306,85 @@ fn load_backup_manifest(
     verify_backup_authentication(&backup_root, &manifest, backup_authentication_key)?;
 
     Ok(manifest)
+}
+
+/// Resolve a retired native child backup ID through the authenticated bundle
+/// manifest that absorbed it. A valid bundle alias wins over a present child
+/// directory, so interrupted cleanup cannot restore only part of a batch.
+fn resolve_backup_id(
+    app_state_root: &Path,
+    backup_id: &str,
+    backup_authentication_key: Option<&BackupAuthenticationKey>,
+) -> Result<String, String> {
+    if !valid_backup_id(backup_id) {
+        return Err(format!("invalid backup id: {backup_id}"));
+    }
+
+    let backups_root = app_state_root.join("backups");
+    let direct_backup_exists = backups_root.join(backup_id).is_dir();
+
+    let entries = match fs::read_dir(&backups_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(format!("backup manifest not found for {backup_id}"));
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut bundles = Vec::new();
+    let mut has_retirement_alias = false;
+    for entry in entries {
+        let entry = entry.map_err(|error| error.to_string())?;
+        if !entry
+            .file_type()
+            .map_err(|error| error.to_string())?
+            .is_dir()
+        {
+            continue;
+        }
+        let Some(bundle_backup_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let manifest_path = entry.path().join("manifest.json");
+        let Some(raw) = read_optional_string(&manifest_path).map_err(|error| error.to_string())?
+        else {
+            continue;
+        };
+        let Ok(manifest) = serde_json::from_str::<BackupManifest>(&raw) else {
+            continue;
+        };
+        if manifest.backup_id != bundle_backup_id
+            || validate_backup_manifest_structure(&bundle_backup_id, &manifest).is_err()
+        {
+            continue;
+        }
+        if !manifest.authenticity.as_ref().is_some_and(|authenticity| {
+            authenticity
+                .retired_backup_ids
+                .iter()
+                .any(|id| id == backup_id)
+        }) {
+            continue;
+        }
+        has_retirement_alias = true;
+        if let Some(backup_authentication_key) = backup_authentication_key
+            && verify_backup_authentication(&entry.path(), &manifest, backup_authentication_key)
+                .is_ok()
+        {
+            bundles.push(bundle_backup_id);
+        }
+    }
+
+    match bundles.as_slice() {
+        [bundle_backup_id] => Ok(bundle_backup_id.clone()),
+        [] if has_retirement_alias => Err(format!(
+            "retired backup id could not be resolved through an authenticated bundle: {backup_id}"
+        )),
+        [] if direct_backup_exists => Ok(backup_id.to_string()),
+        [] => Err(format!("backup manifest not found for {backup_id}")),
+        _ => Err(format!(
+            "retired backup id resolves to multiple bundles: {backup_id}"
+        )),
+    }
 }
 
 pub(crate) fn authenticated_backup_manifest_digest(
@@ -8125,17 +8408,21 @@ fn restore_manifest_transaction(
     let rollback_root = backup_root.join("rollback");
     validate_restore_manifest_preconditions(manifest)?;
     let audit_target = prepare_restore_audit_target(app_state_root)?;
-    let vault_target = (!manifest.target_enabled).then(|| MutationTarget {
-        target_type: "path".to_string(),
-        path: path_string(vault_root_path(app_state_root, &manifest.selection)),
-    });
+    let vault_selections = if !manifest.target_enabled {
+        backup_manifest_selections(manifest)
+    } else {
+        Vec::new()
+    };
     let mut rollback_targets = manifest
         .entries
         .iter()
         .map(|entry| entry.target.clone())
         .collect::<Vec<_>>();
-    if let Some(vault_target) = &vault_target {
-        push_unique_mutation_target(&mut rollback_targets, vault_target.clone());
+    for selection in &vault_selections {
+        push_unique_mutation_target(
+            &mut rollback_targets,
+            vault_mutation_target(app_state_root, selection),
+        );
     }
     push_unique_mutation_target(&mut rollback_targets, audit_target.clone());
     let rollback_entries = capture_restore_rollback_entries(&rollback_targets, &rollback_root)?;
@@ -8153,9 +8440,12 @@ fn restore_manifest_transaction(
         }
     }
 
-    if let Some(vault_target) = vault_target {
-        push_unique_mutation_target(&mut attempted_targets, vault_target);
-        if let Err(reason) = remove_restored_vault_entry(app_state_root, manifest) {
+    for selection in vault_selections {
+        push_unique_mutation_target(
+            &mut attempted_targets,
+            vault_mutation_target(app_state_root, selection),
+        );
+        if let Err(reason) = remove_restored_vault_entry(app_state_root, selection) {
             return Err(rollback_restore_failure(
                 reason,
                 &rollback_root,
@@ -8260,10 +8550,7 @@ fn rollback_restore_failure(
 }
 
 fn validate_restore_manifest_preconditions(manifest: &BackupManifest) -> Result<(), String> {
-    if manifest.selection.kind.as_str() != "agent" {
-        return Ok(());
-    }
-
+    let selections = backup_manifest_selections(manifest);
     for entry in &manifest.entries {
         if !entry.existed
             || entry.target.target_type != "path"
@@ -8273,6 +8560,24 @@ fn validate_restore_manifest_preconditions(manifest: &BackupManifest) -> Result<
         }
 
         let target_path = PathBuf::from(&entry.target.path);
+        let is_agent_target = selections
+            .iter()
+            .copied()
+            .filter(|selection| selection.category == DiscoveryCategory::Agent)
+            .any(|selection| {
+                let state_path = Path::new(&selection.state_path);
+                Path::new(&selection.source_path) == target_path
+                    || state_path == target_path
+                    || (state_path
+                        .file_name()
+                        .is_some_and(|name| name == "entry.json")
+                        && state_path
+                            .parent()
+                            .is_some_and(|parent| parent.join("payload") == target_path))
+            });
+        if !is_agent_target {
+            continue;
+        }
         if target_path.exists() {
             return Err(format!(
                 "restore target already exists: {}",
@@ -8682,18 +8987,32 @@ fn validate_path_has_no_symlink_components(root: &Path, path: &Path) -> Result<(
 
 fn remove_restored_vault_entry(
     app_state_root: &Path,
-    manifest: &BackupManifest,
+    selection: &DiscoveryItem,
 ) -> Result<(), String> {
-    if manifest.target_enabled {
-        return Ok(());
-    }
-
-    let vault_root = vault_root_path(app_state_root, &manifest.selection);
+    let vault_root = vault_root_path(app_state_root, selection);
     if vault_root.exists() {
         fs::remove_dir_all(vault_root).map_err(|error| error.to_string())?;
     }
 
     Ok(())
+}
+
+fn vault_mutation_target(app_state_root: &Path, selection: &DiscoveryItem) -> MutationTarget {
+    MutationTarget {
+        target_type: "path".to_string(),
+        path: path_string(vault_root_path(app_state_root, selection)),
+    }
+}
+
+fn backup_manifest_selections(manifest: &BackupManifest) -> Vec<&DiscoveryItem> {
+    manifest
+        .authenticity
+        .as_ref()
+        .filter(|authenticity| !authenticity.source_selections.is_empty())
+        .map_or_else(
+            || vec![&manifest.selection],
+            |authenticity| authenticity.source_selections.iter().collect(),
+        )
 }
 
 fn restore_failed(

@@ -987,7 +987,7 @@ fn main() -> ExitCode {
                                 .to_string(),
                         }),
                         true,
-                        vec![plan.provider],
+                        plan.providers.clone(),
                         serde_json::json!({"plan": plan}),
                     );
                     println!(
@@ -1070,7 +1070,7 @@ fn main() -> ExitCode {
                     },
                     None,
                     status != RestoreStatus::Restored,
-                    vec![plan.provider],
+                    plan.providers.clone(),
                     serde_json::json!({"result": result}),
                 );
                 let mut value = restore_json_value(&result);

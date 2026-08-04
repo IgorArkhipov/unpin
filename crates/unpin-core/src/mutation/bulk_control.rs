@@ -15,6 +15,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::consolidate_bulk_backup_bundle;
 use crate::{
     approval::{
         ApprovalError, ApprovalExpectation, CONTROL_APPROVAL_ISSUER, ControlApprovalContext,
@@ -1257,6 +1258,7 @@ impl BulkToggleController {
             )?;
         }
         let mut writes_completed = false;
+        let mut child_backup_ids = Vec::new();
         for (identity, native_plan, child_authorization) in prepared {
             match native.apply_with_reach_aware(
                 &native_plan,
@@ -1270,10 +1272,48 @@ impl BulkToggleController {
             ) {
                 Ok(result) if result.status == ToggleStatus::Applied => {
                     writes_completed = true;
+                    let Some(backup_id) = result.backup_id.clone() else {
+                        item_results.push(BulkToggleItemApplyResult {
+                            item: identity,
+                            status: ToggleStatus::RecoveryRequired,
+                            backup_id: None,
+                            reason: Some(
+                                "recovery-required: native toggle applied without backup evidence"
+                                    .to_string(),
+                            ),
+                        });
+                        let lifecycle = ProviderReachLifecycle::RecoveryRequired;
+                        let result = BulkToggleApplyResult {
+                            operation_id: plan.operation_id.clone(),
+                            plan_fingerprint: plan.plan_fingerprint.clone(),
+                            lifecycle,
+                            provider_reach: plan.provider_reach,
+                            provider_coverage: plan.provider_coverage.clone(),
+                            items: item_results,
+                        };
+                        record.terminal_lifecycle = Some(lifecycle);
+                        record.terminal_result = Some(result.clone());
+                        save_bulk_payload(
+                            &payload_store,
+                            &mut record_revision,
+                            &record,
+                            &plan.operation_id,
+                        )?;
+                        finalize_bulk_journal(
+                            &TransitionJournalStore::new(&self.app_state_root),
+                            &mut handle,
+                            plan,
+                            lifecycle,
+                            true,
+                            authority_key,
+                        )?;
+                        return Ok(result);
+                    };
+                    child_backup_ids.push(backup_id.clone());
                     item_results.push(BulkToggleItemApplyResult {
                         item: identity,
                         status: result.status,
-                        backup_id: result.backup_id,
+                        backup_id: Some(backup_id),
                         reason: result.reason,
                     });
                 }
@@ -1354,6 +1394,57 @@ impl BulkToggleController {
                         authority_key,
                     )?;
                     return Ok(result);
+                }
+            }
+        }
+        if !child_backup_ids.is_empty() {
+            let bundle_backup_id = match consolidate_bulk_backup_bundle(
+                &self.app_state_root,
+                &child_backup_ids,
+                backup_key,
+            ) {
+                Ok(backup_id) => backup_id,
+                Err(reason) => {
+                    let lifecycle = ProviderReachLifecycle::RecoveryRequired;
+                    let detail = format!(
+                        "recovery-required: bulk backup bundle consolidation failed: {reason}"
+                    );
+                    for item in &mut item_results {
+                        if item.status == ToggleStatus::Applied && item.backup_id.is_some() {
+                            item.status = ToggleStatus::RecoveryRequired;
+                            item.reason = Some(detail.clone());
+                        }
+                    }
+                    let result = BulkToggleApplyResult {
+                        operation_id: plan.operation_id.clone(),
+                        plan_fingerprint: plan.plan_fingerprint.clone(),
+                        lifecycle,
+                        provider_reach: plan.provider_reach,
+                        provider_coverage: plan.provider_coverage.clone(),
+                        items: item_results,
+                    };
+                    record.terminal_lifecycle = Some(lifecycle);
+                    record.terminal_result = Some(result.clone());
+                    save_bulk_payload(
+                        &payload_store,
+                        &mut record_revision,
+                        &record,
+                        &plan.operation_id,
+                    )?;
+                    finalize_bulk_journal(
+                        &TransitionJournalStore::new(&self.app_state_root),
+                        &mut handle,
+                        plan,
+                        lifecycle,
+                        true,
+                        authority_key,
+                    )?;
+                    return Ok(result);
+                }
+            };
+            for item in &mut item_results {
+                if item.status == ToggleStatus::Applied && item.backup_id.is_some() {
+                    item.backup_id = Some(bundle_backup_id.clone());
                 }
             }
         }
