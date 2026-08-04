@@ -1,8 +1,8 @@
 # Unpin
 
-Unpin is a Rust CLI/TUI for local AI-agent configuration discovery, safe
-mutation, reusable inventory groups, snapshots, restore, and MCP-backed agent
-workflows.
+Unpin is a Rust CLI with a terminal TUI and a macOS desktop workbench for local
+AI-agent configuration discovery, safe mutation, reusable inventory groups,
+snapshots, restore, and MCP-backed agent workflows.
 
 ## Distribution status and quick start
 
@@ -58,6 +58,37 @@ Release users can continue with the five-minute setup below. To connect an
 agent, use the [MCP setup guide](docs/MCP.md). Contributors should start with
 the [onboarding guide](docs/ONBOARDING.md) for the architecture, scope
 precedence, guided code tour, and fixture-backed first mutation.
+
+## Desktop workbench (macOS, first phase)
+
+For people working from source on macOS, the native desktop workbench is the
+preferred first-phase human surface. It organizes high-volume configuration
+work around **Discover and Organize**, **Change Safely**, and **Recover and
+Audit** instead of mirroring every terminal view. It can inspect a cross-provider
+inventory, maintain explicit groups, review and apply a locally approved group
+change, and inspect backup and operation evidence before a reviewed restore.
+
+The app bundles and supervises a matching `unpin` executable over a local stdio
+bridge. SwiftUI only renders redacted bridge state and starts one bundled child;
+the Rust process remains responsible for discovery, plan fingerprints, local
+approval, locks, provider writes, backups, drift checks, and recovery. The app
+does not receive secret keys, raw provider payloads, absolute provider paths, or
+MCP approval artifacts.
+
+At launch, choose the repository workspace you want to manage. The workbench
+passes that exact folder as the bridge's project root; it never infers a project
+from the app bundle or silently falls back to your home directory.
+
+CLI, MCP, and `unpin tui` remain supported. The terminal TUI is the
+compatibility surface for **Profiles**, **Gateways**, **Sessions**, and
+**Hooks** until those workflows receive their own desktop workspaces. The
+desktop's local-human approval is not an MCP approval: agent-created MCP
+handoffs retain the CLI/TUI approval contract described in
+[the MCP guide](docs/MCP.md).
+
+This is a source-build macOS target, not a public desktop release channel. It
+has no Developer ID signing, notarization, update delivery, published `.app`,
+or cross-platform support yet.
 
 ## Five-minute local setup
 
@@ -179,7 +210,7 @@ operation remains handoff-only.
 - `unpin group` maintains explicit mixed-type inventory groups, their revisions, history, previews, MCP approvals, and operation evidence.
 - `unpin catalog`, `profile`, `gateway`, `session`, and `hook` manage normalized capabilities, reusable policy, optional routing, isolated leases, and reviewed hook trust.
 - `unpin mcp` runs a newline-delimited stdio MCP control plane. Default item, bulk, restore, profile, policy, gateway, session, and hook writes return human-action handoffs; approved group apply is an explicit persistent-mode exception.
-- `unpin tui` opens the terminal inventory UI, including item and Groups views. `unpin dashboard` is an alias for the same command.
+- `unpin tui` opens the terminal compatibility UI, including item and Groups views. Use it for Profiles, Gateways, Sessions, and Hooks until their desktop workspaces arrive; `unpin dashboard` is an alias for the same command.
 
 ## Provider Coverage
 
@@ -215,7 +246,7 @@ writable. Each member stores its full `provider:layer:kind:category:id`
 identity. A group does not create an implicit selector or broaden to future
 matching items.
 
-Create definitions through the CLI or the TUI. Definition writes use the same
+Create definitions through the desktop workbench, CLI, or terminal TUI. Definition writes use the same
 preview, exact-fingerprint, and confirmation pattern as other Unpin writes:
 
 ```bash
@@ -252,14 +283,15 @@ repository group document during the final platform rename are outside the
 supported race boundary; do not edit that document with Git or an editor
 while an Unpin definition write is being confirmed.
 
-The Groups view in `unpin tui` can create or edit a definition from staged full
-inventory identities, then plan, confirm, and apply the group as one deliberate
-operation. Group state is `On`, `Off`, or `Mixed`. Planning shows each member,
-connected resource cohort, provider fan-out, unresolved identity, and blocked
-outcome before approval. Unresolved or read-only members are never silently
-skipped. If a multi-resource operation partially fails, preserve its operation
-and backup evidence, repair or restore as directed, and build a fresh plan
-instead of resuming provider writes from the old process.
+The desktop Discover and Organize workspace is the preferred human path for a
+large inventory: it can create or edit a definition from staged full inventory
+identities, then pass the group into Change Safely. The terminal Groups view
+retains the same capability. Group state is `On`, `Off`, or `Mixed`. Planning
+shows each member, connected resource cohort, provider fan-out, unresolved
+identity, and blocked outcome before approval. Unresolved or read-only members
+are never silently skipped. If a multi-resource operation partially fails,
+preserve its operation and backup evidence, repair or restore as directed, and
+build a fresh plan instead of resuming provider writes from the old process.
 
 Groups and profiles serve different purposes. A group is an explicit set of
 provider inventory identities used to change native enabled state now. A

@@ -474,6 +474,16 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
     }));
     assert_eq!(applied["result"]["result"]["requestedState"], "disable");
+    let group_apply_after_success = request(serde_json::json!({
+        "version": 2,
+        "id": "group-apply-after-success",
+        "method": "group.apply",
+        "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
+    }));
+    assert_eq!(
+        group_apply_after_success["error"]["code"],
+        "group-plan-unavailable"
+    );
 
     let backup_id = applied["result"]["result"]["backupIds"][0]
         .as_str()
@@ -587,9 +597,9 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         "restore-plan-unavailable"
     );
 
-    // The stale definition plan above remains available for review; new plans are bounded so a
-    // long-lived bridge cannot retain an unbounded number of full member definitions.
-    for index in 0..31 {
+    // Discarded definition reviews release their bridge slot. A long-lived desktop session does
+    // not keep full member definitions until its process ends.
+    for index in 0..32 {
         let queued_plan = request(serde_json::json!({
             "version": 2,
             "id": format!("definition-limit-{index}"),
@@ -607,11 +617,28 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
                 }],
             },
         }));
-        assert!(queued_plan["result"]["operationId"].is_string());
+        let queued_operation_id = queued_plan["result"]["operationId"]
+            .as_str()
+            .expect("queued definition operation id")
+            .to_string();
+        let queued_fingerprint = queued_plan["result"]["plan"]["planFingerprint"]
+            .as_str()
+            .expect("queued definition plan fingerprint")
+            .to_string();
+        let discarded = request(serde_json::json!({
+            "version": 2,
+            "id": format!("definition-discard-{index}"),
+            "method": "group.definition.discard",
+            "params": {
+                "operationId": queued_operation_id,
+                "planFingerprint": queued_fingerprint,
+            },
+        }));
+        assert_eq!(discarded["result"]["discarded"], true);
     }
-    let definition_limit = request(serde_json::json!({
+    let definition_after_discards = request(serde_json::json!({
         "version": 2,
-        "id": "definition-limit-reached",
+        "id": "definition-after-discards",
         "method": "group.definition.plan",
         "params": {
             "action": "create",
@@ -626,10 +653,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
             }],
         },
     }));
-    assert_eq!(
-        definition_limit["error"]["code"],
-        "group-definition-plan-limit-reached"
-    );
+    assert!(definition_after_discards["result"]["operationId"].is_string());
 
     drop(input);
     let status = child.wait().expect("wait for bridge");

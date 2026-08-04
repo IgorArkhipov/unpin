@@ -133,7 +133,9 @@ struct GroupEditorView: View {
 
             Table(visibleItems) {
                 TableColumn("Include") { item in
-                    Toggle("", isOn: includedBinding(for: item)).labelsHidden()
+                    Toggle("", isOn: includedBinding(for: item))
+                        .labelsHidden()
+                        .accessibilityLabel("Include \(item.displayName) in this group")
                 }
                 TableColumn("Name") { Text($0.displayName) }
                 TableColumn("Provider") { Text($0.provider) }
@@ -224,6 +226,9 @@ struct GroupEditorView: View {
                     Text(review.plan.planFingerprint).font(.caption.monospaced()).foregroundStyle(.secondary)
                 }
                 Spacer()
+                Button("Discard review") {
+                    Task { await workspace.discardReviewedDefinition() }
+                }
                 Button("Confirm \(review.plan.action)") {
                     Task {
                         if await workspace.applyDefinition() {

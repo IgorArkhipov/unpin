@@ -35,8 +35,13 @@ An MCP-connected agent can:
 An MCP-connected agent cannot approve its own persistent write, create or edit
 an inventory-group definition, or mint approval. Item, bulk, restore, profile,
 policy, gateway, session, and hook apply tools return a structured human-action
-handoff. Complete that handoff through the Unpin CLI or TUI after reviewing the
-exact plan.
+handoff. Complete that handoff through the Unpin CLI or terminal TUI after
+reviewing the exact plan.
+
+The macOS desktop workbench has its own local-human review path for its bundled
+local bridge. That approval never mints, receives, or consumes an MCP challenge
+or approval artifact, so it does not complete an agent-originated MCP handoff
+or widen this server's mutation authority.
 
 This boundary distinguishes provider writes from internal handoff-state writes.
 `unpin_apply_toggle_item`, `unpin_apply_toggle_items`, and
@@ -47,7 +52,7 @@ operation. They do not mutate provider configuration.
 
 Inventory groups have one narrow opt-in exception. A persistent server started
 with `--enable-approved-group-apply` may apply an exact group operation only
-after the CLI or TUI independently verifies its challenge and issues a
+after the CLI or terminal TUI independently verifies its challenge and issues a
 short-lived, one-time approval artifact. Default MCP and `mcp --once` never
 expose that apply tool. Keep the host agent's normal MCP tool approvals enabled
 as an additional boundary.
@@ -108,10 +113,10 @@ requiresPersistentSession=true
 
 The MCP process creates a private authenticated session lease, but it cannot
 write the challenge store or approval store on the human's behalf. The CLI or
-TUI must approve the exact operation, plan fingerprint, challenge, session,
-workspace, definition revision, and resources. Approval is single-use and
-expires; any definition, inventory, provider-state, or resource drift requires
-a fresh MCP plan and fresh approval.
+terminal TUI must approve the exact operation, plan fingerprint, challenge,
+session, workspace, definition revision, and resources. Approval is single-use
+and expires; any definition, inventory, provider-state, or resource drift
+requires a fresh MCP plan and fresh approval.
 
 ## Prerequisites
 

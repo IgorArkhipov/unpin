@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 @main
 struct UnpinDesktopApp: App {
@@ -17,43 +18,75 @@ struct UnpinDesktopApp: App {
 private struct WorkbenchView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @State private var workArea = WorkArea.discover
+    @State private var choosingWorkspace = false
 
     var body: some View {
         VStack(spacing: 0) {
-            Picker("Work area", selection: $workArea) {
-                ForEach(WorkArea.allCases) { area in
-                    Text(area.title).tag(area)
+            HStack(spacing: 12) {
+                Picker("Work area", selection: $workArea) {
+                    ForEach(WorkArea.allCases) { area in
+                        Text(area.title).tag(area)
+                    }
+                }
+                .pickerStyle(.segmented)
+
+                Spacer()
+
+                Text(workspace.workspaceName ?? "No workspace selected")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Button("Choose workspace") { choosingWorkspace = true }
+                if workspace.hasWorkspace {
+                    Button("Reload workspace") { Task { await workspace.reloadWorkspace() } }
                 }
             }
-            .pickerStyle(.segmented)
             .padding()
 
             Divider()
 
-            Group {
-                switch workArea {
-                case .discover:
-                    DiscoverOrganizeView()
-                case .govern:
-                    GovernAutomateView()
-                case .change:
-                    SafeChangeView()
-                case .recover:
-                    RecoverAuditView()
+            if workspace.hasWorkspace {
+                Group {
+                    switch workArea {
+                    case .discover:
+                        DiscoverOrganizeView()
+                    case .govern:
+                        GovernAutomateView()
+                    case .change:
+                        SafeChangeView()
+                    case .recover:
+                        RecoverAuditView()
+                    }
                 }
-            }
-            .onChange(of: workArea) { _, area in
-                if area == .recover {
-                    Task { await workspace.refreshRecovery() }
+                .onChange(of: workArea) { _, area in
+                    if area == .recover {
+                        Task { await workspace.refreshRecovery() }
+                    }
                 }
+            } else {
+                ContentUnavailableView(
+                    "Choose a workspace",
+                    systemImage: "folder.badge.gearshape",
+                    description: Text("Select the repository whose project configuration you want to inspect. Unpin will pass that exact folder to its bundled bridge.")
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
+        .disabled(workspace.isBusy)
         .overlay(alignment: .bottomLeading) {
             if let message = workspace.statusMessage {
                 Text(message)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .padding()
+            }
+        }
+        .fileImporter(
+            isPresented: $choosingWorkspace,
+            allowedContentTypes: [.folder],
+            allowsMultipleSelection: false
+        ) { result in
+            if case let .success(urls) = result, let root = urls.first {
+                Task { await workspace.selectWorkspace(root) }
             }
         }
     }

@@ -32,7 +32,7 @@ struct DiscoverOrganizeView: View {
                     }
                 }
                 Button("New group") { creatingGroup = true }
-                Button("Reload") { Task { try? await workspace.refresh() } }
+                Button("Reload") { Task { await workspace.reloadWorkspace() } }
             }
 
             HStack(spacing: 8) {
@@ -49,9 +49,16 @@ struct DiscoverOrganizeView: View {
                 .frame(width: 110)
             }
 
-            if let warnings = workspace.snapshot?.warnings, !warnings.isEmpty {
-                Label("Some provider discovery results are incomplete.", systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
+            if let snapshot = workspace.snapshot,
+               !snapshot.warnings.isEmpty || !snapshot.groupWarnings.isEmpty {
+                VStack(alignment: .leading, spacing: 2) {
+                    Label("Some discovery or group evidence is incomplete.", systemImage: "exclamationmark.triangle")
+                    if !snapshot.groupWarnings.isEmpty {
+                        Text(snapshot.groupWarnings.map { "\($0.scope): \($0.code)" }.joined(separator: " · "))
+                            .font(.caption)
+                    }
+                }
+                .foregroundStyle(.orange)
             }
 
             Table(items) {

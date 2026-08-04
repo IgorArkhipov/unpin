@@ -12,7 +12,7 @@ struct SafeChangeView: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Button("Reload") { Task { try? await workspace.refresh() } }
+                Button("Reload") { Task { await workspace.reloadWorkspace() } }
             }
 
             if let blocker = workspace.lastChangeBlocker {

@@ -17,7 +17,7 @@ struct RestoreReviewView: View {
                     Text(resourceID).font(.caption.monospaced())
                 }
                 HStack {
-                    Button("Discard review") { workspace.discardReviewedRestore() }
+                    Button("Discard review") { Task { await workspace.discardReviewedRestore() } }
                     Spacer()
                     if workspace.reviewedRestoreIsApproved {
                         Label("Local approval is current", systemImage: "checkmark.shield")
