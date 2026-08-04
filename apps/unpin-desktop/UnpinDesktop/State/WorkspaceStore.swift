@@ -1,6 +1,26 @@
 import Combine
 import Foundation
 
+struct InventoryFacets {
+    let providers: [String]
+    let layers: [String]
+    let categories: [String]
+
+    init(inventory: [InventoryItem]) {
+        var providers = Set<String>()
+        var layers = Set<String>()
+        var categories = Set<String>()
+        for item in inventory {
+            providers.insert(item.provider)
+            layers.insert(item.layer)
+            categories.insert(item.category)
+        }
+        self.providers = providers.sorted()
+        self.layers = layers.sorted()
+        self.categories = categories.sorted()
+    }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     enum State { case loading, ready, blocked(String) }
@@ -9,6 +29,9 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var snapshot: BridgeSnapshot?
     @Published private(set) var reviewedPlan: GroupPlan?
     @Published private(set) var lastApply: GroupApplyResult?
+    @Published private(set) var reviewedDefinition: GroupDefinitionPlanEnvelope?
+    @Published private(set) var lastDefinitionChange: GroupDefinitionApplyResult?
+    @Published private(set) var definitionHistory: [GroupDefinitionHistory] = []
     @Published private(set) var recovery: RecoverySnapshot?
     @Published private(set) var reviewedRestore: RestorePlanEnvelope?
     @Published private(set) var lastRestore: RestoreApplyResult?
@@ -66,6 +89,39 @@ final class WorkspaceStore: ObservableObject {
             lastApply = try await bridge.applyGroup(operationID: operationID, fingerprint: plan.planFingerprint).result
             try await refresh()
             await refreshRecovery()
+        } catch { state = .blocked(error.localizedDescription) }
+    }
+
+    func planDefinition(_ parameters: GroupDefinitionPlanParameters) async {
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            reviewedDefinition = try await bridge.planDefinition(parameters)
+            lastDefinitionChange = nil
+        } catch { state = .blocked(error.localizedDescription) }
+    }
+
+    func applyDefinition() async -> Bool {
+        do {
+            guard let bridge, let reviewedDefinition else {
+                throw BridgeClientError.malformedResponse
+            }
+            lastDefinitionChange = try await bridge.applyDefinition(
+                operationID: reviewedDefinition.operationId,
+                fingerprint: reviewedDefinition.plan.planFingerprint
+            )
+            self.reviewedDefinition = nil
+            try await refresh()
+            return true
+        } catch {
+            state = .blocked(error.localizedDescription)
+            return false
+        }
+    }
+
+    func loadDefinitionHistory(scope: String) async {
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            definitionHistory = try await bridge.definitionHistory(scope: scope).history
         } catch { state = .blocked(error.localizedDescription) }
     }
 

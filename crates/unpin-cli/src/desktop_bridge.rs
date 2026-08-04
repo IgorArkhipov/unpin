@@ -12,9 +12,11 @@ use unpin_core::{
     control_operation::ReachAwareOperationFamily,
     discovery::{DiscoveryItem, DiscoveryRoots, discover_all},
     groups::{
-        GroupAccessContext, GroupController, GroupPlanDisposition, GroupPlanMode, GroupPlanner,
-        GroupRef, GroupResolver, GroupTargetState, GroupTogglePlan, MAX_GROUP_MEMBERS,
-        PersonalGroupStore, RepositoryGroupStore, list_group_operation_inspections,
+        GROUP_DEFINITION_OWNER_ID, GroupAccessContext, GroupController, GroupDefinitionV1,
+        GroupMemberIdentity, GroupPlanDisposition, GroupPlanMode, GroupPlanner, GroupRef,
+        GroupResolver, GroupRevision, GroupScope, GroupTargetState, GroupTogglePlan,
+        MAX_GROUP_MEMBERS, PersonalGroupStore, RepositoryGroupStore,
+        list_group_operation_inspections, validate_new_group_members,
     },
     mutation::{
         BackupAuthenticationKey, RestoreControlPlan, RestoreController, RestoreResult,
@@ -22,18 +24,23 @@ use unpin_core::{
     },
     provider_reach::ProviderReach,
     sessions::SessionAuthorityKey,
+    state::atomic_json::OwnerGeneration,
 };
 
-use crate::credentials;
+use crate::{credentials, group_store::ScopedGroupStore};
 
-pub(crate) const PROTOCOL_VERSION: u64 = 1;
+pub(crate) const PROTOCOL_VERSION: u64 = 2;
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_REVIEWED_DEFINITION_PLANS: usize = 32;
 const METHOD_HANDSHAKE: &str = "handshake";
 const METHOD_SNAPSHOT: &str = "snapshot";
 const METHOD_GROUP_PLAN: &str = "group.plan";
 const METHOD_GROUP_APPROVE: &str = "group.approve";
 const METHOD_GROUP_APPLY: &str = "group.apply";
+const METHOD_GROUP_DEFINITION_PLAN: &str = "group.definition.plan";
+const METHOD_GROUP_DEFINITION_APPLY: &str = "group.definition.apply";
+const METHOD_GROUP_DEFINITION_HISTORY: &str = "group.definition.history";
 const METHOD_RECOVERY_SNAPSHOT: &str = "recovery.snapshot";
 const METHOD_RESTORE_PLAN: &str = "restore.plan";
 const METHOD_RESTORE_APPROVE: &str = "restore.approve";
@@ -44,6 +51,9 @@ const BRIDGE_CAPABILITIES: &[&str] = &[
     METHOD_GROUP_PLAN,
     METHOD_GROUP_APPROVE,
     METHOD_GROUP_APPLY,
+    METHOD_GROUP_DEFINITION_PLAN,
+    METHOD_GROUP_DEFINITION_APPLY,
+    METHOD_GROUP_DEFINITION_HISTORY,
     METHOD_RECOVERY_SNAPSHOT,
     METHOD_RESTORE_PLAN,
     METHOD_RESTORE_APPROVE,
@@ -86,6 +96,8 @@ fn run_with_io(
         context,
         reviewed_groups: Default::default(),
         reviewed_restores: Default::default(),
+        reviewed_definitions: Default::default(),
+        next_definition_plan_id: 0,
     };
     let mut seen_request_ids = BTreeSet::new();
     let mut frame = Vec::with_capacity(4096);
@@ -126,6 +138,8 @@ struct DesktopBridgeState {
     context: DesktopBridgeContext,
     reviewed_groups: BTreeMap<String, ReviewedGroupPlan>,
     reviewed_restores: BTreeMap<String, ReviewedRestorePlan>,
+    reviewed_definitions: BTreeMap<String, ReviewedDefinitionChange>,
+    next_definition_plan_id: u64,
 }
 
 struct ReviewedGroupPlan {
@@ -136,6 +150,64 @@ struct ReviewedGroupPlan {
 struct ReviewedRestorePlan {
     plan: RestoreControlPlan,
     authorization: Option<unpin_core::approval::ControlAuthorization>,
+}
+
+#[derive(Clone)]
+struct ReviewedDefinitionChange {
+    action: DefinitionChangeAction,
+    plan_fingerprint: String,
+}
+
+#[derive(Clone)]
+enum DefinitionChangeAction {
+    Create {
+        scope: GroupScope,
+        definition: GroupDefinitionV1,
+    },
+    Replace {
+        scope: GroupScope,
+        qualified_name: String,
+        definition: GroupDefinitionV1,
+        expected_revision: GroupRevision,
+    },
+    Rename {
+        scope: GroupScope,
+        qualified_name: String,
+        new_name: String,
+        expected_revision: GroupRevision,
+    },
+    Delete {
+        scope: GroupScope,
+        qualified_name: String,
+        expected_revision: GroupRevision,
+    },
+    Restore {
+        scope: GroupScope,
+        history_id: String,
+        expected_revision: Option<GroupRevision>,
+    },
+}
+
+impl DefinitionChangeAction {
+    const fn kind(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::Replace { .. } => "replace",
+            Self::Rename { .. } => "rename",
+            Self::Delete { .. } => "delete",
+            Self::Restore { .. } => "restore",
+        }
+    }
+
+    const fn scope(&self) -> GroupScope {
+        match self {
+            Self::Create { scope, .. }
+            | Self::Replace { scope, .. }
+            | Self::Rename { scope, .. }
+            | Self::Delete { scope, .. }
+            | Self::Restore { scope, .. } => *scope,
+        }
+    }
 }
 
 struct RequestError {
@@ -220,6 +292,9 @@ fn handle_request(state: &mut DesktopBridgeState, request: Request) -> Value {
         METHOD_GROUP_PLAN => plan_group(state, &request.params),
         METHOD_GROUP_APPROVE => approve_group(state, &request.params),
         METHOD_GROUP_APPLY => apply_group(state, &request.params),
+        METHOD_GROUP_DEFINITION_PLAN => plan_definition_change(state, &request.params),
+        METHOD_GROUP_DEFINITION_APPLY => apply_definition_change(state, &request.params),
+        METHOD_GROUP_DEFINITION_HISTORY => definition_history(&state.context, &request.params),
         METHOD_RECOVERY_SNAPSHOT => recovery_snapshot_response(&state.context),
         METHOD_RESTORE_PLAN => plan_restore(state, &request.params),
         METHOD_RESTORE_APPROVE => approve_restore(state, &request.params),
@@ -333,6 +408,457 @@ fn apply_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, 
         .apply(&plan, authorization)
         .map_err(|_| "group-apply-blocked")?;
     Ok(json!({"result": result}))
+}
+
+fn plan_definition_change(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(
+        params,
+        &[
+            "action",
+            "scope",
+            "qualifiedName",
+            "name",
+            "newName",
+            "members",
+            "expectedRevision",
+            "historyId",
+        ],
+    )?;
+    if state.reviewed_definitions.len() >= MAX_REVIEWED_DEFINITION_PLANS {
+        return Err("group-definition-plan-limit-reached");
+    }
+    let (action, plan_fingerprint) = definition_change_from_params(&state.context, params)?;
+    let operation_id = next_definition_operation_id(state)?;
+    let plan = redacted_definition_plan(&action, &plan_fingerprint);
+    state.reviewed_definitions.insert(
+        operation_id.clone(),
+        ReviewedDefinitionChange {
+            action,
+            plan_fingerprint,
+        },
+    );
+    Ok(json!({"operationId": operation_id, "plan": plan}))
+}
+
+fn apply_definition_change(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let reviewed = state
+        .reviewed_definitions
+        .get(operation_id)
+        .ok_or("group-definition-plan-unavailable")?;
+    if reviewed.plan_fingerprint != plan_fingerprint {
+        return Err("plan-fingerprint-mismatch");
+    }
+    let action = reviewed.action.clone();
+    require_definition_write_sandbox(&state.context)?;
+    let result = apply_reviewed_definition_change(&state.context, &action)?;
+    state.reviewed_definitions.remove(operation_id);
+    Ok(result)
+}
+
+fn definition_history(
+    context: &DesktopBridgeContext,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["scope"])?;
+    let scope = required_group_scope(params, "scope")?;
+    let history = definition_store(context, scope)?
+        .history()
+        .map_err(|_| "group-definition-history-unavailable")?;
+    Ok(json!({
+        "history": history.iter().map(redacted_definition_history).collect::<Vec<_>>(),
+    }))
+}
+
+fn definition_change_from_params(
+    context: &DesktopBridgeContext,
+    params: &Value,
+) -> Result<(DefinitionChangeAction, String), &'static str> {
+    match required_string(params, "action")? {
+        "create" => {
+            let scope = required_group_scope(params, "scope")?;
+            let definition = definition_from_params(params, "name")?;
+            validate_definition_members(context, &definition, BTreeSet::new())?;
+            let plan_fingerprint = definition_revision(context, scope, &definition)?;
+            Ok((
+                DefinitionChangeAction::Create { scope, definition },
+                plan_fingerprint,
+            ))
+        }
+        "replace" => {
+            let existing = resolved_group_record(context, params)?;
+            let definition = definition_from_params(params, "name")?;
+            let retained = existing.definition.members.iter().cloned().collect();
+            validate_definition_members(context, &definition, retained)?;
+            let expected_revision = required_group_revision(params, "expectedRevision")?;
+            let plan_fingerprint = definition_revision(context, existing.scope, &definition)?;
+            Ok((
+                DefinitionChangeAction::Replace {
+                    scope: existing.scope,
+                    qualified_name: existing.qualified_name,
+                    definition,
+                    expected_revision,
+                },
+                plan_fingerprint,
+            ))
+        }
+        "rename" => {
+            let existing = resolved_group_record(context, params)?;
+            let new_name = required_string(params, "newName")?.to_string();
+            let expected_revision = required_group_revision(params, "expectedRevision")?;
+            let mut renamed = existing.definition.clone();
+            renamed.name = new_name.clone();
+            renamed
+                .canonicalize_and_validate()
+                .map_err(|_| "group-definition-invalid")?;
+            let plan_fingerprint = definition_revision(context, existing.scope, &renamed)?;
+            Ok((
+                DefinitionChangeAction::Rename {
+                    scope: existing.scope,
+                    qualified_name: existing.qualified_name,
+                    new_name,
+                    expected_revision,
+                },
+                plan_fingerprint,
+            ))
+        }
+        "delete" => {
+            let existing = resolved_group_record(context, params)?;
+            let expected_revision = required_group_revision(params, "expectedRevision")?;
+            Ok((
+                DefinitionChangeAction::Delete {
+                    scope: existing.scope,
+                    qualified_name: existing.qualified_name,
+                    expected_revision,
+                },
+                existing.revision.to_string(),
+            ))
+        }
+        "restore" => {
+            let scope = required_group_scope(params, "scope")?;
+            let history_id = required_string(params, "historyId")?.to_string();
+            let expected_revision = optional_group_revision(params, "expectedRevision")?;
+            let history = definition_store(context, scope)?
+                .history()
+                .map_err(|_| "group-definition-history-unavailable")?
+                .into_iter()
+                .find(|record| record.history_id == history_id)
+                .ok_or("group-definition-history-unavailable")?;
+            let definition = history
+                .definition_before
+                .ok_or("group-definition-restore-blocked")?;
+            let plan_fingerprint = definition_revision(context, scope, &definition)?;
+            Ok((
+                DefinitionChangeAction::Restore {
+                    scope,
+                    history_id,
+                    expected_revision,
+                },
+                plan_fingerprint,
+            ))
+        }
+        _ => Err("invalid-group-definition-action"),
+    }
+}
+
+fn definition_from_params(
+    params: &Value,
+    name_key: &str,
+) -> Result<GroupDefinitionV1, &'static str> {
+    let name = required_string(params, name_key)?;
+    let members = params
+        .get("members")
+        .cloned()
+        .ok_or("invalid-params")
+        .and_then(|members| {
+            serde_json::from_value::<Vec<GroupMemberIdentity>>(members)
+                .map_err(|_| "invalid-group-members")
+        })?;
+    GroupDefinitionV1::new(name, members).map_err(|_| "group-definition-invalid")
+}
+
+fn resolved_group_record(
+    context: &DesktopBridgeContext,
+    params: &Value,
+) -> Result<unpin_core::groups::GroupRecord, &'static str> {
+    let reference = GroupRef::parse(required_string(params, "qualifiedName")?)
+        .map_err(|_| "invalid-group-reference")?;
+    if reference.scope.is_none() {
+        return Err("invalid-group-reference");
+    }
+    group_resolver(context)?
+        .resolve_definition(&reference)
+        .map_err(|_| "group-definition-unavailable")
+}
+
+fn required_group_scope(params: &Value, key: &str) -> Result<GroupScope, &'static str> {
+    required_string(params, key)?
+        .parse()
+        .map_err(|_| "invalid-group-scope")
+}
+
+fn required_group_revision(params: &Value, key: &str) -> Result<GroupRevision, &'static str> {
+    GroupRevision::parse(required_string(params, key)?).map_err(|_| "invalid-group-revision")
+}
+
+fn optional_group_revision(
+    params: &Value,
+    key: &str,
+) -> Result<Option<GroupRevision>, &'static str> {
+    params
+        .get(key)
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 1_024)
+                .ok_or("invalid-params")
+                .and_then(|value| GroupRevision::parse(value).map_err(|_| "invalid-group-revision"))
+        })
+        .transpose()
+}
+
+fn validate_definition_members(
+    context: &DesktopBridgeContext,
+    definition: &GroupDefinitionV1,
+    retained: BTreeSet<GroupMemberIdentity>,
+) -> Result<(), &'static str> {
+    let group_context = group_access_context(context)?;
+    validate_new_group_members(&group_context, definition, &retained)
+        .map_err(|_| "group-definition-members-blocked")
+}
+
+fn definition_revision(
+    context: &DesktopBridgeContext,
+    scope: GroupScope,
+    definition: &GroupDefinitionV1,
+) -> Result<String, &'static str> {
+    let group_context = group_access_context(context)?;
+    let binding = match scope {
+        GroupScope::Personal => group_context.binding_for_personal(definition),
+        GroupScope::Repository => group_context.binding_for_repository(definition),
+    };
+    definition
+        .revision(&binding)
+        .map(|revision| revision.to_string())
+        .map_err(|_| "group-definition-invalid")
+}
+
+fn next_definition_operation_id(state: &mut DesktopBridgeState) -> Result<String, &'static str> {
+    state.next_definition_plan_id = state
+        .next_definition_plan_id
+        .checked_add(1)
+        .ok_or("group-definition-session-exhausted")?;
+    Ok(format!("definition-{}", state.next_definition_plan_id))
+}
+
+fn require_definition_write_sandbox(context: &DesktopBridgeContext) -> Result<(), &'static str> {
+    let group_context = group_access_context(context)?;
+    unpin_core::fixture::require_fixture_write_sandbox(
+        context.fixture_mode,
+        [
+            group_context.app_state_root(),
+            group_context.workspace_root(),
+        ],
+    )
+    .map_err(|_| "fixture-write-sandbox-blocked")
+}
+
+fn definition_store(
+    context: &DesktopBridgeContext,
+    scope: GroupScope,
+) -> Result<ScopedGroupStore, &'static str> {
+    let group_context = group_access_context(context)?;
+    let authentication_key = backup_authentication_key(context)?;
+    Ok(match scope {
+        GroupScope::Personal => ScopedGroupStore::Personal(
+            PersonalGroupStore::new(group_context)
+                .with_history_authentication_key(authentication_key),
+        ),
+        GroupScope::Repository => ScopedGroupStore::Repository(
+            RepositoryGroupStore::new(group_context)
+                .with_history_authentication_key(authentication_key),
+        ),
+    })
+}
+
+fn definition_owner() -> OwnerGeneration {
+    OwnerGeneration::new(GROUP_DEFINITION_OWNER_ID, 1).expect("static owner is valid")
+}
+
+fn apply_reviewed_definition_change(
+    context: &DesktopBridgeContext,
+    action: &DefinitionChangeAction,
+) -> Result<Value, &'static str> {
+    let store = definition_store(context, action.scope())?;
+    match action {
+        DefinitionChangeAction::Create { scope, definition } => {
+            let record = store
+                .create(definition, definition_owner())
+                .map_err(|_| "group-definition-apply-blocked")?;
+            Ok(redacted_definition_change_result(
+                "create", *scope, &record, None,
+            ))
+        }
+        DefinitionChangeAction::Replace {
+            scope,
+            definition,
+            expected_revision,
+            ..
+        } => {
+            let record = store
+                .replace(definition, Some(expected_revision), definition_owner())
+                .map_err(|_| "group-definition-apply-blocked")?;
+            Ok(redacted_definition_change_result(
+                "replace", *scope, &record, None,
+            ))
+        }
+        DefinitionChangeAction::Rename {
+            scope,
+            qualified_name,
+            new_name,
+            expected_revision,
+        } => {
+            let old_name = GroupRef::parse(qualified_name)
+                .map_err(|_| "group-definition-apply-blocked")?
+                .name;
+            let record = store
+                .rename(&old_name, new_name, expected_revision, definition_owner())
+                .map_err(|_| "group-definition-apply-blocked")?;
+            Ok(redacted_definition_change_result(
+                "rename", *scope, &record, None,
+            ))
+        }
+        DefinitionChangeAction::Delete {
+            scope,
+            qualified_name,
+            expected_revision,
+        } => {
+            let name = GroupRef::parse(qualified_name)
+                .map_err(|_| "group-definition-apply-blocked")?
+                .name;
+            let history = store
+                .delete(&name, expected_revision, definition_owner())
+                .map_err(|_| "group-definition-apply-blocked")?;
+            Ok(json!({
+                "action": "delete",
+                "scope": scope,
+                "qualifiedName": qualified_name,
+                "historyId": history.history_id,
+            }))
+        }
+        DefinitionChangeAction::Restore {
+            scope,
+            history_id,
+            expected_revision,
+        } => {
+            let record = store
+                .restore(history_id, expected_revision.as_ref(), definition_owner())
+                .map_err(|_| "group-definition-apply-blocked")?;
+            Ok(redacted_definition_change_result(
+                "restore",
+                *scope,
+                &record,
+                Some(history_id),
+            ))
+        }
+    }
+}
+
+fn redacted_definition_plan(action: &DefinitionChangeAction, plan_fingerprint: &str) -> Value {
+    match action {
+        DefinitionChangeAction::Create { scope, definition } => json!({
+            "action": action.kind(),
+            "scope": scope,
+            "qualifiedName": format!("{}:{}", scope.as_str(), definition.name),
+            "memberCount": definition.members.len(),
+            "planFingerprint": plan_fingerprint,
+        }),
+        DefinitionChangeAction::Replace {
+            scope,
+            qualified_name,
+            definition,
+            expected_revision,
+        } => json!({
+            "action": action.kind(),
+            "scope": scope,
+            "qualifiedName": qualified_name,
+            "memberCount": definition.members.len(),
+            "expectedRevision": expected_revision,
+            "planFingerprint": plan_fingerprint,
+        }),
+        DefinitionChangeAction::Rename {
+            scope,
+            qualified_name,
+            new_name,
+            expected_revision,
+        } => json!({
+            "action": action.kind(),
+            "scope": scope,
+            "qualifiedName": qualified_name,
+            "newName": new_name,
+            "expectedRevision": expected_revision,
+            "planFingerprint": plan_fingerprint,
+        }),
+        DefinitionChangeAction::Delete {
+            scope,
+            qualified_name,
+            expected_revision,
+        } => json!({
+            "action": action.kind(),
+            "scope": scope,
+            "qualifiedName": qualified_name,
+            "expectedRevision": expected_revision,
+            "planFingerprint": plan_fingerprint,
+        }),
+        DefinitionChangeAction::Restore {
+            scope,
+            history_id,
+            expected_revision,
+        } => json!({
+            "action": action.kind(),
+            "scope": scope,
+            "historyId": history_id,
+            "expectedRevision": expected_revision,
+            "planFingerprint": plan_fingerprint,
+        }),
+    }
+}
+
+fn redacted_definition_change_result(
+    action: &str,
+    scope: GroupScope,
+    record: &unpin_core::groups::GroupRecord,
+    history_id: Option<&str>,
+) -> Value {
+    json!({
+        "action": action,
+        "scope": scope,
+        "qualifiedName": record.qualified_name,
+        "revision": record.revision,
+        "historyId": history_id,
+    })
+}
+
+fn redacted_definition_history(record: &unpin_core::groups::GroupHistoryRecord) -> Value {
+    json!({
+        "historyId": record.history_id,
+        "createdAt": record.created_at,
+        "scope": record.scope,
+        "change": record.change,
+        "nameBefore": record.name_before,
+        "nameAfter": record.name_after,
+        "revisionBefore": record.revision_before,
+        "revisionAfter": record.revision_after,
+        "definitionAfterExists": record.definition_after.is_some(),
+    })
 }
 
 fn plan_restore(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {

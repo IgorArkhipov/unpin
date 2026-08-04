@@ -128,8 +128,8 @@ fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
     fs::create_dir_all(&app_state_root).expect("app state");
 
     let requests = [
-        serde_json::json!({"version": 1, "id": "handshake-1", "method": "handshake"}),
-        serde_json::json!({"version": 1, "id": "snapshot-1", "method": "snapshot"}),
+        serde_json::json!({"version": 2, "id": "handshake-1", "method": "handshake"}),
+        serde_json::json!({"version": 2, "id": "snapshot-1", "method": "snapshot"}),
     ]
     .into_iter()
     .map(|request| serde_json::to_string(&request).expect("request JSON"))
@@ -166,7 +166,7 @@ fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
         .collect::<Vec<_>>();
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["id"], "handshake-1");
-    assert_eq!(responses[0]["result"]["protocolVersion"], 1);
+    assert_eq!(responses[0]["result"]["protocolVersion"], 2);
     assert_eq!(responses[1]["id"], "snapshot-1");
     let item = responses[1]["result"]["inventory"]
         .as_array()
@@ -181,7 +181,7 @@ fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
 #[test]
 fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request() {
     let oversized = "x".repeat(1_048_577);
-    let handshake = serde_json::json!({"version": 1, "id": "after-large", "method": "handshake"});
+    let handshake = serde_json::json!({"version": 2, "id": "after-large", "method": "handshake"});
     let output = Command::cargo_bin("unpin")
         .expect("unpin binary")
         .args(["desktop", "bridge"])
@@ -198,7 +198,7 @@ fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request()
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["error"]["code"], "frame-too-large");
     assert_eq!(responses[1]["id"], "after-large");
-    assert_eq!(responses[1]["result"]["protocolVersion"], 1);
+    assert_eq!(responses[1]["result"]["protocolVersion"], 2);
 }
 
 #[cfg(unix)]
@@ -280,8 +280,151 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         serde_json::from_str::<serde_json::Value>(&line).expect("bridge response JSON")
     };
 
+    let definition_plan = request(serde_json::json!({
+        "version": 2,
+        "id": "definition-create-plan",
+        "method": "group.definition.plan",
+        "params": {
+            "action": "create",
+            "scope": "personal",
+            "name": "desktop-authoring",
+            "members": [{
+                "provider": "codex",
+                "layer": "global",
+                "kind": "skill",
+                "category": "skill",
+                "id": "codex:global:skill:admin/example-codex-admin-skill",
+            }],
+        },
+    }));
+    let definition_operation_id = definition_plan["result"]["operationId"]
+        .as_str()
+        .expect("definition operation id")
+        .to_string();
+    let definition_fingerprint = definition_plan["result"]["plan"]["planFingerprint"]
+        .as_str()
+        .expect("definition fingerprint")
+        .to_string();
+    assert_eq!(definition_plan["result"]["plan"]["action"], "create");
+
+    let definition_applied = request(serde_json::json!({
+        "version": 2,
+        "id": "definition-create-apply",
+        "method": "group.definition.apply",
+        "params": {
+            "operationId": definition_operation_id,
+            "planFingerprint": definition_fingerprint,
+        },
+    }));
+    assert_eq!(
+        definition_applied["result"]["action"], "create",
+        "definition apply response: {definition_applied}"
+    );
+    assert_eq!(
+        definition_applied["result"]["qualifiedName"],
+        "personal:desktop-authoring"
+    );
+
+    let definition_history = request(serde_json::json!({
+        "version": 2,
+        "id": "definition-history",
+        "method": "group.definition.history",
+        "params": {"scope": "personal"},
+    }));
+    assert!(
+        definition_history["result"]["history"]
+            .as_array()
+            .expect("definition history")
+            .iter()
+            .any(|record| record["nameAfter"] == "desktop-authoring")
+    );
+
+    let definition_revision = definition_applied["result"]["revision"]
+        .as_str()
+        .expect("definition revision")
+        .to_string();
+    let stale_replace = request(serde_json::json!({
+        "version": 2,
+        "id": "definition-replace-plan",
+        "method": "group.definition.plan",
+        "params": {
+            "action": "replace",
+            "qualifiedName": "personal:desktop-authoring",
+            "name": "desktop-authoring",
+            "members": [{
+                "provider": "codex",
+                "layer": "global",
+                "kind": "skill",
+                "category": "skill",
+                "id": "codex:global:skill:admin/example-codex-admin-skill",
+            }],
+            "expectedRevision": definition_revision,
+        },
+    }));
+    let stale_operation_id = stale_replace["result"]["operationId"]
+        .as_str()
+        .expect("stale definition operation id")
+        .to_string();
+    let stale_fingerprint = stale_replace["result"]["plan"]["planFingerprint"]
+        .as_str()
+        .expect("stale definition fingerprint")
+        .to_string();
+
+    let rename_preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "rename",
+                "personal:desktop-authoring",
+                "--new-name",
+                "desktop-authoring-drift",
+                "--expected-revision",
+                &definition_revision,
+            ],
+        ),
+        "external definition rename preview",
+    );
+    let rename_fingerprint = rename_preview["planFingerprint"]
+        .as_str()
+        .expect("external definition rename fingerprint");
+    assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "rename",
+                "personal:desktop-authoring",
+                "--new-name",
+                "desktop-authoring-drift",
+                "--expected-revision",
+                &definition_revision,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                rename_fingerprint,
+            ],
+        ),
+        "external definition rename apply",
+    );
+    let stale_apply = request(serde_json::json!({
+        "version": 2,
+        "id": "definition-replace-stale-apply",
+        "method": "group.definition.apply",
+        "params": {
+            "operationId": stale_operation_id,
+            "planFingerprint": stale_fingerprint,
+        },
+    }));
+    assert_eq!(
+        stale_apply["error"]["code"],
+        "group-definition-apply-blocked"
+    );
+
     let plan = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "plan-1",
         "method": "group.plan",
         "params": {"qualifiedName": "personal:desktop-bridge", "target": "disable"},
@@ -296,7 +439,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         .to_string();
 
     let missing_approval = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "apply-before-approval",
         "method": "group.apply",
         "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
@@ -307,14 +450,14 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
     );
 
     let approved = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "approve-1",
         "method": "group.approve",
         "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
     }));
     assert_eq!(approved["result"]["approval"], "current");
     let applied = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "apply-1",
         "method": "group.apply",
         "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
@@ -326,7 +469,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         .expect("group apply backup id")
         .to_string();
     let recovery = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "recovery-1",
         "method": "recovery.snapshot",
         "params": {},
@@ -343,7 +486,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
     );
 
     let restore_plan = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "restore-plan-1",
         "method": "restore.plan",
         "params": {"backupId": backup_id},
@@ -368,7 +511,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
     );
 
     let restore_without_approval = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "restore-apply-before-approval",
         "method": "restore.apply",
         "params": {
@@ -381,7 +524,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         "desktop-approval-required"
     );
     let restore_approved = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "restore-approve-1",
         "method": "restore.approve",
         "params": {
@@ -391,7 +534,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
     }));
     assert_eq!(restore_approved["result"]["approval"], "current");
     let restored = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "restore-apply-1",
         "method": "restore.apply",
         "params": {
@@ -413,7 +556,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
     assert!(restored["result"]["result"].get("reason").is_none());
 
     let restore_after_success = request(serde_json::json!({
-        "version": 1,
+        "version": 2,
         "id": "restore-apply-after-success",
         "method": "restore.apply",
         "params": {
@@ -424,6 +567,50 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
     assert_eq!(
         restore_after_success["error"]["code"],
         "restore-plan-unavailable"
+    );
+
+    // The stale definition plan above remains available for review; new plans are bounded so a
+    // long-lived bridge cannot retain an unbounded number of full member definitions.
+    for index in 0..31 {
+        let queued_plan = request(serde_json::json!({
+            "version": 2,
+            "id": format!("definition-limit-{index}"),
+            "method": "group.definition.plan",
+            "params": {
+                "action": "create",
+                "scope": "personal",
+                "name": format!("desktop-queued-{index}"),
+                "members": [{
+                    "provider": "codex",
+                    "layer": "global",
+                    "kind": "skill",
+                    "category": "skill",
+                    "id": "codex:global:skill:admin/example-codex-admin-skill",
+                }],
+            },
+        }));
+        assert!(queued_plan["result"]["operationId"].is_string());
+    }
+    let definition_limit = request(serde_json::json!({
+        "version": 2,
+        "id": "definition-limit-reached",
+        "method": "group.definition.plan",
+        "params": {
+            "action": "create",
+            "scope": "personal",
+            "name": "desktop-queued-limit",
+            "members": [{
+                "provider": "codex",
+                "layer": "global",
+                "kind": "skill",
+                "category": "skill",
+                "id": "codex:global:skill:admin/example-codex-admin-skill",
+            }],
+        },
+    }));
+    assert_eq!(
+        definition_limit["error"]["code"],
+        "group-definition-plan-limit-reached"
     );
 
     drop(input);
@@ -445,7 +632,7 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         .arg(&app_state_root)
         .write_stdin(
             serde_json::json!({
-                "version": 1,
+                "version": 2,
                 "id": "foreign-recovery",
                 "method": "recovery.snapshot",
                 "params": {},
