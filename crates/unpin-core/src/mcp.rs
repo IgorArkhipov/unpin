@@ -483,6 +483,13 @@ impl McpProviderScope {
         }
     }
 
+    fn require_allowed_all(self, providers: &[ProviderId]) -> Result<(), String> {
+        for provider in providers {
+            self.require_allowed(*provider)?;
+        }
+        Ok(())
+    }
+
     fn validate_arguments(self, arguments: &Value) -> Result<(), String> {
         let Some(allowed) = self.provider() else {
             return Ok(());
@@ -3268,6 +3275,24 @@ fn control_operation(
     provider: Option<ProviderId>,
     details: Value,
 ) -> ControlOperationEnvelope {
+    control_operation_with_provider_coverage(
+        expectation,
+        plan_fingerprint,
+        activation,
+        lifecycle,
+        provider.map_or_else(|| ProviderId::ALL.to_vec(), |provider| vec![provider]),
+        details,
+    )
+}
+
+fn control_operation_with_provider_coverage(
+    expectation: &crate::approval::ApprovalExpectation,
+    plan_fingerprint: &str,
+    activation: EffectActivation,
+    lifecycle: ControlOperationLifecycle,
+    provider_coverage: Vec<ProviderId>,
+    details: Value,
+) -> ControlOperationEnvelope {
     let human_action = matches!(
         lifecycle,
         ControlOperationLifecycle::Planned | ControlOperationLifecycle::AwaitingHumanAction
@@ -3283,7 +3308,7 @@ fn control_operation(
         lifecycle,
         human_action,
         true,
-        provider.map_or_else(|| ProviderId::ALL.to_vec(), |provider| vec![provider]),
+        provider_coverage,
         details,
     )
 }
@@ -4621,8 +4646,11 @@ fn list_backups(context: &McpContext, arguments: &Value) -> Value {
     .into_iter()
     .filter(|summary| {
         context.provider_scope.provider().is_none_or(|provider| {
-            summary.providers.len() == 1
-                && summary.providers.first().map(String::as_str) == Some(provider.as_str())
+            !summary.providers.is_empty()
+                && summary
+                    .providers
+                    .iter()
+                    .all(|summary_provider| summary_provider == provider.as_str())
         })
     })
     .map(backup_summary_value)
@@ -4674,10 +4702,7 @@ fn restore_backup_tool(context: &McpContext, arguments: &Value) -> Value {
         Ok(plan) => plan,
         Err(error) => return blocked_value(error.to_string()),
     };
-    if let Err(error) = context
-        .provider_scope
-        .require_allowed_optional(Some(plan.provider))
-    {
+    if let Err(error) = context.provider_scope.require_allowed_all(&plan.providers) {
         return blocked_value(error);
     }
     let fingerprint = plan.plan_fingerprint.clone();
@@ -4696,12 +4721,12 @@ fn restore_backup_tool(context: &McpContext, arguments: &Value) -> Value {
     } else {
         ControlOperationLifecycle::Planned
     };
-    let operation = control_operation(
+    let operation = control_operation_with_provider_coverage(
         &expectation,
         &fingerprint,
         plan.activation,
         lifecycle,
-        Some(plan.provider),
+        plan.providers.clone(),
         json!({"plan": plan.clone()}),
     );
     let mut response = if reviewed {
@@ -4882,6 +4907,19 @@ fn discovery_error_provider_issues(scope: McpProviderScope, message: &str) -> Ve
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{McpProviderScope, ProviderId};
+
+    #[test]
+    fn provider_scope_rejects_cross_provider_restore_coverage() {
+        let error = McpProviderScope::Provider(ProviderId::Codex)
+            .require_allowed_all(&[ProviderId::Codex, ProviderId::Zed])
+            .expect_err("pinned Codex MCP must not authorize a Zed restore");
+        assert_eq!(error, "provider zed is outside MCP provider scope codex");
+    }
 }
 
 fn provider_issue_in_scope(scope: McpProviderScope, issue: &Value, field: &str) -> bool {

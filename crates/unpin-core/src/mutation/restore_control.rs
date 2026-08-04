@@ -35,7 +35,7 @@ use crate::{
 
 use super::backup_authentication::digest_backup_payload;
 
-pub const RESTORE_CONTROL_PLAN_SCHEMA_VERSION: u32 = 2;
+pub const RESTORE_CONTROL_PLAN_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -50,7 +50,10 @@ pub struct RestoreResourceState {
 pub struct RestoreControlPlan {
     pub schema_version: u32,
     pub backup_id: String,
+    /// The first bundle provider, retained as a representative for existing
+    /// callers. `providers` is the complete restore authority coverage.
     pub provider: ProviderId,
+    pub providers: Vec<ProviderId>,
     pub repository_key: String,
     pub workspace_key: String,
     pub authentication: BackupAuthenticationStatus,
@@ -64,15 +67,7 @@ impl RestoreControlPlan {
         if self.schema_version != RESTORE_CONTROL_PLAN_SCHEMA_VERSION {
             return Err(RestoreControlError::InvalidPlan);
         }
-        let actual = plan_fingerprint(
-            &self.backup_id,
-            self.provider,
-            &self.repository_key,
-            &self.workspace_key,
-            self.authentication,
-            &self.affected_resources,
-            self.activation,
-        )?;
+        let actual = self.fingerprint()?;
         if actual == self.plan_fingerprint {
             Ok(())
         } else {
@@ -171,26 +166,24 @@ impl RestoreController {
         affected_resources.sort_by(|left, right| left.resource_id.cmp(&right.resource_id));
         affected_resources.dedup_by(|left, right| left.resource_id == right.resource_id);
         let activation = EffectActivation::Live;
-        let plan_fingerprint = plan_fingerprint(
-            backup_id,
-            summary.selection.provider,
-            context.repository_key(),
-            context.workspace_key(),
-            summary.authentication,
-            &affected_resources,
-            activation,
-        )?;
-        Ok(RestoreControlPlan {
+        let providers = ProviderId::ALL
+            .into_iter()
+            .filter(|provider| summary.includes_provider(*provider))
+            .collect::<Vec<_>>();
+        let mut plan = RestoreControlPlan {
             schema_version: RESTORE_CONTROL_PLAN_SCHEMA_VERSION,
-            backup_id: backup_id.to_string(),
+            backup_id: summary.backup_id,
             provider: summary.selection.provider,
+            providers,
             repository_key: context.repository_key().to_string(),
             workspace_key: context.workspace_key().to_string(),
             authentication: summary.authentication,
             affected_resources,
             activation,
-            plan_fingerprint,
-        })
+            plan_fingerprint: String::new(),
+        };
+        plan.plan_fingerprint = plan.fingerprint()?;
+        Ok(plan)
     }
 
     pub fn apply(
@@ -236,12 +229,12 @@ impl RestoreController {
             let backup_root = self
                 .app_state_root
                 .join("backups")
-                .join(&reviewed_plan.backup_id);
+                .join(&manifest.backup_id);
             match restored_targets_match(&backup_root, &manifest) {
                 Ok(true) => {
                     let result = RestoreResult {
                         status: RestoreStatus::Restored,
-                        backup_id: reviewed_plan.backup_id.clone(),
+                        backup_id: manifest.backup_id.clone(),
                         affected_targets: manifest.affected_targets,
                         reason: None,
                     };
@@ -318,7 +311,7 @@ impl RestoreController {
         let backup_root = self
             .app_state_root
             .join("backups")
-            .join(&reviewed_plan.backup_id);
+            .join(&manifest.backup_id);
         match restored_targets_match(&backup_root, &manifest) {
             Ok(true) => {}
             Ok(false) | Err(_) => {
@@ -329,7 +322,7 @@ impl RestoreController {
         }
         Ok(RestoreResult {
             status: RestoreStatus::Restored,
-            backup_id: reviewed_plan.backup_id.clone(),
+            backup_id: manifest.backup_id.clone(),
             affected_targets: manifest.affected_targets,
             reason: None,
         })
@@ -419,7 +412,7 @@ impl RestoreControlPlan {
                 expected_post_fingerprint: Some(crate::encode_lower_hex(&Sha256::digest(
                     format!("{}:{}", self.backup_id, resource.resource_id).as_bytes(),
                 ))),
-                provider_views: vec![self.provider],
+                provider_views: self.providers.clone(),
             })
             .collect();
         TransitionPlan::new(
@@ -507,40 +500,36 @@ fn hash_path(hasher: &mut Sha256, root: &Path, path: &Path) -> Result<(), Restor
     Err(RestoreControlError::UnsupportedTarget(path.to_path_buf()))
 }
 
-fn plan_fingerprint(
-    backup_id: &str,
-    provider: ProviderId,
-    repository_key: &str,
-    workspace_key: &str,
-    authentication: BackupAuthenticationStatus,
-    affected_resources: &[RestoreResourceState],
-    activation: EffectActivation,
-) -> Result<String, RestoreControlError> {
-    #[derive(Serialize)]
-    #[serde(rename_all = "camelCase")]
-    struct FingerprintBody<'a> {
-        schema_version: u32,
-        backup_id: &'a str,
-        provider: ProviderId,
-        repository_key: &'a str,
-        workspace_key: &'a str,
-        authentication: BackupAuthenticationStatus,
-        affected_resources: &'a [RestoreResourceState],
-        activation: EffectActivation,
+impl RestoreControlPlan {
+    fn fingerprint(&self) -> Result<String, RestoreControlError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct FingerprintBody<'a> {
+            schema_version: u32,
+            backup_id: &'a str,
+            provider: ProviderId,
+            providers: &'a [ProviderId],
+            repository_key: &'a str,
+            workspace_key: &'a str,
+            authentication: BackupAuthenticationStatus,
+            affected_resources: &'a [RestoreResourceState],
+            activation: EffectActivation,
+        }
+        let body = FingerprintBody {
+            schema_version: self.schema_version,
+            backup_id: &self.backup_id,
+            provider: self.provider,
+            providers: &self.providers,
+            repository_key: &self.repository_key,
+            workspace_key: &self.workspace_key,
+            authentication: self.authentication,
+            affected_resources: &self.affected_resources,
+            activation: self.activation,
+        };
+        let bytes = serde_json::to_vec(&body)
+            .map_err(|error| RestoreControlError::Serialization(error.to_string()))?;
+        Ok(crate::encode_lower_hex(&Sha256::digest(bytes)))
     }
-    let body = FingerprintBody {
-        schema_version: RESTORE_CONTROL_PLAN_SCHEMA_VERSION,
-        backup_id,
-        provider,
-        repository_key,
-        workspace_key,
-        authentication,
-        affected_resources,
-        activation,
-    };
-    let bytes = serde_json::to_vec(&body)
-        .map_err(|error| RestoreControlError::Serialization(error.to_string()))?;
-    Ok(crate::encode_lower_hex(&Sha256::digest(bytes)))
 }
 
 #[derive(Debug)]

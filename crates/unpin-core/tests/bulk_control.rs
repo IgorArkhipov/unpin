@@ -17,13 +17,16 @@ use unpin_core::{
     },
     mutation::{
         BULK_TOGGLE_APPROVAL_AUDIENCE, BackupAuthenticationKey, BulkToggleController,
-        BulkTogglePlanError, BulkTogglePlanStatus, BulkToggleReachAwareApplyContext,
-        BulkToggleRequest, BulkToggleSelector,
+        BulkTogglePlan, BulkTogglePlanError, BulkTogglePlanStatus,
+        BulkToggleReachAwareApplyContext, BulkToggleRequest, BulkToggleSelector,
+        RestoreBackupInput, RestoreController, RestoreStatus, load_backup_summary_authenticated,
+        plan_backup_deletion, restore_backup,
     },
     provider_reach::{
         ConnectionBoundary, ProviderReachInput, ProviderReachLifecycle, SelectedProviderProvenance,
     },
     sessions::SessionAuthorityKey,
+    transitions::TransitionJournalStore,
 };
 
 mod support;
@@ -74,6 +77,10 @@ struct DurableBulkFixture {
 
 impl DurableBulkFixture {
     fn new() -> Self {
+        Self::new_with_provider_roots(&[ProviderId::Codex])
+    }
+
+    fn new_with_provider_roots(providers: &[ProviderId]) -> Self {
         let fixture_copy = TempDir::new().expect("temp fixture copy");
         let app_state = TempDir::new().expect("temp app state");
         copy_dir_all(&fixtures_root(), fixture_copy.path());
@@ -88,14 +95,18 @@ impl DurableBulkFixture {
         let source_path = PathBuf::from(&selected.source_path);
         let state_path = PathBuf::from(&selected.state_path);
         let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app-state root");
-        let provider_root = fixture_copy.path().join("codex").join("global");
         let roots = ReachAwareRootBinding::from_provider_paths(
             &app_state_root,
-            vec![(
-                ProviderId::Codex,
-                provider_root,
-                "fixture-codex".to_string(),
-            )],
+            providers
+                .iter()
+                .map(|provider| {
+                    (
+                        *provider,
+                        fixture_copy.path().join(provider.as_str()).join("global"),
+                        format!("fixture-{}", provider.as_str()),
+                    )
+                })
+                .collect(),
             "fixture",
         )
         .expect("trusted roots");
@@ -161,8 +172,15 @@ impl DurableBulkFixture {
     }
 
     fn authorization(&self, marker: &str) -> unpin_core::approval::ControlAuthorization {
-        let expectation = self
-            .plan
+        self.authorization_for(&self.plan, marker)
+    }
+
+    fn authorization_for(
+        &self,
+        plan: &BulkTogglePlan,
+        marker: &str,
+    ) -> unpin_core::approval::ControlAuthorization {
+        let expectation = plan
             .approval_expectation(
                 &self.durable.approval_context,
                 &self.durable.principal.session_id,
@@ -170,6 +188,412 @@ impl DurableBulkFixture {
             .expect("bulk approval expectation");
         control_authorization(&self.app_state_root, &expectation, marker, 150)
     }
+}
+
+#[test]
+fn bulk_apply_consolidates_shared_config_backups_and_restores_the_original_file() {
+    let fixture = DurableBulkFixture::new();
+    let original = fs::read_to_string(&fixture.state_path).expect("read Codex config fixture");
+    let pre_batch = format!(
+        "{original}\n[mcp_servers.batch-second]\ncommand = \"node\"\nargs = [\"server.js\"]\n"
+    );
+    fs::write(&fixture.state_path, &pre_batch).expect("add a second enabled Codex MCP");
+    let discovery = discover_all(&DiscoveryRoots::fixture_root(fixture._fixture_copy.path()))
+        .expect("discover expanded Codex fixture");
+    let plan = fixture
+        .controller
+        .plan_from_discovery(
+            discovery.clone(),
+            request(
+                BulkToggleSelector {
+                    ids: vec![
+                        "codex:global:configured-mcp:github".to_string(),
+                        "codex:global:configured-mcp:batch-second".to_string(),
+                    ],
+                    ..BulkToggleSelector::default()
+                },
+                false,
+            ),
+        )
+        .expect("plan two MCPs sharing the Codex config");
+    assert_eq!(plan.write_count(), 2);
+
+    let applied = fixture
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            fixture.authorization_for(&plan, "bulk-shared-config"),
+            fixture.durable.clone(),
+            discovery,
+        )
+        .expect("apply the shared-config batch");
+    assert_eq!(applied.lifecycle, ProviderReachLifecycle::Applied);
+
+    let backup_ids = applied
+        .items
+        .iter()
+        .filter_map(|item| item.backup_id.as_deref())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(backup_ids.len(), 1, "the batch has one backup bundle");
+    let backup_id = backup_ids
+        .iter()
+        .next()
+        .expect("shared backup ID")
+        .to_string();
+    assert_eq!(
+        fs::read_dir(fixture.app_state_root.join("backups"))
+            .expect("backup root")
+            .count(),
+        1,
+        "only the consolidated backup remains"
+    );
+
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .app_state_root
+                .join("backups")
+                .join(&backup_id)
+                .join("manifest.json"),
+        )
+        .expect("consolidated manifest"),
+    )
+    .expect("valid consolidated manifest");
+    let state_path = fixture.state_path.to_string_lossy().into_owned();
+    let config_snapshots = manifest["entries"]
+        .as_array()
+        .expect("manifest entries")
+        .iter()
+        .filter(|entry| entry["target"]["path"].as_str() == Some(state_path.as_str()))
+        .count();
+    assert_eq!(
+        config_snapshots, 1,
+        "one before-image per physical config file"
+    );
+    let retired_backup_ids = manifest["authenticity"]["retiredBackupIds"]
+        .as_array()
+        .expect("authenticated retired backup IDs")
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .map(str::to_owned)
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(retired_backup_ids.len(), 1);
+    let retired_backup_id = retired_backup_ids
+        .first()
+        .expect("one retired child backup ID")
+        .to_string();
+    let retired_restore_plan = RestoreController::new(&fixture.app_state_root)
+        .plan(
+            &retired_backup_id,
+            &fixture.durable.approval_context,
+            Some(&BackupAuthenticationKey::new([0x42; 32])),
+        )
+        .expect("retired child backup ID plans against its bundle");
+    assert_eq!(retired_restore_plan.backup_id, backup_id);
+    assert!(
+        plan_backup_deletion(&fixture.app_state_root, &retired_backup_id).is_err(),
+        "a retired child backup ID cannot delete its full transaction bundle"
+    );
+    let journal_backup_ids = TransitionJournalStore::new(&fixture.app_state_root)
+        .list()
+        .expect("native transition journals")
+        .into_iter()
+        .map(|journal| journal.backup_id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let audit_backup_ids = fs::read_to_string(fixture.app_state_root.join("audit/log.jsonl"))
+        .expect("apply audit")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|entry| entry["backupId"].as_str().map(str::to_owned))
+        .collect::<std::collections::BTreeSet<_>>();
+    for retired_backup_id in retired_backup_ids {
+        assert!(journal_backup_ids.contains(&retired_backup_id));
+        assert!(audit_backup_ids.contains(&retired_backup_id));
+        assert!(
+            !fixture
+                .app_state_root
+                .join("backups")
+                .join(&retired_backup_id)
+                .exists(),
+            "retired child backup has no standalone directory"
+        );
+        let resolved = load_backup_summary_authenticated(
+            &fixture.app_state_root,
+            &retired_backup_id,
+            Some(&BackupAuthenticationKey::new([0x42; 32])),
+        )
+        .expect("retired audit and journal backup ID resolves to the bundle");
+        assert_eq!(resolved.backup_id, backup_id);
+    }
+
+    let replayed_child_root = fixture
+        .app_state_root
+        .join("backups")
+        .join(&retired_backup_id);
+    fs::create_dir(&replayed_child_root).expect("recreate retired child backup directory");
+    let replayed_child_plan = RestoreController::new(&fixture.app_state_root)
+        .plan(
+            &retired_backup_id,
+            &fixture.durable.approval_context,
+            Some(&BackupAuthenticationKey::new([0x42; 32])),
+        )
+        .expect("replayed retired child directory still resolves to the bundle");
+    assert_eq!(replayed_child_plan.backup_id, backup_id);
+
+    let restored = restore_backup(RestoreBackupInput {
+        app_state_root: fixture.app_state_root.clone(),
+        backup_id,
+        backup_authentication_key: Some(BackupAuthenticationKey::new([0x42; 32])),
+    });
+    assert_eq!(restored.status, RestoreStatus::Restored);
+    assert_eq!(
+        fs::read_to_string(&fixture.state_path).expect("restored Codex config"),
+        pre_batch,
+        "restoring the bundle returns the entire config to its pre-batch contents"
+    );
+}
+
+#[test]
+fn bulk_restore_with_an_agent_and_configured_mcp_restores_both_entries() {
+    let fixture = DurableBulkFixture::new();
+    let agent_path = fixture
+        .discovery
+        .items
+        .iter()
+        .find(|item| item.id == "codex:global:agent:codex-global-reviewer")
+        .map(|item| PathBuf::from(&item.state_path))
+        .expect("Codex fixture agent");
+    let config_before = fs::read_to_string(&fixture.state_path).expect("read Codex config fixture");
+    let plan = fixture
+        .controller
+        .plan_from_discovery(
+            fixture.discovery.clone(),
+            request(
+                BulkToggleSelector {
+                    ids: vec![
+                        "codex:global:agent:codex-global-reviewer".to_string(),
+                        "codex:global:configured-mcp:github".to_string(),
+                    ],
+                    ..BulkToggleSelector::default()
+                },
+                false,
+            ),
+        )
+        .expect("plan mixed agent and configured MCP batch");
+    assert_eq!(plan.write_count(), 2);
+
+    let applied = fixture
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            fixture.authorization_for(&plan, "bulk-agent-configured-mcp"),
+            fixture.durable.clone(),
+            fixture.discovery.clone(),
+        )
+        .expect("apply mixed batch");
+    let backup_id = applied
+        .items
+        .iter()
+        .find_map(|item| item.backup_id.as_deref())
+        .expect("bundle backup ID")
+        .to_string();
+    assert!(
+        !agent_path.exists(),
+        "disabling the agent removes its file before restore"
+    );
+    assert!(
+        fixture.state_path.exists(),
+        "disabling a configured MCP preserves its shared config file"
+    );
+
+    let restored = restore_backup(RestoreBackupInput {
+        app_state_root: fixture.app_state_root.clone(),
+        backup_id,
+        backup_authentication_key: Some(BackupAuthenticationKey::new([0x42; 32])),
+    });
+    assert_eq!(restored.status, RestoreStatus::Restored);
+    assert!(agent_path.exists(), "restore returns the agent file");
+    assert_eq!(
+        fs::read_to_string(&fixture.state_path).expect("restored Codex config"),
+        config_before,
+        "restore returns the configured MCP state"
+    );
+}
+
+#[test]
+fn agent_reenable_restore_rejects_a_recreated_vault_payload() {
+    let fixture = DurableBulkFixture::new();
+    let agent_id = "codex:global:agent:codex-global-reviewer";
+    let disable_plan = fixture
+        .controller
+        .plan_from_discovery(
+            fixture.discovery.clone(),
+            request(
+                BulkToggleSelector {
+                    ids: vec![agent_id.to_string()],
+                    ..BulkToggleSelector::default()
+                },
+                false,
+            ),
+        )
+        .expect("plan agent disable");
+    fixture
+        .controller
+        .apply_with_reach_aware(
+            &disable_plan,
+            fixture.authorization_for(&disable_plan, "agent-disable-for-restore"),
+            fixture.durable.clone(),
+            fixture.discovery.clone(),
+        )
+        .expect("disable agent");
+    let vault_entry_path = fixture
+        .app_state_root
+        .join("vault/codex/global/agent/codex%3Aglobal%3Aagent%3Acodex-global-reviewer/entry.json")
+        .to_string_lossy()
+        .into_owned();
+    let mut disabled_agent = fixture
+        .discovery
+        .items
+        .iter()
+        .find(|item| item.id == agent_id)
+        .cloned()
+        .expect("Codex fixture agent");
+    disabled_agent.enabled = false;
+    disabled_agent.state_path = vault_entry_path;
+    let disabled_discovery = DiscoveryOutput {
+        items: vec![disabled_agent],
+        warnings: Vec::new(),
+    };
+    let reenable_plan = fixture
+        .controller
+        .plan_from_discovery(
+            disabled_discovery.clone(),
+            request(
+                BulkToggleSelector {
+                    ids: vec![agent_id.to_string()],
+                    ..BulkToggleSelector::default()
+                },
+                true,
+            ),
+        )
+        .expect("plan agent reenable");
+    let reenabled = fixture
+        .controller
+        .apply_with_reach_aware(
+            &reenable_plan,
+            fixture.authorization_for(&reenable_plan, "agent-reenable-for-restore"),
+            fixture.durable.clone(),
+            disabled_discovery,
+        )
+        .expect("reenable agent");
+    let backup_id = reenabled
+        .items
+        .iter()
+        .find_map(|item| item.backup_id.as_deref())
+        .expect("reenable backup ID");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &fs::read(
+            fixture
+                .app_state_root
+                .join("backups")
+                .join(backup_id)
+                .join("manifest.json"),
+        )
+        .expect("reenable manifest"),
+    )
+    .expect("valid reenable manifest");
+    let vault_payload_path = manifest["entries"]
+        .as_array()
+        .expect("reenable manifest entries")
+        .iter()
+        .filter(|entry| entry["existed"].as_bool() == Some(true))
+        .filter_map(|entry| entry["target"]["path"].as_str())
+        .find(|path| path.ends_with("/payload"))
+        .map(PathBuf::from)
+        .expect("vault payload before-image");
+    fs::create_dir_all(
+        vault_payload_path
+            .parent()
+            .expect("vault payload parent directory"),
+    )
+    .expect("recreate vault directory");
+    fs::write(&vault_payload_path, "unrelated vault payload").expect("recreate vault payload");
+
+    let restored = restore_backup(RestoreBackupInput {
+        app_state_root: fixture.app_state_root.clone(),
+        backup_id: backup_id.to_string(),
+        backup_authentication_key: Some(BackupAuthenticationKey::new([0x42; 32])),
+    });
+    assert_eq!(restored.status, RestoreStatus::Failed);
+    assert_eq!(
+        fs::read_to_string(&vault_payload_path).expect("recreated vault payload remains intact"),
+        "unrelated vault payload"
+    );
+}
+
+#[test]
+fn bulk_backup_summary_includes_every_source_provider_and_layer() {
+    let fixture =
+        DurableBulkFixture::new_with_provider_roots(&[ProviderId::Codex, ProviderId::Zed]);
+    let plan = fixture
+        .controller
+        .plan_from_discovery(
+            fixture.discovery.clone(),
+            BulkToggleRequest::new(
+                BulkToggleSelector {
+                    ids: vec![
+                        "codex:global:configured-mcp:github".to_string(),
+                        "zed:global:configured-mcp:github".to_string(),
+                    ],
+                    ..BulkToggleSelector::default()
+                },
+                false,
+            )
+            .with_reach(ConnectionBoundary::All, ProviderReachInput::All),
+        )
+        .expect("plan one Codex and one Zed MCP");
+    assert_eq!(plan.write_count(), 2);
+
+    let applied = fixture
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            fixture.authorization_for(&plan, "bulk-cross-provider-summary"),
+            fixture.durable.clone(),
+            fixture.discovery.clone(),
+        )
+        .expect("apply cross-provider batch");
+    let backup_id = applied
+        .items
+        .iter()
+        .filter_map(|item| item.backup_id.as_deref())
+        .next()
+        .expect("bundle backup ID");
+    let summary = load_backup_summary_authenticated(
+        &fixture.app_state_root,
+        backup_id,
+        Some(&BackupAuthenticationKey::new([0x42; 32])),
+    )
+    .expect("authenticated bundle summary");
+    assert_eq!(summary.providers, ["codex", "zed"]);
+    assert_eq!(summary.layers, ["global"]);
+
+    let restore_plan = RestoreController::new(&fixture.app_state_root)
+        .plan(
+            backup_id,
+            &fixture.durable.approval_context,
+            Some(&BackupAuthenticationKey::new([0x42; 32])),
+        )
+        .expect("plan cross-provider bundle restore");
+    assert_eq!(restore_plan.schema_version, 3);
+    assert_eq!(restore_plan.provider, ProviderId::Codex);
+    assert_eq!(restore_plan.providers, [ProviderId::Codex, ProviderId::Zed]);
+    let mut tampered = restore_plan;
+    tampered.providers = vec![ProviderId::Codex];
+    assert!(
+        tampered.verify().is_err(),
+        "provider coverage is fingerprint-bound"
+    );
 }
 
 fn item(provider: ProviderId, id: &str, enabled: bool) -> DiscoveryItem {

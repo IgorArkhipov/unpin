@@ -358,7 +358,7 @@ impl RestoreWorkflow {
                     .to_string(),
             }),
             false,
-            vec![plan.provider],
+            plan.providers.clone(),
             json!({"plan": plan}),
         );
         self.reviewed = Some(ReviewedRestorePlan { plan, envelope });
@@ -492,7 +492,7 @@ impl RestoreWorkflow {
             lifecycle,
             None,
             lifecycle == ControlOperationLifecycle::RecoveryRequired,
-            vec![reviewed.plan.provider],
+            reviewed.plan.providers.clone(),
             json!({"result": result}),
         ));
         self.phase = if lifecycle == ControlOperationLifecycle::RecoveryRequired {
@@ -3351,8 +3351,8 @@ fn backup_label(backup: &BackupSummary) -> String {
 fn backup_display_label(backup: &BackupSummary) -> String {
     format!(
         "{} {} {} → {}",
-        backup.selection.provider.as_str(),
-        backup.selection.layer.as_str(),
+        backup.providers.join(","),
+        backup.layers.join(","),
         backup.selection.display_name,
         if backup.target_enabled {
             "enabled"
@@ -6111,6 +6111,17 @@ mod tests {
 
         assert!(rendered.contains("> codex global target-20 → enabled"));
         assert!(!state.restore_workflow.rows()[20].contains("backup-020"));
+    }
+
+    #[test]
+    fn restore_backup_label_discloses_every_bundle_provider() {
+        let mut backup = restore_backup_summary(0);
+        backup.providers = vec!["codex".to_string(), "zed".to_string()];
+
+        assert_eq!(
+            backup_display_label(&backup),
+            "codex,zed global target-0 → enabled"
+        );
     }
 
     #[test]

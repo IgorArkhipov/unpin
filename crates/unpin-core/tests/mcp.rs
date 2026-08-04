@@ -4645,6 +4645,37 @@ fn mcp_restore_confirmation_returns_handoff_and_never_writes_target() {
 }
 
 #[test]
+fn mcp_provider_scope_hides_and_rejects_cross_provider_backup_bundles() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let mut manifest = backup_manifest("backup-cross-provider", "2026-06-20T12:04:00Z", None);
+    let claude_selection = manifest["selection"].clone();
+    let mut zed_selection = claude_selection.clone();
+    zed_selection["provider"] = json!("zed");
+    zed_selection["id"] = json!("zed:project:skill:example");
+    manifest["authenticity"] = json!({
+        "algorithm": "placeholder",
+        "keyId": "placeholder",
+        "payloadDigests": [],
+        "retiredBackupIds": [],
+        "sourceSelections": [claude_selection, zed_selection],
+        "tag": "placeholder"
+    });
+    manifest["version"] = json!(2);
+    write_backup_manifest(app_state.path(), "backup-cross-provider", manifest);
+
+    let unscoped = context_with_roots(fixture_copy.path(), app_state.path());
+    let listed = call_tool(&unscoped, "unpin_list_backups", json!({}));
+    assert_eq!(listed["totalBackups"], 1);
+    assert_eq!(listed["backups"][0]["providers"], json!(["claude", "zed"]));
+    let mut scoped = context_with_roots(fixture_copy.path(), app_state.path());
+    scoped.provider_scope = McpProviderScope::Provider(ProviderId::Claude);
+    let scoped_list = call_tool(&scoped, "unpin_list_backups", json!({}));
+    assert_eq!(scoped_list["totalBackups"], 0);
+}
+
+#[test]
 fn handles_one_stdio_tools_list_request() {
     let request = line_request(json!({
         "jsonrpc": "2.0",

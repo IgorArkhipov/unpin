@@ -604,7 +604,7 @@ fn launch_protected_resources(
             .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
     for backup in load_backup_summaries_authenticated(&request.app_state_root, Some(key))
         .into_iter()
-        .filter(|backup| backup.restorable && backup.selection.provider == request.provider)
+        .filter(|backup| backup.restorable && backup.includes_provider(request.provider))
     {
         let plan = restore_controller
             .plan(&backup.backup_id, &approval_context, Some(key))
