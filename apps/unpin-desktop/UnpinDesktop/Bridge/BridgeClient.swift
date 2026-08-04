@@ -107,10 +107,9 @@ actor BridgeClient {
         child.currentDirectoryURL = projectRoot
         let standardInput = Pipe()
         let standardOutput = Pipe()
-        let standardError = Pipe()
         child.standardInput = standardInput
         child.standardOutput = standardOutput
-        child.standardError = standardError
+        child.standardError = FileHandle.nullDevice
         try child.run()
         process = child
         input = standardInput.fileHandleForWriting
@@ -335,7 +334,13 @@ actor BridgeClient {
     }
 
     private static func sha256(of url: URL) throws -> String {
-        let digest = SHA256.hash(data: try Data(contentsOf: url))
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        var hasher = SHA256()
+        while let chunk = try file.read(upToCount: 1_048_576), chunk.isEmpty == false {
+            hasher.update(data: chunk)
+        }
+        let digest = hasher.finalize()
         return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
