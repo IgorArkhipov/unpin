@@ -22,7 +22,7 @@ struct GroupEditorView: View {
         _scope = State(initialValue: group?.scope ?? "personal")
         _selectedMembers = State(initialValue: Dictionary(
             uniqueKeysWithValues: (group?.members ?? []).map { member in
-                (key(for: member.identity), member.identity)
+                (Self.key(for: member.identity), member.identity)
             }
         ))
     }
