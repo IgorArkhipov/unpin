@@ -488,12 +488,19 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
     assert_eq!(recovery["result"]["backups"][0]["backupId"], backup_id);
     assert!(recovery["result"]["backups"][0].get("paths").is_none());
     assert!(recovery["result"]["backups"][0].get("selection").is_none());
+    let group_operation = recovery["result"]["operations"]
+        .as_array()
+        .expect("operation summaries")
+        .iter()
+        .find(|operation| operation["operationId"] == operation_id)
+        .expect("group operation summary");
+    assert_eq!(group_operation["qualifiedName"], "personal:desktop-bridge");
+    assert_eq!(group_operation["requestedState"], "disable");
     assert!(
-        recovery["result"]["operations"]
+        group_operation["members"]
             .as_array()
-            .expect("operation summaries")
-            .iter()
-            .any(|operation| operation["operationId"] == operation_id)
+            .is_some_and(|members| !members.is_empty()),
+        "group operation detail must retain redacted member outcomes: {group_operation}"
     );
 
     let restore_plan = request(serde_json::json!({

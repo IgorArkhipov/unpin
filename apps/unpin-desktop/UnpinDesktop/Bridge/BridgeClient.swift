@@ -377,7 +377,32 @@ enum RestoreStatus: Decodable, Equatable {
 
 struct RecoverySnapshot: Decodable { let backups: [RecoveryBackup]; let backupStatus: RecoveryEvidenceAvailability; let operations: [RecoveryOperation]; let operationStatus: RecoveryEvidenceAvailability; let groupOperationStatus: RecoveryEvidenceAvailability }
 struct RecoveryBackup: Decodable, Identifiable { let backupId: String; let createdAt: String; let itemCount: Int; let providers: [String]; let layers: [String]; let restorable: Bool; let authentication: String; let targetEnabled: Bool?; var id: String { backupId } }
-struct RecoveryOperation: Decodable, Identifiable { let operationId: String; let operationKind: String; let lifecycle: String; let effectGraphDigest: String?; let authorizationRecorded: Bool?; let terminalCode: String?; let recoveryRequired: Bool; let resourceCount: Int; let backupIds: [String]?; let evidenceAvailable: Bool?; var id: String { operationId } }
+struct RecoveryOperation: Decodable, Identifiable {
+    let operationId: String
+    let operationKind: String
+    let lifecycle: String
+    let qualifiedName: String?
+    let requestedState: String?
+    let createdAt: String?
+    let updatedAt: String?
+    let effectGraphDigest: String?
+    let authorizationRecorded: Bool?
+    let terminalCode: String?
+    let providerReach: String?
+    let providerCoverage: ProviderReachCoverage?
+    let providerReachLifecycle: String?
+    let providerWritesStarted: Bool?
+    let recoveryRequired: Bool
+    let resourceCount: Int
+    let backupIds: [String]?
+    let evidenceAvailable: Bool?
+    let finalState: String?
+    let observationFresh: Bool?
+    let observationReason: String?
+    let members: [GroupApplyMemberResult]?
+
+    var id: String { operationId }
+}
 struct RestorePlanEnvelope: Decodable { let operationId: String; let plan: RestorePlan }
 struct RestorePlan: Decodable { let backupId: String; let providers: [String]; let authentication: String; let affectedResourceIds: [String]; let planFingerprint: String }
 struct RestoreApplyEnvelope: Decodable { let result: RestoreApplyResult }
