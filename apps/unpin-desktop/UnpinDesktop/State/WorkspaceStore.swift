@@ -43,7 +43,12 @@ final class WorkspaceStore: ObservableObject {
     private var bridge: BridgeClient?
     private var workspaceRoot: URL?
     private var connectionGeneration = 0
+    private let bridgeRoots: BridgeLaunchRoots
     @Published private(set) var controlRequestInFlight = false
+
+    init(bridgeRoots: BridgeLaunchRoots = BridgeLaunchRoots()) {
+        self.bridgeRoots = bridgeRoots
+    }
 
     var statusMessage: String? {
         switch state {
@@ -119,7 +124,8 @@ final class WorkspaceStore: ObservableObject {
             let bridge = BridgeClient(
                 executableURL: bundledBridge.executable,
                 projectRoot: root,
-                manifest: bundledBridge.manifest
+                manifest: bundledBridge.manifest,
+                roots: bridgeRoots
             )
             replacement = bridge
             try await bridge.start()
