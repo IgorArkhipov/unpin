@@ -6,26 +6,31 @@ snapshots, restore, and MCP-backed agent workflows.
 
 ## Distribution status and quick start
 
-Unpin `0.5.0` is the non-prerelease release channel. Its public stdio MCP
-server supports the stateless 2026-07-28 protocol edition while retaining
-legacy MCP host compatibility; this does not expand its plan-first mutation
-authority. It is a program-logic release, so the full provider matrix and
-live-host validation are required before publication. Its GNU/Linux archive is
-built on
-Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
-artifacts are published only after required CI and release-specific evidence
-are complete. GitHub Releases then provides
-provenance-attested archives for Apple Silicon macOS, Intel macOS, and 64-bit
-GNU/Linux, together with CycloneDX SBOM attestations, SHA-256 checksums, and
-approved release evidence. The binaries are not Apple-notarized or
-platform-code-signed. crates.io and package-manager distribution are deferred.
+Unpin `1.0.0-rc.1` is the first unified CLI, terminal TUI, MCP, and macOS
+desktop release candidate. `0.6.2` remains the non-prerelease channel until a
+GA release is approved. The public stdio MCP server supports the stateless
+2026-07-28 protocol edition while retaining legacy MCP host compatibility;
+this does not expand its plan-first mutation authority.
+
+GitHub Releases provides provenance-attested CLI archives for Apple Silicon
+macOS, Intel macOS, and 64-bit GNU/Linux, plus separate native desktop archives
+for Apple Silicon and Intel macOS. Each archive has a CycloneDX SBOM
+attestation and is covered by `SHA256SUMS`. The GNU/Linux CLI is built on
+Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12.
+
+The `1.0.0-rc.1` desktop archives are ad-hoc signed with Hardened Runtime, but
+they are not Developer ID signed or Apple-notarized. macOS can therefore show
+an unidentified-developer Gatekeeper warning. This is an explicit RC
+limitation, not a trusted-distribution claim. See the desktop installation
+instructions below before opening the app. crates.io and package-manager
+distribution are deferred.
 
 After publication, download the archive for your platform from
 [GitHub Releases](https://github.com/IgorArkhipov/unpin/releases), verify it
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v0.5.0-TARGET.tar.gz \
+gh attestation verify unpin-v1.0.0-rc.1-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -33,7 +38,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v0.5.0-TARGET
+cd unpin-v1.0.0-rc.1-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"
@@ -61,8 +66,8 @@ precedence, guided code tour, and fixture-backed first mutation.
 
 ## Desktop workbench (macOS, first phase)
 
-For people working from source on macOS, the native desktop workbench is the
-preferred first-phase human surface. It organizes high-volume configuration
+The native desktop workbench is the preferred first-phase human surface on
+macOS. It organizes high-volume configuration
 work around **Discover and Organize**, **Change Safely**, and **Recover and
 Audit** instead of mirroring every terminal view. It can inspect a cross-provider
 inventory, maintain explicit groups, review and apply a locally approved group
@@ -86,9 +91,32 @@ desktop's local-human approval is not an MCP approval: agent-created MCP
 handoffs retain the CLI/TUI approval contract described in
 [the MCP guide](docs/MCP.md).
 
-This is a source-build macOS target, not a public desktop release channel. It
-has no Developer ID signing, notarization, update delivery, published `.app`,
-or cross-platform support yet.
+`1.0.0-rc.1` ships separate desktop archives for Apple Silicon
+(`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`). Verify the selected
+archive against `SHA256SUMS` and its GitHub attestation before extracting it:
+
+```bash
+gh attestation verify \
+  unpin-desktop-v1.0.0-rc.1-TARGET.tar.gz \
+  --repo IgorArkhipov/unpin
+tar -xzf unpin-desktop-v1.0.0-rc.1-TARGET.tar.gz
+```
+
+Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
+to `/Applications` or `~/Applications`. Updates are manual in this RC: verify
+the replacement archive, quit the old app, and replace the existing app
+bundle. To uninstall the desktop app, quit it and move `UnpinDesktop.app` to
+Trash. This leaves the CLI and shared Unpin state under `~/.config/unpin`
+untouched; that state can contain backup and recovery evidence and should not
+be removed as part of an ordinary app uninstall.
+
+Because the RC is not Developer ID signed or notarized, the first launch can
+be blocked by Gatekeeper. After verifying both the checksum and GitHub
+attestation, use Finder to Control-click the app, choose **Open**, then confirm
+**Open**. If macOS instead reports that the app is damaged or its signature is
+invalid, stop and re-download it; do not disable Gatekeeper or strip quarantine
+metadata. See [the desktop guide](docs/DESKTOP.md) for the full install,
+update, uninstall, and trust boundary.
 
 ## Five-minute local setup
 

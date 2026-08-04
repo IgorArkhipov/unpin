@@ -11,9 +11,10 @@ draft prerelease; final version tags create a stable draft release.
 - Canonical repository: `IgorArkhipov/unpin`
 - Version format: semantic version, with an optional prerelease suffix
 - Supported release artifacts:
-  - `aarch64-apple-darwin`
-  - `x86_64-apple-darwin`
-  - `x86_64-unknown-linux-gnu`
+  - CLI: `aarch64-apple-darwin`, `x86_64-apple-darwin`, and
+    `x86_64-unknown-linux-gnu`
+  - desktop: `unpin-desktop` archives for `aarch64-apple-darwin` and
+    `x86_64-apple-darwin`
 - Distribution channel: GitHub Releases
 - crates.io, Homebrew, Linux ARM64, and Windows are deferred
 - Published releases are immutable
@@ -23,9 +24,17 @@ has separate GitHub SLSA build-provenance and SBOM attestations. The draft
 workflow generates `SHA256SUMS`; ordinary program releases also attach a
 manifest-approved provider-matrix evidence bundle.
 
+Desktop RC archives are reproducibly ad-hoc signed with Hardened Runtime and no
+timestamp. They are not Developer ID signed or notarized, and must never be
+described as Gatekeeper-trusted. Until Developer ID signing, notarization, and
+an installed-artifact smoke are available, desktop artifacts may ship only as
+explicit prereleases. A GA `1.0.0` desktop release is blocked on those gates.
+
 ## Prepare release commit
 
-1. Update the workspace version, `CHANGELOG.md`, and `docs/releases/vVERSION.md`.
+1. Update the workspace version, exact `unpin-core` dependency, Cargo lockfile,
+   Xcode `MARKETING_VERSION`, `CHANGELOG.md`, and
+   `docs/releases/vVERSION.md`.
 2. Run the focused checks and repository gates:
 
    ```bash
@@ -35,6 +44,10 @@ manifest-approved provider-matrix evidence bundle.
    cargo run -p unpin-cli --locked -- --help
    cargo audit --deny warnings
    cargo machete
+   xcodebuild test \
+     -project apps/unpin-desktop/UnpinDesktop.xcodeproj \
+     -scheme UnpinDesktop \
+     -destination 'platform=macOS'
    ```
 
 3. With supported Pi and OpenCode executables on `PATH`, run
@@ -72,10 +85,11 @@ git tag -a vVERSION -m "Unpin vVERSION"
 git push origin vVERSION
 ```
 
-The tag workflow builds and attests all supported targets, generates CycloneDX
-SBOMs and `SHA256SUMS`, and creates a draft release. A tag with a prerelease
-suffix creates a draft prerelease; a final version tag creates a stable draft
-release. Do not publish it yet.
+The tag workflow builds and attests all supported CLI and desktop targets,
+generates CycloneDX SBOMs and `SHA256SUMS`, and creates a draft release. It
+checks that the tag, Cargo package version, and Xcode marketing version match.
+A tag with a prerelease suffix creates a draft prerelease; a final version tag
+creates a stable draft release. Do not publish it yet.
 
 ## Add evidence and checksums
 
@@ -190,8 +204,22 @@ After publication:
    ```
 
 3. Extract each archive and run `unpin --version` and `unpin --help`.
-4. Confirm the GitHub release is immutable.
-5. Confirm onboarding, security, changelog, and release links resolve.
+4. For each desktop archive, run:
+
+   ```bash
+   scripts/verify_desktop_release_artifact.sh \
+     unpin-desktop-vVERSION-TARGET.tar.gz \
+     TARGET \
+     VERSION
+   ```
+
+   Confirm the app and bundled bridge architectures match the target, the
+   bridge digest and version match the manifest, the ad-hoc Hardened Runtime
+   signature verifies, and the isolated stdio handshake passes.
+5. Confirm the release notes link to the Gatekeeper, manual update, and
+   uninstall guidance in `docs/DESKTOP.md`.
+6. Confirm the GitHub release is immutable.
+7. Confirm onboarding, security, changelog, and release links resolve.
 
 Release evidence must never include raw live inventory, case directories,
 backup payloads, audit logs, credentials, or private local paths.

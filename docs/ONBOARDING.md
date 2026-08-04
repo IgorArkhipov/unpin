@@ -68,8 +68,15 @@ cannot create or consume an MCP approval artifact, so an agent-originated MCP
 handoff continues through the CLI or terminal TUI. CLI and MCP remain
 first-class surfaces, and the terminal TUI remains the compatibility path for
 Profiles, Gateways, Sessions, and Hooks until each has a dedicated desktop
-workflow. The macOS target is source-build only; signing, notarization, update
-delivery, published `.app` assets, and cross-platform support are deferred.
+workflow.
+
+The `1.0.0-rc.1` distribution adds separate native desktop archives for Apple
+Silicon and Intel macOS. They are ad-hoc signed with Hardened Runtime, not
+Developer ID signed or notarized, and updates are manual. The signing verifies
+bundle consistency but does not establish Gatekeeper trust. Use the
+[desktop guide](DESKTOP.md) for checksum and provenance verification,
+Gatekeeper-safe first launch, update, and uninstall instructions. A notarized
+GA desktop release and cross-platform desktop support remain deferred.
 
 ## First safe run from source
 
@@ -114,6 +121,19 @@ keychain:
 ```
 
 Fixture mode uses deterministic test keys and never opens the OS keychain.
+
+To build and test the native app from source, install Xcode and run:
+
+```bash
+xcodebuild test \
+  -project apps/unpin-desktop/UnpinDesktop.xcodeproj \
+  -scheme UnpinDesktop \
+  -destination 'platform=macOS'
+```
+
+The shared scheme includes the XCTest action and bundles a matching Debug
+`unpin` child. Its tests use repository fixtures and temporary app-state roots;
+they do not inspect or mutate real provider state.
 
 ## Architecture
 
