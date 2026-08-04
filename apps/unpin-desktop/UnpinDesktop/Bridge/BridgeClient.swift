@@ -1,45 +1,77 @@
+import CryptoKit
+import Darwin
 import Foundation
 
 enum BridgeClientError: LocalizedError {
     case bundledExecutableMissing
+    case bundledManifestInvalid
+    case bundleIntegrityMismatch
     case incompatibleProtocol
+    case incompatibleBinary
     case malformedResponse
     case requestFailed(String)
+    case requestTimedOut
     case childStopped
 
     var errorDescription: String? {
         switch self {
         case .bundledExecutableMissing: "The bundled Unpin executable is missing. Rebuild the app."
+        case .bundledManifestInvalid: "The bundled Unpin manifest is invalid. Rebuild the app."
+        case .bundleIntegrityMismatch: "The bundled Unpin executable did not match its manifest. Rebuild the app."
         case .incompatibleProtocol: "The bundled Unpin executable does not support this workbench."
+        case .incompatibleBinary: "The bundled Unpin executable does not match this workbench release."
         case .malformedResponse: "The Unpin bridge returned an invalid response."
         case .requestFailed(let code): "The Unpin bridge blocked this request: \(code)."
+        case .requestTimedOut: "The bundled Unpin bridge did not respond. Select Reload workspace to restart it."
         case .childStopped: "The bundled Unpin process stopped unexpectedly."
         }
     }
 }
 
+struct BundledBridgeManifest: Decodable {
+    let bridgeProtocolVersion: Int
+    let unpinVersion: String
+    let sha256: String
+}
+
 actor BridgeClient {
     static let protocolVersion = 2
+    private static let maximumFrameBytes = 1_048_576
+    private static let readOnlyRequestTimeoutMilliseconds = 15_000
 
     private let executableURL: URL
+    private let projectRoot: URL
+    private let manifest: BundledBridgeManifest
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
     private var outputBuffer = Data()
     private var requestSequence = 0
+    private var controlRequestInFlight = false
 
-    init(executableURL: URL) {
+    init(executableURL: URL, projectRoot: URL, manifest: BundledBridgeManifest) {
         self.executableURL = executableURL
+        self.projectRoot = projectRoot
+        self.manifest = manifest
     }
 
     func start() throws {
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
             throw BridgeClientError.bundledExecutableMissing
         }
+        guard manifest.bridgeProtocolVersion == Self.protocolVersion,
+              manifest.unpinVersion.isEmpty == false,
+              manifest.sha256.count == 64,
+              manifest.sha256.allSatisfy(\.isHexDigit) else {
+            throw BridgeClientError.bundledManifestInvalid
+        }
+        guard try Self.sha256(of: executableURL) == manifest.sha256.lowercased() else {
+            throw BridgeClientError.bundleIntegrityMismatch
+        }
         let child = Process()
         child.executableURL = executableURL
-        child.arguments = ["desktop", "bridge"]
-        child.currentDirectoryURL = executableURL.deletingLastPathComponent()
+        child.arguments = ["desktop", "bridge", "--project-root", projectRoot.path]
+        child.currentDirectoryURL = projectRoot
         let standardInput = Pipe()
         let standardOutput = Pipe()
         let standardError = Pipe()
@@ -52,72 +84,145 @@ actor BridgeClient {
         output = standardOutput.fileHandleForReading
     }
 
-    func handshake() throws -> BridgeHandshake {
-        let handshake: BridgeHandshake = try request(method: "handshake", parameters: EmptyParameters())
+    func handshake() async throws -> BridgeHandshake {
+        let handshake: BridgeHandshake = try await request(
+            method: "handshake",
+            parameters: EmptyParameters(),
+            kind: .readOnly
+        )
         guard handshake.protocolVersion == Self.protocolVersion else {
+            stop()
             throw BridgeClientError.incompatibleProtocol
+        }
+        guard handshake.binaryVersion == manifest.unpinVersion else {
+            stop()
+            throw BridgeClientError.incompatibleBinary
         }
         return handshake
     }
 
-    func snapshot() throws -> BridgeSnapshot {
-        try request(method: "snapshot", parameters: EmptyParameters())
+    func snapshot() async throws -> BridgeSnapshot {
+        try await request(method: "snapshot", parameters: EmptyParameters(), kind: .readOnly)
     }
 
-    func planGroup(name: String, target: String) throws -> GroupPlanEnvelope {
-        try request(method: "group.plan", parameters: GroupPlanParameters(qualifiedName: name, target: target))
+    func planGroup(name: String, target: String) async throws -> GroupPlanEnvelope {
+        try await request(
+            method: "group.plan",
+            parameters: GroupPlanParameters(qualifiedName: name, target: target),
+            kind: .readOnly
+        )
     }
 
-    func approveGroup(operationID: String, fingerprint: String) throws -> GroupApprovalEnvelope {
-        try request(method: "group.approve", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    func approveGroup(operationID: String, fingerprint: String) async throws -> GroupApprovalEnvelope {
+        try await request(
+            method: "group.approve",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .localControl
+        )
     }
 
-    func applyGroup(operationID: String, fingerprint: String) throws -> GroupApplyEnvelope {
-        try request(method: "group.apply", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    func applyGroup(operationID: String, fingerprint: String) async throws -> GroupApplyEnvelope {
+        try await request(
+            method: "group.apply",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .mutation
+        )
     }
 
-    func planDefinition(_ parameters: GroupDefinitionPlanParameters) throws -> GroupDefinitionPlanEnvelope {
-        try request(method: "group.definition.plan", parameters: parameters)
+    func discardGroup(operationID: String, fingerprint: String) async throws {
+        let _: DiscardedReview = try await request(
+            method: "group.discard",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .readOnly
+        )
     }
 
-    func applyDefinition(operationID: String, fingerprint: String) throws -> GroupDefinitionApplyResult {
-        try request(method: "group.definition.apply", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    func planDefinition(_ parameters: GroupDefinitionPlanParameters) async throws -> GroupDefinitionPlanEnvelope {
+        try await request(method: "group.definition.plan", parameters: parameters, kind: .readOnly)
     }
 
-    func definitionHistory(scope: String) throws -> GroupDefinitionHistoryEnvelope {
-        try request(method: "group.definition.history", parameters: GroupDefinitionHistoryParameters(scope: scope))
+    func applyDefinition(operationID: String, fingerprint: String) async throws -> GroupDefinitionApplyResult {
+        try await request(
+            method: "group.definition.apply",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .mutation
+        )
     }
 
-    func recoverySnapshot() throws -> RecoverySnapshot {
-        try request(method: "recovery.snapshot", parameters: EmptyParameters())
+    func discardDefinition(operationID: String, fingerprint: String) async throws {
+        let _: DiscardedReview = try await request(
+            method: "group.definition.discard",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .readOnly
+        )
     }
 
-    func planRestore(backupID: String) throws -> RestorePlanEnvelope {
-        try request(method: "restore.plan", parameters: RestorePlanParameters(backupId: backupID))
+    func definitionHistory(scope: String) async throws -> GroupDefinitionHistoryEnvelope {
+        try await request(
+            method: "group.definition.history",
+            parameters: GroupDefinitionHistoryParameters(scope: scope),
+            kind: .readOnly
+        )
     }
 
-    func approveRestore(operationID: String, fingerprint: String) throws -> GroupApprovalEnvelope {
-        try request(method: "restore.approve", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    func recoverySnapshot() async throws -> RecoverySnapshot {
+        try await request(method: "recovery.snapshot", parameters: EmptyParameters(), kind: .readOnly)
     }
 
-    func applyRestore(operationID: String, fingerprint: String) throws -> RestoreApplyEnvelope {
-        try request(method: "restore.apply", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    func planRestore(backupID: String) async throws -> RestorePlanEnvelope {
+        try await request(
+            method: "restore.plan",
+            parameters: RestorePlanParameters(backupId: backupID),
+            kind: .readOnly
+        )
     }
 
-    func stop() {
+    func approveRestore(operationID: String, fingerprint: String) async throws -> GroupApprovalEnvelope {
+        try await request(
+            method: "restore.approve",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .localControl
+        )
+    }
+
+    func applyRestore(operationID: String, fingerprint: String) async throws -> RestoreApplyEnvelope {
+        try await request(
+            method: "restore.apply",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .mutation
+        )
+    }
+
+    func discardRestore(operationID: String, fingerprint: String) async throws {
+        let _: DiscardedReview = try await request(
+            method: "restore.discard",
+            parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .readOnly
+        )
+    }
+
+    @discardableResult
+    func stop() -> Bool {
+        guard controlRequestInFlight == false else { return false }
+        let child = process
         input?.closeFile()
         output?.closeFile()
-        process?.terminate()
         process = nil
         input = nil
         output = nil
         outputBuffer.removeAll(keepingCapacity: false)
+        if let child, child.isRunning {
+            child.terminate()
+            child.waitUntilExit()
+        }
+        return true
     }
 
     private func request<Parameters: Encodable, Response: Decodable>(
         method: String,
-        parameters: Parameters
-    ) throws -> Response {
+        parameters: Parameters,
+        kind: BridgeRequestKind
+    ) async throws -> Response {
         guard let process, process.isRunning, let input, let output else {
             throw BridgeClientError.childStopped
         }
@@ -129,34 +234,83 @@ actor BridgeClient {
             params: parameters
         )
         let encoded = try JSONEncoder().encode(request)
-        guard encoded.count <= 1_048_576 else { throw BridgeClientError.malformedResponse }
+        guard encoded.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
         input.write(encoded)
         input.write(Data([0x0A]))
-        let responseData = try readFrame(from: output)
-        let response = try JSONDecoder().decode(BridgeResponse<Response>.self, from: responseData)
-        guard response.version == Self.protocolVersion, response.id == request.id else {
-            throw BridgeClientError.malformedResponse
+        if kind != .readOnly {
+            controlRequestInFlight = true
         }
-        if let error = response.error { throw BridgeClientError.requestFailed(error.code) }
-        guard let result = response.result else { throw BridgeClientError.malformedResponse }
-        return result
+        defer {
+            if kind != .readOnly {
+                controlRequestInFlight = false
+            }
+        }
+        do {
+            let responseData = try await readFrame(from: output, kind: kind)
+            let response = try JSONDecoder().decode(BridgeResponse<Response>.self, from: responseData)
+            guard response.version == Self.protocolVersion, response.id == request.id else {
+                throw BridgeClientError.malformedResponse
+            }
+            if let error = response.error { throw BridgeClientError.requestFailed(error.code) }
+            guard let result = response.result else { throw BridgeClientError.malformedResponse }
+            return result
+        } catch let error as BridgeClientError {
+            if case .requestFailed = error {
+                throw error
+            }
+            if kind == .readOnly {
+                stop()
+            }
+            throw error
+        } catch {
+            if kind == .readOnly {
+                stop()
+            }
+            throw error
+        }
     }
 
-    private func readFrame(from output: FileHandle) throws -> Data {
+    private func readFrame(from output: FileHandle, kind: BridgeRequestKind) async throws -> Data {
+        let deadline = kind == .readOnly
+            ? Date().timeIntervalSinceReferenceDate + Double(Self.readOnlyRequestTimeoutMilliseconds) / 1_000
+            : nil
         while true {
+            if kind == .readOnly {
+                try Task.checkCancellation()
+            }
             if let newline = outputBuffer.firstIndex(of: 0x0A) {
                 let frame = outputBuffer.prefix(upTo: newline)
                 outputBuffer.removeSubrange(...newline)
-                guard frame.count <= 1_048_576 else { throw BridgeClientError.malformedResponse }
+                guard frame.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
                 return Data(frame)
             }
-            guard let chunk = try output.read(upToCount: 4_096), !chunk.isEmpty else {
+            if let deadline, Date().timeIntervalSinceReferenceDate >= deadline {
+                throw BridgeClientError.requestTimedOut
+            }
+            var descriptor = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)
+            let readiness = poll(&descriptor, 1, 100)
+            if readiness < 0 {
+                if errno == EINTR { continue }
                 throw BridgeClientError.childStopped
             }
+            guard readiness > 0 else { continue }
+            let chunk = output.availableData
+            guard chunk.isEmpty == false else { throw BridgeClientError.childStopped }
             outputBuffer.append(chunk)
-            guard outputBuffer.count <= 1_048_576 else { throw BridgeClientError.malformedResponse }
+            guard outputBuffer.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
         }
     }
+
+    private static func sha256(of url: URL) throws -> String {
+        let digest = SHA256.hash(data: try Data(contentsOf: url))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private enum BridgeRequestKind {
+    case readOnly
+    case localControl
+    case mutation
 }
 
 private struct BridgeRequest<Parameters: Encodable>: Encodable {
@@ -174,6 +328,7 @@ private struct BridgeResponse<Result: Decodable>: Decodable {
 }
 
 private struct BridgeErrorPayload: Decodable { let code: String }
+private struct DiscardedReview: Decodable { let discarded: Bool }
 private struct EmptyParameters: Codable {}
 private struct GroupPlanParameters: Codable { let qualifiedName: String; let target: String }
 private struct GroupApprovalParameters: Codable { let operationId: String; let planFingerprint: String }
@@ -208,9 +363,21 @@ struct GroupDefinitionPlanParameters: Encodable {
 }
 
 struct BridgeHandshake: Decodable { let protocolVersion: Int; let binaryVersion: String; let capabilities: [String] }
-struct BridgeSnapshot: Decodable { let capturedAtUnix: Int; let inventory: [InventoryItem]; let warnings: [BridgeWarning]; let groups: [GroupSummary] }
+struct BridgeSnapshot: Decodable {
+    let capturedAtUnix: Int
+    let inventory: [InventoryItem]
+    let warnings: [BridgeWarning]
+    let groups: [GroupSummary]
+    let groupWarnings: [GroupWarning]
+}
 struct InventoryItem: Decodable, Identifiable { let provider: String; let kind: String; let category: String; let layer: String; let id: String; let displayName: String; let enabled: Bool; let mutability: String }
 struct BridgeWarning: Decodable, Identifiable { let provider: String; let layer: String?; let code: String; var id: String { "\(provider)-\(code)" } }
+struct GroupWarning: Decodable, Identifiable {
+    let scope: String
+    let code: String
+
+    var id: String { "\(scope)-\(code)" }
+}
 struct GroupSummary: Decodable, Identifiable {
     let qualifiedName: String
     let scope: String

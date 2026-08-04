@@ -239,7 +239,7 @@ pub(crate) fn issue_desktop_human_approval(
 ) -> Result<HumanApproval, String> {
     if fixture_mode {
         let key = fixture_approval_key(app_state_root)?;
-        return issue_desktop_human_approval_with(
+        return issue_human_approval_with(
             expectation,
             plan_fingerprint,
             reviewed_fingerprint,
@@ -252,7 +252,7 @@ pub(crate) fn issue_desktop_human_approval(
 
     #[cfg(target_os = "macos")]
     {
-        issue_desktop_human_approval_with(
+        issue_human_approval_with(
             expectation,
             plan_fingerprint,
             reviewed_fingerprint,
@@ -493,26 +493,6 @@ fn issue_human_approval_with(
         receipt,
         verifier: ApprovalVerifier::new(verifier_key),
     })
-}
-
-fn issue_desktop_human_approval_with(
-    expectation: &ApprovalExpectation,
-    plan_fingerprint: &str,
-    reviewed_fingerprint: Option<&str>,
-    now_unix: i64,
-    presence: &impl HumanPresence,
-    load_key: impl FnOnce() -> Result<Option<ApprovalKey>, String>,
-    random_suffix: impl FnOnce() -> Result<String, String>,
-) -> Result<HumanApproval, String> {
-    issue_human_approval_with(
-        expectation,
-        plan_fingerprint,
-        reviewed_fingerprint,
-        now_unix,
-        presence,
-        load_key,
-        random_suffix,
-    )
 }
 
 #[cfg(target_os = "macos")]
@@ -1056,7 +1036,7 @@ mod tests {
     fn desktop_approval_requires_presence_before_the_signing_key_is_opened() {
         let expectation = approval_expectation();
         let key_loaded = Cell::new(false);
-        let error = match issue_desktop_human_approval_with(
+        let error = match issue_human_approval_with(
             &expectation,
             &expectation.effect_graph_digest,
             Some(&expectation.effect_graph_digest),

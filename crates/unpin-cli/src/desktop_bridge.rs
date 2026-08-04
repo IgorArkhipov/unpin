@@ -1,5 +1,6 @@
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    fs,
     io::{self, BufRead, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -32,32 +33,41 @@ use crate::{credentials, group_store::ScopedGroupStore};
 pub(crate) const PROTOCOL_VERSION: u64 = 2;
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_REQUEST_ID_BYTES: usize = 128;
+const MAX_SEEN_REQUEST_IDS: usize = 4_096;
+const MAX_REVIEWED_CONTROL_PLANS: usize = 32;
 const MAX_REVIEWED_DEFINITION_PLANS: usize = 32;
+const REVIEWED_PLAN_TTL_SECONDS: i64 = 15 * 60;
 const METHOD_HANDSHAKE: &str = "handshake";
 const METHOD_SNAPSHOT: &str = "snapshot";
 const METHOD_GROUP_PLAN: &str = "group.plan";
 const METHOD_GROUP_APPROVE: &str = "group.approve";
 const METHOD_GROUP_APPLY: &str = "group.apply";
+const METHOD_GROUP_DISCARD: &str = "group.discard";
 const METHOD_GROUP_DEFINITION_PLAN: &str = "group.definition.plan";
 const METHOD_GROUP_DEFINITION_APPLY: &str = "group.definition.apply";
+const METHOD_GROUP_DEFINITION_DISCARD: &str = "group.definition.discard";
 const METHOD_GROUP_DEFINITION_HISTORY: &str = "group.definition.history";
 const METHOD_RECOVERY_SNAPSHOT: &str = "recovery.snapshot";
 const METHOD_RESTORE_PLAN: &str = "restore.plan";
 const METHOD_RESTORE_APPROVE: &str = "restore.approve";
 const METHOD_RESTORE_APPLY: &str = "restore.apply";
+const METHOD_RESTORE_DISCARD: &str = "restore.discard";
 const METHOD_SHUTDOWN: &str = "shutdown";
 const BRIDGE_CAPABILITIES: &[&str] = &[
     METHOD_SNAPSHOT,
     METHOD_GROUP_PLAN,
     METHOD_GROUP_APPROVE,
     METHOD_GROUP_APPLY,
+    METHOD_GROUP_DISCARD,
     METHOD_GROUP_DEFINITION_PLAN,
     METHOD_GROUP_DEFINITION_APPLY,
+    METHOD_GROUP_DEFINITION_DISCARD,
     METHOD_GROUP_DEFINITION_HISTORY,
     METHOD_RECOVERY_SNAPSHOT,
     METHOD_RESTORE_PLAN,
     METHOD_RESTORE_APPROVE,
     METHOD_RESTORE_APPLY,
+    METHOD_RESTORE_DISCARD,
 ];
 
 pub(crate) struct DesktopBridgeContext {
@@ -99,7 +109,7 @@ fn run_with_io(
         reviewed_definitions: Default::default(),
         next_definition_plan_id: 0,
     };
-    let mut seen_request_ids = BTreeSet::new();
+    let mut seen_request_ids = RecentRequestIds::default();
     let mut frame = Vec::with_capacity(4096);
     while let Some(frame_status) =
         read_frame(&mut input, &mut frame).map_err(|error| error.to_string())?
@@ -109,10 +119,10 @@ fn run_with_io(
             continue;
         }
         let response = match parse_request(&frame) {
-            Ok(request) if !seen_request_ids.insert(request.id.clone()) => {
-                error_response(Some(&request.id), "duplicate-request-id")
-            }
-            Ok(request) => handle_request(&mut state, request),
+            Ok(request) => match record_request_id(&mut seen_request_ids, &request.id) {
+                Ok(()) => handle_request(&mut state, request),
+                Err(code) => error_response(Some(&request.id), code),
+            },
             Err(error) => error_response(error.id.as_deref(), error.code),
         };
         write_response(&mut output, &response)?;
@@ -145,17 +155,26 @@ struct DesktopBridgeState {
 struct ReviewedGroupPlan {
     plan: GroupTogglePlan,
     authorization: Option<unpin_core::approval::ControlAuthorization>,
+    reviewed_at_unix: i64,
 }
 
 struct ReviewedRestorePlan {
     plan: RestoreControlPlan,
     authorization: Option<unpin_core::approval::ControlAuthorization>,
+    reviewed_at_unix: i64,
 }
 
 #[derive(Clone)]
 struct ReviewedDefinitionChange {
     action: DefinitionChangeAction,
     plan_fingerprint: String,
+    reviewed_at_unix: i64,
+}
+
+#[derive(Default)]
+struct RecentRequestIds {
+    order: VecDeque<String>,
+    values: BTreeSet<String>,
 }
 
 #[derive(Clone)]
@@ -285,20 +304,62 @@ fn valid_request_id(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_REQUEST_ID_BYTES && !value.chars().any(char::is_control)
 }
 
+fn record_request_id(
+    seen_request_ids: &mut RecentRequestIds,
+    id: &str,
+) -> Result<(), &'static str> {
+    if seen_request_ids.values.contains(id) {
+        return Err("duplicate-request-id");
+    }
+    if seen_request_ids.order.len() == MAX_SEEN_REQUEST_IDS
+        && let Some(expired) = seen_request_ids.order.pop_front()
+    {
+        seen_request_ids.values.remove(&expired);
+    }
+    seen_request_ids.order.push_back(id.to_string());
+    seen_request_ids.values.insert(id.to_string());
+    Ok(())
+}
+
+fn has_reviewed_plan_capacity<T>(plans: &BTreeMap<String, T>, operation_id: &str) -> bool {
+    plans.contains_key(operation_id) || plans.len() < MAX_REVIEWED_CONTROL_PLANS
+}
+
+fn reviewed_plan_is_expired(reviewed_at_unix: i64, now_unix: i64) -> bool {
+    now_unix.saturating_sub(reviewed_at_unix) > REVIEWED_PLAN_TTL_SECONDS
+}
+
+fn prune_expired_reviewed_plans(state: &mut DesktopBridgeState) {
+    let now_unix = unix_now();
+    state
+        .reviewed_groups
+        .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
+    state
+        .reviewed_restores
+        .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
+    state
+        .reviewed_definitions
+        .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
+}
+
 fn handle_request(state: &mut DesktopBridgeState, request: Request) -> Value {
+    prune_expired_reviewed_plans(state);
     let result = match request.method.as_str() {
         METHOD_HANDSHAKE => Ok(handshake_response()),
         METHOD_SNAPSHOT => snapshot_response(&state.context),
         METHOD_GROUP_PLAN => plan_group(state, &request.params),
         METHOD_GROUP_APPROVE => approve_group(state, &request.params),
         METHOD_GROUP_APPLY => apply_group(state, &request.params),
+        METHOD_GROUP_DISCARD => discard_group(state, &request.params),
         METHOD_GROUP_DEFINITION_PLAN => plan_definition_change(state, &request.params),
         METHOD_GROUP_DEFINITION_APPLY => apply_definition_change(state, &request.params),
+        METHOD_GROUP_DEFINITION_DISCARD => discard_definition_change(state, &request.params),
         METHOD_GROUP_DEFINITION_HISTORY => definition_history(&state.context, &request.params),
         METHOD_RECOVERY_SNAPSHOT => recovery_snapshot_response(&state.context),
         METHOD_RESTORE_PLAN => plan_restore(state, &request.params),
         METHOD_RESTORE_APPROVE => approve_restore(state, &request.params),
         METHOD_RESTORE_APPLY => apply_restore(state, &request.params),
+        METHOD_RESTORE_DISCARD => discard_restore(state, &request.params),
         METHOD_SHUTDOWN => Ok(json!({"shutdown": true})),
         _ => Err("unknown-method"),
     };
@@ -340,11 +401,15 @@ fn plan_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &
         )
         .map_err(|_| "group-plan-unavailable")?;
     if let Some(operation_id) = plan.operation_id.clone() {
+        if !has_reviewed_plan_capacity(&state.reviewed_groups, &operation_id) {
+            return Err("group-plan-limit-reached");
+        }
         state.reviewed_groups.insert(
             operation_id,
             ReviewedGroupPlan {
                 plan: plan.clone(),
                 authorization: None,
+                reviewed_at_unix: unix_now(),
             },
         );
     }
@@ -404,10 +469,27 @@ fn apply_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, 
         .take()
         .ok_or("desktop-approval-required")?;
     let plan = reviewed.plan.clone();
+    require_group_write_sandbox(&state.context)?;
     let result = controller
         .apply(&plan, authorization)
         .map_err(|_| "group-apply-blocked")?;
+    state.reviewed_groups.remove(operation_id);
     Ok(json!({"result": result}))
+}
+
+fn discard_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let reviewed = state
+        .reviewed_groups
+        .get(operation_id)
+        .ok_or("group-plan-unavailable")?;
+    if reviewed.plan.plan_fingerprint != plan_fingerprint {
+        return Err("plan-fingerprint-mismatch");
+    }
+    state.reviewed_groups.remove(operation_id);
+    Ok(json!({"discarded": true}))
 }
 
 fn plan_definition_change(
@@ -438,6 +520,7 @@ fn plan_definition_change(
         ReviewedDefinitionChange {
             action,
             plan_fingerprint,
+            reviewed_at_unix: unix_now(),
         },
     );
     Ok(json!({"operationId": operation_id, "plan": plan}))
@@ -458,10 +541,28 @@ fn apply_definition_change(
         return Err("plan-fingerprint-mismatch");
     }
     let action = reviewed.action.clone();
-    require_definition_write_sandbox(&state.context)?;
+    require_group_write_sandbox(&state.context)?;
     let result = apply_reviewed_definition_change(&state.context, &action)?;
     state.reviewed_definitions.remove(operation_id);
     Ok(result)
+}
+
+fn discard_definition_change(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let reviewed = state
+        .reviewed_definitions
+        .get(operation_id)
+        .ok_or("group-definition-plan-unavailable")?;
+    if reviewed.plan_fingerprint != plan_fingerprint {
+        return Err("plan-fingerprint-mismatch");
+    }
+    state.reviewed_definitions.remove(operation_id);
+    Ok(json!({"discarded": true}))
 }
 
 fn definition_history(
@@ -659,16 +760,48 @@ fn next_definition_operation_id(state: &mut DesktopBridgeState) -> Result<String
     Ok(format!("definition-{}", state.next_definition_plan_id))
 }
 
-fn require_definition_write_sandbox(context: &DesktopBridgeContext) -> Result<(), &'static str> {
+fn require_group_write_sandbox(context: &DesktopBridgeContext) -> Result<(), &'static str> {
     let group_context = group_access_context(context)?;
-    unpin_core::fixture::require_fixture_write_sandbox(
+    require_fixture_group_write_sandbox(
         context.fixture_mode,
-        [
-            group_context.app_state_root(),
-            group_context.workspace_root(),
-        ],
+        group_context.app_state_root(),
+        group_context.workspace_root(),
+        &context.discovery_roots,
     )
-    .map_err(|_| "fixture-write-sandbox-blocked")
+}
+
+fn require_fixture_group_write_sandbox(
+    fixture_mode: bool,
+    app_state_root: &std::path::Path,
+    workspace_root: &std::path::Path,
+    discovery_roots: &DiscoveryRoots,
+) -> Result<(), &'static str> {
+    let mut roots = vec![
+        app_state_root,
+        workspace_root,
+        &discovery_roots.claude_global,
+        &discovery_roots.claude_user_state,
+        &discovery_roots.claude_project,
+        &discovery_roots.codex_global,
+        &discovery_roots.codex_admin,
+        &discovery_roots.codex_project,
+        &discovery_roots.cursor_global,
+        &discovery_roots.cursor_config,
+        &discovery_roots.cursor_project,
+        &discovery_roots.pi_global,
+        &discovery_roots.pi_project,
+        &discovery_roots.opencode_global,
+        &discovery_roots.opencode_project,
+        &discovery_roots.shared_global,
+        &discovery_roots.shared_project,
+        &discovery_roots.zed_global,
+        &discovery_roots.zed_project,
+    ];
+    if let Some(app_state_root) = discovery_roots.app_state_root.as_deref() {
+        roots.push(app_state_root);
+    }
+    unpin_core::fixture::require_fixture_write_sandbox(fixture_mode, roots)
+        .map_err(|_| "fixture-write-sandbox-blocked")
 }
 
 fn definition_store(
@@ -875,11 +1008,15 @@ fn plan_restore(state: &mut DesktopBridgeState, params: &Value) -> Result<Value,
         .approval_expectation(&approval_context)
         .map_err(|_| "restore-plan-unavailable")?;
     let operation_id = expectation.operation_id.clone();
+    if !has_reviewed_plan_capacity(&state.reviewed_restores, &operation_id) {
+        return Err("restore-plan-limit-reached");
+    }
     state.reviewed_restores.insert(
         operation_id.clone(),
         ReviewedRestorePlan {
             plan: plan.clone(),
             authorization: None,
+            reviewed_at_unix: unix_now(),
         },
     );
     Ok(json!({
@@ -971,6 +1108,21 @@ fn apply_restore(state: &mut DesktopBridgeState, params: &Value) -> Result<Value
         .map_err(|_| "restore-apply-blocked")?;
     state.reviewed_restores.remove(operation_id);
     Ok(json!({"result": redacted_restore_result(&result)}))
+}
+
+fn discard_restore(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let reviewed = state
+        .reviewed_restores
+        .get(operation_id)
+        .ok_or("restore-plan-unavailable")?;
+    if reviewed.plan.plan_fingerprint != plan_fingerprint {
+        return Err("plan-fingerprint-mismatch");
+    }
+    state.reviewed_restores.remove(operation_id);
+    Ok(json!({"discarded": true}))
 }
 
 fn require_only_params(params: &Value, allowed: &[&str]) -> Result<(), &'static str> {
@@ -1066,13 +1218,7 @@ fn session_authority_key(
 fn recovery_snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &'static str> {
     let backup_key = backup_authentication_key(context);
     let (backups, backup_status) = match backup_key.as_ref() {
-        Ok(key) => (
-            load_backup_summaries_authenticated(&context.config.app_state_root, Some(key))
-                .iter()
-                .map(redacted_backup_summary)
-                .collect::<Vec<_>>(),
-            "available",
-        ),
+        Ok(key) => recovery_backup_summaries(context, key),
         Err(_) => (Vec::new(), "unavailable"),
     };
     let (mut operations, control_operation_status) = control_operation_summaries(context);
@@ -1097,6 +1243,42 @@ fn recovery_snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &
         "operationStatus": operation_status,
         "groupOperationStatus": group_operation_status,
     }))
+}
+
+fn recovery_backup_summaries(
+    context: &DesktopBridgeContext,
+    backup_key: &BackupAuthenticationKey,
+) -> (Vec<Value>, &'static str) {
+    let backups_root = context.config.app_state_root.join("backups");
+    let entries = match fs::read_dir(&backups_root) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return (Vec::new(), "available"),
+        Err(_) => return (Vec::new(), "unavailable"),
+    };
+    let mut candidate_directories = 0;
+    let mut unreadable_entry = false;
+    for entry in entries {
+        match entry {
+            Ok(entry) if entry.file_name() == ".quarantine" => {}
+            Ok(entry) if entry.path().is_dir() => candidate_directories += 1,
+            Ok(_) => {}
+            Err(_) => unreadable_entry = true,
+        }
+    }
+    let summaries =
+        load_backup_summaries_authenticated(&context.config.app_state_root, Some(backup_key));
+    let status = if unreadable_entry || summaries.len() != candidate_directories {
+        "unavailable"
+    } else {
+        "available"
+    };
+    (
+        summaries
+            .iter()
+            .map(redacted_backup_summary)
+            .collect::<Vec<_>>(),
+        status,
+    )
 }
 
 fn control_operation_summaries(context: &DesktopBridgeContext) -> (Vec<Value>, &'static str) {
@@ -1368,5 +1550,98 @@ fn discard_to_newline(input: &mut impl BufRead) -> io::Result<()> {
         }
         let length = available.len();
         input.consume(length);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn request_ids_are_bounded_without_hiding_duplicates() {
+        let mut seen = RecentRequestIds::default();
+        record_request_id(&mut seen, "already-seen").expect("first request id");
+        assert_eq!(
+            record_request_id(&mut seen, "already-seen"),
+            Err("duplicate-request-id")
+        );
+        for index in 1..MAX_SEEN_REQUEST_IDS {
+            record_request_id(&mut seen, &format!("request-{index}"))
+                .expect("request id within limit");
+        }
+        record_request_id(&mut seen, "one-too-many")
+            .expect("oldest request id is evicted from the replay window");
+        assert_eq!(
+            record_request_id(&mut seen, "request-1"),
+            Err("duplicate-request-id")
+        );
+        record_request_id(&mut seen, "already-seen")
+            .expect("evicted request ids can be reused after the replay window");
+    }
+
+    #[test]
+    fn reviewed_control_plans_allow_replacing_existing_operations_at_capacity() {
+        let mut plans = BTreeMap::new();
+        for index in 0..MAX_REVIEWED_CONTROL_PLANS {
+            plans.insert(format!("operation-{index}"), ());
+        }
+        assert!(has_reviewed_plan_capacity(&plans, "operation-0"));
+        assert!(!has_reviewed_plan_capacity(&plans, "new-operation"));
+    }
+
+    #[test]
+    fn expired_reviewed_plans_are_not_current() {
+        assert!(!reviewed_plan_is_expired(
+            100,
+            100 + REVIEWED_PLAN_TTL_SECONDS
+        ));
+        assert!(reviewed_plan_is_expired(
+            100,
+            101 + REVIEWED_PLAN_TTL_SECONDS
+        ));
+    }
+
+    #[test]
+    fn fixture_group_apply_requires_a_temporary_workspace() {
+        let temporary = tempfile::tempdir().expect("temporary fixture root");
+        let app_state_root = temporary.path().join("state");
+        let workspace_root = temporary.path().join("workspace");
+        let discovery_roots = DiscoveryRoots::fixture_root(temporary.path());
+        assert!(
+            require_fixture_group_write_sandbox(
+                true,
+                &app_state_root,
+                &workspace_root,
+                &discovery_roots,
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            require_fixture_group_write_sandbox(
+                true,
+                &app_state_root,
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
+                &discovery_roots,
+            ),
+            Err("fixture-write-sandbox-blocked")
+        );
+    }
+
+    #[test]
+    fn fixture_group_apply_rejects_external_provider_roots() {
+        let temporary = tempfile::tempdir().expect("temporary fixture root");
+        let app_state_root = temporary.path().join("state");
+        let workspace_root = temporary.path().join("workspace");
+        let mut discovery_roots = DiscoveryRoots::fixture_root(temporary.path());
+        discovery_roots.codex_global = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        assert_eq!(
+            require_fixture_group_write_sandbox(
+                true,
+                &app_state_root,
+                &workspace_root,
+                &discovery_roots,
+            ),
+            Err("fixture-write-sandbox-blocked")
+        );
     }
 }

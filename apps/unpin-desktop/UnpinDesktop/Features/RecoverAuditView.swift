@@ -18,8 +18,10 @@ struct RecoverAuditView: View {
             }
 
             if let recovery = workspace.recovery {
-                if !recovery.backupStatus.isAvailable || !recovery.operationStatus.isAvailable {
-                    Label("Some recovery evidence is currently unavailable.", systemImage: "exclamationmark.triangle")
+                if !recovery.backupStatus.isAvailable
+                    || !recovery.operationStatus.isAvailable
+                    || !recovery.groupOperationStatus.isAvailable {
+                    Label(recoveryWarning(recovery), systemImage: "exclamationmark.triangle")
                         .foregroundStyle(.orange)
                 }
                 HStack(alignment: .top, spacing: 24) {
@@ -159,5 +161,13 @@ struct RecoverAuditView: View {
                 }
             }
         }
+    }
+
+    private func recoveryWarning(_ recovery: RecoverySnapshot) -> String {
+        var unavailable = [String]()
+        if !recovery.backupStatus.isAvailable { unavailable.append("backup") }
+        if !recovery.operationStatus.isAvailable { unavailable.append("operation") }
+        if !recovery.groupOperationStatus.isAvailable { unavailable.append("group operation") }
+        return "Some \(unavailable.joined(separator: ", ")) evidence is currently unavailable."
     }
 }

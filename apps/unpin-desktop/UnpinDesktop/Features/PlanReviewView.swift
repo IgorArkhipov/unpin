@@ -39,7 +39,7 @@ struct PlanReviewView: View {
                     Text("\(plan.cohorts.count) execution cohort(s) · \(plan.resources.count) protected resource(s)")
                         .foregroundStyle(.secondary)
                     Spacer()
-                    Button("Discard review") { workspace.discardReviewedPlan() }
+                    Button("Discard review") { Task { await workspace.discardReviewedPlan() } }
                     if workspace.reviewedPlanIsApproved {
                         Label("Local approval is current", systemImage: "checkmark.shield")
                             .foregroundStyle(.green)

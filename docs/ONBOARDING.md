@@ -5,6 +5,10 @@ Choose the path that matches what you want to do:
 - **Use an installed release:** follow the
   [README five-minute setup](../README.md#five-minute-local-setup), including
   the project-scoped skill and MCP toggle recipe.
+- **Use the macOS desktop workbench from source:** read the
+  [desktop workbench boundary](../README.md#desktop-workbench-macos-first-phase).
+  Its first phase covers Discover and Organize, Change Safely, and Recover and
+  Audit; it is not yet a signed or published desktop release.
 - **Connect Unpin to an agent:** follow the
   [MCP setup guide](MCP.md) for Codex, Claude Code, Cursor, OpenCode, Zed, and
   the copy-ready automatic setup prompt. Then use the
@@ -19,10 +23,10 @@ For the release-grade provider test procedure, use
 
 ## Project overview
 
-Unpin is a Rust CLI/TUI that discovers and safely manages local AI-agent
-configuration for Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It
-normalizes provider-specific skills, MCP servers, plugins, hooks, agents, and
-settings into one inventory.
+Unpin is a Rust CLI with a terminal TUI and a macOS desktop workbench that
+discovers and safely manages local AI-agent configuration for Claude Code,
+Codex, Cursor, Pi, OpenCode, and Zed. It normalizes provider-specific skills,
+MCP servers, plugins, hooks, agents, and settings into one inventory.
 
 Unpin `0.5.0` is the non-prerelease release channel. Its public stdio MCP
 server supports the stateless 2026-07-28 protocol edition while retaining
@@ -43,6 +47,29 @@ The central safety rule is plan first, apply the exact reviewed plan second.
 Persistent writes require confirmation, an exact plan fingerprint, scoped
 approval, conflict protection, authenticated backup evidence, audit evidence,
 and a restore path.
+
+## Desktop first-phase boundary
+
+The macOS desktop workbench is the preferred first-phase human interface for
+large configuration inventories. Its native work areas are **Discover and
+Organize**, **Change Safely**, and **Recover and Audit**. The app runs only a
+matching `unpin` executable bundled with the app and communicates through a
+versioned local stdio bridge. SwiftUI has no provider-write, secret, raw
+provider-payload, absolute-provider-path, or MCP-approval authority; the Rust
+process continues to own discovery, plan/approval/apply, locks, backups, drift
+checks, and recovery.
+
+The desktop starts only after the operator chooses a workspace folder. That
+selection is passed explicitly as `--project-root`; the app bundle is never an
+implicit repository and the workbench does not silently use the home directory.
+
+The desktop's local-human approval is intentionally separate from MCP. It
+cannot create or consume an MCP approval artifact, so an agent-originated MCP
+handoff continues through the CLI or terminal TUI. CLI and MCP remain
+first-class surfaces, and the terminal TUI remains the compatibility path for
+Profiles, Gateways, Sessions, and Hooks until each has a dedicated desktop
+workflow. The macOS target is source-build only; signing, notarization, update
+delivery, published `.app` assets, and cross-platform support are deferred.
 
 ## First safe run from source
 
@@ -92,7 +119,9 @@ Fixture mode uses deterministic test keys and never opens the OS keychain.
 
 ```mermaid
 flowchart LR
-    A[CLI / TUI / MCP] --> B[unpin-cli]
+    A[CLI / terminal TUI / MCP] --> B[unpin-cli]
+    Desktop[macOS workbench] --> Bridge[Bundled local stdio bridge]
+    Bridge --> B
     B --> C[Discovery and catalog]
     C --> D[Profiles and policy resolution]
     D --> E[Reviewed transition plan]
@@ -106,7 +135,8 @@ flowchart LR
 
 | Layer | Responsibility | Start here |
 | --- | --- | --- |
-| CLI and TUI | Parse commands, render output, run interactive workflows, and supervise processes | [`crates/unpin-cli/src/main.rs`](../crates/unpin-cli/src/main.rs), [`crates/unpin-cli/src/tui.rs`](../crates/unpin-cli/src/tui.rs) |
+| Desktop workbench | Render redacted Discover/Organize, Change Safely, and Recover/Audit state; supervise one bundled bridge child | [`apps/unpin-desktop/`](../apps/unpin-desktop), [`desktop_bridge.rs`](../crates/unpin-cli/src/desktop_bridge.rs) |
+| CLI and terminal TUI | Parse commands, render output, run interactive workflows, and retain compatibility workflows for Profiles, Gateways, Sessions, and Hooks | [`crates/unpin-cli/src/main.rs`](../crates/unpin-cli/src/main.rs), [`crates/unpin-cli/src/tui.rs`](../crates/unpin-cli/src/tui.rs) |
 | Provider inventory | Discover provider-native files and normalize them into typed records | [`discovery.rs`](../crates/unpin-core/src/discovery.rs), [`providers/registry.rs`](../crates/unpin-core/src/providers/registry.rs) |
 | Catalog and policy | Track stable capabilities, immutable profiles, layered selection, and global locks | [`catalog/`](../crates/unpin-core/src/catalog), [`profiles/`](../crates/unpin-core/src/profiles) |
 | Approval and transitions | Bind reviewed intent to immutable effects, execute safely, and record recovery state | [`approval.rs`](../crates/unpin-core/src/approval.rs), [`transitions/`](../crates/unpin-core/src/transitions) |
@@ -181,9 +211,10 @@ not claim strict enforcement when the provider adapter cannot prove it.
 
 MCP is a control plane, not an approval oracle. It can inventory and prepare
 reviewed handoffs. Persistent writes are normally completed through the CLI or
-TUI; the only MCP-side exception is an explicitly enabled persistent inventory
-group apply using an exact short-lived artifact independently approved through
-the CLI or TUI.
+terminal TUI; the only MCP-side exception is an explicitly enabled persistent
+inventory-group apply using an exact short-lived artifact independently
+approved through the CLI or TUI. Desktop local-human approval is deliberately
+not that artifact and does not widen MCP authority.
 
 ### Session diagnostics
 
