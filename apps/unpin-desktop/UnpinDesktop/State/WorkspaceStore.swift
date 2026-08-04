@@ -36,6 +36,8 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var definitionHistory: [GroupDefinitionHistory] = []
     @Published private(set) var recovery: RecoverySnapshot?
     @Published private(set) var reviewedRestore: RestorePlanEnvelope?
+    @Published private(set) var approvedRestoreFingerprint: String?
+    @Published private(set) var lastRestoreBlocker: String?
     @Published private(set) var lastRestore: RestoreApplyResult?
 
     private var bridge: BridgeClient?
@@ -50,6 +52,10 @@ final class WorkspaceStore: ObservableObject {
 
     var reviewedPlanIsApproved: Bool {
         reviewedPlan?.planFingerprint == approvedPlanFingerprint
+    }
+
+    var reviewedRestoreIsApproved: Bool {
+        reviewedRestore?.plan.planFingerprint == approvedRestoreFingerprint
     }
 
     func launch() async {
@@ -165,11 +171,14 @@ final class WorkspaceStore: ObservableObject {
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
             reviewedRestore = try await bridge.planRestore(backupID: backupID)
+            approvedRestoreFingerprint = nil
+            lastRestoreBlocker = nil
             lastRestore = nil
+            state = .ready
         } catch { state = .blocked(error.localizedDescription) }
     }
 
-    func approveAndRestore() async {
+    func approveReviewedRestore() async {
         do {
             guard let bridge, let reviewedRestore else {
                 throw BridgeClientError.malformedResponse
@@ -178,14 +187,39 @@ final class WorkspaceStore: ObservableObject {
                 operationID: reviewedRestore.operationId,
                 fingerprint: reviewedRestore.plan.planFingerprint
             )
+            approvedRestoreFingerprint = reviewedRestore.plan.planFingerprint
+            lastRestoreBlocker = nil
+            state = .ready
+        } catch { state = .blocked(error.localizedDescription) }
+    }
+
+    func applyApprovedRestore() async {
+        do {
+            guard let bridge, let reviewedRestore,
+                  approvedRestoreFingerprint == reviewedRestore.plan.planFingerprint else {
+                throw BridgeClientError.requestFailed("desktop-approval-required")
+            }
             lastRestore = try await bridge.applyRestore(
                 operationID: reviewedRestore.operationId,
                 fingerprint: reviewedRestore.plan.planFingerprint
             ).result
             self.reviewedRestore = nil
+            approvedRestoreFingerprint = nil
             try await refresh()
             await refreshRecovery()
-        } catch { state = .blocked(error.localizedDescription) }
+        } catch {
+            reviewedRestore = nil
+            approvedRestoreFingerprint = nil
+            lastRestoreBlocker = "The restore review is no longer current. Start again from authenticated backup evidence."
+            await refreshRecovery()
+            state = .blocked(error.localizedDescription)
+        }
+    }
+
+    func discardReviewedRestore() {
+        reviewedRestore = nil
+        approvedRestoreFingerprint = nil
+        lastRestoreBlocker = nil
     }
 
     private static func bundledUnpin() throws -> URL {

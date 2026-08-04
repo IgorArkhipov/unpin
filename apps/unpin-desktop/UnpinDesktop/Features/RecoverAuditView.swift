@@ -3,6 +3,7 @@ import SwiftUI
 struct RecoverAuditView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @State private var selectedBackupID: String?
+    @State private var selectedOperationID: String?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -31,7 +32,12 @@ struct RecoverAuditView: View {
 
             if let reviewed = workspace.reviewedRestore {
                 Divider()
-                restoreReview(reviewed)
+                RestoreReviewView(reviewed: reviewed)
+            }
+
+            if let blocker = workspace.lastRestoreBlocker {
+                Label(blocker, systemImage: "exclamationmark.triangle")
+                    .foregroundStyle(.orange)
             }
 
             if let result = workspace.lastRestore {
@@ -59,6 +65,9 @@ struct RecoverAuditView: View {
             .frame(minWidth: 410, minHeight: 240)
 
             if let backup = recovery.backups.first(where: { $0.id == selectedBackupID }) {
+                LabeledContent("Created", value: backup.createdAt)
+                LabeledContent("Scope", value: backup.layers.joined(separator: ", "))
+                LabeledContent("Target state", value: backup.targetEnabled == true ? "On" : backup.targetEnabled == false ? "Off" : "Unavailable")
                 Button("Review restore") {
                     Task { await workspace.planRestore(backupID: backup.backupId) }
                 }
@@ -80,7 +89,8 @@ struct RecoverAuditView: View {
     private func operationList(_ recovery: RecoverySnapshot) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Operations").font(.headline)
-            List(recovery.operations) { operation in
+            List(selection: $selectedOperationID) {
+                ForEach(recovery.operations) { operation in
                 VStack(alignment: .leading, spacing: 3) {
                     Text(operation.operationKind.replacingOccurrences(of: "-", with: " ").capitalized)
                     Text("\(operation.lifecycle) · \(operation.resourceCount) resource(s)")
@@ -88,22 +98,66 @@ struct RecoverAuditView: View {
                         .foregroundStyle(operation.recoveryRequired ? .orange : .secondary)
                     Text(operation.operationId).font(.caption.monospaced()).foregroundStyle(.secondary)
                 }
+                .tag(Optional(operation.id))
+                }
             }
             .frame(minWidth: 360, minHeight: 240)
+
+            if let operation = recovery.operations.first(where: { $0.id == selectedOperationID }) {
+                operationDetail(operation)
+            } else {
+                Text("Select an operation to inspect its durable evidence.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 
-    private func restoreReview(_ reviewed: RestorePlanEnvelope) -> some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Review restore").font(.headline)
-            LabeledContent("Backup", value: reviewed.plan.backupId)
-            LabeledContent("Providers", value: reviewed.plan.providers.joined(separator: ", "))
-            LabeledContent("Resources", value: "\(reviewed.plan.affectedResourceIds.count)")
-            LabeledContent("Fingerprint", value: reviewed.plan.planFingerprint)
-                .font(.caption.monospaced())
-            Button("Approve and restore") { Task { await workspace.approveAndRestore() } }
-                .buttonStyle(.borderedProminent)
+    private func operationDetail(_ operation: RecoveryOperation) -> some View {
+        GroupBox("Operation evidence") {
+            VStack(alignment: .leading, spacing: 6) {
+                if let name = operation.qualifiedName {
+                    LabeledContent("Group", value: name)
+                }
+                if let state = operation.requestedState {
+                    LabeledContent("Requested state", value: state)
+                }
+                if let reach = operation.providerReach {
+                    LabeledContent("Provider reach", value: reach)
+                }
+                if let fingerprint = operation.effectGraphDigest {
+                    LabeledContent("Fingerprint", value: fingerprint)
+                        .font(.caption.monospaced())
+                }
+                LabeledContent("Lifecycle", value: operation.lifecycle)
+                LabeledContent("Resources", value: "\(operation.resourceCount)")
+                if let finalState = operation.finalState {
+                    LabeledContent("Final state", value: finalState)
+                }
+                if let createdAt = operation.createdAt {
+                    LabeledContent("Created", value: createdAt)
+                }
+                if let reason = operation.observationReason {
+                    Label(reason, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
+                if let backups = operation.backupIds, !backups.isEmpty {
+                    Text("Backup references: \(backups.joined(separator: ", "))")
+                        .font(.caption.monospaced())
+                }
+                if let members = operation.members {
+                    List(members) { member in
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(member.identity.id)
+                            Text(member.reason ?? member.failureMode ?? member.status)
+                                .font(.caption)
+                                .foregroundStyle(member.failureMode == "recovery-required" ? .orange : .secondary)
+                        }
+                    }
+                    .frame(minHeight: 100, maxHeight: 180)
+                }
+            }
         }
     }
 }

@@ -1199,8 +1199,16 @@ fn redacted_group_operation_summary(
         "operationId": inspection.operation.operation_id,
         "operationKind": ReachAwareOperationFamily::GroupToggle.as_str(),
         "lifecycle": inspection.operation.lifecycle,
+        "qualifiedName": inspection.operation.qualified_name,
+        "requestedState": inspection.operation.requested_state,
+        "createdAt": inspection.operation.created_at,
+        "updatedAt": inspection.operation.updated_at,
         "effectGraphDigest": inspection.operation.plan_fingerprint,
         "authorizationRecorded": true,
+        "providerReach": inspection.operation.provider_reach,
+        "providerCoverage": inspection.operation.provider_coverage,
+        "providerReachLifecycle": inspection.operation.provider_reach_lifecycle,
+        "providerWritesStarted": inspection.operation.provider_writes_started,
         "recoveryRequired": inspection.operation.lifecycle
             == unpin_core::groups::GroupOperationLifecycle::RecoveryRequired,
         "resourceCount": inspection
@@ -1214,6 +1222,10 @@ fn redacted_group_operation_summary(
             .flat_map(|cohort| cohort.backup_ids.iter())
             .collect::<Vec<_>>(),
         "evidenceAvailable": inspection.evidence_available,
+        "finalState": inspection.operation.terminal_result.as_ref().map(|result| result.final_state),
+        "observationFresh": inspection.operation.terminal_result.as_ref().map(|result| result.observation_fresh),
+        "observationReason": inspection.operation.terminal_result.as_ref().and_then(|result| result.observation_reason.as_ref()),
+        "members": inspection.operation.terminal_result.as_ref().map(|result| &result.members),
     })
 }
 
