@@ -9,6 +9,9 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var snapshot: BridgeSnapshot?
     @Published private(set) var reviewedPlan: GroupPlan?
     @Published private(set) var lastApply: GroupApplyResult?
+    @Published private(set) var recovery: RecoverySnapshot?
+    @Published private(set) var reviewedRestore: RestorePlanEnvelope?
+    @Published private(set) var lastRestore: RestoreApplyResult?
 
     private var bridge: BridgeClient?
 
@@ -39,6 +42,14 @@ final class WorkspaceStore: ObservableObject {
         state = .ready
     }
 
+    func refreshRecovery() async {
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            recovery = try await bridge.recoverySnapshot()
+            state = .ready
+        } catch { state = .blocked(error.localizedDescription) }
+    }
+
     func plan(group: GroupSummary, target: String) async {
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
@@ -54,6 +65,34 @@ final class WorkspaceStore: ObservableObject {
             _ = try await bridge.approveGroup(operationID: operationID, fingerprint: plan.planFingerprint)
             lastApply = try await bridge.applyGroup(operationID: operationID, fingerprint: plan.planFingerprint).result
             try await refresh()
+            await refreshRecovery()
+        } catch { state = .blocked(error.localizedDescription) }
+    }
+
+    func planRestore(backupID: String) async {
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            reviewedRestore = try await bridge.planRestore(backupID: backupID)
+            lastRestore = nil
+        } catch { state = .blocked(error.localizedDescription) }
+    }
+
+    func approveAndRestore() async {
+        do {
+            guard let bridge, let reviewedRestore else {
+                throw BridgeClientError.malformedResponse
+            }
+            _ = try await bridge.approveRestore(
+                operationID: reviewedRestore.operationId,
+                fingerprint: reviewedRestore.plan.planFingerprint
+            )
+            lastRestore = try await bridge.applyRestore(
+                operationID: reviewedRestore.operationId,
+                fingerprint: reviewedRestore.plan.planFingerprint
+            ).result
+            self.reviewedRestore = nil
+            try await refresh()
+            await refreshRecovery()
         } catch { state = .blocked(error.localizedDescription) }
     }
 

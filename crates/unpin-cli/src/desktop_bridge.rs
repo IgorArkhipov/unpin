@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     io::{self, BufRead, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -8,13 +8,18 @@ use serde_json::{Value, json};
 use unpin_core::{
     approval::ControlApprovalContext,
     config::UnpinConfig,
+    control::build_control_status,
+    control_operation::ReachAwareOperationFamily,
     discovery::{DiscoveryItem, DiscoveryRoots, discover_all},
     groups::{
         GroupAccessContext, GroupController, GroupPlanDisposition, GroupPlanMode, GroupPlanner,
         GroupRef, GroupResolver, GroupTargetState, GroupTogglePlan, MAX_GROUP_MEMBERS,
-        PersonalGroupStore, RepositoryGroupStore,
+        PersonalGroupStore, RepositoryGroupStore, list_group_operation_inspections,
     },
-    mutation::BackupAuthenticationKey,
+    mutation::{
+        BackupAuthenticationKey, RestoreControlPlan, RestoreController, RestoreResult,
+        load_backup_summaries_authenticated,
+    },
     provider_reach::ProviderReach,
     sessions::SessionAuthorityKey,
 };
@@ -24,6 +29,26 @@ use crate::credentials;
 pub(crate) const PROTOCOL_VERSION: u64 = 1;
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_REQUEST_ID_BYTES: usize = 128;
+const METHOD_HANDSHAKE: &str = "handshake";
+const METHOD_SNAPSHOT: &str = "snapshot";
+const METHOD_GROUP_PLAN: &str = "group.plan";
+const METHOD_GROUP_APPROVE: &str = "group.approve";
+const METHOD_GROUP_APPLY: &str = "group.apply";
+const METHOD_RECOVERY_SNAPSHOT: &str = "recovery.snapshot";
+const METHOD_RESTORE_PLAN: &str = "restore.plan";
+const METHOD_RESTORE_APPROVE: &str = "restore.approve";
+const METHOD_RESTORE_APPLY: &str = "restore.apply";
+const METHOD_SHUTDOWN: &str = "shutdown";
+const BRIDGE_CAPABILITIES: &[&str] = &[
+    METHOD_SNAPSHOT,
+    METHOD_GROUP_PLAN,
+    METHOD_GROUP_APPROVE,
+    METHOD_GROUP_APPLY,
+    METHOD_RECOVERY_SNAPSHOT,
+    METHOD_RESTORE_PLAN,
+    METHOD_RESTORE_APPROVE,
+    METHOD_RESTORE_APPLY,
+];
 
 pub(crate) struct DesktopBridgeContext {
     config: UnpinConfig,
@@ -60,6 +85,7 @@ fn run_with_io(
     let mut state = DesktopBridgeState {
         context,
         reviewed_groups: Default::default(),
+        reviewed_restores: Default::default(),
     };
     let mut seen_request_ids = BTreeSet::new();
     let mut frame = Vec::with_capacity(4096);
@@ -98,11 +124,17 @@ struct Request {
 
 struct DesktopBridgeState {
     context: DesktopBridgeContext,
-    reviewed_groups: std::collections::BTreeMap<String, ReviewedGroupPlan>,
+    reviewed_groups: BTreeMap<String, ReviewedGroupPlan>,
+    reviewed_restores: BTreeMap<String, ReviewedRestorePlan>,
 }
 
 struct ReviewedGroupPlan {
     plan: GroupTogglePlan,
+    authorization: Option<unpin_core::approval::ControlAuthorization>,
+}
+
+struct ReviewedRestorePlan {
+    plan: RestoreControlPlan,
     authorization: Option<unpin_core::approval::ControlAuthorization>,
 }
 
@@ -183,12 +215,16 @@ fn valid_request_id(value: &str) -> bool {
 
 fn handle_request(state: &mut DesktopBridgeState, request: Request) -> Value {
     let result = match request.method.as_str() {
-        "handshake" => Ok(handshake_response()),
-        "snapshot" => snapshot_response(&state.context),
-        "group.plan" => plan_group(state, &request.params),
-        "group.approve" => approve_group(state, &request.params),
-        "group.apply" => apply_group(state, &request.params),
-        "shutdown" => Ok(json!({"shutdown": true})),
+        METHOD_HANDSHAKE => Ok(handshake_response()),
+        METHOD_SNAPSHOT => snapshot_response(&state.context),
+        METHOD_GROUP_PLAN => plan_group(state, &request.params),
+        METHOD_GROUP_APPROVE => approve_group(state, &request.params),
+        METHOD_GROUP_APPLY => apply_group(state, &request.params),
+        METHOD_RECOVERY_SNAPSHOT => recovery_snapshot_response(&state.context),
+        METHOD_RESTORE_PLAN => plan_restore(state, &request.params),
+        METHOD_RESTORE_APPROVE => approve_restore(state, &request.params),
+        METHOD_RESTORE_APPLY => apply_restore(state, &request.params),
+        METHOD_SHUTDOWN => Ok(json!({"shutdown": true})),
         _ => Err("unknown-method"),
     };
     match result {
@@ -205,7 +241,7 @@ fn handshake_response() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "binaryVersion": env!("CARGO_PKG_VERSION"),
-        "capabilities": ["snapshot", "group.plan", "group.approve", "group.apply"],
+        "capabilities": BRIDGE_CAPABILITIES,
     })
 }
 
@@ -253,12 +289,7 @@ fn approve_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value
     {
         return Err("plan-fingerprint-mismatch");
     }
-    let group_context = group_access_context(&state.context)?;
-    let approval_context = ControlApprovalContext::new(
-        group_context.repository_key(),
-        group_context.workspace_key(),
-    )
-    .map_err(|_| "approval-context-unavailable")?;
+    let approval_context = approval_context(&state.context)?;
     let expectation = reviewed
         .plan
         .approval_expectation(&approval_context)
@@ -304,6 +335,118 @@ fn apply_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, 
     Ok(json!({"result": result}))
 }
 
+fn plan_restore(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &["backupId"])?;
+    let backup_id = required_string(params, "backupId")?;
+    let group_context = group_access_context(&state.context)?;
+    let approval_context = control_approval_context(&group_context)?;
+    let app_state_root = group_context.app_state_root().to_path_buf();
+    let backup_key = backup_authentication_key(&state.context)?;
+    let plan = RestoreController::new(&app_state_root)
+        .plan(backup_id, &approval_context, Some(&backup_key))
+        .map_err(|_| "restore-plan-unavailable")?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|_| "restore-plan-unavailable")?;
+    let operation_id = expectation.operation_id.clone();
+    state.reviewed_restores.insert(
+        operation_id.clone(),
+        ReviewedRestorePlan {
+            plan: plan.clone(),
+            authorization: None,
+        },
+    );
+    Ok(json!({
+        "operationId": operation_id,
+        "plan": redacted_restore_plan(&plan),
+    }))
+}
+
+fn approve_restore(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let plan = {
+        let reviewed = state
+            .reviewed_restores
+            .get(operation_id)
+            .ok_or("restore-plan-unavailable")?;
+        if reviewed.plan.plan_fingerprint != plan_fingerprint {
+            return Err("plan-fingerprint-mismatch");
+        }
+        reviewed.plan.clone()
+    };
+    let approval_context = approval_context(&state.context)?;
+    let expectation = plan
+        .approval_expectation(&approval_context)
+        .map_err(|_| "restore-plan-unavailable")?;
+    let authorization = credentials::authorize_desktop_control_decision(
+        state.context.fixture_mode,
+        &state.context.config.app_state_root,
+        &expectation,
+        &plan.plan_fingerprint,
+        Some(plan_fingerprint),
+        "unpin-desktop-local-restore-approval",
+        unix_now(),
+    )
+    .map_err(|_| "desktop-approval-blocked")?;
+    state
+        .reviewed_restores
+        .get_mut(operation_id)
+        .ok_or("restore-plan-unavailable")?
+        .authorization = Some(authorization);
+    Ok(json!({
+        "operationId": operation_id,
+        "planFingerprint": plan_fingerprint,
+        "approval": "current",
+    }))
+}
+
+fn apply_restore(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let plan = {
+        let reviewed = state
+            .reviewed_restores
+            .get(operation_id)
+            .ok_or("restore-plan-unavailable")?;
+        if reviewed.plan.plan_fingerprint != plan_fingerprint {
+            return Err("plan-fingerprint-mismatch");
+        }
+        reviewed
+            .authorization
+            .as_ref()
+            .ok_or("desktop-approval-required")?;
+        reviewed.plan.clone()
+    };
+    let group_context = group_access_context(&state.context)?;
+    let approval_context = control_approval_context(&group_context)?;
+    let app_state_root = group_context.app_state_root().to_path_buf();
+    let backup_key = backup_authentication_key(&state.context)?;
+    let session_key = session_authority_key(&state.context)?;
+    let mut fixture_paths = vec![app_state_root.as_path()];
+    fixture_paths.extend(
+        plan.affected_resources
+            .iter()
+            .map(|resource| std::path::Path::new(resource.path.as_str())),
+    );
+    unpin_core::fixture::require_fixture_write_sandbox(state.context.fixture_mode, fixture_paths)
+        .map_err(|_| "fixture-write-sandbox-blocked")?;
+    let authorization = state
+        .reviewed_restores
+        .get_mut(operation_id)
+        .ok_or("restore-plan-unavailable")?
+        .authorization
+        .take()
+        .ok_or("desktop-approval-required")?;
+    let result = RestoreController::with_session_authority_key(&app_state_root, session_key)
+        .apply(&plan, authorization, &approval_context, Some(backup_key))
+        .map_err(|_| "restore-apply-blocked")?;
+    state.reviewed_restores.remove(operation_id);
+    Ok(json!({"result": redacted_restore_result(&result)}))
+}
+
 fn require_only_params(params: &Value, allowed: &[&str]) -> Result<(), &'static str> {
     let object = params.as_object().ok_or("invalid-params")?;
     if object.keys().any(|key| !allowed.contains(&key.as_str())) {
@@ -328,27 +471,21 @@ fn group_access_context(
 }
 
 fn group_planner(context: &DesktopBridgeContext) -> Result<GroupPlanner, &'static str> {
+    Ok(GroupPlanner::new(group_resolver(context)?))
+}
+
+fn group_resolver(context: &DesktopBridgeContext) -> Result<GroupResolver, &'static str> {
     let group_context = group_access_context(context)?;
-    Ok(GroupPlanner::new(GroupResolver::new(
+    Ok(GroupResolver::new(
         group_context.clone(),
         PersonalGroupStore::new(group_context.clone()),
         RepositoryGroupStore::new(group_context),
-    )))
+    ))
 }
 
 fn group_controller(context: &DesktopBridgeContext) -> Result<GroupController, &'static str> {
-    let backup_key = credentials::resolve_backup_authentication_key(
-        context.fixture_mode,
-        &context.config.app_state_root,
-    )
-    .map_err(|_| "backup-authentication-unavailable")?
-    .ok_or("backup-authentication-unavailable")?;
-    let session_key = credentials::resolve_session_authority_key(
-        context.fixture_mode,
-        &context.config.app_state_root,
-    )
-    .map_err(|_| "session-authority-unavailable")?
-    .ok_or("session-authority-unavailable")?;
+    let backup_key = backup_authentication_key(context)?;
+    let session_key = session_authority_key(context)?;
     controller_with_keys(context, backup_key, session_key)
 }
 
@@ -364,16 +501,217 @@ fn controller_with_keys(
     ))
 }
 
+fn approval_context(
+    context: &DesktopBridgeContext,
+) -> Result<ControlApprovalContext, &'static str> {
+    let group_context = group_access_context(context)?;
+    control_approval_context(&group_context)
+}
+
+fn control_approval_context(
+    group_context: &GroupAccessContext,
+) -> Result<ControlApprovalContext, &'static str> {
+    ControlApprovalContext::new(
+        group_context.repository_key(),
+        group_context.workspace_key(),
+    )
+    .map_err(|_| "approval-context-unavailable")
+}
+
+fn backup_authentication_key(
+    context: &DesktopBridgeContext,
+) -> Result<BackupAuthenticationKey, &'static str> {
+    credentials::resolve_backup_authentication_key(
+        context.fixture_mode,
+        &context.config.app_state_root,
+    )
+    .map_err(|_| "backup-authentication-unavailable")?
+    .ok_or("backup-authentication-unavailable")
+}
+
+fn session_authority_key(
+    context: &DesktopBridgeContext,
+) -> Result<SessionAuthorityKey, &'static str> {
+    credentials::resolve_session_authority_key(context.fixture_mode, &context.config.app_state_root)
+        .map_err(|_| "session-authority-unavailable")?
+        .ok_or("session-authority-unavailable")
+}
+
+fn recovery_snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &'static str> {
+    let backup_key = backup_authentication_key(context);
+    let (backups, backup_status) = match backup_key.as_ref() {
+        Ok(key) => (
+            load_backup_summaries_authenticated(&context.config.app_state_root, Some(key))
+                .iter()
+                .map(redacted_backup_summary)
+                .collect::<Vec<_>>(),
+            "available",
+        ),
+        Err(_) => (Vec::new(), "unavailable"),
+    };
+    let (mut operations, control_operation_status) = control_operation_summaries(context);
+    let (group_operations, group_operation_status) =
+        group_operation_summaries(context, backup_key.as_ref().ok());
+    operations.extend(group_operations);
+    operations.sort_by(|left, right| {
+        left["operationId"]
+            .as_str()
+            .cmp(&right["operationId"].as_str())
+    });
+    let operation_status =
+        if control_operation_status == "available" && group_operation_status == "available" {
+            "available"
+        } else {
+            "unavailable"
+        };
+    Ok(json!({
+        "backups": backups,
+        "backupStatus": backup_status,
+        "operations": operations,
+        "operationStatus": operation_status,
+        "groupOperationStatus": group_operation_status,
+    }))
+}
+
+fn control_operation_summaries(context: &DesktopBridgeContext) -> (Vec<Value>, &'static str) {
+    let Ok(session_key) = session_authority_key(context) else {
+        return (Vec::new(), "unavailable");
+    };
+    let Ok(discovery) = discover_all(&context.discovery_roots) else {
+        return (Vec::new(), "unavailable");
+    };
+    let Ok(status) = build_control_status(
+        &discovery,
+        &context.config.app_state_root,
+        &context.config.project_root,
+        &session_key,
+    ) else {
+        return (Vec::new(), "unavailable");
+    };
+    (
+        status
+            .operations
+            .iter()
+            .map(redacted_operation_summary)
+            .collect(),
+        "available",
+    )
+}
+
+fn group_operation_summaries(
+    context: &DesktopBridgeContext,
+    backup_key: Option<&BackupAuthenticationKey>,
+) -> (Vec<Value>, &'static str) {
+    let Some(backup_key) = backup_key else {
+        return (Vec::new(), "unavailable");
+    };
+    let Ok(group_context) = group_access_context(context) else {
+        return (Vec::new(), "unavailable");
+    };
+    match list_group_operation_inspections(
+        group_context.app_state_root(),
+        backup_key.clone(),
+        group_context.repository_key(),
+        group_context.workspace_key(),
+    ) {
+        Ok(operations) => (
+            operations
+                .iter()
+                .map(redacted_group_operation_summary)
+                .collect(),
+            "available",
+        ),
+        Err(
+            unpin_core::groups::GroupOperationError::Authentication(_)
+            | unpin_core::groups::GroupOperationError::AuthenticationFailed,
+        ) => (Vec::new(), "authentication-unavailable"),
+        Err(unpin_core::groups::GroupOperationError::ContextMismatch) => {
+            (Vec::new(), "context-unavailable")
+        }
+        Err(unpin_core::groups::GroupOperationError::State(_)) => (Vec::new(), "state-unavailable"),
+        Err(unpin_core::groups::GroupOperationError::Io(_)) => (Vec::new(), "storage-unavailable"),
+        Err(
+            unpin_core::groups::GroupOperationError::InvalidOperationId
+            | unpin_core::groups::GroupOperationError::InvalidRecord
+            | unpin_core::groups::GroupOperationError::InvalidBackupIndex
+            | unpin_core::groups::GroupOperationError::Json(_)
+            | unpin_core::groups::GroupOperationError::Clock(_),
+        ) => (Vec::new(), "evidence-invalid"),
+    }
+}
+
+fn redacted_backup_summary(summary: &unpin_core::mutation::BackupSummary) -> Value {
+    json!({
+        "backupId": summary.backup_id,
+        "createdAt": summary.created_at,
+        "itemCount": summary.item_count,
+        "providers": summary.providers,
+        "layers": summary.layers,
+        "restorable": summary.restorable,
+        "authentication": summary.authentication,
+        "targetEnabled": summary.target_enabled,
+    })
+}
+
+fn redacted_operation_summary(operation: &unpin_core::control::ControlOperationStatus) -> Value {
+    json!({
+        "operationId": operation.operation_id,
+        "operationKind": operation.operation_kind,
+        "lifecycle": operation.lifecycle,
+        "effectGraphDigest": operation.effect_graph_digest,
+        "authorizationRecorded": operation.authorization_recorded,
+        "terminalCode": operation.terminal_code,
+        "recoveryRequired": operation.recovery_required,
+        "resourceCount": operation.resources.len(),
+    })
+}
+
+fn redacted_group_operation_summary(
+    inspection: &unpin_core::groups::GroupOperationInspection,
+) -> Value {
+    json!({
+        "operationId": inspection.operation.operation_id,
+        "operationKind": ReachAwareOperationFamily::GroupToggle.as_str(),
+        "lifecycle": inspection.operation.lifecycle,
+        "effectGraphDigest": inspection.operation.plan_fingerprint,
+        "authorizationRecorded": true,
+        "recoveryRequired": inspection.operation.lifecycle
+            == unpin_core::groups::GroupOperationLifecycle::RecoveryRequired,
+        "resourceCount": inspection
+            .cohort_backup_indexes
+            .iter()
+            .map(|cohort| cohort.resource_ids.len())
+            .sum::<usize>(),
+        "backupIds": inspection
+            .cohort_backup_indexes
+            .iter()
+            .flat_map(|cohort| cohort.backup_ids.iter())
+            .collect::<Vec<_>>(),
+        "evidenceAvailable": inspection.evidence_available,
+    })
+}
+
+fn redacted_restore_plan(plan: &RestoreControlPlan) -> Value {
+    json!({
+        "backupId": plan.backup_id,
+        "providers": plan.providers,
+        "authentication": plan.authentication,
+        "affectedResourceIds": plan.affected_resources.iter().map(|resource| &resource.resource_id).collect::<Vec<_>>(),
+        "planFingerprint": plan.plan_fingerprint,
+    })
+}
+
+fn redacted_restore_result(result: &RestoreResult) -> Value {
+    json!({
+        "status": result.status,
+        "backupId": result.backup_id,
+        "affectedTargetCount": result.affected_targets.len(),
+    })
+}
+
 fn snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &'static str> {
     let discovery = discover_all(&context.discovery_roots).map_err(|_| "discovery-unavailable")?;
-    let group_context =
-        GroupAccessContext::from_config(&context.config, &context.discovery_roots, None, None)
-            .map_err(|_| "group-context-unavailable")?;
-    let resolver = GroupResolver::new(
-        group_context.clone(),
-        PersonalGroupStore::new(group_context.clone()),
-        RepositoryGroupStore::new(group_context),
-    );
+    let resolver = group_resolver(context)?;
     let (groups, group_warnings) = resolver
         .list_views_with_warnings(&discovery)
         .map_err(|_| "group-state-unavailable")?;

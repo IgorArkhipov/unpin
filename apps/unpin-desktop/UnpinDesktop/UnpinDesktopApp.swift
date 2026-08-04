@@ -42,6 +42,11 @@ private struct WorkbenchView: View {
                     RecoverAuditView()
                 }
             }
+            .onChange(of: workArea) { _, area in
+                if area == .recover {
+                    Task { await workspace.refreshRecovery() }
+                }
+            }
         }
         .overlay(alignment: .bottomLeading) {
             if let message = workspace.statusMessage {

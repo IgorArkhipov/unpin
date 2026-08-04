@@ -1,4 +1,8 @@
-use std::{collections::BTreeSet, fmt, path::PathBuf};
+use std::{
+    collections::BTreeSet,
+    fmt,
+    path::{Path, PathBuf},
+};
 
 use crate::{
     approval::ApprovalExpectation,
@@ -6,6 +10,7 @@ use crate::{
     control_operation::{
         ControlOperationEnvelope, ControlOperationLifecycle, ControlResolvedContext,
     },
+    fs_support::read_optional_dir,
     groups::{GroupMemberIdentity, GroupState, GroupTargetState, GroupTogglePlan},
     mutation::{BackupAuthenticationKey, authenticated_backup_manifest_digest},
     provider_reach::{ProviderReach, ProviderReachCoverage, ProviderReachLifecycle},
@@ -370,9 +375,7 @@ impl GroupOperationStore {
     ) -> Result<(), GroupOperationError> {
         index.verify(&self.authentication_key)?;
         AtomicJsonStore::new(
-            self.app_state_root
-                .join("groups")
-                .join("operations")
+            operations_root(&self.app_state_root)
                 .join(&index.operation_id)
                 .join("cohorts")
                 .join(format!("{}.json", index.cohort_id)),
@@ -395,9 +398,7 @@ impl GroupOperationStore {
         let mut indexes = Vec::new();
         for cohort in &plan.cohorts {
             let Some(snapshot) = AtomicJsonStore::new(
-                self.app_state_root
-                    .join("groups")
-                    .join("operations")
+                operations_root(&self.app_state_root)
                     .join(operation_id)
                     .join("cohorts")
                     .join(format!("{}.json", cohort.cohort_id)),
@@ -420,13 +421,18 @@ impl GroupOperationStore {
 
     fn store(&self, operation_id: &str) -> AtomicJsonStore {
         AtomicJsonStore::new(
-            self.app_state_root
-                .join("groups")
-                .join("operations")
-                .join(format!("{operation_id}.json")),
+            operation_record_path(&self.app_state_root, operation_id),
             GROUP_OPERATION_STATE_SCHEMA_VERSION,
         )
     }
+}
+
+fn operations_root(app_state_root: &Path) -> PathBuf {
+    app_state_root.join("groups").join("operations")
+}
+
+fn operation_record_path(app_state_root: &Path, operation_id: &str) -> PathBuf {
+    operations_root(app_state_root).join(format!("{operation_id}.json"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -453,13 +459,24 @@ pub fn load_group_operation_inspection(
     if record.repository_key != repository_key || record.workspace_key != workspace_key {
         return Err(GroupOperationError::ContextMismatch);
     }
-    let backup_indexes = store.load_backup_indexes(&record.sealed_plan)?;
-    let manifests_available = backup_indexes.iter().all(|index| {
-        index.backup_ids.iter().all(|backup_id| {
-            authenticated_backup_manifest_digest(&app_state_root, backup_id, &authentication_key)
+    let (backup_indexes, indexes_available) = match store.load_backup_indexes(&record.sealed_plan) {
+        Ok(indexes) => (indexes, true),
+        // Do not hide a durable operation because its index cannot be read.
+        // A write that lacks authenticated evidence is explicitly unsafe to
+        // retry, so the public projection below marks it recovery-required.
+        Err(_) => (Vec::new(), false),
+    };
+    let manifests_available = indexes_available
+        && backup_indexes.iter().all(|index| {
+            index.backup_ids.iter().all(|backup_id| {
+                authenticated_backup_manifest_digest(
+                    &app_state_root,
+                    backup_id,
+                    &authentication_key,
+                )
                 .is_ok()
-        })
-    });
+            })
+        });
     let evidence_available = manifests_available
         && if let Some(result) = record.terminal_result.as_ref() {
             backup_indexes_cover_result(result, &backup_indexes)
@@ -496,6 +513,51 @@ pub fn load_group_operation_inspection(
         cohort_backup_indexes,
         evidence_available,
     }))
+}
+
+/// List authenticated group-operation evidence for one exact workspace.
+///
+/// Discovery of operation ids remains inside the core boundary: callers never
+/// construct a filesystem path from a desktop-client supplied identifier.
+pub fn list_group_operation_inspections(
+    app_state_root: impl Into<PathBuf>,
+    authentication_key: BackupAuthenticationKey,
+    repository_key: &str,
+    workspace_key: &str,
+) -> Result<Vec<GroupOperationInspection>, GroupOperationError> {
+    let app_state_root = app_state_root.into();
+    let Some(entries) = read_optional_dir(&operations_root(&app_state_root))
+        .map_err(|error| GroupOperationError::Io(error.to_string()))?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut operation_ids = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| GroupOperationError::Io(error.to_string()))?;
+        let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(operation_id) = file_name.strip_suffix(".json") else {
+            continue;
+        };
+        validate_operation_id(operation_id)?;
+        operation_ids.push(operation_id.to_string());
+    }
+    let mut inspections = Vec::new();
+    for operation_id in operation_ids {
+        match load_group_operation_inspection(
+            app_state_root.clone(),
+            authentication_key.clone(),
+            &operation_id,
+            repository_key,
+            workspace_key,
+        ) {
+            Ok(Some(inspection)) => inspections.push(inspection),
+            Ok(None) | Err(GroupOperationError::ContextMismatch) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(inspections)
 }
 
 fn backup_indexes_cover_result(
@@ -768,6 +830,7 @@ fn valid_cohort_id(value: &str) -> bool {
 pub enum GroupOperationError {
     State(StateError),
     Json(serde_json::Error),
+    Io(String),
     Clock(String),
     InvalidOperationId,
     InvalidRecord,
@@ -788,6 +851,7 @@ impl fmt::Display for GroupOperationError {
         match self {
             Self::State(error) => error.fmt(formatter),
             Self::Json(error) => write!(formatter, "group operation JSON failed: {error}"),
+            Self::Io(error) => write!(formatter, "group operation I/O failed: {error}"),
             Self::Clock(error) => write!(formatter, "group operation clock failed: {error}"),
             Self::InvalidOperationId => formatter.write_str("invalid group operation id"),
             Self::InvalidRecord => formatter.write_str("invalid group operation record"),

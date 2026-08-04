@@ -203,7 +203,7 @@ fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request()
 
 #[cfg(unix)]
 #[test]
-fn desktop_bridge_group_apply_requires_a_current_one_time_local_approval() {
+fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approval() {
     let root = TempDir::new().expect("tempdir");
     let fixture_root = root.path().join("fixtures");
     let project_root = root.path().join("workspace");
@@ -321,10 +321,147 @@ fn desktop_bridge_group_apply_requires_a_current_one_time_local_approval() {
     }));
     assert_eq!(applied["result"]["result"]["requestedState"], "disable");
 
-    drop(request);
+    let backup_id = applied["result"]["result"]["backupIds"][0]
+        .as_str()
+        .expect("group apply backup id")
+        .to_string();
+    let recovery = request(serde_json::json!({
+        "version": 1,
+        "id": "recovery-1",
+        "method": "recovery.snapshot",
+        "params": {},
+    }));
+    assert_eq!(recovery["result"]["backups"][0]["backupId"], backup_id);
+    assert!(recovery["result"]["backups"][0].get("paths").is_none());
+    assert!(recovery["result"]["backups"][0].get("selection").is_none());
+    assert!(
+        recovery["result"]["operations"]
+            .as_array()
+            .expect("operation summaries")
+            .iter()
+            .any(|operation| operation["operationId"] == operation_id)
+    );
+
+    let restore_plan = request(serde_json::json!({
+        "version": 1,
+        "id": "restore-plan-1",
+        "method": "restore.plan",
+        "params": {"backupId": backup_id},
+    }));
+    let restore_operation_id = restore_plan["result"]["operationId"]
+        .as_str()
+        .expect("restore operation id")
+        .to_string();
+    let restore_fingerprint = restore_plan["result"]["plan"]["planFingerprint"]
+        .as_str()
+        .expect("restore plan fingerprint")
+        .to_string();
+    assert!(
+        restore_plan["result"]["plan"]
+            .get("affectedResources")
+            .is_none()
+    );
+    assert!(
+        restore_plan["result"]["plan"]
+            .get("affectedResourceIds")
+            .is_some()
+    );
+
+    let restore_without_approval = request(serde_json::json!({
+        "version": 1,
+        "id": "restore-apply-before-approval",
+        "method": "restore.apply",
+        "params": {
+            "operationId": restore_operation_id,
+            "planFingerprint": restore_fingerprint,
+        },
+    }));
+    assert_eq!(
+        restore_without_approval["error"]["code"],
+        "desktop-approval-required"
+    );
+    let restore_approved = request(serde_json::json!({
+        "version": 1,
+        "id": "restore-approve-1",
+        "method": "restore.approve",
+        "params": {
+            "operationId": restore_operation_id,
+            "planFingerprint": restore_fingerprint,
+        },
+    }));
+    assert_eq!(restore_approved["result"]["approval"], "current");
+    let restored = request(serde_json::json!({
+        "version": 1,
+        "id": "restore-apply-1",
+        "method": "restore.apply",
+        "params": {
+            "operationId": restore_operation_id,
+            "planFingerprint": restore_fingerprint,
+        },
+    }));
+    assert_eq!(restored["result"]["result"]["status"], "restored");
+    assert!(
+        restored["result"]["result"]
+            .get("affectedTargets")
+            .is_none()
+    );
+    assert!(
+        restored["result"]["result"]
+            .get("affectedTargetCount")
+            .is_some()
+    );
+    assert!(restored["result"]["result"].get("reason").is_none());
+
+    let restore_after_success = request(serde_json::json!({
+        "version": 1,
+        "id": "restore-apply-after-success",
+        "method": "restore.apply",
+        "params": {
+            "operationId": restore_operation_id,
+            "planFingerprint": restore_fingerprint,
+        },
+    }));
+    assert_eq!(
+        restore_after_success["error"]["code"],
+        "restore-plan-unavailable"
+    );
+
     drop(input);
     let status = child.wait().expect("wait for bridge");
     assert!(status.success());
+
+    let other_project_root = root.path().join("other-workspace");
+    fs::create_dir_all(other_project_root.join(".git")).expect("other workspace");
+    let foreign_recovery = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["desktop", "bridge"])
+        .arg("--fixture-root")
+        .arg(&fixture_root)
+        .arg("--home-root")
+        .arg(&fixture_root)
+        .arg("--project-root")
+        .arg(&other_project_root)
+        .arg("--app-state-root")
+        .arg(&app_state_root)
+        .write_stdin(
+            serde_json::json!({
+                "version": 1,
+                "id": "foreign-recovery",
+                "method": "recovery.snapshot",
+                "params": {},
+            })
+            .to_string()
+                + "\n",
+        )
+        .output()
+        .expect("foreign recovery output");
+    assert!(foreign_recovery.status.success());
+    let foreign_recovery = serde_json::from_slice::<serde_json::Value>(&foreign_recovery.stdout)
+        .expect("foreign recovery JSON");
+    assert_eq!(
+        foreign_recovery["result"]["groupOperationStatus"],
+        "available"
+    );
 }
 
 fn assert_success_json(output: Output, label: &str) -> serde_json::Value {
