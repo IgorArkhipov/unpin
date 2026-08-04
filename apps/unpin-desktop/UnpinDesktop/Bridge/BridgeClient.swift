@@ -11,6 +11,7 @@ enum BridgeClientError: LocalizedError {
     case malformedResponse
     case requestFailed(String)
     case requestTimedOut
+    case controlRequestUncertain
     case childStopped
 
     var errorDescription: String? {
@@ -23,6 +24,7 @@ enum BridgeClientError: LocalizedError {
         case .malformedResponse: "The Unpin bridge returned an invalid response."
         case .requestFailed(let code): "The Unpin bridge blocked this request: \(code)."
         case .requestTimedOut: "The bundled Unpin bridge did not respond. Select Reload workspace to restart it."
+        case .controlRequestUncertain: "The Unpin bridge did not confirm this change. Inspect Recover and Audit before trying again."
         case .childStopped: "The bundled Unpin process stopped unexpectedly."
         }
     }
@@ -54,6 +56,7 @@ actor BridgeClient {
     static let protocolVersion = 2
     private static let maximumFrameBytes = 1_048_576
     private static let readOnlyRequestTimeoutMilliseconds = 15_000
+    private static let defaultControlRequestTimeoutMilliseconds = 180_000
 
     private let executableURL: URL
     private let projectRoot: URL
@@ -65,17 +68,20 @@ actor BridgeClient {
     private var outputBuffer = Data()
     private var requestSequence = 0
     private var controlRequestInFlight = false
+    private let controlRequestTimeoutMilliseconds: Int
 
     init(
         executableURL: URL,
         projectRoot: URL,
         manifest: BundledBridgeManifest,
-        roots: BridgeLaunchRoots = BridgeLaunchRoots()
+        roots: BridgeLaunchRoots = BridgeLaunchRoots(),
+        controlRequestTimeoutMilliseconds: Int = BridgeClient.defaultControlRequestTimeoutMilliseconds
     ) {
         self.executableURL = executableURL
         self.projectRoot = projectRoot
         self.manifest = manifest
         self.roots = roots
+        self.controlRequestTimeoutMilliseconds = max(1, controlRequestTimeoutMilliseconds)
     }
 
     func start() throws {
@@ -236,6 +242,11 @@ actor BridgeClient {
     @discardableResult
     func stop() -> Bool {
         guard controlRequestInFlight == false else { return false }
+        forceStop()
+        return true
+    }
+
+    private func forceStop() {
         let child = process
         input?.closeFile()
         output?.closeFile()
@@ -247,7 +258,6 @@ actor BridgeClient {
             child.terminate()
             child.waitUntilExit()
         }
-        return true
     }
 
     private func request<Parameters: Encodable, Response: Decodable>(
@@ -267,8 +277,6 @@ actor BridgeClient {
         )
         let encoded = try JSONEncoder().encode(request)
         guard encoded.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
-        input.write(encoded)
-        input.write(Data([0x0A]))
         if kind != .readOnly {
             controlRequestInFlight = true
         }
@@ -278,6 +286,9 @@ actor BridgeClient {
             }
         }
         do {
+            try Task.checkCancellation()
+            input.write(encoded)
+            input.write(Data([0x0A]))
             let responseData = try await readFrame(from: output, kind: kind)
             let response = try JSONDecoder().decode(BridgeResponse<Response>.self, from: responseData)
             guard response.version == Self.protocolVersion, response.id == request.id else {
@@ -286,37 +297,50 @@ actor BridgeClient {
             if let error = response.error { throw BridgeClientError.requestFailed(error.code) }
             guard let result = response.result else { throw BridgeClientError.malformedResponse }
             return result
+        } catch is CancellationError {
+            if kind == .readOnly {
+                forceStop()
+                throw CancellationError()
+            }
+            forceStop()
+            throw BridgeClientError.controlRequestUncertain
         } catch let error as BridgeClientError {
             if case .requestFailed = error {
                 throw error
             }
             if kind == .readOnly {
-                stop()
+                forceStop()
+                throw error
+            }
+            forceStop()
+            if case .requestTimedOut = error {
+                throw BridgeClientError.controlRequestUncertain
             }
             throw error
         } catch {
             if kind == .readOnly {
-                stop()
+                forceStop()
+                throw error
             }
+            forceStop()
             throw error
         }
     }
 
     private func readFrame(from output: FileHandle, kind: BridgeRequestKind) async throws -> Data {
-        let deadline = kind == .readOnly
-            ? Date().timeIntervalSinceReferenceDate + Double(Self.readOnlyRequestTimeoutMilliseconds) / 1_000
-            : nil
+        let timeoutMilliseconds = kind == .readOnly
+            ? Self.readOnlyRequestTimeoutMilliseconds
+            : controlRequestTimeoutMilliseconds
+        let deadline = Date().timeIntervalSinceReferenceDate + Double(timeoutMilliseconds) / 1_000
         while true {
-            if kind == .readOnly {
-                try Task.checkCancellation()
-            }
+            try Task.checkCancellation()
             if let newline = outputBuffer.firstIndex(of: 0x0A) {
                 let frame = outputBuffer.prefix(upTo: newline)
                 outputBuffer.removeSubrange(...newline)
                 guard frame.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
                 return Data(frame)
             }
-            if let deadline, Date().timeIntervalSinceReferenceDate >= deadline {
+            if Date().timeIntervalSinceReferenceDate >= deadline {
                 throw BridgeClientError.requestTimedOut
             }
             var descriptor = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)
@@ -416,6 +440,77 @@ struct GroupWarning: Decodable, Identifiable {
 
     var id: String { "\(scope)-\(code)" }
 }
+
+enum ProviderReachValue: Decodable, Equatable {
+    case all
+    case selected(provider: String, provenance: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case selected
+    }
+
+    private struct Selected: Decodable {
+        let provider: String
+        let provenance: String
+    }
+
+    init(from decoder: Decoder) throws {
+        let singleValue = try decoder.singleValueContainer()
+        if let value = try? singleValue.decode(String.self) {
+            guard value == "all" else {
+                throw DecodingError.dataCorruptedError(
+                    in: singleValue,
+                    debugDescription: "Unsupported provider reach value: \(value)"
+                )
+            }
+            self = .all
+            return
+        }
+
+        let object = try decoder.container(keyedBy: CodingKeys.self)
+        let selected = try object.decode(Selected.self, forKey: .selected)
+        self = .selected(provider: selected.provider, provenance: selected.provenance)
+    }
+
+    var displayName: String {
+        switch self {
+        case .all:
+            "all"
+        case .selected(let provider, let provenance):
+            "selected · \(provider) · \(provenance)"
+        }
+    }
+}
+
+@propertyWrapper
+struct ProviderReachField: Decodable {
+    private let value: ProviderReachValue
+
+    var wrappedValue: String { value.displayName }
+    var projectedValue: ProviderReachValue { value }
+
+    init(from decoder: Decoder) throws {
+        value = try ProviderReachValue(from: decoder)
+    }
+}
+
+@propertyWrapper
+struct OptionalProviderReachField: Decodable {
+    private let value: ProviderReachValue?
+
+    var wrappedValue: String? { value?.displayName }
+    var projectedValue: ProviderReachValue? { value }
+
+    init(value: ProviderReachValue?) {
+        self.value = value
+    }
+
+    init(from decoder: Decoder) throws {
+        let singleValue = try decoder.singleValueContainer()
+        value = singleValue.decodeNil() ? nil : try ProviderReachValue(from: decoder)
+    }
+}
+
 struct GroupSummary: Decodable, Identifiable {
     let qualifiedName: String
     let scope: String
@@ -427,6 +522,27 @@ struct GroupSummary: Decodable, Identifiable {
 
     var id: String { qualifiedName }
     var name: String { qualifiedName.split(separator: ":", maxSplits: 1).last.map(String.init) ?? qualifiedName }
+
+    private enum CodingKeys: String, CodingKey {
+        case qualifiedName
+        case scope
+        case revision
+        case contextCompatible
+        case members
+        case state
+        case fresh
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        qualifiedName = try container.decode(String.self, forKey: .qualifiedName)
+        scope = try container.decode(String.self, forKey: .scope)
+        revision = try container.decode(String.self, forKey: .revision)
+        contextCompatible = try container.decode(Bool.self, forKey: .contextCompatible)
+        members = try container.decodeIfPresent([GroupMemberView].self, forKey: .members) ?? []
+        state = try container.decodeIfPresent(String.self, forKey: .state)
+        fresh = try container.decodeIfPresent(Bool.self, forKey: .fresh)
+    }
 }
 struct GroupPlanEnvelope: Decodable { let plan: GroupPlan }
 struct GroupPlan: Decodable {
@@ -438,7 +554,7 @@ struct GroupPlan: Decodable {
     let groupRevision: String
     let target: String
     let totalMembers: Int
-    let providerReach: String
+    @ProviderReachField var providerReach: String
     let providerCoverage: ProviderReachCoverage
     let lifecycle: String
     let members: [GroupPlanMember]
@@ -490,7 +606,7 @@ struct GroupApplyResult: Decodable {
     let planFingerprint: String
     let requestedState: String
     let lifecycle: String
-    let providerReach: String
+    @ProviderReachField var providerReach: String
     let providerCoverage: ProviderReachCoverage
     let providerReachLifecycle: String
     let members: [GroupApplyMemberResult]
@@ -593,7 +709,7 @@ struct RecoveryOperation: Decodable, Identifiable {
     let effectGraphDigest: String?
     let authorizationRecorded: Bool?
     let terminalCode: String?
-    let providerReach: String?
+    @OptionalProviderReachField var providerReach: String?
     let providerCoverage: ProviderReachCoverage?
     let providerReachLifecycle: String?
     let providerWritesStarted: Bool?
@@ -607,6 +723,58 @@ struct RecoveryOperation: Decodable, Identifiable {
     let members: [GroupApplyMemberResult]?
 
     var id: String { operationId }
+
+    private enum CodingKeys: String, CodingKey {
+        case operationId
+        case operationKind
+        case lifecycle
+        case qualifiedName
+        case requestedState
+        case createdAt
+        case updatedAt
+        case effectGraphDigest
+        case authorizationRecorded
+        case terminalCode
+        case providerReach
+        case providerCoverage
+        case providerReachLifecycle
+        case providerWritesStarted
+        case recoveryRequired
+        case resourceCount
+        case backupIds
+        case evidenceAvailable
+        case finalState
+        case observationFresh
+        case observationReason
+        case members
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        operationId = try container.decode(String.self, forKey: .operationId)
+        operationKind = try container.decode(String.self, forKey: .operationKind)
+        lifecycle = try container.decode(String.self, forKey: .lifecycle)
+        qualifiedName = try container.decodeIfPresent(String.self, forKey: .qualifiedName)
+        requestedState = try container.decodeIfPresent(String.self, forKey: .requestedState)
+        createdAt = try container.decodeIfPresent(String.self, forKey: .createdAt)
+        updatedAt = try container.decodeIfPresent(String.self, forKey: .updatedAt)
+        effectGraphDigest = try container.decodeIfPresent(String.self, forKey: .effectGraphDigest)
+        authorizationRecorded = try container.decodeIfPresent(Bool.self, forKey: .authorizationRecorded)
+        terminalCode = try container.decodeIfPresent(String.self, forKey: .terminalCode)
+        _providerReach = try container.decodeIfPresent(OptionalProviderReachField.self, forKey: .providerReach)
+            ?? OptionalProviderReachField(value: nil)
+        providerCoverage = try container.decodeIfPresent(ProviderReachCoverage.self, forKey: .providerCoverage)
+        providerReachLifecycle = try container.decodeIfPresent(String.self, forKey: .providerReachLifecycle)
+        providerWritesStarted = try container.decodeIfPresent(Bool.self, forKey: .providerWritesStarted)
+        recoveryRequired = try container.decode(Bool.self, forKey: .recoveryRequired)
+        resourceCount = try container.decode(Int.self, forKey: .resourceCount)
+        backupIds = try container.decodeIfPresent([String].self, forKey: .backupIds)
+        evidenceAvailable = try container.decodeIfPresent(Bool.self, forKey: .evidenceAvailable)
+        finalState = try container.decodeIfPresent(String.self, forKey: .finalState)
+        observationFresh = try container.decodeIfPresent(Bool.self, forKey: .observationFresh)
+        observationReason = try container.decodeIfPresent(String.self, forKey: .observationReason)
+        members = try container.decodeIfPresent([GroupApplyMemberResult].self, forKey: .members)
+    }
 }
 struct RestorePlanEnvelope: Decodable { let operationId: String; let plan: RestorePlan }
 struct RestorePlan: Decodable { let backupId: String; let providers: [String]; let authentication: String; let affectedResourceIds: [String]; let planFingerprint: String }

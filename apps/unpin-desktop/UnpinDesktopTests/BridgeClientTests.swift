@@ -106,6 +106,129 @@ final class BridgeClientTests: XCTestCase {
         }
     }
 
+    func testStalledControlTimeoutStopsChildAndAllowsRestart() async throws {
+        let script = """
+        #!/bin/sh
+        while IFS= read -r request; do
+            case "$request" in
+                *group.approve*)
+                    while :; do sleep 1; done
+                    ;;
+                *handshake*)
+                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0-rc.1","capabilities":[]}}'
+                    ;;
+            esac
+        done
+        """
+        let temporary = try temporaryExecutable(script: script)
+        defer { try? FileManager.default.removeItem(at: temporary.root) }
+        let digest = SHA256.hash(data: try Data(contentsOf: temporary.executable))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let bridge = BridgeClient(
+            executableURL: temporary.executable,
+            projectRoot: temporary.root,
+            manifest: BundledBridgeManifest(
+                bridgeProtocolVersion: BridgeClient.protocolVersion,
+                unpinVersion: "1.0.0-rc.1",
+                sha256: digest
+            ),
+            controlRequestTimeoutMilliseconds: 50
+        )
+
+        try await bridge.start()
+        do {
+            _ = try await bridge.approveGroup(operationID: "operation", fingerprint: "fingerprint")
+            XCTFail("a stalled control request must not complete")
+        } catch BridgeClientError.controlRequestUncertain {
+            // The child was stopped because the mutation outcome is uncertain.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        try await bridge.start()
+        let handshake = try await bridge.handshake()
+        XCTAssertEqual(handshake.binaryVersion, "1.0.0-rc.1")
+        let stopped = await bridge.stop()
+        XCTAssertTrue(stopped)
+    }
+
+    func testIncompatibleGroupDefaultsMissingMembersToEmpty() throws {
+        let data = Data(#"""
+        {
+          "qualifiedName": "personal:incompatible",
+          "scope": "personal",
+          "revision": "revision-1",
+          "contextCompatible": false,
+          "state": null,
+          "fresh": true
+        }
+        """#.utf8)
+
+        let group = try JSONDecoder().decode(GroupSummary.self, from: data)
+
+        XCTAssertFalse(group.contextCompatible)
+        XCTAssertTrue(group.members.isEmpty)
+    }
+
+    func testProviderReachDecodesAllAndSelected() throws {
+        let all = try JSONDecoder().decode(
+            ProviderReachValue.self,
+            from: Data("\"all\"".utf8)
+        )
+        XCTAssertEqual(all, .all)
+
+        let selected = try JSONDecoder().decode(
+            ProviderReachValue.self,
+            from: Data(#"""
+            {"selected":{"provider":"codex","provenance":"explicit-input"}}
+            """#.utf8)
+        )
+        XCTAssertEqual(selected, .selected(provider: "codex", provenance: "explicit-input"))
+
+        let plan = try JSONDecoder().decode(
+            GroupPlan.self,
+            from: Data(#"""
+            {
+              "operationId": null,
+              "disposition": "actionable",
+              "mode": "native",
+              "qualifiedName": "personal:example",
+              "scope": "personal",
+              "groupRevision": "revision-1",
+              "target": "enable",
+              "totalMembers": 0,
+              "providerReach": {"selected":{"provider":"codex","provenance":"explicit-input"}},
+              "providerCoverage": {"entries":[]},
+              "lifecycle": "planned",
+              "members": [],
+              "resources": [],
+              "cohorts": [],
+              "planFingerprint": "fingerprint"
+            }
+            """#.utf8)
+        )
+        XCTAssertEqual(plan.providerReach, "selected · codex · explicit-input")
+        XCTAssertEqual(plan.$providerReach, selected)
+    }
+
+    func testRecoveryOperationAllowsMissingProviderReach() throws {
+        let operation = try JSONDecoder().decode(
+            RecoveryOperation.self,
+            from: Data(#"""
+            {
+              "operationId": "operation-1",
+              "operationKind": "group-toggle",
+              "lifecycle": "planned",
+              "recoveryRequired": false,
+              "resourceCount": 0
+            }
+            """#.utf8)
+        )
+
+        XCTAssertNil(operation.providerReach)
+    }
+
     private func temporaryExecutable(script: String) throws -> (root: URL, executable: URL) {
         let root = FileManager.default.temporaryDirectory
             .appendingPathComponent("unpin-bridge-client-\(UUID().uuidString)", isDirectory: true)
