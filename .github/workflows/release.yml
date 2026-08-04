@@ -124,9 +124,130 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  desktop:
+    name: Build desktop ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-desktop-${{ matrix.target }}
+
+      - name: Verify tag matches CLI and desktop versions
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          package_version="$(
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "unpin-cli") | .version'
+          )"
+          desktop_version="$(
+            xcodebuild -showBuildSettings \
+              -project apps/unpin-desktop/UnpinDesktop.xcodeproj \
+              -scheme UnpinDesktop \
+              -configuration Release \
+              | awk '$1 == "MARKETING_VERSION" { print $3; exit }'
+          )"
+          test "v${release_version}" = "${GITHUB_REF_NAME}"
+          test "${release_version}" = "${package_version}"
+          test "${release_version}" = "${desktop_version}"
+          printf 'value=%s\n' "${release_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build, sign, and package desktop workbench
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          export SOURCE_DATE_EPOCH
+          SOURCE_DATE_EPOCH="$(git show -s --format=%ct "${GITHUB_SHA}")"
+          archive="$(
+            scripts/build_desktop_release.sh \
+              "${{ matrix.target }}" \
+              "${{ steps.version.outputs.value }}" \
+              dist
+          )"
+          scripts/verify_desktop_release_artifact.sh \
+            "${archive}" \
+            "${{ matrix.target }}" \
+            "${{ steps.version.outputs.value }}"
+          printf 'archive=%s\n' "${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install SBOM generator
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Generate desktop SBOM
+        id: sbom
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo cyclonedx \
+            --manifest-path crates/unpin-cli/Cargo.toml \
+            --format json \
+            --describe binaries \
+            --all-features \
+            --target "${{ matrix.target }}" \
+            --target-in-filename \
+            --spec-version 1.5
+          source_sbom="crates/unpin-cli/unpin_bin_${{ matrix.target }}.cdx.json"
+          desktop_sbom="dist/unpin-desktop-v${{ steps.version.outputs.value }}-${{ matrix.target }}.cdx.json"
+          jq --arg version "${{ steps.version.outputs.value }}" '
+            .metadata.component.name = "unpin-desktop" |
+            .metadata.component.version = $version |
+            .metadata.component.type = "application" |
+            .metadata.component.properties = ((.metadata.component.properties // []) + [
+              {"name": "unpin:distribution", "value": "macOS desktop workbench"},
+              {"name": "unpin:embedded-binary", "value": "unpin"}
+            ])
+          ' "${source_sbom}" > "${desktop_sbom}"
+          printf 'path=%s\n' "${desktop_sbom}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest desktop build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      - name: Attest desktop archive SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+          sbom-path: ${{ steps.sbom.outputs.path }}
+
+      - name: Upload desktop release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-desktop-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   draft:
     name: Create draft release
-    needs: build
+    needs: [build, desktop]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
