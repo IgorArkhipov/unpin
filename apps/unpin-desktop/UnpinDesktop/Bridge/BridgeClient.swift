@@ -76,6 +76,22 @@ actor BridgeClient {
         try request(method: "group.apply", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
     }
 
+    func recoverySnapshot() throws -> RecoverySnapshot {
+        try request(method: "recovery.snapshot", parameters: EmptyParameters())
+    }
+
+    func planRestore(backupID: String) throws -> RestorePlanEnvelope {
+        try request(method: "restore.plan", parameters: RestorePlanParameters(backupId: backupID))
+    }
+
+    func approveRestore(operationID: String, fingerprint: String) throws -> GroupApprovalEnvelope {
+        try request(method: "restore.approve", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    }
+
+    func applyRestore(operationID: String, fingerprint: String) throws -> RestoreApplyEnvelope {
+        try request(method: "restore.apply", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    }
+
     func stop() {
         input?.closeFile()
         output?.closeFile()
@@ -149,6 +165,7 @@ private struct BridgeErrorPayload: Decodable { let code: String }
 private struct EmptyParameters: Codable {}
 private struct GroupPlanParameters: Codable { let qualifiedName: String; let target: String }
 private struct GroupApprovalParameters: Codable { let operationId: String; let planFingerprint: String }
+private struct RestorePlanParameters: Codable { let backupId: String }
 
 struct BridgeHandshake: Decodable { let protocolVersion: Int; let binaryVersion: String; let capabilities: [String] }
 struct BridgeSnapshot: Decodable { let capturedAtUnix: Int; let inventory: [InventoryItem]; let warnings: [BridgeWarning]; let groups: [GroupSummary] }
@@ -162,3 +179,49 @@ struct GroupMemberIdentity: Decodable { let provider: String; let layer: String;
 struct GroupApprovalEnvelope: Decodable { let operationId: String; let planFingerprint: String; let approval: String }
 struct GroupApplyEnvelope: Decodable { let result: GroupApplyResult }
 struct GroupApplyResult: Decodable { let operationId: String; let requestedState: String; let lifecycle: String; let backupIds: [String]; let observationFresh: Bool }
+enum RecoveryEvidenceAvailability: Decodable, Equatable {
+    case available
+    case unavailable
+    case unknown(String)
+
+    init(from decoder: Decoder) throws {
+        switch try decoder.singleValueContainer().decode(String.self) {
+        case "available": self = .available
+        case "unavailable": self = .unavailable
+        case let value: self = .unknown(value)
+        }
+    }
+
+    var isAvailable: Bool {
+        self == .available
+    }
+}
+
+enum RestoreStatus: Decodable, Equatable {
+    case restored
+    case other(String)
+
+    init(from decoder: Decoder) throws {
+        let value = try decoder.singleValueContainer().decode(String.self)
+        self = value == "restored" ? .restored : .other(value)
+    }
+
+    var displayName: String {
+        switch self {
+        case .restored: "restored"
+        case .other(let value): value
+        }
+    }
+
+    var isRestored: Bool {
+        self == .restored
+    }
+}
+
+struct RecoverySnapshot: Decodable { let backups: [RecoveryBackup]; let backupStatus: RecoveryEvidenceAvailability; let operations: [RecoveryOperation]; let operationStatus: RecoveryEvidenceAvailability; let groupOperationStatus: RecoveryEvidenceAvailability }
+struct RecoveryBackup: Decodable, Identifiable { let backupId: String; let createdAt: String; let itemCount: Int; let providers: [String]; let layers: [String]; let restorable: Bool; let authentication: String; let targetEnabled: Bool?; var id: String { backupId } }
+struct RecoveryOperation: Decodable, Identifiable { let operationId: String; let operationKind: String; let lifecycle: String; let effectGraphDigest: String?; let authorizationRecorded: Bool?; let terminalCode: String?; let recoveryRequired: Bool; let resourceCount: Int; let backupIds: [String]?; let evidenceAvailable: Bool?; var id: String { operationId } }
+struct RestorePlanEnvelope: Decodable { let operationId: String; let plan: RestorePlan }
+struct RestorePlan: Decodable { let backupId: String; let providers: [String]; let authentication: String; let affectedResourceIds: [String]; let planFingerprint: String }
+struct RestoreApplyEnvelope: Decodable { let result: RestoreApplyResult }
+struct RestoreApplyResult: Decodable { let status: RestoreStatus; let backupId: String; let affectedTargetCount: Int }
