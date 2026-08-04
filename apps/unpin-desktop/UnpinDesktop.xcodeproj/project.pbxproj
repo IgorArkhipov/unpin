@@ -1,0 +1,76 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A10000000000000000000001 /* UnpinDesktopApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000001 /* UnpinDesktopApp.swift */; };
+		A10000000000000000000002 /* BridgeClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000002 /* BridgeClient.swift */; };
+		A10000000000000000000003 /* WorkspaceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000003 /* WorkspaceStore.swift */; };
+		A10000000000000000000004 /* DiscoverOrganizeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000004 /* DiscoverOrganizeView.swift */; };
+		A10000000000000000000005 /* GroupEditorView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000005 /* GroupEditorView.swift */; };
+		A10000000000000000000006 /* SafeChangeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000006 /* SafeChangeView.swift */; };
+		A10000000000000000000007 /* PlanReviewView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000007 /* PlanReviewView.swift */; };
+		A10000000000000000000008 /* RecoverAuditView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000008 /* RecoverAuditView.swift */; };
+		A10000000000000000000009 /* GovernAutomateView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000009 /* GovernAutomateView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A20000000000000000000001 /* UnpinDesktopApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UnpinDesktopApp.swift; sourceTree = "<group>"; };
+		A20000000000000000000002 /* BridgeClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BridgeClient.swift; sourceTree = "<group>"; };
+		A20000000000000000000003 /* WorkspaceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkspaceStore.swift; sourceTree = "<group>"; };
+		A20000000000000000000004 /* DiscoverOrganizeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DiscoverOrganizeView.swift; sourceTree = "<group>"; };
+		A20000000000000000000005 /* GroupEditorView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GroupEditorView.swift; sourceTree = "<group>"; };
+		A20000000000000000000006 /* SafeChangeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SafeChangeView.swift; sourceTree = "<group>"; };
+		A20000000000000000000007 /* PlanReviewView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlanReviewView.swift; sourceTree = "<group>"; };
+		A20000000000000000000008 /* RecoverAuditView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecoverAuditView.swift; sourceTree = "<group>"; };
+		A20000000000000000000009 /* GovernAutomateView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GovernAutomateView.swift; sourceTree = "<group>"; };
+		A2000000000000000000000A /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A2000000000000000000000B /* UnpinDesktop.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = UnpinDesktop.app; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXFileReference section */
+
+/* Begin PBXGroup section */
+		A30000000000000000000001 = {isa = PBXGroup; children = (A30000000000000000000002 /* UnpinDesktop */, A30000000000000000000006 /* Products */); sourceTree = "<group>"; };
+		A30000000000000000000002 /* UnpinDesktop */ = {isa = PBXGroup; children = (A20000000000000000000001 /* UnpinDesktopApp.swift */, A30000000000000000000003 /* Bridge */, A30000000000000000000004 /* State */, A30000000000000000000005 /* Features */, A2000000000000000000000A /* Info.plist */); path = UnpinDesktop; sourceTree = "<group>"; };
+		A30000000000000000000003 /* Bridge */ = {isa = PBXGroup; children = (A20000000000000000000002 /* BridgeClient.swift */); path = Bridge; sourceTree = "<group>"; };
+		A30000000000000000000004 /* State */ = {isa = PBXGroup; children = (A20000000000000000000003 /* WorkspaceStore.swift */); path = State; sourceTree = "<group>"; };
+		A30000000000000000000005 /* Features */ = {isa = PBXGroup; children = (A20000000000000000000004 /* DiscoverOrganizeView.swift */, A20000000000000000000005 /* GroupEditorView.swift */, A20000000000000000000006 /* SafeChangeView.swift */, A20000000000000000000007 /* PlanReviewView.swift */, A20000000000000000000008 /* RecoverAuditView.swift */, A20000000000000000000009 /* GovernAutomateView.swift */); path = Features; sourceTree = "<group>"; };
+		A30000000000000000000006 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000B /* UnpinDesktop.app */); name = Products; sourceTree = "<group>"; };
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A40000000000000000000001 /* UnpinDesktop */ = {isa = PBXNativeTarget; buildConfigurationList = A50000000000000000000002 /* Build configuration list for PBXNativeTarget "UnpinDesktop" */; buildPhases = (A60000000000000000000001 /* Sources */, A60000000000000000000002 /* Frameworks */, A60000000000000000000003 /* Bundle Unpin */); buildRules = (); dependencies = (); name = UnpinDesktop; productName = UnpinDesktop; productReference = A2000000000000000000000B /* UnpinDesktop.app */; productType = "com.apple.product-type.application"; };
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A70000000000000000000001 /* Project object */ = {isa = PBXProject; attributes = { LastUpgradeCheck = 1600; TargetAttributes = { A40000000000000000000001 = { CreatedOnToolsVersion = 16.0; }; }; }; buildConfigurationList = A50000000000000000000001 /* Build configuration list for PBXProject "UnpinDesktop" */; compatibilityVersion = "Xcode 14.0"; developmentRegion = en; hasScannedForEncodings = 0; knownRegions = (en, Base); mainGroup = A30000000000000000000001; productRefGroup = A30000000000000000000006 /* Products */; projectDirPath = ""; projectRoot = ""; targets = (A40000000000000000000001 /* UnpinDesktop */); };
+/* End PBXProject section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A60000000000000000000003 /* Bundle Unpin */ = {isa = PBXShellScriptBuildPhase; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Bundle Unpin"; outputPaths = ("$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/unpin", "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/unpin-bridge-manifest.json"); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh; shellScript = "/bin/sh \"$SRCROOT/Scripts/bundle-unpin.sh\"\n"; };
+/* End PBXShellScriptBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A60000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* UnpinDesktopApp.swift in Sources */, A10000000000000000000002 /* BridgeClient.swift in Sources */, A10000000000000000000003 /* WorkspaceStore.swift in Sources */, A10000000000000000000004 /* DiscoverOrganizeView.swift in Sources */, A10000000000000000000005 /* GroupEditorView.swift in Sources */, A10000000000000000000006 /* SafeChangeView.swift in Sources */, A10000000000000000000007 /* PlanReviewView.swift in Sources */, A10000000000000000000008 /* RecoverAuditView.swift in Sources */, A10000000000000000000009 /* GovernAutomateView.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXSourcesBuildPhase section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A60000000000000000000002 /* Frameworks */ = {isa = PBXFrameworksBuildPhase; buildActionMask = 2147483647; files = (); runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A80000000000000000000001 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; }; name = Debug; };
+		A80000000000000000000002 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { CLANG_ENABLE_MODULES = YES; MACOSX_DEPLOYMENT_TARGET = 14.0; SDKROOT = macosx; }; name = Release; };
+		A80000000000000000000003 /* Debug */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; DEVELOPMENT_ASSET_PATHS = ""; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = UnpinDesktop/Info.plist; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.6.2; PRODUCT_BUNDLE_IDENTIFIER = dev.unpin.workbench; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; }; name = Debug; };
+		A80000000000000000000004 /* Release */ = {isa = XCBuildConfiguration; buildSettings = { CODE_SIGN_STYLE = Automatic; CURRENT_PROJECT_VERSION = 1; GENERATE_INFOPLIST_FILE = NO; INFOPLIST_FILE = UnpinDesktop/Info.plist; MACOSX_DEPLOYMENT_TARGET = 14.0; MARKETING_VERSION = 0.6.2; PRODUCT_BUNDLE_IDENTIFIER = dev.unpin.workbench; PRODUCT_NAME = "$(TARGET_NAME)"; SWIFT_VERSION = 6.0; }; name = Release; };
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A50000000000000000000001 /* Build configuration list for PBXProject "UnpinDesktop" */ = {isa = XCConfigurationList; buildConfigurations = (A80000000000000000000001 /* Debug */, A80000000000000000000002 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Release; };
+		A50000000000000000000002 /* Build configuration list for PBXNativeTarget "UnpinDesktop" */ = {isa = XCConfigurationList; buildConfigurations = (A80000000000000000000003 /* Debug */, A80000000000000000000004 /* Release */); defaultConfigurationIsVisible = 0; defaultConfigurationName = Debug; };
+/* End XCConfigurationList section */
+	};
+	rootObject = A70000000000000000000001 /* Project object */;
+}
