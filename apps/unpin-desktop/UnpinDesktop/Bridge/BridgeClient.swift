@@ -19,7 +19,7 @@ enum BridgeClientError: LocalizedError {
 }
 
 actor BridgeClient {
-    static let protocolVersion = 1
+    static let protocolVersion = 2
 
     private let executableURL: URL
     private var process: Process?
@@ -74,6 +74,18 @@ actor BridgeClient {
 
     func applyGroup(operationID: String, fingerprint: String) throws -> GroupApplyEnvelope {
         try request(method: "group.apply", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    }
+
+    func planDefinition(_ parameters: GroupDefinitionPlanParameters) throws -> GroupDefinitionPlanEnvelope {
+        try request(method: "group.definition.plan", parameters: parameters)
+    }
+
+    func applyDefinition(operationID: String, fingerprint: String) throws -> GroupDefinitionApplyResult {
+        try request(method: "group.definition.apply", parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint))
+    }
+
+    func definitionHistory(scope: String) throws -> GroupDefinitionHistoryEnvelope {
+        try request(method: "group.definition.history", parameters: GroupDefinitionHistoryParameters(scope: scope))
     }
 
     func recoverySnapshot() throws -> RecoverySnapshot {
@@ -166,19 +178,91 @@ private struct EmptyParameters: Codable {}
 private struct GroupPlanParameters: Codable { let qualifiedName: String; let target: String }
 private struct GroupApprovalParameters: Codable { let operationId: String; let planFingerprint: String }
 private struct RestorePlanParameters: Codable { let backupId: String }
+private struct GroupDefinitionHistoryParameters: Codable { let scope: String }
+
+struct GroupDefinitionPlanParameters: Encodable {
+    let action: String
+    let scope: String?
+    let qualifiedName: String?
+    let name: String?
+    let newName: String?
+    let members: [GroupMemberIdentity]?
+    let expectedRevision: String?
+    let historyId: String?
+
+    enum CodingKeys: String, CodingKey {
+        case action, scope, qualifiedName, name, newName, members, expectedRevision, historyId
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(action, forKey: .action)
+        try container.encodeIfPresent(scope, forKey: .scope)
+        try container.encodeIfPresent(qualifiedName, forKey: .qualifiedName)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(newName, forKey: .newName)
+        try container.encodeIfPresent(members, forKey: .members)
+        try container.encodeIfPresent(expectedRevision, forKey: .expectedRevision)
+        try container.encodeIfPresent(historyId, forKey: .historyId)
+    }
+}
 
 struct BridgeHandshake: Decodable { let protocolVersion: Int; let binaryVersion: String; let capabilities: [String] }
 struct BridgeSnapshot: Decodable { let capturedAtUnix: Int; let inventory: [InventoryItem]; let warnings: [BridgeWarning]; let groups: [GroupSummary] }
 struct InventoryItem: Decodable, Identifiable { let provider: String; let kind: String; let category: String; let layer: String; let id: String; let displayName: String; let enabled: Bool; let mutability: String }
 struct BridgeWarning: Decodable, Identifiable { let provider: String; let layer: String?; let code: String; var id: String { "\(provider)-\(code)" } }
-struct GroupSummary: Decodable, Identifiable { let qualifiedName: String; let state: String?; let fresh: Bool?; var id: String { qualifiedName } }
+struct GroupSummary: Decodable, Identifiable {
+    let qualifiedName: String
+    let scope: String
+    let revision: String
+    let contextCompatible: Bool
+    let members: [GroupMemberView]
+    let state: String?
+    let fresh: Bool?
+
+    var id: String { qualifiedName }
+    var name: String { qualifiedName.split(separator: ":", maxSplits: 1).last.map(String.init) ?? qualifiedName }
+}
 struct GroupPlanEnvelope: Decodable { let plan: GroupPlan }
 struct GroupPlan: Decodable { let operationId: String?; let qualifiedName: String; let target: String; let planFingerprint: String; let providerReach: String; let members: [GroupPlanMember] }
 struct GroupPlanMember: Decodable, Identifiable { let identity: GroupMemberIdentity; let outcome: String; let reason: String?; var id: String { identity.id } }
-struct GroupMemberIdentity: Decodable { let provider: String; let layer: String; let kind: String; let category: String; let id: String }
+struct GroupMemberIdentity: Codable { let provider: String; let layer: String; let kind: String; let category: String; let id: String }
+struct GroupMemberView: Decodable { let identity: GroupMemberIdentity; let enabled: Bool?; let eligible: Bool; let reason: String?; let displayName: String? }
 struct GroupApprovalEnvelope: Decodable { let operationId: String; let planFingerprint: String; let approval: String }
 struct GroupApplyEnvelope: Decodable { let result: GroupApplyResult }
 struct GroupApplyResult: Decodable { let operationId: String; let requestedState: String; let lifecycle: String; let backupIds: [String]; let observationFresh: Bool }
+struct GroupDefinitionPlanEnvelope: Decodable { let operationId: String; let plan: GroupDefinitionPlan }
+struct GroupDefinitionPlan: Decodable {
+    let action: String
+    let scope: String
+    let qualifiedName: String?
+    let memberCount: Int?
+    let newName: String?
+    let expectedRevision: String?
+    let historyId: String?
+    let planFingerprint: String
+}
+struct GroupDefinitionApplyResult: Decodable {
+    let action: String
+    let scope: String
+    let qualifiedName: String
+    let revision: String?
+    let historyId: String?
+}
+struct GroupDefinitionHistoryEnvelope: Decodable { let history: [GroupDefinitionHistory] }
+struct GroupDefinitionHistory: Decodable, Identifiable {
+    let historyId: String
+    let createdAt: String
+    let scope: String
+    let change: String
+    let nameBefore: String?
+    let nameAfter: String?
+    let revisionBefore: String?
+    let revisionAfter: String?
+    let definitionAfterExists: Bool
+
+    var id: String { historyId }
+}
 enum RecoveryEvidenceAvailability: Decodable, Equatable {
     case available
     case unavailable
