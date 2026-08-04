@@ -14,7 +14,8 @@ use std::{
 use zeroize::Zeroizing;
 
 mod commands;
-mod credentials;
+pub(crate) mod credentials;
+mod desktop_bridge;
 mod gateway_session;
 mod group_store;
 mod hook_support;
@@ -311,6 +312,12 @@ enum Commands {
         #[arg(long)]
         enable_approved_group_apply: bool,
     },
+    /// Serve the private native desktop workbench bridge over stdio.
+    #[command(hide = true)]
+    Desktop {
+        #[command(subcommand)]
+        command: DesktopCommands,
+    },
     /// Open the Unpin terminal UI.
     #[command(alias = "dashboard")]
     Tui {
@@ -363,6 +370,18 @@ enum AuthCommands {
     CursorDashboard {
         #[command(subcommand)]
         command: CursorDashboardAuthCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DesktopCommands {
+    /// Run the app-bundled workbench transport on stdin/stdout.
+    Bridge {
+        #[command(flatten)]
+        roots: DiscoveryRootArgs,
+        /// Unpin-owned state root containing groups, backups, and operations.
+        #[arg(long)]
+        app_state_root: Option<PathBuf>,
     },
 }
 
@@ -1369,6 +1388,40 @@ fn main() -> ExitCode {
                     ExitCode::FAILURE
                 } else {
                     ExitCode::SUCCESS
+                }
+            }
+        }
+        Some(Commands::Desktop {
+            command:
+                DesktopCommands::Bridge {
+                    roots,
+                    app_state_root,
+                },
+        }) => {
+            let fixture_mode = roots.fixture_root.is_some();
+            let config = match resolve_config(&roots, app_state_root) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("desktop bridge configuration failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let discovery_roots = match resolve_discovery_roots_with_config(&roots, &config) {
+                Ok(roots) => roots.with_app_state_root(&config.app_state_root),
+                Err(error) => {
+                    eprintln!("desktop bridge configuration failed: {error}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match desktop_bridge::run(desktop_bridge::DesktopBridgeContext::new(
+                config,
+                discovery_roots,
+                fixture_mode,
+            )) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("desktop bridge stopped: {error}");
+                    ExitCode::FAILURE
                 }
             }
         }
