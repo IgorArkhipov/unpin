@@ -437,6 +437,17 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         .as_str()
         .expect("group plan fingerprint")
         .to_string();
+    assert!(
+        plan["result"]["plan"]["providerCoverage"]["entries"]
+            .as_array()
+            .is_some_and(|entries| !entries.is_empty()),
+        "desktop review must include provider coverage: {plan}"
+    );
+    assert!(
+        plan["result"]["plan"]["resources"].is_array()
+            && plan["result"]["plan"]["cohorts"].is_array(),
+        "desktop review must include resource and cohort safeguards: {plan}"
+    );
 
     let missing_approval = request(serde_json::json!({
         "version": 2,

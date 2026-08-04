@@ -28,6 +28,8 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var state: State = .loading
     @Published private(set) var snapshot: BridgeSnapshot?
     @Published private(set) var reviewedPlan: GroupPlan?
+    @Published private(set) var approvedPlanFingerprint: String?
+    @Published private(set) var lastChangeBlocker: String?
     @Published private(set) var lastApply: GroupApplyResult?
     @Published private(set) var reviewedDefinition: GroupDefinitionPlanEnvelope?
     @Published private(set) var lastDefinitionChange: GroupDefinitionApplyResult?
@@ -44,6 +46,10 @@ final class WorkspaceStore: ObservableObject {
         case .ready: nil
         case .blocked(let message): message
         }
+    }
+
+    var reviewedPlanIsApproved: Bool {
+        reviewedPlan?.planFingerprint == approvedPlanFingerprint
     }
 
     func launch() async {
@@ -77,19 +83,49 @@ final class WorkspaceStore: ObservableObject {
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
             reviewedPlan = try await bridge.planGroup(name: group.qualifiedName, target: target).plan
+            approvedPlanFingerprint = nil
+            lastChangeBlocker = nil
+            lastApply = nil
+            state = .ready
         } catch { state = .blocked(error.localizedDescription) }
     }
 
-    func approveAndApply() async {
+    func approveReviewedPlan() async {
         do {
             guard let bridge, let plan = reviewedPlan, let operationID = plan.operationId else {
                 throw BridgeClientError.malformedResponse
             }
             _ = try await bridge.approveGroup(operationID: operationID, fingerprint: plan.planFingerprint)
+            approvedPlanFingerprint = plan.planFingerprint
+            lastChangeBlocker = nil
+            state = .ready
+        } catch { state = .blocked(error.localizedDescription) }
+    }
+
+    func applyApprovedPlan() async {
+        do {
+            guard let bridge, let plan = reviewedPlan, let operationID = plan.operationId,
+                  approvedPlanFingerprint == plan.planFingerprint else {
+                throw BridgeClientError.requestFailed("desktop-approval-required")
+            }
             lastApply = try await bridge.applyGroup(operationID: operationID, fingerprint: plan.planFingerprint).result
+            self.reviewedPlan = nil
+            approvedPlanFingerprint = nil
             try await refresh()
             await refreshRecovery()
-        } catch { state = .blocked(error.localizedDescription) }
+        } catch {
+            reviewedPlan = nil
+            approvedPlanFingerprint = nil
+            lastChangeBlocker = "The reviewed change is no longer current. Create a fresh plan before retrying."
+            try? await refresh()
+            state = .blocked(error.localizedDescription)
+        }
+    }
+
+    func discardReviewedPlan() {
+        reviewedPlan = nil
+        approvedPlanFingerprint = nil
+        lastChangeBlocker = nil
     }
 
     func planDefinition(_ parameters: GroupDefinitionPlanParameters) async {
