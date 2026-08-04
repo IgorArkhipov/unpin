@@ -145,6 +145,40 @@ pub(crate) fn authorize_reviewed_control_decision(
     .map_err(|error| error.to_string())
 }
 
+pub(crate) fn authorize_desktop_control_decision(
+    fixture_mode: bool,
+    app_state_root: &Path,
+    expectation: &ApprovalExpectation,
+    plan_fingerprint: &str,
+    reviewed_fingerprint: Option<&str>,
+    actor_id: &str,
+    now_unix: i64,
+) -> Result<ControlAuthorization, String> {
+    let canonical_fixture_root = if fixture_mode {
+        Some(canonical_fixture_scope_path(app_state_root)?)
+    } else {
+        None
+    };
+    let approval_state_root = canonical_fixture_root.as_deref().unwrap_or(app_state_root);
+    let approval = issue_desktop_human_approval(
+        fixture_mode,
+        approval_state_root,
+        expectation,
+        plan_fingerprint,
+        reviewed_fingerprint,
+        now_unix,
+    )?;
+    authorize_control(
+        approval_state_root,
+        approval.receipt(),
+        approval.verifier(),
+        expectation,
+        now_unix,
+        OwnerGeneration::new(actor_id, 1).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| error.to_string())
+}
+
 pub(crate) struct HumanApproval {
     receipt: ApprovalReceipt,
     verifier: ApprovalVerifier,
@@ -189,6 +223,55 @@ pub(crate) fn issue_human_approval(
         || load_approval_key(&KeychainSecretStore),
         random_suffix,
     )
+}
+
+/// Issue a local-desktop approval without accepting a client-provided
+/// confirmation value. On macOS the Rust child creates and reads a temporary
+/// Keychain item protected by `userPresence`; the approval key is opened only
+/// after that OS-mediated check succeeds.
+pub(crate) fn issue_desktop_human_approval(
+    fixture_mode: bool,
+    app_state_root: &Path,
+    expectation: &ApprovalExpectation,
+    plan_fingerprint: &str,
+    reviewed_fingerprint: Option<&str>,
+    now_unix: i64,
+) -> Result<HumanApproval, String> {
+    if fixture_mode {
+        let key = fixture_approval_key(app_state_root)?;
+        return issue_desktop_human_approval_with(
+            expectation,
+            plan_fingerprint,
+            reviewed_fingerprint,
+            now_unix,
+            &FixtureHumanPresence,
+            || Ok(Some(key)),
+            random_suffix,
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        issue_desktop_human_approval_with(
+            expectation,
+            plan_fingerprint,
+            reviewed_fingerprint,
+            now_unix,
+            &MacOsUserPresence,
+            || load_approval_key(&KeychainSecretStore),
+            random_suffix,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (
+            expectation,
+            plan_fingerprint,
+            reviewed_fingerprint,
+            now_unix,
+        );
+        Err("desktop approval is supported only on macOS".to_string())
+    }
 }
 
 pub(crate) fn issue_inventory_group_approval(
@@ -280,6 +363,20 @@ impl HumanPresence for ControllingTerminalHumanPresence {
         plan_fingerprint: &str,
     ) -> Result<(), String> {
         require_controlling_terminal_presence(expectation, plan_fingerprint)
+    }
+}
+
+#[cfg(target_os = "macos")]
+struct MacOsUserPresence;
+
+#[cfg(target_os = "macos")]
+impl HumanPresence for MacOsUserPresence {
+    fn require(
+        &self,
+        expectation: &ApprovalExpectation,
+        plan_fingerprint: &str,
+    ) -> Result<(), String> {
+        macos_user_presence::require(expectation, plan_fingerprint)
     }
 }
 
@@ -396,6 +493,318 @@ fn issue_human_approval_with(
         receipt,
         verifier: ApprovalVerifier::new(verifier_key),
     })
+}
+
+fn issue_desktop_human_approval_with(
+    expectation: &ApprovalExpectation,
+    plan_fingerprint: &str,
+    reviewed_fingerprint: Option<&str>,
+    now_unix: i64,
+    presence: &impl HumanPresence,
+    load_key: impl FnOnce() -> Result<Option<ApprovalKey>, String>,
+    random_suffix: impl FnOnce() -> Result<String, String>,
+) -> Result<HumanApproval, String> {
+    issue_human_approval_with(
+        expectation,
+        plan_fingerprint,
+        reviewed_fingerprint,
+        now_unix,
+        presence,
+        load_key,
+        random_suffix,
+    )
+}
+
+#[cfg(target_os = "macos")]
+mod macos_user_presence {
+    use std::{
+        ffi::{CString, c_char, c_void},
+        ptr,
+    };
+
+    use zeroize::Zeroizing;
+
+    use super::{ApprovalExpectation, random_suffix};
+
+    type CFTypeRef = *const c_void;
+    type CFDataRef = CFTypeRef;
+    type CFDictionaryRef = CFTypeRef;
+    type CFAllocatorRef = CFTypeRef;
+    type CFIndex = isize;
+    type OSStatus = i32;
+
+    const K_CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+    const K_SEC_ACCESS_CONTROL_USER_PRESENCE: u32 = 1;
+    const ERR_SEC_SUCCESS: OSStatus = 0;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        static kCFAllocatorDefault: CFAllocatorRef;
+        static kCFBooleanTrue: CFTypeRef;
+        fn CFStringCreateWithCString(
+            allocator: CFAllocatorRef,
+            value: *const c_char,
+            encoding: u32,
+        ) -> CFTypeRef;
+        fn CFDataCreate(allocator: CFAllocatorRef, bytes: *const u8, length: CFIndex) -> CFDataRef;
+        fn CFDataGetBytePtr(data: CFDataRef) -> *const u8;
+        fn CFDataGetLength(data: CFDataRef) -> CFIndex;
+        fn CFDictionaryCreate(
+            allocator: CFAllocatorRef,
+            keys: *const CFTypeRef,
+            values: *const CFTypeRef,
+            count: CFIndex,
+            key_callbacks: *const c_void,
+            value_callbacks: *const c_void,
+        ) -> CFDictionaryRef;
+        fn CFRelease(value: CFTypeRef);
+    }
+
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        static kSecClass: CFTypeRef;
+        static kSecClassGenericPassword: CFTypeRef;
+        static kSecAttrService: CFTypeRef;
+        static kSecAttrAccount: CFTypeRef;
+        static kSecAttrAccessControl: CFTypeRef;
+        static kSecValueData: CFTypeRef;
+        static kSecReturnData: CFTypeRef;
+        static kSecUseOperationPrompt: CFTypeRef;
+        static kSecAttrAccessibleWhenUnlockedThisDeviceOnly: CFTypeRef;
+        fn SecAccessControlCreateWithFlags(
+            allocator: CFAllocatorRef,
+            protection: CFTypeRef,
+            flags: u32,
+            error: *mut CFTypeRef,
+        ) -> CFTypeRef;
+        fn SecItemAdd(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+        fn SecItemCopyMatching(query: CFDictionaryRef, result: *mut CFTypeRef) -> OSStatus;
+        fn SecItemDelete(query: CFDictionaryRef) -> OSStatus;
+    }
+
+    struct CfRef(CFTypeRef);
+
+    impl CfRef {
+        fn new(value: CFTypeRef) -> Result<Self, String> {
+            (!value.is_null())
+                .then_some(Self(value))
+                .ok_or_else(|| "desktop user presence could not be prepared".to_string())
+        }
+
+        const fn as_raw(&self) -> CFTypeRef {
+            self.0
+        }
+    }
+
+    impl Drop for CfRef {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                // SAFETY: `CfRef` owns values returned from CoreFoundation or
+                // Security create/copy APIs and releases each exactly once.
+                unsafe { CFRelease(self.0) };
+            }
+        }
+    }
+
+    pub(super) fn require(
+        expectation: &ApprovalExpectation,
+        plan_fingerprint: &str,
+    ) -> Result<(), String> {
+        let mut proof = Zeroizing::new([0_u8; 32]);
+        getrandom::fill(&mut *proof)
+            .map_err(|_| "desktop user presence could not be prepared".to_string())?;
+        let account = format!("desktop-presence-{}", random_suffix()?);
+        let prompt = format!(
+            "Approve Unpin desktop operation {}",
+            plan_fingerprint.chars().take(12).collect::<String>()
+        );
+        let service = string("dev.unpin.desktop-user-presence-v1")?;
+        let account = string(&account)?;
+        let prompt = string(&prompt)?;
+        let proof_data = data(&proof[..])?;
+        let access_control = access_control()?;
+
+        let add_query = dictionary(&[
+            (
+                security_constant("class"),
+                security_constant("generic-password"),
+            ),
+            (security_constant("service"), service.as_raw()),
+            (security_constant("account"), account.as_raw()),
+            (security_constant("access-control"), access_control.as_raw()),
+            (security_constant("value-data"), proof_data.as_raw()),
+        ])?;
+        let add_status = unsafe {
+            // SAFETY: the query is a valid CoreFoundation dictionary whose
+            // entries remain alive for the duration of the Security call.
+            SecItemAdd(add_query.as_raw(), ptr::null_mut())
+        };
+        if add_status != ERR_SEC_SUCCESS {
+            return Err("desktop user presence could not be prepared".to_string());
+        }
+
+        let delete_query = dictionary(&[
+            (
+                security_constant("class"),
+                security_constant("generic-password"),
+            ),
+            (security_constant("service"), service.as_raw()),
+            (security_constant("account"), account.as_raw()),
+        ])?;
+        let copy_query = dictionary(&[
+            (
+                security_constant("class"),
+                security_constant("generic-password"),
+            ),
+            (security_constant("service"), service.as_raw()),
+            (security_constant("account"), account.as_raw()),
+            (security_constant("return-data"), unsafe { kCFBooleanTrue }),
+            (security_constant("operation-prompt"), prompt.as_raw()),
+        ])?;
+        let mut result = ptr::null();
+        let copy_status = unsafe {
+            // SAFETY: the query and output pointer are valid for this
+            // synchronous Security call.
+            SecItemCopyMatching(copy_query.as_raw(), &mut result)
+        };
+        let matches = if copy_status == ERR_SEC_SUCCESS && !result.is_null() {
+            let result = CfRef(result);
+            data_matches(result.as_raw(), &proof[..])
+        } else {
+            false
+        };
+        let delete_status = unsafe {
+            // SAFETY: this removes only the unique item just created above.
+            SecItemDelete(delete_query.as_raw())
+        };
+        if delete_status != ERR_SEC_SUCCESS {
+            return Err("desktop user presence cleanup failed".to_string());
+        }
+        if matches {
+            Ok(())
+        } else {
+            let _ = expectation;
+            Err("desktop user presence was not approved".to_string())
+        }
+    }
+
+    fn string(value: &str) -> Result<CfRef, String> {
+        let value = CString::new(value)
+            .map_err(|_| "desktop user presence could not be prepared".to_string())?;
+        let raw = unsafe {
+            // SAFETY: CString supplies a NUL-terminated UTF-8 buffer for the
+            // duration of the CoreFoundation call.
+            CFStringCreateWithCString(
+                k_cf_allocator_default(),
+                value.as_ptr(),
+                K_CF_STRING_ENCODING_UTF8,
+            )
+        };
+        CfRef::new(raw)
+    }
+
+    fn data(value: &[u8]) -> Result<CfRef, String> {
+        let length = CFIndex::try_from(value.len())
+            .map_err(|_| "desktop user presence could not be prepared".to_string())?;
+        let raw = unsafe {
+            // SAFETY: the slice remains valid while CoreFoundation copies it.
+            CFDataCreate(k_cf_allocator_default(), value.as_ptr(), length)
+        };
+        CfRef::new(raw)
+    }
+
+    fn access_control() -> Result<CfRef, String> {
+        let mut error = ptr::null();
+        let raw = unsafe {
+            // SAFETY: Security returns a retained access-control object or a
+            // retained error object, both of which are released below.
+            SecAccessControlCreateWithFlags(
+                k_cf_allocator_default(),
+                k_sec_accessible_when_unlocked_this_device_only(),
+                K_SEC_ACCESS_CONTROL_USER_PRESENCE,
+                &mut error,
+            )
+        };
+        if !error.is_null() {
+            // SAFETY: Security transferred ownership of the returned error.
+            unsafe { CFRelease(error) };
+        }
+        CfRef::new(raw)
+    }
+
+    fn dictionary(entries: &[(CFTypeRef, CFTypeRef)]) -> Result<CfRef, String> {
+        let keys = entries.iter().map(|(key, _)| *key).collect::<Vec<_>>();
+        let values = entries.iter().map(|(_, value)| *value).collect::<Vec<_>>();
+        let count = CFIndex::try_from(entries.len())
+            .map_err(|_| "desktop user presence could not be prepared".to_string())?;
+        let raw = unsafe {
+            // SAFETY: all keys and values are valid CF objects retained by the
+            // surrounding function for the duration of the Security call.
+            CFDictionaryCreate(
+                k_cf_allocator_default(),
+                keys.as_ptr(),
+                values.as_ptr(),
+                count,
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        CfRef::new(raw)
+    }
+
+    fn data_matches(data: CFDataRef, expected: &[u8]) -> bool {
+        let length = unsafe {
+            // SAFETY: Security returned a CFData value for `kSecReturnData`.
+            CFDataGetLength(data)
+        };
+        let Ok(length) = usize::try_from(length) else {
+            return false;
+        };
+        if length != expected.len() {
+            return false;
+        }
+        let bytes = unsafe {
+            // SAFETY: CFData owns an immutable buffer of `length` bytes.
+            let pointer = CFDataGetBytePtr(data);
+            if pointer.is_null() {
+                return false;
+            }
+            std::slice::from_raw_parts(pointer, length)
+        };
+        bytes == expected
+    }
+
+    fn k_cf_allocator_default() -> CFAllocatorRef {
+        unsafe {
+            // SAFETY: CoreFoundation exposes this process-global constant.
+            kCFAllocatorDefault
+        }
+    }
+
+    fn k_sec_accessible_when_unlocked_this_device_only() -> CFTypeRef {
+        unsafe {
+            // SAFETY: Security exposes this process-global constant.
+            kSecAttrAccessibleWhenUnlockedThisDeviceOnly
+        }
+    }
+
+    fn security_constant(name: &str) -> CFTypeRef {
+        unsafe {
+            // SAFETY: each selected symbol is a process-global Security
+            // constant; callers use only the fixed spellings below.
+            match name {
+                "class" => kSecClass,
+                "generic-password" => kSecClassGenericPassword,
+                "service" => kSecAttrService,
+                "account" => kSecAttrAccount,
+                "access-control" => kSecAttrAccessControl,
+                "value-data" => kSecValueData,
+                "return-data" => kSecReturnData,
+                "operation-prompt" => kSecUseOperationPrompt,
+                _ => unreachable!("fixed Security constant"),
+            }
+        }
+    }
 }
 
 fn validate_human_approval_request(
@@ -641,6 +1050,29 @@ mod tests {
             assert!(result.is_err(), "response {response:?} must fail");
             assert!(!key_loaded.get(), "signing key must remain unopened");
         }
+    }
+
+    #[test]
+    fn desktop_approval_requires_presence_before_the_signing_key_is_opened() {
+        let expectation = approval_expectation();
+        let key_loaded = Cell::new(false);
+        let error = match issue_desktop_human_approval_with(
+            &expectation,
+            &expectation.effect_graph_digest,
+            Some(&expectation.effect_graph_digest),
+            2_000_000_000,
+            &UnavailableHumanPresence,
+            || {
+                key_loaded.set(true);
+                Ok(Some(ApprovalKey::new([0x24; 32])))
+            },
+            || Ok("unreachable".to_string()),
+        ) {
+            Ok(_) => panic!("desktop approval must fail closed without OS presence"),
+            Err(error) => error,
+        };
+        assert!(error.contains("controlling terminal"));
+        assert!(!key_loaded.get(), "signing key must remain unopened");
     }
 
     #[test]

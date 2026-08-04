@@ -2,6 +2,7 @@ use assert_cmd::Command;
 use std::{
     collections::BTreeSet,
     fs,
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command as StdCommand, Output},
 };
@@ -114,6 +115,216 @@ fn run_group_command(
         .arg("--json")
         .output()
         .expect("group command output")
+}
+
+#[test]
+fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
+    let root = TempDir::new().expect("tempdir");
+    let fixture_root = root.path().join("fixtures");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    let project_root = root.path().join("workspace");
+    let app_state_root = root.path().join("state");
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(&app_state_root).expect("app state");
+
+    let requests = [
+        serde_json::json!({"version": 1, "id": "handshake-1", "method": "handshake"}),
+        serde_json::json!({"version": 1, "id": "snapshot-1", "method": "snapshot"}),
+    ]
+    .into_iter()
+    .map(|request| serde_json::to_string(&request).expect("request JSON"))
+    .collect::<Vec<_>>()
+    .join("\n");
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["desktop", "bridge"])
+        .arg("--fixture-root")
+        .arg(&fixture_root)
+        .arg("--home-root")
+        .arg(&fixture_root)
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--app-state-root")
+        .arg(&app_state_root)
+        .write_stdin(format!("{requests}\n"))
+        .output()
+        .expect("desktop bridge output");
+
+    assert!(
+        output.status.success(),
+        "desktop bridge failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "bridge diagnostics leaked to stderr"
+    );
+    let responses = String::from_utf8(output.stdout)
+        .expect("bridge stdout is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("response JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["id"], "handshake-1");
+    assert_eq!(responses[0]["result"]["protocolVersion"], 1);
+    assert_eq!(responses[1]["id"], "snapshot-1");
+    let item = responses[1]["result"]["inventory"]
+        .as_array()
+        .and_then(|items| items.first())
+        .expect("fixture inventory item");
+    assert!(item.get("sourcePath").is_none());
+    assert!(item.get("statePath").is_none());
+    assert!(item.get("sourceFingerprint").is_none());
+    assert!(responses[1]["result"]["capturedAtUnix"].is_i64());
+}
+
+#[test]
+fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request() {
+    let oversized = "x".repeat(1_048_577);
+    let handshake = serde_json::json!({"version": 1, "id": "after-large", "method": "handshake"});
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["desktop", "bridge"])
+        .write_stdin(format!("{oversized}\n{handshake}\n"))
+        .output()
+        .expect("desktop bridge output");
+
+    assert!(output.status.success());
+    let responses = String::from_utf8(output.stdout)
+        .expect("bridge stdout is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("response JSON"))
+        .collect::<Vec<_>>();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["error"]["code"], "frame-too-large");
+    assert_eq!(responses[1]["id"], "after-large");
+    assert_eq!(responses[1]["result"]["protocolVersion"], 1);
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_bridge_group_apply_requires_a_current_one_time_local_approval() {
+    let root = TempDir::new().expect("tempdir");
+    let fixture_root = root.path().join("fixtures");
+    let project_root = root.path().join("workspace");
+    let app_state_root = root.path().join("state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(&app_state_root).expect("app state");
+
+    let member = "codex:global:skill:skill:codex:global:skill:admin/example-codex-admin-skill";
+    let preview = assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "create",
+                "--scope",
+                "personal",
+                "--name",
+                "desktop-bridge",
+                "--member",
+                member,
+            ],
+        ),
+        "group create preview",
+    );
+    let fingerprint = preview["planFingerprint"]
+        .as_str()
+        .expect("definition plan fingerprint");
+    assert_success_json(
+        run_group_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "create",
+                "--scope",
+                "personal",
+                "--name",
+                "desktop-bridge",
+                "--member",
+                member,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                fingerprint,
+            ],
+        ),
+        "group create apply",
+    );
+
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_unpin"))
+        .args(["desktop", "bridge"])
+        .arg("--fixture-root")
+        .arg(&fixture_root)
+        .arg("--home-root")
+        .arg(&fixture_root)
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--app-state-root")
+        .arg(&app_state_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch desktop bridge");
+    let mut input = child.stdin.take().expect("bridge stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("bridge stdout"));
+    let mut request = |value: serde_json::Value| {
+        writeln!(input, "{value}").expect("write bridge request");
+        input.flush().expect("flush bridge request");
+        let mut line = String::new();
+        output.read_line(&mut line).expect("read bridge response");
+        serde_json::from_str::<serde_json::Value>(&line).expect("bridge response JSON")
+    };
+
+    let plan = request(serde_json::json!({
+        "version": 1,
+        "id": "plan-1",
+        "method": "group.plan",
+        "params": {"qualifiedName": "personal:desktop-bridge", "target": "disable"},
+    }));
+    let operation_id = plan["result"]["plan"]["operationId"]
+        .as_str()
+        .expect("group operation id")
+        .to_string();
+    let plan_fingerprint = plan["result"]["plan"]["planFingerprint"]
+        .as_str()
+        .expect("group plan fingerprint")
+        .to_string();
+
+    let missing_approval = request(serde_json::json!({
+        "version": 1,
+        "id": "apply-before-approval",
+        "method": "group.apply",
+        "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
+    }));
+    assert_eq!(
+        missing_approval["error"]["code"],
+        "desktop-approval-required"
+    );
+
+    let approved = request(serde_json::json!({
+        "version": 1,
+        "id": "approve-1",
+        "method": "group.approve",
+        "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
+    }));
+    assert_eq!(approved["result"]["approval"], "current");
+    let applied = request(serde_json::json!({
+        "version": 1,
+        "id": "apply-1",
+        "method": "group.apply",
+        "params": {"operationId": operation_id, "planFingerprint": plan_fingerprint},
+    }));
+    assert_eq!(applied["result"]["result"]["requestedState"], "disable");
+
+    drop(request);
+    drop(input);
+    let status = child.wait().expect("wait for bridge");
+    assert!(status.success());
 }
 
 fn assert_success_json(output: Output, label: &str) -> serde_json::Value {
