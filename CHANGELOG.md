@@ -7,6 +7,32 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.0.0-rc.1] - 2026-08-04
+
+### Added
+
+- A native macOS workbench organizes the primary human workflows around
+  Discover and Organize, Govern and Automate, Change Safely, and Recover and
+  Audit while retaining the terminal TUI for later-parity workflows.
+- A versioned local stdio desktop bridge exposes redacted inventory, group,
+  reviewed change, backup, audit, and restore state while keeping Rust as the
+  only provider-mutation authority.
+- The shared Xcode scheme now has an XCTest action covering bundled-child
+  integrity, protocol and binary compatibility, isolated workspace loading,
+  and work-oriented navigation.
+- Release automation builds separate Apple Silicon and Intel desktop archives
+  with deterministic packaging, ad-hoc Hardened Runtime signing, SBOMs,
+  provenance attestations, checksums, and isolated bridge smoke verification.
+
+### Compatibility
+
+- CLI, terminal TUI, and MCP remain supported. Profiles, gateways, sessions,
+  and hooks continue through their existing non-desktop surfaces until later
+  workbench parity phases.
+- Desktop updates are manual in this release candidate. Desktop archives are
+  not Developer ID signed or notarized, so Gatekeeper can require an explicit
+  first-launch override after checksum and provenance verification.
+
 ## [0.6.2] - 2026-08-03
 
 ### Fixed
