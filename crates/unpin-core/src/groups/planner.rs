@@ -52,8 +52,24 @@ impl GroupTargetState {
 #[serde(rename_all = "kebab-case")]
 pub enum GroupPlanMode {
     PreviewOnly,
-    TuiDirect,
+    /// A locally supervised human interaction such as the terminal UI or the
+    /// desktop workbench. The wire value intentionally remains stable so
+    /// existing persisted terminal reviews continue to verify.
+    #[serde(rename = "tui-direct", alias = "local-interactive")]
+    LocalInteractive,
     McpHandoff,
+}
+
+impl GroupPlanMode {
+    /// Source-compatible name for callers compiled against the terminal-only
+    /// mode. New code must use [`Self::LocalInteractive`].
+    #[allow(non_upper_case_globals)]
+    pub const TuiDirect: Self = Self::LocalInteractive;
+
+    #[must_use]
+    pub const fn is_local_interactive(self) -> bool {
+        matches!(self, Self::LocalInteractive)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

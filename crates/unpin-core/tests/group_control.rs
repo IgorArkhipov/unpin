@@ -233,6 +233,30 @@ fn actionable_plans_allocate_distinct_high_entropy_operation_ids() {
 }
 
 #[test]
+fn local_interactive_plan_keeps_terminal_wire_compatibility_without_becoming_mcp() {
+    let harness = GroupHarness::new();
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::LocalInteractive);
+
+    assert!(plan.mode.is_local_interactive());
+    assert_eq!(plan.disposition, GroupPlanDisposition::Actionable);
+    assert_eq!(plan.provider_reach, ProviderReach::All);
+    assert!(
+        plan.provider_coverage
+            .entries()
+            .iter()
+            .all(|entry| entry.included)
+    );
+    plan.verify().expect("local-interactive plan verifies");
+
+    let serialized = serde_json::to_value(&plan).expect("serialize plan");
+    assert_eq!(serialized["mode"], "tui-direct");
+    let restored: unpin_core::groups::GroupTogglePlan =
+        serde_json::from_value(serialized).expect("deserialize legacy wire mode");
+    assert_eq!(restored.mode, GroupPlanMode::LocalInteractive);
+    restored.verify().expect("restored plan verifies");
+}
+
+#[test]
 fn beta4_group_plans_without_preserved_members_remain_compatible() {
     let harness = GroupHarness::new();
     let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);

@@ -1027,7 +1027,7 @@ impl GroupWorkflow {
                 &reference,
                 self.target,
                 group.members.len().max(1),
-                GroupPlanMode::TuiDirect,
+                GroupPlanMode::LocalInteractive,
                 ProviderReachRequest::new(ConnectionBoundary::All, reach, DerivedTargetKind::Group),
             )
             .map_err(|error| error.to_string())?;
