@@ -34,6 +34,22 @@ struct BundledBridgeManifest: Decodable {
     let sha256: String
 }
 
+struct BridgeLaunchRoots: Sendable {
+    let fixtureRoot: URL?
+    let homeRoot: URL?
+    let appStateRoot: URL?
+
+    init(
+        fixtureRoot: URL? = nil,
+        homeRoot: URL? = nil,
+        appStateRoot: URL? = nil
+    ) {
+        self.fixtureRoot = fixtureRoot
+        self.homeRoot = homeRoot
+        self.appStateRoot = appStateRoot
+    }
+}
+
 actor BridgeClient {
     static let protocolVersion = 2
     private static let maximumFrameBytes = 1_048_576
@@ -42,6 +58,7 @@ actor BridgeClient {
     private let executableURL: URL
     private let projectRoot: URL
     private let manifest: BundledBridgeManifest
+    private let roots: BridgeLaunchRoots
     private var process: Process?
     private var input: FileHandle?
     private var output: FileHandle?
@@ -49,10 +66,16 @@ actor BridgeClient {
     private var requestSequence = 0
     private var controlRequestInFlight = false
 
-    init(executableURL: URL, projectRoot: URL, manifest: BundledBridgeManifest) {
+    init(
+        executableURL: URL,
+        projectRoot: URL,
+        manifest: BundledBridgeManifest,
+        roots: BridgeLaunchRoots = BridgeLaunchRoots()
+    ) {
         self.executableURL = executableURL
         self.projectRoot = projectRoot
         self.manifest = manifest
+        self.roots = roots
     }
 
     func start() throws {
@@ -70,7 +93,17 @@ actor BridgeClient {
         }
         let child = Process()
         child.executableURL = executableURL
-        child.arguments = ["desktop", "bridge", "--project-root", projectRoot.path]
+        var arguments = ["desktop", "bridge", "--project-root", projectRoot.path]
+        if let fixtureRoot = roots.fixtureRoot {
+            arguments.append(contentsOf: ["--fixture-root", fixtureRoot.path])
+        }
+        if let homeRoot = roots.homeRoot {
+            arguments.append(contentsOf: ["--home-root", homeRoot.path])
+        }
+        if let appStateRoot = roots.appStateRoot {
+            arguments.append(contentsOf: ["--app-state-root", appStateRoot.path])
+        }
+        child.arguments = arguments
         child.currentDirectoryURL = projectRoot
         let standardInput = Pipe()
         let standardOutput = Pipe()
