@@ -224,13 +224,86 @@ struct GroupSummary: Decodable, Identifiable {
     var name: String { qualifiedName.split(separator: ":", maxSplits: 1).last.map(String.init) ?? qualifiedName }
 }
 struct GroupPlanEnvelope: Decodable { let plan: GroupPlan }
-struct GroupPlan: Decodable { let operationId: String?; let qualifiedName: String; let target: String; let planFingerprint: String; let providerReach: String; let members: [GroupPlanMember] }
-struct GroupPlanMember: Decodable, Identifiable { let identity: GroupMemberIdentity; let outcome: String; let reason: String?; var id: String { identity.id } }
+struct GroupPlan: Decodable {
+    let operationId: String?
+    let disposition: String
+    let mode: String
+    let qualifiedName: String
+    let scope: String
+    let groupRevision: String
+    let target: String
+    let totalMembers: Int
+    let providerReach: String
+    let providerCoverage: ProviderReachCoverage
+    let lifecycle: String
+    let members: [GroupPlanMember]
+    let resources: [GroupPlanResource]
+    let cohorts: [GroupPlanCohort]
+    let planFingerprint: String
+}
+struct ProviderReachCoverage: Decodable { let entries: [ProviderCoverageEntry] }
+struct ProviderCoverageEntry: Decodable, Identifiable {
+    let provider: String
+    let targetId: String
+    let included: Bool
+    let reason: String?
+
+    var id: String { "\(provider):\(targetId)" }
+}
+struct GroupPlanMember: Decodable, Identifiable {
+    let identity: GroupMemberIdentity
+    let currentEnabled: Bool?
+    let requestedEnabled: Bool
+    let outcome: String
+    let reason: String?
+    let affectedResources: [String]
+
+    var id: String { "\(identity.provider):\(identity.layer):\(identity.kind):\(identity.category):\(identity.id)" }
+}
+struct GroupPlanResource: Decodable, Identifiable {
+    let resourceId: String
+    let targetType: String
+    let memberIndices: [Int]
+    let activation: String
+
+    var id: String { resourceId }
+}
+struct GroupPlanCohort: Decodable, Identifiable {
+    let cohortId: String
+    let memberIndices: [Int]
+    let resourceIds: [String]
+
+    var id: String { cohortId }
+}
 struct GroupMemberIdentity: Codable { let provider: String; let layer: String; let kind: String; let category: String; let id: String }
 struct GroupMemberView: Decodable { let identity: GroupMemberIdentity; let enabled: Bool?; let eligible: Bool; let reason: String?; let displayName: String? }
 struct GroupApprovalEnvelope: Decodable { let operationId: String; let planFingerprint: String; let approval: String }
 struct GroupApplyEnvelope: Decodable { let result: GroupApplyResult }
-struct GroupApplyResult: Decodable { let operationId: String; let requestedState: String; let lifecycle: String; let backupIds: [String]; let observationFresh: Bool }
+struct GroupApplyResult: Decodable {
+    let operationId: String
+    let qualifiedName: String
+    let planFingerprint: String
+    let requestedState: String
+    let lifecycle: String
+    let providerReach: String
+    let providerCoverage: ProviderReachCoverage
+    let providerReachLifecycle: String
+    let members: [GroupApplyMemberResult]
+    let backupIds: [String]
+    let finalState: String
+    let observationFresh: Bool
+    let observationReason: String?
+}
+struct GroupApplyMemberResult: Decodable, Identifiable {
+    let identity: GroupMemberIdentity
+    let status: String
+    let failureMode: String?
+    let reason: String?
+    let cohortId: String?
+    let backupId: String?
+
+    var id: String { "\(identity.provider):\(identity.layer):\(identity.kind):\(identity.category):\(identity.id)" }
+}
 struct GroupDefinitionPlanEnvelope: Decodable { let operationId: String; let plan: GroupDefinitionPlan }
 struct GroupDefinitionPlan: Decodable {
     let action: String

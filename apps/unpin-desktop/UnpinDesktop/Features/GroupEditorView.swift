@@ -110,6 +110,21 @@ struct GroupEditorView: View {
                 .buttonStyle(.borderedProminent)
                 .disabled(name.isEmpty || selectedMembers.isEmpty)
                 if let group {
+                    Menu("Plan change") {
+                        Button("Enable") {
+                            Task {
+                                await workspace.plan(group: group, target: "enable")
+                                dismiss()
+                            }
+                        }
+                        Button("Disable") {
+                            Task {
+                                await workspace.plan(group: group, target: "disable")
+                                dismiss()
+                            }
+                        }
+                    }
+                    .disabled(!group.contextCompatible)
                     Button("Review delete", role: .destructive) {
                         Task { await reviewDelete(group) }
                     }
