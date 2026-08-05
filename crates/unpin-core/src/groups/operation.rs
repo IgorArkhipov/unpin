@@ -205,7 +205,7 @@ pub(crate) struct GroupOperationAuthorizationLink {
     pub session_generation: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupOperationPublicRecord {
     pub schema_version: u8,
@@ -437,7 +437,7 @@ fn operation_record_path(app_state_root: &Path, operation_id: &str) -> PathBuf {
     operations_root(app_state_root).join(format!("{operation_id}.json"))
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupOperationInspection {
     pub operation: GroupOperationPublicRecord,
@@ -668,7 +668,7 @@ pub struct GroupCohortBackupCoverageV1 {
     pub resource_ids: Vec<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GroupCohortBackupPublicIndex {
     pub schema_version: u8,

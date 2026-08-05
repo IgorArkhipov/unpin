@@ -8,6 +8,7 @@ import sys
 import tarfile
 import tempfile
 import textwrap
+import time
 import unittest
 from pathlib import Path
 
@@ -179,6 +180,99 @@ class DesktopReleaseScriptTests(unittest.TestCase):
 
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertIn("desktop archive inventory projection is invalid", completed.stderr)
+
+    def test_full_verifier_terminates_hung_bridge(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("full desktop artifact verification requires macOS")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command_bin = root / "bin"
+            command_bin.mkdir()
+            version = "1.0.0-rc.1"
+            target = "aarch64-apple-darwin"
+            release_name = f"unpin-desktop-v{version}-{target}"
+            app = root / release_name / "UnpinDesktop.app"
+            macos = app / "Contents" / "MacOS"
+            resources = app / "Contents" / "Resources"
+            macos.mkdir(parents=True)
+            resources.mkdir()
+            pid_file = root / "bridge.pid"
+
+            self._write_executable(
+                macos / "UnpinDesktop",
+                "#!/bin/sh\nexit 0\n",
+            )
+            self._write_executable(
+                macos / "unpin",
+                f"""\
+                #!/bin/sh
+                set -eu
+                if [ "${{1:-}}" = "--version" ]; then
+                    printf '%s\\n' 'unpin {version}'
+                    exit 0
+                fi
+                printf '%s\\n' "$$" > "{pid_file}"
+                trap '' TERM
+                while :; do sleep 1; done
+                """,
+            )
+            (app / "Contents" / "Info.plist").write_text("{}", encoding="utf-8")
+            bridge = macos / "unpin"
+            (resources / "unpin-bridge-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "bridgeProtocolVersion": 2,
+                        "unpinVersion": version,
+                        "sha256": hashlib.sha256(bridge.read_bytes()).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            archive = root / f"{release_name}.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(root / release_name, arcname=release_name)
+
+            self._write_executable(
+                command_bin / "lipo",
+                "#!/bin/sh\nprintf '%s\\n' arm64\n",
+            )
+            self._write_executable(command_bin / "codesign", "#!/bin/sh\nexit 0\n")
+            self._write_executable(
+                command_bin / "plutil",
+                f"#!/bin/sh\nprintf '%s\\n' '{version}'\n",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = os.pathsep.join(
+                [str(command_bin), environment.get("PATH", "")]
+            )
+            # Leave enough startup budget for `arch` on a busy macOS runner;
+            # the fake bridge still proves the TERM/KILL timeout path.
+            environment["UNPIN_DESKTOP_RELEASE_BRIDGE_TIMEOUT_SECONDS"] = "1"
+
+            started = time.monotonic()
+            completed = subprocess.run(
+                [str(VERIFY_SCRIPT), str(archive), target, version],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            elapsed = time.monotonic() - started
+
+            self.assertEqual(completed.returncode, 124, completed.stderr)
+            self.assertLess(elapsed, 8, completed.stderr)
+            self.assertIn("desktop archive bridge timed out", completed.stderr)
+            bridge_pid = int(pid_file.read_text(encoding="utf-8"))
+            for _ in range(20):
+                try:
+                    os.kill(bridge_pid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail(f"hung bridge process {bridge_pid} survived verifier timeout")
 
     def test_projection_validator_rejects_boolean_inventory_identity(self) -> None:
         version = "1.0.0-rc.1"

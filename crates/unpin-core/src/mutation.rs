@@ -1897,8 +1897,7 @@ pub struct AuthenticatedBackupIndex {
     available: bool,
     candidate_directories: usize,
     unreadable_entry: bool,
-    #[allow(dead_code)]
-    directory_scan_count: usize,
+    unauthenticated_candidate: bool,
 }
 
 impl AuthenticatedBackupIndex {
@@ -1914,6 +1913,7 @@ impl AuthenticatedBackupIndex {
     pub fn is_complete(&self) -> bool {
         self.available
             && !self.unreadable_entry
+            && !self.unauthenticated_candidate
             && self.summaries.len() == self.candidate_directories
     }
 
@@ -1945,15 +1945,11 @@ pub fn load_backup_index_authenticated(
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return AuthenticatedBackupIndex {
                 available: true,
-                directory_scan_count: 1,
                 ..AuthenticatedBackupIndex::default()
             };
         }
         Err(_) => {
-            return AuthenticatedBackupIndex {
-                directory_scan_count: 1,
-                ..AuthenticatedBackupIndex::default()
-            };
+            return AuthenticatedBackupIndex::default();
         }
     };
     let (entries, available, mut unreadable_entry) = entries;
@@ -2033,6 +2029,22 @@ pub fn load_backup_index_authenticated(
         };
         manifest_digests.insert(name.to_string(), transition_digest(&bytes));
     }
+
+    // Summaries intentionally retain legacy and failed manifests for
+    // diagnostics, but no such candidate may make the index authoritative.
+    // Require every candidate directory to have a structurally valid,
+    // authenticated manifest digest before allowing any digest lookup.
+    let unauthenticated_candidate = scanned.iter().any(|entry| {
+        if !entry.summary_directory || entry.name.as_deref() == Some(".quarantine") {
+            return false;
+        }
+        let Some(name) = entry.name.as_deref() else {
+            return true;
+        };
+        !entry.resolution_directory
+            || !valid_backup_id(name)
+            || !manifest_digests.contains_key(name)
+    });
 
     let mut retirement_aliases = BTreeMap::<String, Vec<String>>::new();
     let mut retirement_alias_present = BTreeSet::new();
@@ -2124,7 +2136,7 @@ pub fn load_backup_index_authenticated(
         available,
         candidate_directories,
         unreadable_entry,
-        directory_scan_count: 1,
+        unauthenticated_candidate,
     }
 }
 
@@ -11480,27 +11492,58 @@ mod backup_index_tests {
     }
 
     #[test]
-    fn authenticated_backup_index_scans_hundreds_of_backups_once() {
+    fn authenticated_backup_index_scans_hundreds_of_backups() {
         let temporary = tempfile::tempdir().expect("temporary app state");
         let app_state_root = temporary.path();
         let backups_root = app_state_root.join("backups");
         let target_path = app_state_root.join("workspace").join("settings.json");
+        let authentication_key = BackupAuthenticationKey::new([0x42; 32]);
         let backup_count = 256;
         for index in 0..backup_count {
             let backup_id = format!("backup-{index}");
             let backup_root = backups_root.join(&backup_id);
-            write_test_backup(&backup_root, &backup_id, &target_path);
+            authenticate_test_backup(
+                &backup_root,
+                &backup_id,
+                &target_path,
+                Vec::new(),
+                &authentication_key,
+            );
         }
 
-        let index = load_backup_index_authenticated(
-            app_state_root,
-            Some(&BackupAuthenticationKey::new([0x42; 32])),
-        );
+        let index = load_backup_index_authenticated(app_state_root, Some(&authentication_key));
 
-        assert_eq!(index.directory_scan_count, 1);
         assert_eq!(index.candidate_directories, backup_count);
         assert_eq!(index.summaries.len(), backup_count);
         assert!(index.is_complete());
+    }
+
+    #[test]
+    fn unauthenticated_invalid_directory_with_parseable_manifest_withholds_digests() {
+        let temporary = tempfile::tempdir().expect("temporary app state");
+        let app_state_root = temporary.path();
+        let backups_root = app_state_root.join("backups");
+        let target_path = app_state_root.join("workspace").join("settings.json");
+        let authentication_key = BackupAuthenticationKey::new([0x42; 32]);
+        authenticate_test_backup(
+            &backups_root.join("backup-current"),
+            "backup-current",
+            &target_path,
+            Vec::new(),
+            &authentication_key,
+        );
+        let invalid_sibling = backups_root.join("backup_invalid");
+        write_test_backup(&invalid_sibling, "backup_invalid", &target_path);
+
+        let index = load_backup_index_authenticated(app_state_root, Some(&authentication_key));
+
+        assert!(!index.is_complete());
+        assert!(
+            index
+                .authenticated_manifest_digest("backup-current")
+                .is_none(),
+            "an invalid backup directory must not make any digest authoritative"
+        );
     }
 
     #[test]

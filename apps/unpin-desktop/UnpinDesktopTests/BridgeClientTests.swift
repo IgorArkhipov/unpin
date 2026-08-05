@@ -153,6 +153,58 @@ final class BridgeClientTests: XCTestCase {
         XCTAssertTrue(stopped)
     }
 
+    func testStalledControlTimeoutKillsChildIgnoringSigterm() async throws {
+        let script = """
+        #!/bin/sh
+        trap '' TERM
+        while IFS= read -r request; do
+            case "$request" in
+                *group.approve*)
+                    while :; do :; done
+                    ;;
+                *handshake*)
+                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0-rc.1","capabilities":[]}}'
+                    ;;
+            esac
+        done
+        """
+        let temporary = try temporaryExecutable(script: script)
+        defer { try? FileManager.default.removeItem(at: temporary.root) }
+        let digest = SHA256.hash(data: try Data(contentsOf: temporary.executable))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let bridge = BridgeClient(
+            executableURL: temporary.executable,
+            projectRoot: temporary.root,
+            manifest: BundledBridgeManifest(
+                bridgeProtocolVersion: BridgeClient.protocolVersion,
+                unpinVersion: "1.0.0-rc.1",
+                sha256: digest
+            ),
+            controlRequestTimeoutMilliseconds: 50,
+            terminationPolicy: BridgeTerminationPolicy(
+                gracePeriodNanoseconds: 10_000_000,
+                settlePeriodNanoseconds: 10_000_000
+            )
+        )
+
+        try await bridge.start()
+        do {
+            _ = try await bridge.approveGroup(operationID: "operation", fingerprint: "fingerprint")
+            XCTFail("a stalled control request must not complete")
+        } catch BridgeClientError.controlRequestUncertain {
+            // SIGTERM is ignored; forceStop must escalate to SIGKILL and return.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+
+        try await bridge.start()
+        let handshake = try await bridge.handshake()
+        XCTAssertEqual(handshake.binaryVersion, "1.0.0-rc.1")
+        let stopped = await bridge.stop()
+        XCTAssertTrue(stopped)
+    }
+
     func testIncompatibleGroupDefaultsMissingMembersToEmpty() throws {
         let data = Data(#"""
         {

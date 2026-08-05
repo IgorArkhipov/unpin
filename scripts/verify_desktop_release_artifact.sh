@@ -45,6 +45,102 @@ if [[ ! -d "$fixture_source" ]]; then
   exit 1
 fi
 
+bridge_timeout_seconds="${UNPIN_DESKTOP_RELEASE_BRIDGE_TIMEOUT_SECONDS:-30}"
+python3_binary="$(command -v python3 || true)"
+if [[ -z "$python3_binary" || ! -x "$python3_binary" ]]; then
+  echo "python3 is required for bounded desktop bridge verification" >&2
+  exit 1
+fi
+timeout_helper="$smoke_root/run_bridge_with_timeout.py"
+cat > "$timeout_helper" <<'PY'
+from __future__ import annotations
+
+import os
+import pathlib
+import signal
+import subprocess
+import sys
+
+
+def terminate_process_group(process: subprocess.Popen[bytes]) -> bool:
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return process.poll() is not None
+
+    try:
+        process.wait(timeout=1.0)
+        return True
+    except subprocess.TimeoutExpired:
+        pass
+
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return process.poll() is not None
+
+    try:
+        process.wait(timeout=1.0)
+        return True
+    except subprocess.TimeoutExpired:
+        return False
+
+
+try:
+    timeout_seconds = float(sys.argv[1])
+except (IndexError, ValueError):
+    raise SystemExit("desktop archive bridge timeout is invalid")
+if timeout_seconds <= 0:
+    raise SystemExit("desktop archive bridge timeout must be greater than zero")
+
+stdin_path = pathlib.Path(sys.argv[2])
+stdout_path = pathlib.Path(sys.argv[3])
+stderr_path = pathlib.Path(sys.argv[4])
+command = sys.argv[5:]
+if not command:
+    raise SystemExit("desktop archive bridge command is missing")
+
+stdin_handle = None if str(stdin_path) == "-" else stdin_path.open("rb")
+stdout_handle = None if str(stdout_path) == "-" else stdout_path.open("wb")
+stderr_handle = None if str(stderr_path) == "-" else stderr_path.open("wb")
+try:
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL if stdin_handle is None else stdin_handle,
+        stdout=subprocess.PIPE if stdout_handle is None else stdout_handle,
+        stderr=stderr_handle,
+        start_new_session=True,
+    )
+    try:
+        stdout, _ = process.communicate(
+            timeout=timeout_seconds,
+        )
+    except subprocess.TimeoutExpired:
+        if not terminate_process_group(process):
+            print(
+                "desktop archive bridge did not terminate after SIGKILL",
+                file=sys.stderr,
+            )
+        print(
+            f"desktop archive bridge timed out after {timeout_seconds:g}s",
+            file=sys.stderr,
+        )
+        raise SystemExit(124)
+
+    if stdout_handle is None and stdout is not None:
+        sys.stdout.buffer.write(stdout)
+    if process.returncode:
+        raise SystemExit(process.returncode)
+finally:
+    if stdin_handle is not None:
+        stdin_handle.close()
+    if stdout_handle is not None:
+        stdout_handle.close()
+    if stderr_handle is not None:
+        stderr_handle.close()
+PY
+chmod 700 "$timeout_helper"
+
 tar -xzf "$archive" -C "$smoke_root"
 app="$smoke_root/$release_name/UnpinDesktop.app"
 desktop_binary="$app/Contents/MacOS/UnpinDesktop"
@@ -91,14 +187,28 @@ if payload != {
     raise SystemExit("desktop bridge manifest does not match bundled binary")
 PY
 
-version_output="$(
-  env -i \
-    HOME="$smoke_root" \
-    PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
-    TMPDIR="$smoke_root" \
-    LC_ALL=C \
+version_output_file="$smoke_root/bridge-version.out"
+set +e
+env -i \
+  HOME="$smoke_root" \
+  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  TMPDIR="$smoke_root" \
+  LC_ALL=C \
+  "$python3_binary" "$timeout_helper" \
+    "$bridge_timeout_seconds" \
+    - \
+    "$version_output_file" \
+    - \
     arch "-$expected_architecture" "$bridge_binary" --version
-)"
+bridge_status=$?
+set -e
+if [[ "$bridge_status" -ne 0 ]]; then
+  if [[ "$bridge_status" -eq 124 ]]; then
+    echo "desktop archive bridge timed out during version verification" >&2
+  fi
+  exit "$bridge_status"
+fi
+version_output="$(<"$version_output_file")"
 if [[ "$version_output" != "unpin $release_version" ]]; then
   echo "desktop archive bridge version mismatch: $version_output" >&2
   exit 1
@@ -140,6 +250,7 @@ printf '%s\n' \
 
 # An empty environment plus explicit roots makes accidental HOME/provider
 # lookups observable and keeps this smoke independent of the host account.
+set +e
 (
   cd "$smoke_root"
   env -i \
@@ -147,15 +258,25 @@ printf '%s\n' \
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     TMPDIR="$tmp_root" \
     LC_ALL=C \
-    arch "-$expected_architecture" "$bridge_binary" desktop bridge \
-      --fixture-root "$fixture_root" \
-      --home-root "$home_root" \
-      --project-root "$project_root" \
-      --app-state-root "$app_state_root" \
-      < "$request_file" \
-      > "$response_file" \
-      2> "$stderr_file"
+    "$python3_binary" "$timeout_helper" \
+      "$bridge_timeout_seconds" \
+      "$request_file" \
+      "$response_file" \
+      "$stderr_file" \
+      arch "-$expected_architecture" "$bridge_binary" desktop bridge \
+        --fixture-root "$fixture_root" \
+        --home-root "$home_root" \
+        --project-root "$project_root" \
+        --app-state-root "$app_state_root"
 )
+bridge_status=$?
+set -e
+if [[ "$bridge_status" -ne 0 ]]; then
+  if [[ "$bridge_status" -eq 124 ]]; then
+    echo "desktop archive bridge timed out during smoke verification" >&2
+  fi
+  exit "$bridge_status"
+fi
 if [[ -s "$stderr_file" ]]; then
   echo "desktop archive bridge emitted unexpected diagnostics" >&2
   cat "$stderr_file" >&2
