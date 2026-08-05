@@ -5,10 +5,12 @@ Choose the path that matches what you want to do:
 - **Use an installed release:** follow the
   [README five-minute setup](../README.md#five-minute-local-setup), including
   the project-scoped skill and MCP toggle recipe.
-- **Use the macOS desktop workbench from source:** read the
+- **Use the macOS desktop workbench:** read the
   [desktop workbench boundary](../README.md#desktop-workbench-macos-first-phase).
   Its first phase covers Discover and Organize, Change Safely, and Recover and
-  Audit; it is not yet a signed or published desktop release.
+  Audit. Stable `1.0.0` archives are ad-hoc signed with Hardened Runtime under
+  the documented unsigned-GA exception; they are not Developer ID signed or
+  Apple-notarized.
 - **Connect Unpin to an agent:** follow the
   [MCP setup guide](MCP.md) for Codex, Claude Code, Cursor, OpenCode, Zed, and
   the copy-ready automatic setup prompt. Then use the
@@ -28,11 +30,11 @@ discovers and safely manages local AI-agent configuration for Claude Code,
 Codex, Cursor, Pi, OpenCode, and Zed. It normalizes provider-specific skills,
 MCP servers, plugins, hooks, agents, and settings into one inventory.
 
-Unpin `0.5.0` is the non-prerelease release channel. Its public stdio MCP
+Unpin `1.0.0` is the stable release channel. Its public stdio MCP
 server supports the stateless 2026-07-28 protocol edition while retaining
 legacy MCP host compatibility; this does not expand its plan-first mutation
-authority. It is a program-logic release, so the full provider matrix and
-live-host validation are required before publication. Its GNU/Linux archive is
+authority. The implementation passed the full provider matrix and live-host
+validation before the version-only stable promotion. Its GNU/Linux archive is
 built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12. Release
 artifacts are published only after required CI and release-specific evidence
@@ -70,13 +72,14 @@ first-class surfaces, and the terminal TUI remains the compatibility path for
 Profiles, Gateways, Sessions, and Hooks until each has a dedicated desktop
 workflow.
 
-The `1.0.0-rc.1` distribution adds separate native desktop archives for Apple
+The `1.0.0` distribution adds separate native desktop archives for Apple
 Silicon and Intel macOS. They are ad-hoc signed with Hardened Runtime, not
 Developer ID signed or notarized, and updates are manual. The signing verifies
 bundle consistency but does not establish Gatekeeper trust. Use the
 [desktop guide](DESKTOP.md) for checksum and provenance verification,
-Gatekeeper-safe first launch, update, and uninstall instructions. A notarized
-GA desktop release and cross-platform desktop support remain deferred.
+Gatekeeper-safe first launch, update, and uninstall instructions. The stable
+`1.0.0` release uses an explicit unsigned-GA exception; notarized distribution
+and cross-platform desktop support remain deferred.
 
 ## First safe run from source
 

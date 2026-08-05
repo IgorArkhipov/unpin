@@ -24,11 +24,15 @@ has separate GitHub SLSA build-provenance and SBOM attestations. The draft
 workflow generates `SHA256SUMS`; ordinary program releases also attach a
 manifest-approved provider-matrix evidence bundle.
 
-Desktop RC archives are reproducibly ad-hoc signed with Hardened Runtime and no
+Desktop archives are reproducibly ad-hoc signed with Hardened Runtime and no
 timestamp. They are not Developer ID signed or notarized, and must never be
-described as Gatekeeper-trusted. Until Developer ID signing, notarization, and
-an installed-artifact smoke are available, desktop artifacts may ship only as
-explicit prereleases. A GA `1.0.0` desktop release is blocked on those gates.
+described as Gatekeeper-trusted. A stable release may include them only when a
+maintainer explicitly approves the unsigned-GA exception, release-facing
+documentation explains Gatekeeper's manual first-launch requirement, and the
+downloaded archive passes checksum, attestation, signature, bridge-handshake,
+and installed-artifact verification. Developer ID signing and notarization
+remain future distribution hardening rather than a blocker under that explicit
+exception.
 
 ## Prepare release commit
 

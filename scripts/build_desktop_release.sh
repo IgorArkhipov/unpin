@@ -69,7 +69,7 @@ if [[ "$(lipo -archs "$bridge_binary")" != "$xcode_architecture" ]]; then
   exit 1
 fi
 
-# RC artifacts are intentionally ad-hoc signed. The absent timestamp makes the
+# Desktop artifacts are intentionally ad-hoc signed. The absent timestamp makes the
 # signing step reproducible, while Hardened Runtime keeps the bundle compatible
 # with a future Developer ID/notarization release process.
 codesign --force --sign - --timestamp=none --options runtime "$bridge_binary" >&2

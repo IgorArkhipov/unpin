@@ -15,7 +15,7 @@ audit evidence, and explicit recovery outcomes.
 
 ## Current status
 
-- Version: `0.5.0` stable release candidate.
+- Version: `1.0.0` stable unified release.
 - Canonical repository: `https://github.com/IgorArkhipov/unpin`.
 - License: MIT, copyright Igor Arkhipov.
 - Distribution: GitHub release archives for Apple Silicon macOS, Intel macOS,
@@ -46,13 +46,15 @@ SBOM generation, provenance attestation, checksums, and a draft-only release
 workflow. crates.io, Homebrew, Linux ARM64, Windows, and platform code signing
 remain deferred.
 
-Publishing `v0.5.0` is gated on required CI, workflow lint, locked
-package metadata, version smoke, Linux artifact verification on an exact clean
+Publishing `v1.0.0` is gated on required CI, workflow lint, locked package
+metadata, a version smoke, and Linux artifact verification on an exact clean
 release commit (a `GLIBC_2.35`-or-older symbol ceiling and Debian 12 smoke),
-generated checksums attached to the draft, enabled branch protection,
-private-security-reporting, and immutable-release controls. This program-logic
-release also requires a full provider matrix and live-host validation on the
-exact clean release commit.
+plus generated checksums attached to the draft, enabled branch protection,
+private-security-reporting, and immutable-release controls. The preceding
+implementation commit passed the full provider matrix and live-host validation;
+the delivery-only stable promotion uses the documented maintainer-approved
+unsigned-GA exception. Publication still requires fresh-download checksum,
+attestation, signature, bridge-handshake, and installed-artifact verification.
 
 The [README](README.md#five-minute-local-setup) provides the installed-user
 quick start and exact project toggle recipe. The [MCP setup guide](docs/MCP.md)
