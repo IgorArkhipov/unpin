@@ -2,12 +2,12 @@ use assert_cmd::Command;
 use std::{
     collections::BTreeSet,
     fs,
-    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{Command as StdCommand, Output},
 };
 #[cfg(unix)]
 use std::{
+    io::{BufRead, BufReader, Write},
     process::Stdio,
     thread,
     time::{Duration, Instant},
