@@ -34,6 +34,39 @@ private actor ReadBarrier {
     }
 }
 
+private actor FirstInvocationBarrier {
+    private var firstInvocationReached = false
+    private var released = false
+    private var reachWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func pauseFirstInvocation() async {
+        guard firstInvocationReached == false else { return }
+        firstInvocationReached = true
+        let reachWaiters = self.reachWaiters
+        self.reachWaiters.removeAll()
+        reachWaiters.forEach { $0.resume() }
+        guard released == false else { return }
+        await withCheckedContinuation { continuation in
+            releaseWaiters.append(continuation)
+        }
+    }
+
+    func waitUntilFirstInvocation() async {
+        guard firstInvocationReached == false else { return }
+        await withCheckedContinuation { continuation in
+            reachWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        let releaseWaiters = self.releaseWaiters
+        self.releaseWaiters.removeAll()
+        releaseWaiters.forEach { $0.resume() }
+    }
+}
+
 @MainActor
 final class WorkspaceStoreTests: XCTestCase {
     func testLaunchStartsWithoutAnImplicitWorkspace() async {
@@ -144,6 +177,106 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertTrue(store.lastRestore?.status.isRestored == true)
     }
 
+    func testConcurrentGroupPlansKeepTheLatestUserIntent() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let group = try await createGroup(in: store, name: "plan-ordering")
+
+        let firstPlanBarrier = FirstInvocationBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeGroupPlan: { await firstPlanBarrier.pauseFirstInvocation() }
+        ))
+        let enableTask = Task { await store.plan(group: group, target: "enable") }
+        await firstPlanBarrier.waitUntilFirstInvocation()
+
+        let disableTask = Task { await store.plan(group: group, target: "disable") }
+        await disableTask.value
+        XCTAssertEqual(store.reviewedPlan?.target, "disable")
+
+        await firstPlanBarrier.release()
+        await enableTask.value
+
+        XCTAssertEqual(store.reviewedPlan?.target, "disable")
+    }
+
+    func testGroupApplyUncertaintyRetainsBlockerUntilWorkspaceReload() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        await store.refreshRecovery()
+        let group = try await createGroup(in: store, name: "uncertain-group")
+
+        await store.plan(group: group, target: "disable")
+        await store.approveReviewedPlan()
+
+        let applyBarrier = ReadBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeGroupApply: { await applyBarrier.pause() }
+        ))
+        let applyTask = Task { await store.applyApprovedPlan() }
+        await applyBarrier.waitUntilReached()
+        applyTask.cancel()
+        await applyBarrier.release()
+        await applyTask.value
+
+        XCTAssertNil(store.reviewedPlan)
+        XCTAssertNil(store.approvedPlanFingerprint)
+        XCTAssertNotNil(store.mutationUncertaintyBlocker)
+        XCTAssertTrue(store.actionsBlocked)
+        await store.plan(group: group, target: "enable")
+        XCTAssertNil(store.reviewedPlan)
+        XCTAssertEqual(store.statusMessage, store.mutationUncertaintyBlocker)
+
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks())
+        await store.reloadWorkspace()
+        XCTAssertNil(store.mutationUncertaintyBlocker)
+        XCTAssertNil(store.recoveryBlocker)
+        XCTAssertFalse(store.actionsBlocked)
+    }
+
+    func testRestoreApplyUncertaintyRetainsBlockerUntilWorkspaceReload() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let group = try await createGroup(in: store, name: "uncertain-restore")
+
+        await store.plan(group: group, target: "disable")
+        await store.approveReviewedPlan()
+        await store.applyApprovedPlan()
+        await store.refreshRecovery()
+        let backup = try XCTUnwrap(store.recovery?.backups.first(where: \.restorable))
+        await store.planRestore(backupID: backup.backupId)
+        await store.approveReviewedRestore()
+
+        let applyBarrier = ReadBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeRestoreApply: { await applyBarrier.pause() }
+        ))
+        let applyTask = Task { await store.applyApprovedRestore() }
+        await applyBarrier.waitUntilReached()
+        applyTask.cancel()
+        await applyBarrier.release()
+        await applyTask.value
+
+        XCTAssertNil(store.reviewedRestore)
+        XCTAssertNil(store.approvedRestoreFingerprint)
+        XCTAssertNotNil(store.mutationUncertaintyBlocker)
+        XCTAssertTrue(store.actionsBlocked)
+        await store.planRestore(backupID: backup.backupId)
+        XCTAssertNil(store.reviewedRestore)
+        XCTAssertEqual(store.statusMessage, store.mutationUncertaintyBlocker)
+
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks())
+        await store.reloadWorkspace()
+        XCTAssertNil(store.mutationUncertaintyBlocker)
+        XCTAssertNil(store.recoveryBlocker)
+        XCTAssertFalse(store.actionsBlocked)
+    }
+
     func testApprovalMismatchClearsReviewAndDiscardLeavesNoReview() async throws {
         let fixture = try makeFixtureStore()
         defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
@@ -156,7 +289,9 @@ final class WorkspaceStoreTests: XCTestCase {
 
         XCTAssertNil(store.reviewedPlan)
         XCTAssertNil(store.approvedPlanFingerprint)
-        XCTAssertNotNil(store.lastChangeBlocker)
+        XCTAssertNil(store.lastChangeBlocker)
+        XCTAssertNil(store.mutationUncertaintyBlocker)
+        XCTAssertNil(store.recoveryBlocker)
 
         await store.plan(group: group, target: "disable")
         XCTAssertNotNil(store.reviewedPlan)
@@ -164,6 +299,36 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertNil(store.reviewedPlan)
         XCTAssertNil(store.approvedPlanFingerprint)
         XCTAssertNil(store.lastChangeBlocker)
+    }
+
+    func testRestoreApprovalMismatchDoesNotCreateMutationUncertaintyBlocker() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let group = try await createGroup(in: store, name: "restore-approval-flow")
+
+        await store.plan(group: group, target: "disable")
+        await store.approveReviewedPlan()
+        await store.applyApprovedPlan()
+        await store.refreshRecovery()
+        let backup = try XCTUnwrap(store.recovery?.backups.first(where: \.restorable))
+        await store.planRestore(backupID: backup.backupId)
+        XCTAssertNotNil(store.reviewedRestore)
+
+        await store.applyApprovedRestore()
+
+        XCTAssertNil(store.reviewedRestore)
+        XCTAssertNil(store.approvedRestoreFingerprint)
+        XCTAssertNil(store.lastRestoreBlocker)
+        XCTAssertNil(store.mutationUncertaintyBlocker)
+        XCTAssertNil(store.recoveryBlocker)
+        guard case .blocked = store.state else {
+            return XCTFail("a deterministic restore approval rejection should report a blocked request")
+        }
+
+        await store.planRestore(backupID: backup.backupId)
+        XCTAssertNotNil(store.reviewedRestore)
     }
 
     func testRecoveryRefreshFailurePreservesEvidenceAndBlocksNewActions() async throws {

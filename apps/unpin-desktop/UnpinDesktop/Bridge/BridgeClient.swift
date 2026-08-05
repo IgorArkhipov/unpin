@@ -52,6 +52,21 @@ struct BridgeLaunchRoots: Sendable {
     }
 }
 
+struct BridgeTerminationPolicy: Sendable {
+    let gracePeriodNanoseconds: UInt64
+    let settlePeriodNanoseconds: UInt64
+
+    static let production = Self(
+        gracePeriodNanoseconds: 1_000_000_000,
+        settlePeriodNanoseconds: 1_000_000_000
+    )
+
+    init(gracePeriodNanoseconds: UInt64, settlePeriodNanoseconds: UInt64) {
+        self.gracePeriodNanoseconds = gracePeriodNanoseconds
+        self.settlePeriodNanoseconds = settlePeriodNanoseconds
+    }
+}
+
 actor BridgeClient {
     static let protocolVersion = 2
     private static let maximumFrameBytes = 1_048_576
@@ -69,19 +84,22 @@ actor BridgeClient {
     private var requestSequence = 0
     private var controlRequestInFlight = false
     private let controlRequestTimeoutMilliseconds: Int
+    private let terminationPolicy: BridgeTerminationPolicy
 
     init(
         executableURL: URL,
         projectRoot: URL,
         manifest: BundledBridgeManifest,
         roots: BridgeLaunchRoots = BridgeLaunchRoots(),
-        controlRequestTimeoutMilliseconds: Int = BridgeClient.defaultControlRequestTimeoutMilliseconds
+        controlRequestTimeoutMilliseconds: Int = BridgeClient.defaultControlRequestTimeoutMilliseconds,
+        terminationPolicy: BridgeTerminationPolicy = .production
     ) {
         self.executableURL = executableURL
         self.projectRoot = projectRoot
         self.manifest = manifest
         self.roots = roots
         self.controlRequestTimeoutMilliseconds = max(1, controlRequestTimeoutMilliseconds)
+        self.terminationPolicy = terminationPolicy
     }
 
     func start() throws {
@@ -129,11 +147,11 @@ actor BridgeClient {
             kind: .readOnly
         )
         guard handshake.protocolVersion == Self.protocolVersion else {
-            stop()
+            await stop()
             throw BridgeClientError.incompatibleProtocol
         }
         guard handshake.binaryVersion == manifest.unpinVersion else {
-            stop()
+            await stop()
             throw BridgeClientError.incompatibleBinary
         }
         return handshake
@@ -240,13 +258,13 @@ actor BridgeClient {
     }
 
     @discardableResult
-    func stop() -> Bool {
+    func stop() async -> Bool {
         guard controlRequestInFlight == false else { return false }
-        forceStop()
+        await forceStop()
         return true
     }
 
-    private func forceStop() {
+    private func forceStop() async {
         let child = process
         input?.closeFile()
         output?.closeFile()
@@ -256,7 +274,14 @@ actor BridgeClient {
         outputBuffer.removeAll(keepingCapacity: false)
         if let child, child.isRunning {
             child.terminate()
-            child.waitUntilExit()
+            await Self.waitForTermination(of: child, timeoutNanoseconds: terminationPolicy.gracePeriodNanoseconds)
+            if child.isRunning {
+                _ = kill(child.processIdentifier, SIGKILL)
+                await Self.waitForTermination(
+                    of: child,
+                    timeoutNanoseconds: terminationPolicy.settlePeriodNanoseconds
+                )
+            }
         }
     }
 
@@ -299,31 +324,45 @@ actor BridgeClient {
             return result
         } catch is CancellationError {
             if kind == .readOnly {
-                forceStop()
+                await forceStop()
                 throw CancellationError()
             }
-            forceStop()
+            await forceStop()
             throw BridgeClientError.controlRequestUncertain
         } catch let error as BridgeClientError {
             if case .requestFailed = error {
                 throw error
             }
             if kind == .readOnly {
-                forceStop()
+                await forceStop()
                 throw error
             }
-            forceStop()
+            await forceStop()
             if case .requestTimedOut = error {
                 throw BridgeClientError.controlRequestUncertain
             }
             throw error
         } catch {
             if kind == .readOnly {
-                forceStop()
+                await forceStop()
                 throw error
             }
-            forceStop()
+            await forceStop()
             throw error
+        }
+    }
+
+    private nonisolated static func waitForTermination(
+        of child: Process,
+        timeoutNanoseconds: UInt64
+    ) async {
+        await withCheckedContinuation { continuation in
+            let completion = ProcessTerminationCompletion(continuation)
+            child.terminationHandler = { _ in completion.finish() }
+            let deadline = DispatchTime.now() + .nanoseconds(Int(timeoutNanoseconds))
+            DispatchQueue.global(qos: .utility).asyncAfter(deadline: deadline) {
+                completion.finish()
+            }
         }
     }
 
@@ -366,6 +405,23 @@ actor BridgeClient {
         }
         let digest = hasher.finalize()
         return digest.map { String(format: "%02x", $0) }.joined()
+    }
+}
+
+private final class ProcessTerminationCompletion: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = continuation
+    }
+
+    func finish() {
+        lock.lock()
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume()
     }
 }
 

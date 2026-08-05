@@ -117,6 +117,21 @@ final class WorkbenchFlowTests: XCTestCase {
         }
     }
 
+    func testInventoryFiltersDeclareMeaningfulAccessibilityLabels() {
+        XCTAssertEqual(
+            WorkbenchFilterAccessibility.discoverLabels,
+            ["Provider", "Layer", "Category", "State"]
+        )
+        XCTAssertEqual(
+            WorkbenchFilterAccessibility.groupLabels,
+            ["Provider", "Layer", "Category", "State", "Membership"]
+        )
+        XCTAssertTrue(
+            (WorkbenchFilterAccessibility.discoverLabels + WorkbenchFilterAccessibility.groupLabels)
+                .allSatisfy { !$0.isEmpty }
+        )
+    }
+
     func testWorkbenchOffersExactlyLightAndDarkAppearances() {
         XCTAssertEqual(WorkbenchColorScheme.allCases, [.light, .dark])
         XCTAssertEqual(WorkbenchColorScheme.allCases.map(\.title), ["Light", "Dark"])
@@ -129,6 +144,22 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertEqual(WorkbenchColorScheme.resolve(storedValue: "unsupported"), .dark)
         XCTAssertEqual(WorkbenchPalette.resolve(for: .light).scheme, .light)
         XCTAssertEqual(WorkbenchPalette.resolve(for: .dark).scheme, .dark)
+    }
+
+    func testWorkbenchAppearanceSelectionPersistsInIsolatedDefaults() throws {
+        let suiteName = "unpin-workbench-appearance-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let first = WorkbenchAppearanceStorageProbe(defaults: defaults)
+        XCTAssertEqual(first.value, WorkbenchColorScheme.defaultValue.rawValue)
+
+        first.value = WorkbenchColorScheme.light.rawValue
+        XCTAssertEqual(WorkbenchAppearanceStorageProbe(defaults: defaults).value, "light")
+
+        first.value = WorkbenchColorScheme.dark.rawValue
+        XCTAssertEqual(WorkbenchAppearanceStorageProbe(defaults: defaults).value, "dark")
     }
 
     func testGroupEditorFilterSelectionsFitAtCaptureWidth() {
@@ -161,20 +192,95 @@ final class WorkbenchFlowTests: XCTestCase {
         }
     }
 
+    func testInventoryFilterRevisionNormalizesSameSecondReplacement() {
+        let original = [inventoryItem(name: "Claude skill", provider: "claude", id: "old")]
+        let replacement = [inventoryItem(
+            name: "Zed MCP",
+            provider: "zed",
+            id: "new",
+            category: "mcp",
+            layer: "project"
+        )]
+
+        XCTAssertNotEqual(
+            InventoryFilterRevision(inventory: original),
+            InventoryFilterRevision(inventory: replacement),
+            "Facet revision must change even when a bridge snapshot shares capturedAtUnix"
+        )
+
+        let normalized = normalizedInventoryFacetSelection(
+            InventoryFacetSelection(provider: "claude", layer: "global", category: "skill"),
+            facets: InventoryFacets(inventory: replacement)
+        )
+        XCTAssertEqual(normalized, InventoryFacetSelection())
+    }
+
+    func testGroupMemberFilterCoversEveryDimension() {
+        let target = inventoryItem(
+            name: "Alpha skill",
+            provider: "codex",
+            id: "target",
+            category: "skill",
+            layer: "project",
+            enabled: true
+        )
+        let selectedKeys = Set([groupMemberKey(for: target)])
+        var filter = GroupMemberFilterState()
+
+        XCTAssertTrue(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+
+        filter.provider = "claude"
+        XCTAssertFalse(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+        filter = GroupMemberFilterState(layer: "global")
+        XCTAssertFalse(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+        filter = GroupMemberFilterState(category: "mcp")
+        XCTAssertFalse(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+        filter = GroupMemberFilterState(state: "off")
+        XCTAssertFalse(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+
+        filter = GroupMemberFilterState(membership: "included")
+        XCTAssertTrue(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+        filter.membership = "excluded"
+        XCTAssertFalse(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+
+        filter = GroupMemberFilterState(search: "alpha")
+        XCTAssertTrue(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+        filter.search = "missing"
+        XCTAssertFalse(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
+    }
+
     private func inventoryItem(
         name: String,
         provider: String,
-        id: String
+        id: String,
+        kind: String = "skill",
+        category: String = "skill",
+        layer: String = "global",
+        enabled: Bool = true,
+        mutability: String = "read-write"
     ) -> InventoryItem {
         InventoryItem(
             provider: provider,
-            kind: "skill",
-            category: "skill",
-            layer: "global",
+            kind: kind,
+            category: category,
+            layer: layer,
             id: id,
             displayName: name,
-            enabled: true,
-            mutability: "read-write"
+            enabled: enabled,
+            mutability: mutability
+        )
+    }
+}
+
+private struct WorkbenchAppearanceStorageProbe {
+    @AppStorage(WorkbenchColorScheme.storageKey)
+    var value = WorkbenchColorScheme.defaultValue.rawValue
+
+    init(defaults: UserDefaults) {
+        _value = AppStorage(
+            wrappedValue: WorkbenchColorScheme.defaultValue.rawValue,
+            WorkbenchColorScheme.storageKey,
+            store: defaults
         )
     }
 }

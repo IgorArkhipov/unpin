@@ -29,7 +29,7 @@ use crate::groups::{
     GroupPlanMode, GroupPlanner, GroupRef, GroupResolveError, GroupResolver, GroupTargetState,
     GroupTogglePlan, McpGroupSessionLeaseStore, PersonalGroupStore, RepositoryGroupStore,
     current_unix_seconds, index_discovery, issue_group_approval_challenge,
-    verify_group_approval_challenge,
+    list_group_operation_inspections, verify_group_approval_challenge,
 };
 use crate::hooks::HookTrustStore;
 use crate::mutation::{
@@ -1458,17 +1458,12 @@ fn redact_group_projection(value: &mut Value, allowed: Option<ProviderId>) {
         .and_then(Value::as_array_mut)
     {
         entries.retain(|entry| {
-            let included = entry
-                .get("included")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if included {
-                return true;
-            }
-            if let Some(provider) = entry.get("provider").and_then(Value::as_str) {
+            let provider = entry.get("provider");
+            let retained = provider == Some(&allowed_value);
+            if !retained && let Some(provider) = provider.and_then(Value::as_str) {
                 *excluded_counts.entry(provider.to_string()).or_default() += 1;
             }
-            false
+            retained
         });
     }
     if !excluded_counts.is_empty() {
@@ -1479,6 +1474,73 @@ fn redact_group_projection(value: &mut Value, allowed: Option<ProviderId>) {
                 .collect::<Vec<_>>(),
             "count": excluded_counts.values().sum::<usize>(),
             "reason": "out-of-provider-reach",
+        });
+    }
+}
+
+fn redact_group_operation_inspections(value: &mut Value, allowed: Option<ProviderId>) {
+    let Some(allowed) = allowed else {
+        return;
+    };
+    let Some(inspections) = value
+        .get_mut("groupOperations")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for inspection in inspections {
+        // Cohort indexes contain aggregate resource and backup identifiers.
+        // Their resource IDs do not carry an independently verifiable provider
+        // attribution, so never expose them through a pinned-provider status
+        // read. Likewise, an aggregate evidence bit cannot be recomputed once
+        // the other providers are removed.
+        if let Some(inspection_object) = inspection.as_object_mut() {
+            inspection_object.insert("cohortBackupIndexes".to_string(), Value::Array(Vec::new()));
+            inspection_object.insert("evidenceAvailable".to_string(), Value::Bool(false));
+        }
+        let Some(operation) = inspection.get_mut("operation") else {
+            continue;
+        };
+        redact_group_projection(operation, Some(allowed));
+        if let Some(result) = operation.get_mut("terminalResult") {
+            redact_group_result_backup_ids(result, allowed);
+            redact_group_projection(result, Some(allowed));
+        }
+    }
+}
+
+fn redact_group_result_backup_ids(value: &mut Value, allowed: ProviderId) {
+    let mut backup_providers = BTreeMap::<String, BTreeSet<String>>::new();
+    for member in value
+        .get("members")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let (Some(backup_id), Some(provider)) = (
+            member.get("backupId").and_then(Value::as_str),
+            member
+                .get("identity")
+                .and_then(|identity| identity.get("provider"))
+                .and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        backup_providers
+            .entry(backup_id.to_owned())
+            .or_default()
+            .insert(provider.to_owned());
+    }
+    let allowed_backup_ids = backup_providers
+        .into_iter()
+        .filter(|(_, providers)| providers.len() == 1 && providers.contains(allowed.as_str()))
+        .map(|(backup_id, _)| backup_id)
+        .collect::<BTreeSet<_>>();
+    if let Some(backup_ids) = value.get_mut("backupIds").and_then(Value::as_array_mut) {
+        backup_ids.retain(|backup_id| {
+            backup_id
+                .as_str()
+                .is_some_and(|backup_id| allowed_backup_ids.contains(backup_id))
         });
     }
 }
@@ -1887,8 +1949,25 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
             .ok_or_else(|| "session authority key is unavailable".to_string())?,
     )
     .map_err(|error| error.to_string())?;
+    if let Some(authentication_key) = context.backup_authentication_key.clone() {
+        // Group-operation records and cohort indexes are independently
+        // authenticated.  A missing or invalid backup key must not turn this
+        // status read into an unauthenticated state lookup, so keep the
+        // additive projection empty unless the complete authenticated list is
+        // available for this exact workspace.
+        control.group_operations = list_group_operation_inspections(
+            &app_state_root,
+            authentication_key,
+            &control.repository_key,
+            &control.workspace_key,
+        )
+        .unwrap_or_default();
+    }
     context.provider_scope.filter_control_status(&mut control);
     if let Some(operation_id) = operation_id {
+        control
+            .group_operations
+            .retain(|inspection| inspection.operation.operation_id == operation_id);
         control
             .operations
             .retain(|operation| operation.operation_id == operation_id);
@@ -1914,9 +1993,11 @@ fn get_control_status(context: &McpContext, arguments: &Value) -> Result<Value, 
             operation.operation_id == operation_id && operation.reach_aware.is_some()
         });
     }
+    let mut control_value = serde_json::to_value(&control).map_err(|error| error.to_string())?;
+    redact_group_operation_inspections(&mut control_value, context.provider_scope.provider());
     Ok(json!({
         "status": "ok",
-        "control": control,
+        "control": control_value,
         "warnings": discovery.warnings
     }))
 }
@@ -4911,7 +4992,9 @@ fn discovery_error_provider_issues(scope: McpProviderScope, message: &str) -> Ve
 
 #[cfg(test)]
 mod tests {
-    use super::{McpProviderScope, ProviderId};
+    use serde_json::json;
+
+    use super::{McpProviderScope, ProviderId, redact_group_operation_inspections};
 
     #[test]
     fn provider_scope_rejects_cross_provider_restore_coverage() {
@@ -4919,6 +5002,92 @@ mod tests {
             .require_allowed_all(&[ProviderId::Codex, ProviderId::Zed])
             .expect_err("pinned Codex MCP must not authorize a Zed restore");
         assert_eq!(error, "provider zed is outside MCP provider scope codex");
+    }
+
+    #[test]
+    fn pinned_group_operation_status_redacts_cross_provider_evidence() {
+        let mut value = json!({
+            "groupOperations": [{
+                "evidenceAvailable": true,
+                "cohortBackupIndexes": [{
+                    "memberIdentities": [
+                        {"provider": "claude", "id": "claude-member"},
+                        {"provider": "codex", "id": "codex-member"}
+                    ],
+                    "resourceIds": ["claude-resource", "codex-resource"],
+                    "backupIds": ["claude-backup", "codex-backup"],
+                    "coverage": [
+                        {
+                            "backupId": "claude-backup",
+                            "memberIdentities": [{"provider": "claude", "id": "claude-member"}],
+                            "resourceIds": ["claude-resource"]
+                        },
+                        {
+                            "backupId": "codex-backup",
+                            "memberIdentities": [{"provider": "codex", "id": "codex-member"}],
+                            "resourceIds": ["codex-resource"]
+                        }
+                    ]
+                }],
+                "operation": {
+                    "providerCoverage": {"entries": [
+                        {"provider": "claude", "included": true, "targetId": "claude-target"},
+                        {"provider": "codex", "included": true, "targetId": "codex-target"}
+                    ]},
+                    "terminalResult": {
+                        "providerCoverage": {"entries": [
+                            {"provider": "claude", "included": true, "targetId": "claude-target"},
+                            {"provider": "codex", "included": true, "targetId": "codex-target"}
+                        ]},
+                        "members": [
+                            {
+                                "identity": {"provider": "claude", "id": "claude-member"},
+                                "backupId": "claude-backup"
+                            },
+                            {
+                                "identity": {"provider": "codex", "id": "codex-member"},
+                                "backupId": "codex-backup"
+                            }
+                        ],
+                        "backupIds": ["claude-backup", "codex-backup"]
+                    }
+                }
+            }]
+        });
+
+        redact_group_operation_inspections(&mut value, Some(ProviderId::Codex));
+
+        let inspection = &value["groupOperations"][0];
+        assert_eq!(inspection["evidenceAvailable"], false);
+        assert_eq!(inspection["cohortBackupIndexes"], json!([]));
+        assert_eq!(
+            inspection["operation"]["providerCoverage"]["entries"],
+            json!([{"provider": "codex", "included": true, "targetId": "codex-target"}])
+        );
+        assert_eq!(
+            inspection["operation"]["terminalResult"]["providerCoverage"]["entries"],
+            json!([{"provider": "codex", "included": true, "targetId": "codex-target"}])
+        );
+        assert_eq!(
+            inspection["operation"]["terminalResult"]["backupIds"],
+            json!(["codex-backup"])
+        );
+        assert_eq!(
+            inspection["operation"]["terminalResult"]["members"],
+            json!([{
+                "identity": {"provider": "codex", "id": "codex-member"},
+                "backupId": "codex-backup"
+            }])
+        );
+        let encoded = inspection.to_string();
+        for secret in [
+            "claude-member",
+            "claude-resource",
+            "claude-backup",
+            "claude-target",
+        ] {
+            assert!(!encoded.contains(secret), "pinned status exposed {secret}");
+        }
     }
 }
 

@@ -1667,6 +1667,67 @@ fn inventory_group_mcp_is_read_only_by_default_and_applies_only_external_one_tim
         "structured group apply error exposed a private path"
     );
 
+    // Control status must expose the same authenticated durable inspection as
+    // the desktop recovery snapshot, rather than reducing a group operation
+    // to the generic transition journal's recoveryRequired bit.
+    let control_status = call_tool(&context, "unpin_get_control_status", json!({}));
+    let inspection = control_status["control"]["groupOperations"]
+        .as_array()
+        .expect("authenticated group operation inspections")
+        .iter()
+        .find(|inspection| inspection["operation"]["operationId"] == operation_id)
+        .expect("recovery group operation in control status");
+    assert_eq!(inspection["operation"]["lifecycle"], "recovery-required");
+    assert!(!inspection["evidenceAvailable"].as_bool().unwrap_or(true));
+    assert_eq!(
+        inspection["operation"]["terminalResult"]["finalState"],
+        "mixed"
+    );
+    assert_eq!(
+        inspection["operation"]["terminalResult"]["observationFresh"],
+        false
+    );
+    assert!(
+        inspection["operation"]["terminalResult"]["members"]
+            .as_array()
+            .expect("recovery member outcomes")
+            .iter()
+            .any(|member| {
+                member["status"] == "failed" && member["failureMode"] == "recovery-required"
+            })
+    );
+    for internal_field in [
+        "authorizationDecisionDigest",
+        "sealedPlan",
+        "authenticationKeyId",
+        "authenticationTag",
+        "repositoryKey",
+        "workspaceKey",
+    ] {
+        assert!(
+            !inspection.to_string().contains(internal_field),
+            "control status exposed {internal_field}"
+        );
+    }
+    assert!(
+        !control_status
+            .to_string()
+            .contains(root.to_string_lossy().as_ref()),
+        "control status exposed a private path"
+    );
+    let filtered_control_status = call_tool(
+        &context,
+        "unpin_get_control_status",
+        json!({"operationId": operation_id}),
+    );
+    assert_eq!(
+        filtered_control_status["control"]["groupOperations"]
+            .as_array()
+            .expect("filtered group operation inspections")
+            .len(),
+        1
+    );
+
     let replay = call_tool(
         &context,
         UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME,

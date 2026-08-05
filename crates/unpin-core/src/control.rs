@@ -13,6 +13,7 @@ use crate::{
         ReachAwarePrincipal, ReachAwareRecoveryEvidence, ReachAwareTransferCapability,
     },
     discovery::DiscoveryOutput,
+    groups::GroupOperationInspection,
     profiles::{PolicyStore, ProfileDefinitionEntry, ProfileStore, ResolutionPolicies},
     provider_reach::{
         ConnectionBoundary, ProviderReach, ProviderReachCoverage, ProviderReachLifecycle,
@@ -43,6 +44,13 @@ pub struct ControlStatus {
     pub sessions: Vec<SessionControlStatus>,
     pub operations: Vec<ControlOperationStatus>,
     pub hooks: Vec<HookControlCoverage>,
+    /// Authenticated, workspace-scoped group-operation recovery evidence.
+    ///
+    /// The generic control builder leaves this empty because it only has the
+    /// session authority key.  MCP populates it after authenticating the
+    /// backup key, while other surfaces can continue to omit the field.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub group_operations: Vec<GroupOperationInspection>,
 }
 
 impl ControlStatus {
@@ -302,6 +310,7 @@ pub fn build_control_status(
         sessions,
         operations,
         hooks: persistent.hooks,
+        group_operations: Vec::new(),
     })
 }
 

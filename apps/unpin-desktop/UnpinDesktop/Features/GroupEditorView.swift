@@ -1,5 +1,38 @@
 import SwiftUI
 
+struct GroupMemberFilterState: Equatable {
+    var search = ""
+    var provider = "all"
+    var layer = "all"
+    var category = "all"
+    var state = "all"
+    var membership = "all"
+}
+
+func groupMemberKey(for identity: GroupMemberIdentity) -> String {
+    "\(identity.provider):\(identity.layer):\(identity.kind):\(identity.category):\(identity.id)"
+}
+
+func groupMemberKey(for item: InventoryItem) -> String {
+    "\(item.provider):\(item.layer):\(item.kind):\(item.category):\(item.id)"
+}
+
+func matchesGroupMemberFilter(
+    _ item: InventoryItem,
+    selectedMemberKeys: Set<String>,
+    filter: GroupMemberFilterState
+) -> Bool {
+    let included = selectedMemberKeys.contains(groupMemberKey(for: item))
+    return (filter.provider == "all" || item.provider == filter.provider)
+        && (filter.layer == "all" || item.layer == filter.layer)
+        && (filter.category == "all" || item.category == filter.category)
+        && (filter.state == "all" || (filter.state == "on") == item.enabled)
+        && (filter.membership == "all" || (filter.membership == "included") == included)
+        && (filter.search.isEmpty
+            || item.displayName.localizedCaseInsensitiveContains(filter.search)
+            || item.id.localizedCaseInsensitiveContains(filter.search))
+}
+
 struct GroupEditorView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
@@ -22,33 +55,34 @@ struct GroupEditorView: View {
         _scope = State(initialValue: group?.scope ?? "personal")
         _selectedMembers = State(initialValue: Dictionary(
             uniqueKeysWithValues: (group?.members ?? []).map { member in
-                (Self.key(for: member.identity), member.identity)
+                (groupMemberKey(for: member.identity), member.identity)
             }
         ))
     }
 
     private var selectedMemberList: [GroupMemberIdentity] {
-        selectedMembers.values.sorted { key(for: $0) < key(for: $1) }
+        selectedMembers.values.sorted { groupMemberKey(for: $0) < groupMemberKey(for: $1) }
     }
 
     var body: some View {
         let inventory = workspace.snapshot?.inventory ?? []
         let facets = InventoryFacets(inventory: inventory)
+        let filterRevision = InventoryFilterRevision(inventory: inventory)
         let selectedKeys = Set(selectedMembers.keys)
-        let visibleItems = inventory.filter { item in
-            let included = selectedKeys.contains(key(for: item))
-            return (selectedProvider == "all" || item.provider == selectedProvider)
-                && (selectedLayer == "all" || item.layer == selectedLayer)
-                && (selectedCategory == "all" || item.category == selectedCategory)
-                && (selectedState == "all" || (selectedState == "on") == item.enabled)
-                && (membership == "all" || (membership == "included") == included)
-                && (search.isEmpty
-                    || item.displayName.localizedCaseInsensitiveContains(search)
-                    || item.id.localizedCaseInsensitiveContains(search))
+        let memberFilter = GroupMemberFilterState(
+            search: search,
+            provider: selectedProvider,
+            layer: selectedLayer,
+            category: selectedCategory,
+            state: selectedState,
+            membership: membership
+        )
+        let visibleItems = inventory.filter {
+            matchesGroupMemberFilter($0, selectedMemberKeys: selectedKeys, filter: memberFilter)
         }
-        let visibleKeys = Set(visibleItems.map { key(for: $0) })
+        let visibleKeys = Set(visibleItems.map { groupMemberKey(for: $0) })
         let hiddenSelectionCount = selectedKeys.subtracting(visibleKeys).count
-        let inventoryKeys = Set(inventory.map { key(for: $0) })
+        let inventoryKeys = Set(inventory.map { groupMemberKey(for: $0) })
         let missingSelectionCount = selectedKeys.subtracting(inventoryKeys).count
         VStack(alignment: .leading, spacing: 14) {
             HStack {
@@ -87,11 +121,12 @@ struct GroupEditorView: View {
                         Text("State")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Picker("", selection: $selectedState) {
+                        Picker("State", selection: $selectedState) {
                             Text("Any state").tag("all")
                             Text("On").tag("on")
                             Text("Off").tag("off")
                         }
+                        .accessibilityLabel(WorkbenchFilterAccessibility.state)
                         .labelsHidden()
                         .frame(minWidth: 150, maxWidth: .infinity)
                     }
@@ -100,11 +135,12 @@ struct GroupEditorView: View {
                         Text("Membership")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Picker("", selection: $membership) {
+                        Picker("Membership", selection: $membership) {
                             Text("All items").tag("all")
                             Text("Included").tag("included")
                             Text("Not included").tag("excluded")
                         }
+                        .accessibilityLabel(WorkbenchFilterAccessibility.membership)
                         .labelsHidden()
                         .frame(minWidth: 150, maxWidth: .infinity)
                     }
@@ -190,7 +226,7 @@ struct GroupEditorView: View {
         }
         .padding()
         .frame(minWidth: 900, minHeight: 650)
-        .onChange(of: workspace.snapshot?.capturedAtUnix) { _, _ in
+        .onChange(of: filterRevision) { _, _ in
             normalizeInventoryFilters(inventory)
         }
     }
@@ -271,7 +307,7 @@ struct GroupEditorView: View {
             category: item.category,
             id: item.id
         )
-        let identityKey = key(for: identity)
+        let identityKey = groupMemberKey(for: identity)
         return Binding(
             get: { selectedMembers[identityKey] != nil },
             set: { included in
@@ -285,16 +321,17 @@ struct GroupEditorView: View {
     }
 
     private func normalizeInventoryFilters(_ inventory: [InventoryItem]) {
-        let facets = InventoryFacets(inventory: inventory)
-        if selectedProvider != "all", !facets.providers.contains(selectedProvider) {
-            selectedProvider = "all"
-        }
-        if selectedLayer != "all", !facets.layers.contains(selectedLayer) {
-            selectedLayer = "all"
-        }
-        if selectedCategory != "all", !facets.categories.contains(selectedCategory) {
-            selectedCategory = "all"
-        }
+        let normalized = normalizedInventoryFacetSelection(
+            InventoryFacetSelection(
+                provider: selectedProvider,
+                layer: selectedLayer,
+                category: selectedCategory
+            ),
+            facets: InventoryFacets(inventory: inventory)
+        )
+        selectedProvider = normalized.provider
+        selectedLayer = normalized.layer
+        selectedCategory = normalized.category
     }
 
     private func filter(
@@ -306,24 +343,15 @@ struct GroupEditorView: View {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Picker("", selection: selection) {
+            Picker(title, selection: selection) {
                 Text("All \(title.lowercased())").tag("all")
                 ForEach(values, id: \.self) { Text($0).tag($0) }
             }
+            .accessibilityLabel(WorkbenchFilterAccessibility.label(for: title))
             .labelsHidden()
             .frame(minWidth: 150, maxWidth: .infinity)
         }
         .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
     }
 
-    private static func key(for identity: GroupMemberIdentity) -> String {
-        "\(identity.provider):\(identity.layer):\(identity.kind):\(identity.category):\(identity.id)"
-    }
-
-    private static func key(for item: InventoryItem) -> String {
-        "\(item.provider):\(item.layer):\(item.kind):\(item.category):\(item.id)"
-    }
-
-    private func key(for identity: GroupMemberIdentity) -> String { Self.key(for: identity) }
-    private func key(for item: InventoryItem) -> String { Self.key(for: item) }
 }

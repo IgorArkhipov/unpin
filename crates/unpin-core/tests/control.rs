@@ -1120,6 +1120,7 @@ fn reach_aware_status_projection_authorizes_filters_and_redacts_excluded_targets
             reach_aware: None,
         }],
         hooks: Vec::new(),
+        group_operations: Vec::new(),
     };
     let before_unfiltered = control.clone();
     attach_reach_aware_status_for_operation(
@@ -1257,6 +1258,7 @@ fn reach_aware_status_attachment_preserves_canonical_lifecycle_states() {
                 reach_aware: None,
             }],
             hooks: Vec::new(),
+            group_operations: Vec::new(),
         };
 
         attach_reach_aware_status_for_operation(

@@ -169,6 +169,55 @@ private extension InventoryItem {
     var stateSortValue: Int { enabled ? 1 : 0 }
 }
 
+struct InventoryFilterRevision: Equatable {
+    let providers: [String]
+    let layers: [String]
+    let categories: [String]
+
+    init(inventory: [InventoryItem]) {
+        let facets = InventoryFacets(inventory: inventory)
+        providers = facets.providers
+        layers = facets.layers
+        categories = facets.categories
+    }
+}
+
+struct InventoryFacetSelection: Equatable {
+    var provider: String = "all"
+    var layer: String = "all"
+    var category: String = "all"
+}
+
+enum WorkbenchFilterAccessibility {
+    static let provider = "Provider"
+    static let layer = "Layer"
+    static let category = "Category"
+    static let state = "State"
+    static let membership = "Membership"
+
+    static let discoverLabels = [provider, layer, category, state]
+    static let groupLabels = [provider, layer, category, state, membership]
+
+    static func label(for title: String) -> String { title }
+}
+
+func normalizedInventoryFacetSelection(
+    _ selection: InventoryFacetSelection,
+    facets: InventoryFacets
+) -> InventoryFacetSelection {
+    InventoryFacetSelection(
+        provider: selection.provider == "all" || facets.providers.contains(selection.provider)
+            ? selection.provider
+            : "all",
+        layer: selection.layer == "all" || facets.layers.contains(selection.layer)
+            ? selection.layer
+            : "all",
+        category: selection.category == "all" || facets.categories.contains(selection.category)
+            ? selection.category
+            : "all"
+    )
+}
+
 struct DiscoverOrganizeView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @Environment(\.colorScheme) private var colorScheme
@@ -184,6 +233,7 @@ struct DiscoverOrganizeView: View {
     var body: some View {
         let inventory = workspace.snapshot?.inventory ?? []
         let facets = InventoryFacets(inventory: inventory)
+        let filterRevision = InventoryFilterRevision(inventory: inventory)
         let palette = WorkbenchPalette.resolve(for: colorScheme)
         let items = sort.sorted(inventory.filter { item in
             (selectedProvider == "all" || item.provider == selectedProvider)
@@ -219,11 +269,12 @@ struct DiscoverOrganizeView: View {
                         Text("State")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Picker("", selection: $selectedState) {
+                        Picker("State", selection: $selectedState) {
                             Text("Any state").tag("all")
                             Text("On").tag("on")
                             Text("Off").tag("off")
                         }
+                        .accessibilityLabel(WorkbenchFilterAccessibility.state)
                         .labelsHidden()
                         .frame(minWidth: 170, maxWidth: .infinity)
                     }
@@ -282,7 +333,7 @@ struct DiscoverOrganizeView: View {
         .sheet(isPresented: $creatingGroup) {
             GroupEditorView(group: nil)
         }
-        .onChange(of: workspace.snapshot?.capturedAtUnix) { _, _ in
+        .onChange(of: filterRevision) { _, _ in
             normalizeInventoryFilters(inventory)
         }
     }
@@ -347,16 +398,17 @@ struct DiscoverOrganizeView: View {
     }
 
     private func normalizeInventoryFilters(_ inventory: [InventoryItem]) {
-        let facets = InventoryFacets(inventory: inventory)
-        if selectedProvider != "all", !facets.providers.contains(selectedProvider) {
-            selectedProvider = "all"
-        }
-        if selectedLayer != "all", !facets.layers.contains(selectedLayer) {
-            selectedLayer = "all"
-        }
-        if selectedCategory != "all", !facets.categories.contains(selectedCategory) {
-            selectedCategory = "all"
-        }
+        let normalized = normalizedInventoryFacetSelection(
+            InventoryFacetSelection(
+                provider: selectedProvider,
+                layer: selectedLayer,
+                category: selectedCategory
+            ),
+            facets: InventoryFacets(inventory: inventory)
+        )
+        selectedProvider = normalized.provider
+        selectedLayer = normalized.layer
+        selectedCategory = normalized.category
     }
 
     private func filter(
@@ -368,10 +420,11 @@ struct DiscoverOrganizeView: View {
             Text(title)
                 .font(.caption)
                 .foregroundStyle(.secondary)
-            Picker("", selection: selection) {
+            Picker(title, selection: selection) {
                 Text("All \(title.lowercased())").tag("all")
                 ForEach(values, id: \.self) { Text($0).tag($0) }
             }
+            .accessibilityLabel(WorkbenchFilterAccessibility.label(for: title))
             .labelsHidden()
             .frame(minWidth: 170, maxWidth: .infinity)
         }

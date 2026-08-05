@@ -24,18 +24,27 @@ struct InventoryFacets {
 struct WorkspaceStoreTestHooks {
     var beforeReadResponse: (() async -> Void)?
     var beforeReadError: (() async -> Void)?
+    var beforeGroupPlan: (() async -> Void)?
+    var beforeGroupApply: (() async -> Void)?
     var beforeDefinitionApply: (() async -> Void)?
+    var beforeRestoreApply: (() async -> Void)?
     var beforeWorkspaceConnect: (() async throws -> Void)?
 
     init(
         beforeReadResponse: (() async -> Void)? = nil,
         beforeReadError: (() async -> Void)? = nil,
+        beforeGroupPlan: (() async -> Void)? = nil,
+        beforeGroupApply: (() async -> Void)? = nil,
         beforeDefinitionApply: (() async -> Void)? = nil,
+        beforeRestoreApply: (() async -> Void)? = nil,
         beforeWorkspaceConnect: (() async throws -> Void)? = nil
     ) {
         self.beforeReadResponse = beforeReadResponse
         self.beforeReadError = beforeReadError
+        self.beforeGroupPlan = beforeGroupPlan
+        self.beforeGroupApply = beforeGroupApply
         self.beforeDefinitionApply = beforeDefinitionApply
+        self.beforeRestoreApply = beforeRestoreApply
         self.beforeWorkspaceConnect = beforeWorkspaceConnect
     }
 }
@@ -50,6 +59,8 @@ final class WorkspaceStore: ObservableObject {
         "Unpin is still confirming a configuration change. Wait for it to finish before reloading the workspace."
     private static let definitionChangeUnconfirmedMessage =
         "Unpin did not confirm this definition change. It may have written configuration; inspect Recover and Audit before creating another definition change."
+    private static let mutationUncertaintyMessage =
+        "Unpin did not confirm this change. It may have written configuration; inspect Recover and Audit or reload the workspace before trying another change."
 
     @Published private(set) var state: State = .needsWorkspace
     @Published private(set) var snapshot: BridgeSnapshot?
@@ -67,12 +78,14 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var lastRestoreBlocker: String?
     @Published private(set) var lastRestore: RestoreApplyResult?
     @Published private(set) var workspaceName: String?
+    @Published private(set) var mutationUncertaintyBlocker: String?
 
     private var bridge: BridgeClient?
     private var workspaceRoot: URL?
     private var connectionGeneration = 0
     private let bridgeRoots: BridgeLaunchRoots
     private var testHooks = WorkspaceStoreTestHooks()
+    private var groupPlanRequestGeneration = 0
     @Published private(set) var controlRequestInFlight = false
 
     init(bridgeRoots: BridgeLaunchRoots = BridgeLaunchRoots()) {
@@ -102,7 +115,9 @@ final class WorkspaceStore: ObservableObject {
 
     var hasWorkspace: Bool { workspaceRoot != nil }
 
-    var actionsBlocked: Bool { recoveryBlocker != nil }
+    var actionsBlocked: Bool {
+        recoveryBlocker != nil || mutationUncertaintyBlocker != nil
+    }
 
     var isBusy: Bool {
         if case .loading = state { return true }
@@ -124,6 +139,7 @@ final class WorkspaceStore: ObservableObject {
         if preserveRecovery == false {
             recovery = nil
             recoveryBlocker = nil
+            mutationUncertaintyBlocker = nil
         }
         workspaceRoot = selectedRoot
         workspaceName = selectedRoot.lastPathComponent
@@ -245,6 +261,7 @@ final class WorkspaceStore: ObservableObject {
         if preservingRecovery == false {
             recovery = nil
             recoveryBlocker = nil
+            mutationUncertaintyBlocker = nil
         }
         reviewedRestore = nil
         approvedRestoreFingerprint = nil
@@ -269,6 +286,7 @@ final class WorkspaceStore: ObservableObject {
             guard connectionIsCurrent(expectedGeneration) else { return }
             recovery = freshRecovery
             recoveryBlocker = nil
+            mutationUncertaintyBlocker = nil
             setReadyUnlessDefinitionBlocked()
         } catch {
             guard connectionIsCurrent(expectedGeneration) else { return }
@@ -279,15 +297,20 @@ final class WorkspaceStore: ObservableObject {
     func plan(group: GroupSummary, target: String) async {
         guard guardActionsAllowed() else { return }
         let expectedGeneration = connectionGeneration
-        await discardReviewedPlan()
-        guard connectionIsCurrent(expectedGeneration) else { return }
+        groupPlanRequestGeneration &+= 1
+        let requestGeneration = groupPlanRequestGeneration
+        await discardReviewedPlanContents()
+        guard planRequestIsCurrent(requestGeneration, connectionGeneration: expectedGeneration) else { return }
         lastApply = nil
         lastChangeBlocker = nil
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeGroupPlan {
+                await hook()
+            }
             let freshPlan = try await bridge.planGroup(name: group.qualifiedName, target: target).plan
             await awaitReadResponseHook()
-            guard connectionIsCurrent(expectedGeneration) else { return }
+            guard planRequestIsCurrent(requestGeneration, connectionGeneration: expectedGeneration) else { return }
             reviewedPlan = freshPlan
             approvedPlanFingerprint = nil
             lastChangeBlocker = nil
@@ -295,7 +318,7 @@ final class WorkspaceStore: ObservableObject {
             setReadyUnlessDefinitionBlocked()
         } catch {
             await awaitReadErrorHook()
-            guard connectionIsCurrent(expectedGeneration) else { return }
+            guard planRequestIsCurrent(requestGeneration, connectionGeneration: expectedGeneration) else { return }
             state = .blocked(error.localizedDescription)
         }
     }
@@ -332,6 +355,9 @@ final class WorkspaceStore: ObservableObject {
                   approvedPlanFingerprint == plan.planFingerprint else {
                 throw BridgeClientError.requestFailed("desktop-approval-required")
             }
+            if let hook = testHooks.beforeGroupApply {
+                await hook()
+            }
             let result = try await bridge.applyGroup(operationID: operationID, fingerprint: plan.planFingerprint).result
             guard connectionIsCurrent(expectedGeneration) else { return }
             lastApply = result
@@ -349,16 +375,27 @@ final class WorkspaceStore: ObservableObject {
             guard connectionIsCurrent(expectedGeneration) else { return }
             reviewedPlan = nil
             approvedPlanFingerprint = nil
-            lastChangeBlocker = "Unpin did not confirm this change. It may have written configuration; inspect Recover and Audit before creating another plan."
+            guard mutationMayBeUnconfirmed(error) else {
+                lastChangeBlocker = nil
+                state = .blocked(error.localizedDescription)
+                return
+            }
+            lastChangeBlocker = Self.mutationUncertaintyMessage
+            mutationUncertaintyBlocker = Self.mutationUncertaintyMessage
             let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(connectionGeneration: expectedGeneration)
             guard connectionIsCurrent(expectedGeneration) else { return }
             if recoveryRefreshed {
-                state = .blocked(error.localizedDescription)
+                state = .blocked(Self.mutationUncertaintyMessage)
             }
         }
     }
 
     func discardReviewedPlan() async {
+        groupPlanRequestGeneration &+= 1
+        await discardReviewedPlanContents()
+    }
+
+    private func discardReviewedPlanContents() async {
         let review = reviewedPlan
         reviewedPlan = nil
         approvedPlanFingerprint = nil
@@ -366,6 +403,11 @@ final class WorkspaceStore: ObservableObject {
         guard let bridge, let operationID = review?.operationId,
               let fingerprint = review?.planFingerprint else { return }
         try? await bridge.discardGroup(operationID: operationID, fingerprint: fingerprint)
+    }
+
+    private func planRequestIsCurrent(_ requestGeneration: Int, connectionGeneration: Int) -> Bool {
+        requestGeneration == groupPlanRequestGeneration
+            && connectionIsCurrent(connectionGeneration)
     }
 
     func planDefinition(_ parameters: GroupDefinitionPlanParameters) async {
@@ -511,6 +553,9 @@ final class WorkspaceStore: ObservableObject {
                   approvedRestoreFingerprint == reviewedRestore.plan.planFingerprint else {
                 throw BridgeClientError.requestFailed("desktop-approval-required")
             }
+            if let hook = testHooks.beforeRestoreApply {
+                await hook()
+            }
             let result = try await bridge.applyRestore(
                 operationID: reviewedRestore.operationId,
                 fingerprint: reviewedRestore.plan.planFingerprint
@@ -533,11 +578,17 @@ final class WorkspaceStore: ObservableObject {
             guard connectionIsCurrent(expectedGeneration) else { return }
             reviewedRestore = nil
             approvedRestoreFingerprint = nil
-            lastRestoreBlocker = "Unpin did not confirm this restore. Inspect Recover and Audit before creating another restore plan."
+            guard mutationMayBeUnconfirmed(error) else {
+                lastRestoreBlocker = nil
+                state = .blocked(error.localizedDescription)
+                return
+            }
+            lastRestoreBlocker = "Unpin did not confirm this restore. Inspect Recover and Audit or reload the workspace before trying another restore."
+            mutationUncertaintyBlocker = Self.mutationUncertaintyMessage
             let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(connectionGeneration: expectedGeneration)
             guard connectionIsCurrent(expectedGeneration) else { return }
             if recoveryRefreshed {
-                state = .blocked(error.localizedDescription)
+                state = .blocked(Self.mutationUncertaintyMessage)
             }
         }
     }
@@ -573,16 +624,28 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
+    private func mutationMayBeUnconfirmed(_ error: Error) -> Bool {
+        guard let bridgeError = error as? BridgeClientError else { return true }
+        if case .requestFailed = bridgeError {
+            return false
+        }
+        return true
+    }
+
     private func guardActionsAllowed() -> Bool {
         guard actionsBlocked == false else {
-            state = .blocked(recoveryBlocker ?? Self.recoveryUnavailableMessage)
+            state = .blocked(
+                mutationUncertaintyBlocker
+                    ?? recoveryBlocker
+                    ?? Self.recoveryUnavailableMessage
+            )
             return false
         }
         return true
     }
 
     private func setReadyUnlessDefinitionBlocked() {
-        guard lastDefinitionBlocker == nil else { return }
+        guard lastDefinitionBlocker == nil, actionsBlocked == false else { return }
         state = .ready
     }
 
