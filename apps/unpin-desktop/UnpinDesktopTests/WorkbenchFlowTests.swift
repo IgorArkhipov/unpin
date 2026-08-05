@@ -18,16 +18,7 @@ final class WorkbenchFlowTests: XCTestCase {
         try FileManager.default.createDirectory(at: appStateRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
 
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let fixtureRoot = repositoryRoot
-            .appendingPathComponent("crates")
-            .appendingPathComponent("unpin-core")
-            .appendingPathComponent("tests")
-            .appendingPathComponent("fixtures", isDirectory: true)
+        let fixtureRoot = try FixtureResources.root()
         let store = WorkspaceStore(bridgeRoots: BridgeLaunchRoots(
             fixtureRoot: fixtureRoot,
             homeRoot: fixtureRoot,

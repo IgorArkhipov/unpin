@@ -389,16 +389,7 @@ final class WorkspaceStoreTests: XCTestCase {
         )
         try FileManager.default.createDirectory(at: appStateRoot, withIntermediateDirectories: true)
 
-        let repositoryRoot = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let sourceFixtureRoot = repositoryRoot
-            .appendingPathComponent("crates")
-            .appendingPathComponent("unpin-core")
-            .appendingPathComponent("tests")
-            .appendingPathComponent("fixtures", isDirectory: true)
+        let sourceFixtureRoot = try FixtureResources.root()
         let fixtureRoot = temporaryRoot.appendingPathComponent("fixtures", isDirectory: true)
         try FileManager.default.copyItem(at: sourceFixtureRoot, to: fixtureRoot)
         let store = WorkspaceStore(bridgeRoots: BridgeLaunchRoots(
