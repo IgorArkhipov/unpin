@@ -34,6 +34,9 @@ fi
 trap 'rm -rf -- "$build_root"' EXIT
 
 derived_data="$build_root/DerivedData"
+# Stdout is a machine-readable contract: exactly one line containing the
+# resulting archive path. Keep Xcode's diagnostics on stderr so callers can
+# safely capture stdout without losing build failures or logs.
 UNPIN_RUST_TARGET="$release_target" xcodebuild build \
   -project "$repository_root/apps/unpin-desktop/UnpinDesktop.xcodeproj" \
   -scheme UnpinDesktop \
@@ -44,7 +47,7 @@ UNPIN_RUST_TARGET="$release_target" xcodebuild build \
   ONLY_ACTIVE_ARCH=YES \
   CODE_SIGNING_ALLOWED=NO \
   CODE_SIGNING_REQUIRED=NO \
-  MARKETING_VERSION="$release_version"
+  MARKETING_VERSION="$release_version" >&2
 
 app="$derived_data/Build/Products/Release/UnpinDesktop.app"
 desktop_binary="$app/Contents/MacOS/UnpinDesktop"
@@ -69,18 +72,23 @@ fi
 # RC artifacts are intentionally ad-hoc signed. The absent timestamp makes the
 # signing step reproducible, while Hardened Runtime keeps the bundle compatible
 # with a future Developer ID/notarization release process.
-codesign --force --sign - --timestamp=none --options runtime "$bridge_binary"
+codesign --force --sign - --timestamp=none --options runtime "$bridge_binary" >&2
 bridge_digest="$(shasum -a 256 "$bridge_binary" | awk '{print $1}')"
 printf '{"bridgeProtocolVersion":2,"unpinVersion":"%s","sha256":"%s"}\n' \
   "$release_version" "$bridge_digest" > "$manifest"
-codesign --force --sign - --timestamp=none --options runtime "$app"
-codesign --verify --deep --strict --verbose=2 "$app"
+codesign --force --sign - --timestamp=none --options runtime "$app" >&2
+codesign --verify --deep --strict --verbose=2 "$app" >&2
 
-python3 "$repository_root/scripts/package_desktop_release.py" \
+archive="$(python3 "$repository_root/scripts/package_desktop_release.py" \
   --app "$app" \
   --target "$release_target" \
   --version "$release_version" \
   --output-directory "$release_output" \
   --source-date-epoch "$source_date_epoch" \
   --resource "$repository_root/README.md" \
-  --resource "$repository_root/LICENSE"
+  --resource "$repository_root/LICENSE")"
+if [[ -z "$archive" || "$archive" == *$'\n'* || "$archive" == *$'\r'* || ! -f "$archive" || -L "$archive" ]]; then
+  echo "desktop release packager must print one existing archive path" >&2
+  exit 1
+fi
+printf '%s\n' "$archive"

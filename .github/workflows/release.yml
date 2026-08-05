@@ -190,6 +190,10 @@ jobs:
               "${{ steps.version.outputs.value }}" \
               dist
           )"
+          if [[ -z "${archive}" || "${archive}" == *$'\n'* || "${archive}" == *$'\r'* || ! -f "${archive}" || -L "${archive}" ]]; then
+            echo "desktop release builder must print one existing archive path" >&2
+            exit 1
+          fi
           scripts/verify_desktop_release_artifact.sh \
             "${archive}" \
             "${{ matrix.target }}" \
