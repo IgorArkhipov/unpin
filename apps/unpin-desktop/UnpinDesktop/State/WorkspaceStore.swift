@@ -24,13 +24,19 @@ struct InventoryFacets {
 struct WorkspaceStoreTestHooks {
     var beforeReadResponse: (() async -> Void)?
     var beforeReadError: (() async -> Void)?
+    var beforeDefinitionApply: (() async -> Void)?
+    var beforeWorkspaceConnect: (() async throws -> Void)?
 
     init(
         beforeReadResponse: (() async -> Void)? = nil,
-        beforeReadError: (() async -> Void)? = nil
+        beforeReadError: (() async -> Void)? = nil,
+        beforeDefinitionApply: (() async -> Void)? = nil,
+        beforeWorkspaceConnect: (() async throws -> Void)? = nil
     ) {
         self.beforeReadResponse = beforeReadResponse
         self.beforeReadError = beforeReadError
+        self.beforeDefinitionApply = beforeDefinitionApply
+        self.beforeWorkspaceConnect = beforeWorkspaceConnect
     }
 }
 
@@ -109,10 +115,20 @@ final class WorkspaceStore: ObservableObject {
             state = .blocked("Choose a workspace folder, not a file.")
             return
         }
+        let preserveRecovery = workspaceRoot == selectedRoot
+        if preserveRecovery == false {
+            recovery = nil
+            recoveryBlocker = nil
+        }
         workspaceRoot = selectedRoot
         workspaceName = selectedRoot.lastPathComponent
         connectionGeneration &+= 1
-        await connectWorkspace(root: selectedRoot, generation: connectionGeneration, loadRecovery: false)
+        await connectWorkspace(
+            root: selectedRoot,
+            generation: connectionGeneration,
+            loadRecovery: preserveRecovery && (recovery != nil || recoveryBlocker != nil),
+            preserveRecovery: preserveRecovery
+        )
     }
 
     func reloadWorkspace() async {
@@ -121,29 +137,43 @@ final class WorkspaceStore: ObservableObject {
             state = .needsWorkspace
             return
         }
-        let loadRecovery = recovery != nil
+        let preserveRecovery = recovery != nil || recoveryBlocker != nil
+        let loadRecovery = recovery != nil || recoveryBlocker != nil
         connectionGeneration &+= 1
         await connectWorkspace(
             root: workspaceRoot,
             generation: connectionGeneration,
-            loadRecovery: loadRecovery
+            loadRecovery: loadRecovery,
+            preserveRecovery: preserveRecovery
         )
     }
 
-    private func connectWorkspace(root: URL, generation: Int, loadRecovery: Bool) async {
+    private func connectWorkspace(
+        root: URL,
+        generation: Int,
+        loadRecovery: Bool,
+        preserveRecovery: Bool
+    ) async {
         guard connectionIsCurrent(generation) else { return }
         state = .loading
         let previousBridge = bridge
         if let previousBridge, await previousBridge.stop() == false {
             guard connectionIsCurrent(generation) else { return }
-            state = .blocked("Unpin is still confirming a configuration change. Wait for it to finish before reloading the workspace.")
+            if preserveRecovery {
+                setRecoveryUnavailable()
+            } else {
+                state = .blocked("Unpin is still confirming a configuration change. Wait for it to finish before reloading the workspace.")
+            }
             return
         }
         guard connectionIsCurrent(generation) else { return }
         bridge = nil
-        clearWorkspaceState()
+        clearWorkspaceState(preservingRecovery: preserveRecovery)
         var replacement: BridgeClient?
         do {
+            if let hook = testHooks.beforeWorkspaceConnect {
+                try await hook()
+            }
             let bundledBridge = try Self.bundledBridge()
             let bridge = BridgeClient(
                 executableURL: bundledBridge.executable,
@@ -165,16 +195,21 @@ final class WorkspaceStore: ObservableObject {
             self.bridge = bridge
             try await refresh(connectionGeneration: generation)
             guard connectionIsCurrent(generation) else { return }
-            recoveryBlocker = nil
             if loadRecovery {
                 await refreshRecovery(connectionGeneration: generation)
+            } else {
+                recoveryBlocker = nil
             }
         } catch {
             if let replacement {
                 await replacement.stop()
             }
             guard connectionIsCurrent(generation) else { return }
-            state = .blocked(error.localizedDescription)
+            if preserveRecovery {
+                setRecoveryUnavailable()
+            } else {
+                state = .blocked(error.localizedDescription)
+            }
         }
     }
 
@@ -194,7 +229,7 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    private func clearWorkspaceState() {
+    private func clearWorkspaceState(preservingRecovery: Bool) {
         snapshot = nil
         reviewedPlan = nil
         approvedPlanFingerprint = nil
@@ -202,7 +237,10 @@ final class WorkspaceStore: ObservableObject {
         lastApply = nil
         reviewedDefinition = nil
         definitionHistory = []
-        recovery = nil
+        if preservingRecovery == false {
+            recovery = nil
+            recoveryBlocker = nil
+        }
         reviewedRestore = nil
         approvedRestoreFingerprint = nil
         lastRestoreBlocker = nil
@@ -354,6 +392,9 @@ final class WorkspaceStore: ObservableObject {
             guard let bridge, let reviewedDefinition else {
                 throw BridgeClientError.malformedResponse
             }
+            if let hook = testHooks.beforeDefinitionApply {
+                await hook()
+            }
             _ = try await bridge.applyDefinition(
                 operationID: reviewedDefinition.operationId,
                 fingerprint: reviewedDefinition.plan.planFingerprint
@@ -365,7 +406,14 @@ final class WorkspaceStore: ObservableObject {
             return true
         } catch {
             guard connectionIsCurrent(expectedGeneration) else { return false }
-            state = .blocked(error.localizedDescription)
+            self.reviewedDefinition = nil
+            let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(
+                connectionGeneration: expectedGeneration
+            )
+            guard connectionIsCurrent(expectedGeneration) else { return false }
+            if recoveryRefreshed {
+                state = .blocked(error.localizedDescription)
+            }
             return false
         }
     }

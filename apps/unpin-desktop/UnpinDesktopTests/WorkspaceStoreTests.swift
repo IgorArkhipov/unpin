@@ -194,6 +194,76 @@ final class WorkspaceStoreTests: XCTestCase {
         }
     }
 
+    func testDefinitionApplyUncertaintyClearsReviewAndBlocksWhenRecoveryUnavailable() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        await store.refreshRecovery()
+        let previousRecovery = try XCTUnwrap(store.recovery)
+        await store.planDefinition(makeCreateParameters(name: "uncertain-definition"))
+        XCTAssertNotNil(store.reviewedDefinition)
+
+        let applyBarrier = ReadBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeDefinitionApply: { await applyBarrier.pause() }
+        ))
+        let applyTask = Task { await store.applyDefinition() }
+        await applyBarrier.waitUntilReached()
+        applyTask.cancel()
+        await applyBarrier.release()
+        let applied = await applyTask.value
+
+        XCTAssertFalse(applied)
+        XCTAssertNil(store.reviewedDefinition)
+        XCTAssertEqual(store.recovery?.backups.map(\.backupId), previousRecovery.backups.map(\.backupId))
+        XCTAssertNotNil(store.recoveryBlocker)
+        XCTAssertTrue(store.actionsBlocked)
+        guard case .blocked = store.state else {
+            return XCTFail("an unconfirmed definition apply should block the workspace")
+        }
+
+        await store.planDefinition(makeCreateParameters(name: "blocked-definition"))
+        XCTAssertNil(store.reviewedDefinition)
+        XCTAssertEqual(store.statusMessage, store.recoveryBlocker)
+    }
+
+    func testSameWorkspaceReloadPreservesRecoveryOnFailureButSwitchClearsIt() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        await store.refreshRecovery()
+        let previousRecovery = try XCTUnwrap(store.recovery)
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeWorkspaceConnect: { throw BridgeClientError.childStopped }
+        ))
+
+        await store.reloadWorkspace()
+
+        XCTAssertEqual(store.recovery?.backups.map(\.backupId), previousRecovery.backups.map(\.backupId))
+        XCTAssertNotNil(store.recoveryBlocker)
+        XCTAssertTrue(store.actionsBlocked)
+        guard case .blocked = store.state else {
+            return XCTFail("a failed same-workspace reload should block the workspace")
+        }
+
+        let switchedWorkspace = fixture.temporaryRoot.appendingPathComponent("different-workspace", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: switchedWorkspace.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks())
+        await store.selectWorkspace(switchedWorkspace)
+
+        guard case .ready = store.state else {
+            return XCTFail("a different workspace should reconnect successfully")
+        }
+        XCTAssertNil(store.recovery)
+        XCTAssertNil(store.recoveryBlocker)
+        XCTAssertFalse(store.actionsBlocked)
+    }
+
     func testInFlightReadsCannotPublishAfterWorkspaceSwitch() async throws {
         let fixture = try makeFixtureStore()
         defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
