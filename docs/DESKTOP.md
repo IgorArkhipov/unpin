@@ -1,6 +1,6 @@
 # Unpin desktop workbench
 
-Unpin `1.0.0-rc.1` is the first macOS desktop release candidate. It ships as
+Unpin `1.0.0` is the first stable macOS desktop release. It ships as
 separate native archives for Apple Silicon and Intel Macs. The app supervises
 the bundled `unpin` executable over stdio; SwiftUI does not write provider
 configuration or receive Unpin's secret keys.
@@ -15,7 +15,7 @@ directory, then verify the selected archive's GitHub build provenance:
 ```bash
 shasum -a 256 -c SHA256SUMS
 gh attestation verify \
-  unpin-desktop-v1.0.0-rc.1-TARGET.tar.gz \
+  unpin-desktop-v1.0.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -27,11 +27,11 @@ Extract the archive and move `UnpinDesktop.app` to `/Applications` or
 `~/Applications`:
 
 ```bash
-tar -xzf unpin-desktop-v1.0.0-rc.1-TARGET.tar.gz
-open unpin-desktop-v1.0.0-rc.1-TARGET
+tar -xzf unpin-desktop-v1.0.0-TARGET.tar.gz
+open unpin-desktop-v1.0.0-TARGET
 ```
 
-The release candidate is ad-hoc signed with Hardened Runtime. It is not
+The release is ad-hoc signed with Hardened Runtime. It is not
 Developer ID signed or Apple-notarized, so ad-hoc signing does not establish
 Gatekeeper trust. On first launch, macOS can report that Apple cannot verify
 the developer.
@@ -49,7 +49,7 @@ bundle.
 
 ## Update
 
-Updates are manual in `1.0.0-rc.1`:
+Updates are manual in `1.0.0`:
 
 1. Download the new architecture-matched desktop archive and its release
    checksum file.
@@ -74,11 +74,12 @@ group definitions, authenticated backup evidence, audit records, and recovery
 state used by CLI, TUI, or MCP workflows. Removing it is a separate destructive
 full reset, not part of uninstalling the app.
 
-## Release-candidate limitations
+## Distribution limitations
 
 - No Developer ID signature or Apple notarization.
 - No automatic update mechanism; replacement is manual.
 - No Windows, Linux, or universal macOS desktop bundle.
 - Profiles, gateways, sessions, and hooks remain on CLI, TUI, and MCP surfaces.
-- GA `1.0.0` remains blocked on signed, notarized distribution and installed-
-  artifact verification.
+- The stable `1.0.0` release uses a maintainer-approved unsigned-GA exception.
+  Gatekeeper trust is not claimed; checksum and attestation verification plus
+  the documented first-launch override remain required.

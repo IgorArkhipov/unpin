@@ -38,7 +38,7 @@ class PackageDesktopReleaseTests(unittest.TestCase):
         output: Path,
         *,
         target: str = "aarch64-apple-darwin",
-        version: str = "1.0.0-rc.1",
+        version: str = "1.0.0",
         epoch: str = "1700000000",
     ) -> subprocess.CompletedProcess[str]:
         return subprocess.run(
@@ -73,7 +73,7 @@ class PackageDesktopReleaseTests(unittest.TestCase):
         archive = Path(completed.stdout.strip())
         self.assertEqual(
             archive.name,
-            "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin.tar.gz",
+            "unpin-desktop-v1.0.0-aarch64-apple-darwin.tar.gz",
         )
         with tarfile.open(archive, "r:gz") as packaged:
             members = packaged.getmembers()
@@ -82,14 +82,14 @@ class PackageDesktopReleaseTests(unittest.TestCase):
             self.assertEqual(
                 names,
                 [
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin",
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin/LICENSE",
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin/README.md",
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin/UnpinDesktop.app",
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin/UnpinDesktop.app/Contents",
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS",
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS/UnpinDesktop",
-                    "unpin-desktop-v1.0.0-rc.1-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS/unpin",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/LICENSE",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/README.md",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS/UnpinDesktop",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS/unpin",
                 ],
             )
             for member in members:

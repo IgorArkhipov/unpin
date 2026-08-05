@@ -7,6 +7,28 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-08-05
+
+### Changed
+
+- Promoted the unified CLI, terminal TUI, MCP server, and native macOS
+  workbench from release candidate to the stable `1.0.0` GitHub release.
+- Stable desktop archives remain ad-hoc signed with Hardened Runtime under an
+  explicit maintainer-approved unsigned-GA exception. They are not Developer ID
+  signed or notarized, so checksum and attestation verification plus the
+  documented Gatekeeper first-launch override remain required.
+
+### Verification
+
+- The promotion changes release versions, distribution policy, and
+  documentation only. The exact preceding implementation commit passed the
+  finalized 31/31 CLI, 31/31 TUI, and 31/31 MCP provider matrix, 35 native
+  XCTest cases, both macOS architecture archive smokes, and live Pi/OpenCode
+  validation without provider-state mutation.
+- The stable promotion commit must additionally pass locked metadata and
+  workspace gates, release-tool tests, workflow lint, Linux compatibility, and
+  exact-version desktop artifact verification before publication.
+
 ## [1.0.0-rc.1] - 2026-08-04
 
 ### Added
@@ -292,7 +314,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0-rc.1...v1.0.0
+[1.0.0-rc.1]: https://github.com/IgorArkhipov/unpin/compare/v0.6.2...v1.0.0-rc.1
+[0.6.2]: https://github.com/IgorArkhipov/unpin/compare/v0.6.1...v0.6.2
 
 [0.6.1]: https://github.com/IgorArkhipov/unpin/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/IgorArkhipov/unpin/compare/v0.5.0...v0.6.0

@@ -58,7 +58,7 @@ final class BridgeClientTests: XCTestCase {
             projectRoot: temporary.root,
             manifest: BundledBridgeManifest(
                 bridgeProtocolVersion: BridgeClient.protocolVersion,
-                unpinVersion: "1.0.0-rc.1",
+                unpinVersion: "1.0.0",
                 sha256: String(repeating: "0", count: 64)
             )
         )
@@ -89,7 +89,7 @@ final class BridgeClientTests: XCTestCase {
             projectRoot: temporary.root,
             manifest: BundledBridgeManifest(
                 bridgeProtocolVersion: BridgeClient.protocolVersion,
-                unpinVersion: "1.0.0-rc.1",
+                unpinVersion: "1.0.0",
                 sha256: digest
             )
         )
@@ -115,7 +115,7 @@ final class BridgeClientTests: XCTestCase {
                     while :; do sleep 1; done
                     ;;
                 *handshake*)
-                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0-rc.1","capabilities":[]}}'
+                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":[]}}'
                     ;;
             esac
         done
@@ -130,7 +130,7 @@ final class BridgeClientTests: XCTestCase {
             projectRoot: temporary.root,
             manifest: BundledBridgeManifest(
                 bridgeProtocolVersion: BridgeClient.protocolVersion,
-                unpinVersion: "1.0.0-rc.1",
+                unpinVersion: "1.0.0",
                 sha256: digest
             ),
             controlRequestTimeoutMilliseconds: 50
@@ -148,7 +148,7 @@ final class BridgeClientTests: XCTestCase {
 
         try await bridge.start()
         let handshake = try await bridge.handshake()
-        XCTAssertEqual(handshake.binaryVersion, "1.0.0-rc.1")
+        XCTAssertEqual(handshake.binaryVersion, "1.0.0")
         let stopped = await bridge.stop()
         XCTAssertTrue(stopped)
     }
@@ -163,7 +163,7 @@ final class BridgeClientTests: XCTestCase {
                     while :; do :; done
                     ;;
                 *handshake*)
-                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0-rc.1","capabilities":[]}}'
+                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":[]}}'
                     ;;
             esac
         done
@@ -178,7 +178,7 @@ final class BridgeClientTests: XCTestCase {
             projectRoot: temporary.root,
             manifest: BundledBridgeManifest(
                 bridgeProtocolVersion: BridgeClient.protocolVersion,
-                unpinVersion: "1.0.0-rc.1",
+                unpinVersion: "1.0.0",
                 sha256: digest
             ),
             controlRequestTimeoutMilliseconds: 50,
@@ -200,7 +200,7 @@ final class BridgeClientTests: XCTestCase {
 
         try await bridge.start()
         let handshake = try await bridge.handshake()
-        XCTAssertEqual(handshake.binaryVersion, "1.0.0-rc.1")
+        XCTAssertEqual(handshake.binaryVersion, "1.0.0")
         let stopped = await bridge.stop()
         XCTAssertTrue(stopped)
     }

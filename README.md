@@ -6,9 +6,8 @@ snapshots, restore, and MCP-backed agent workflows.
 
 ## Distribution status and quick start
 
-Unpin `1.0.0-rc.1` is the first unified CLI, terminal TUI, MCP, and macOS
-desktop release candidate. `0.6.2` remains the non-prerelease channel until a
-GA release is approved. The public stdio MCP server supports the stateless
+Unpin `1.0.0` is the first unified stable CLI, terminal TUI, MCP, and macOS
+desktop release. The public stdio MCP server supports the stateless
 2026-07-28 protocol edition while retaining legacy MCP host compatibility;
 this does not expand its plan-first mutation authority.
 
@@ -18,10 +17,10 @@ for Apple Silicon and Intel macOS. Each archive has a CycloneDX SBOM
 attestation and is covered by `SHA256SUMS`. The GNU/Linux CLI is built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12.
 
-The `1.0.0-rc.1` desktop archives are ad-hoc signed with Hardened Runtime, but
+The `1.0.0` desktop archives are ad-hoc signed with Hardened Runtime, but
 they are not Developer ID signed or Apple-notarized. macOS can therefore show
-an unidentified-developer Gatekeeper warning. This is an explicit RC
-limitation, not a trusted-distribution claim. See the desktop installation
+an unidentified-developer Gatekeeper warning. This is an explicit
+maintainer-approved GA exception, not a trusted-distribution claim. See the desktop installation
 instructions below before opening the app. crates.io and package-manager
 distribution are deferred.
 
@@ -30,7 +29,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v1.0.0-rc.1-TARGET.tar.gz \
+gh attestation verify unpin-v1.0.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -38,7 +37,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v1.0.0-rc.1-TARGET
+cd unpin-v1.0.0-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"
@@ -91,26 +90,26 @@ desktop's local-human approval is not an MCP approval: agent-created MCP
 handoffs retain the CLI/TUI approval contract described in
 [the MCP guide](docs/MCP.md).
 
-`1.0.0-rc.1` ships separate desktop archives for Apple Silicon
+`1.0.0` ships separate desktop archives for Apple Silicon
 (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`). Verify the selected
 archive against `SHA256SUMS` and its GitHub attestation before extracting it:
 
 ```bash
 gh attestation verify \
-  unpin-desktop-v1.0.0-rc.1-TARGET.tar.gz \
+  unpin-desktop-v1.0.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
-tar -xzf unpin-desktop-v1.0.0-rc.1-TARGET.tar.gz
+tar -xzf unpin-desktop-v1.0.0-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
-to `/Applications` or `~/Applications`. Updates are manual in this RC: verify
+to `/Applications` or `~/Applications`. Updates are manual in this release: verify
 the replacement archive, quit the old app, and replace the existing app
 bundle. To uninstall the desktop app, quit it and move `UnpinDesktop.app` to
 Trash. This leaves the CLI and shared Unpin state under `~/.config/unpin`
 untouched; that state can contain backup and recovery evidence and should not
 be removed as part of an ordinary app uninstall.
 
-Because the RC is not Developer ID signed or notarized, the first launch can
+Because the desktop app is not Developer ID signed or notarized, the first launch can
 be blocked by Gatekeeper. After verifying both the checksum and GitHub
 attestation, use Finder to Control-click the app, choose **Open**, then confirm
 **Open**. If macOS instead reports that the app is damaged or its signature is

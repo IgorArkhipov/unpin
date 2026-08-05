@@ -80,7 +80,7 @@ class DesktopReleaseScriptTests(unittest.TestCase):
                 [
                     str(BUILD_SCRIPT),
                     "aarch64-apple-darwin",
-                    "1.0.0-rc.1",
+                    "1.0.0",
                     str(output_directory),
                 ],
                 cwd=REPOSITORY_ROOT,
@@ -190,9 +190,9 @@ class DesktopReleaseScriptTests(unittest.TestCase):
             def run_bundle(
                 build_directory: Path,
                 package_id: str = (
-                    "path+file:///workspace/crates/unpin-cli#1.0.0-rc.1"
+                    "path+file:///workspace/crates/unpin-cli#1.0.0"
                 ),
-                marketing_version: str = "1.0.0-rc.1",
+                marketing_version: str = "1.0.0",
             ) -> subprocess.CompletedProcess[str]:
                 invocation_environment = environment.copy()
                 invocation_environment.update(
@@ -227,12 +227,12 @@ class DesktopReleaseScriptTests(unittest.TestCase):
                     / "unpin-bridge-manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(manifest["unpinVersion"], "1.0.0-rc.1")
+            self.assertEqual(manifest["unpinVersion"], "1.0.0")
 
             named_package_build = root / "build-named-package"
             named_package_completed = run_bundle(
                 named_package_build,
-                "path+file:///workspace/crates/unpin-cli#unpin-cli@1.0.0-rc.1",
+                "path+file:///workspace/crates/unpin-cli#unpin-cli@1.0.0",
             )
             self.assertEqual(
                 named_package_completed.returncode,
@@ -248,25 +248,25 @@ class DesktopReleaseScriptTests(unittest.TestCase):
                     / "unpin-bridge-manifest.json"
                 ).read_text(encoding="utf-8")
             )
-            self.assertEqual(named_package_manifest["unpinVersion"], "1.0.0-rc.1")
+            self.assertEqual(named_package_manifest["unpinVersion"], "1.0.0")
 
             rejection_cases = (
                 (
                     "version-mismatch",
-                    "path+file:///workspace/crates/unpin-cli#1.0.0-rc.1",
+                    "path+file:///workspace/crates/unpin-cli#1.0.0",
                     "9.9.9",
                     "does not match app version",
                 ),
                 (
                     "missing-version-fragment",
                     "path+file:///workspace/crates/unpin-cli",
-                    "1.0.0-rc.1",
+                    "1.0.0",
                     "could not determine bundled Unpin version",
                 ),
                 (
                     "empty-version-fragment",
                     "path+file:///workspace/crates/unpin-cli#",
-                    "1.0.0-rc.1",
+                    "1.0.0",
                     "returned an empty bundled Unpin version",
                 ),
             )
@@ -324,7 +324,7 @@ class DesktopReleaseScriptTests(unittest.TestCase):
             root = Path(temporary)
             command_bin = root / "bin"
             command_bin.mkdir()
-            version = "1.0.0-rc.1"
+            version = "1.0.0"
             target = "aarch64-apple-darwin"
             release_name = f"unpin-desktop-v{version}-{target}"
             app = root / release_name / "UnpinDesktop.app"
@@ -411,7 +411,7 @@ class DesktopReleaseScriptTests(unittest.TestCase):
             root = Path(temporary)
             command_bin = root / "bin"
             command_bin.mkdir()
-            version = "1.0.0-rc.1"
+            version = "1.0.0"
             target = "aarch64-apple-darwin"
             release_name = f"unpin-desktop-v{version}-{target}"
             app = root / release_name / "UnpinDesktop.app"
@@ -497,7 +497,7 @@ class DesktopReleaseScriptTests(unittest.TestCase):
                 self.fail(f"hung bridge process {bridge_pid} survived verifier timeout")
 
     def test_projection_validator_rejects_boolean_inventory_identity(self) -> None:
-        version = "1.0.0-rc.1"
+        version = "1.0.0"
         with tempfile.TemporaryDirectory() as temporary:
             response_file = Path(temporary) / "bridge-responses.jsonl"
             response_file.write_text(
