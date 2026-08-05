@@ -1918,6 +1918,9 @@ impl AuthenticatedBackupIndex {
     }
 
     pub(crate) fn authenticated_manifest_digest(&self, backup_id: &str) -> Option<&str> {
+        if !self.is_complete() {
+            return None;
+        }
         self.manifest_digests.get(backup_id).map(String::as_str)
     }
 }
@@ -11454,6 +11457,28 @@ mod backup_index_tests {
         .expect("backup manifest");
     }
 
+    fn authenticate_test_backup(
+        backup_root: &Path,
+        backup_id: &str,
+        target_path: &Path,
+        retired_backup_ids: Vec<String>,
+        authentication_key: &BackupAuthenticationKey,
+    ) {
+        write_test_backup(backup_root, backup_id, target_path);
+        let raw = fs::read(backup_root.join("manifest.json")).expect("backup manifest");
+        let mut manifest: BackupManifest =
+            serde_json::from_slice(&raw).expect("parse backup manifest");
+        write_authenticated_backup_manifest(backup_root, &mut manifest, authentication_key)
+            .expect("authenticate backup manifest");
+        manifest
+            .authenticity
+            .as_mut()
+            .expect("authenticated manifest")
+            .retired_backup_ids = retired_backup_ids;
+        write_authenticated_backup_manifest(backup_root, &mut manifest, authentication_key)
+            .expect("authenticate backup retirement aliases");
+    }
+
     #[test]
     fn authenticated_backup_index_scans_hundreds_of_backups_once() {
         let temporary = tempfile::tempdir().expect("temporary app state");
@@ -11476,6 +11501,42 @@ mod backup_index_tests {
         assert_eq!(index.candidate_directories, backup_count);
         assert_eq!(index.summaries.len(), backup_count);
         assert!(index.is_complete());
+    }
+
+    #[test]
+    fn incomplete_authenticated_backup_index_withholds_all_manifest_digests() {
+        let temporary = tempfile::tempdir().expect("temporary app state");
+        let app_state_root = temporary.path();
+        let backups_root = app_state_root.join("backups");
+        let target_path = app_state_root.join("workspace").join("settings.json");
+        let authentication_key = BackupAuthenticationKey::new([0x42; 32]);
+        authenticate_test_backup(
+            &backups_root.join("backup-current"),
+            "backup-current",
+            &target_path,
+            vec!["backup-retired".to_string()],
+            &authentication_key,
+        );
+        let malformed_sibling = backups_root.join("backup-unknown-alias");
+        fs::create_dir_all(&malformed_sibling).expect("malformed backup directory");
+        fs::write(malformed_sibling.join("manifest.json"), b"not-json")
+            .expect("malformed backup manifest");
+
+        let index = load_backup_index_authenticated(app_state_root, Some(&authentication_key));
+
+        assert!(!index.is_complete());
+        assert!(
+            index
+                .authenticated_manifest_digest("backup-retired")
+                .is_none(),
+            "an unreadable sibling could conceal a conflicting retirement alias"
+        );
+        assert!(
+            index
+                .authenticated_manifest_digest("backup-current")
+                .is_none(),
+            "an incomplete index must not authenticate any requested backup ID"
+        );
     }
 
     #[cfg(unix)]
