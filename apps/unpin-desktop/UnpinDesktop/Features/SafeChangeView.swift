@@ -19,6 +19,10 @@ struct SafeChangeView: View {
                 Label(blocker, systemImage: "exclamationmark.triangle")
                     .foregroundStyle(.orange)
             }
+            if let blocker = workspace.recoveryBlocker {
+                Label(blocker, systemImage: "lock.trianglebadge.exclamationmark")
+                    .foregroundStyle(.orange)
+            }
 
             if let plan = workspace.reviewedPlan {
                 PlanReviewView(plan: plan)
@@ -48,7 +52,7 @@ struct SafeChangeView: View {
                         Button("Enable") { Task { await workspace.plan(group: group, target: "enable") } }
                         Button("Disable") { Task { await workspace.plan(group: group, target: "disable") } }
                     }
-                    .disabled(!group.contextCompatible)
+                    .disabled(!group.contextCompatible || workspace.actionsBlocked)
                 }
                 .frame(minHeight: 220)
             } else {

@@ -108,7 +108,7 @@ struct GroupEditorView: View {
                     Task { await reviewDefinition() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(name.isEmpty || selectedMembers.isEmpty)
+                .disabled(name.isEmpty || selectedMembers.isEmpty || workspace.actionsBlocked)
                 if let group {
                     Menu("Plan change") {
                         Button("Enable") {
@@ -124,10 +124,11 @@ struct GroupEditorView: View {
                             }
                         }
                     }
-                    .disabled(!group.contextCompatible)
+                    .disabled(!group.contextCompatible || workspace.actionsBlocked)
                     Button("Review delete", role: .destructive) {
                         Task { await reviewDelete(group) }
                     }
+                    .disabled(workspace.actionsBlocked)
                 }
             }
 
@@ -237,6 +238,7 @@ struct GroupEditorView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(workspace.actionsBlocked)
             }
         }
     }
