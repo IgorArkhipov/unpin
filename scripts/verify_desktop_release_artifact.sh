@@ -201,10 +201,10 @@ for field in ("inventory", "warnings", "groups", "groupWarnings"):
 if not snapshot["inventory"]:
     raise SystemExit("desktop archive snapshot inventory is empty")
 for item in snapshot["inventory"]:
-    required = ("provider", "kind", "category", "layer", "id", "displayName", "enabled", "mutability")
-    if any(not isinstance(item.get(field), (str, bool)) for field in required):
+    string_fields = ("provider", "kind", "category", "layer", "id", "displayName", "mutability")
+    if any(not isinstance(item.get(field), str) for field in string_fields):
         raise SystemExit("desktop archive inventory projection is invalid")
-    if not isinstance(item["enabled"], bool):
+    if not isinstance(item.get("enabled"), bool):
         raise SystemExit("desktop archive inventory state is invalid")
 for warning in snapshot["warnings"]:
     if not isinstance(warning.get("provider"), str) or not isinstance(warning.get("code"), str):

@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import os
 import subprocess
+import tarfile
 import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_desktop_release.sh"
+VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify_desktop_release_artifact.sh"
 
 
 class DesktopReleaseScriptTests(unittest.TestCase):
@@ -84,9 +89,93 @@ class DesktopReleaseScriptTests(unittest.TestCase):
             self.assertTrue(archive.is_file(), stdout_lines[0])
             self.assertIn("synthetic xcodebuild diagnostic", completed.stderr)
 
+    def test_verifier_rejects_boolean_inventory_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command_bin = root / "bin"
+            command_bin.mkdir()
+            version = "1.0.0-rc.1"
+            target = "aarch64-apple-darwin"
+            release_name = f"unpin-desktop-v{version}-{target}"
+            app = root / release_name / "UnpinDesktop.app"
+            macos = app / "Contents" / "MacOS"
+            resources = app / "Contents" / "Resources"
+            macos.mkdir(parents=True)
+            resources.mkdir()
+
+            self._write_executable(
+                macos / "UnpinDesktop",
+                "#!/bin/sh\nexit 0\n",
+            )
+            self._write_executable(
+                macos / "unpin",
+                f"""\
+                #!/bin/sh
+                set -eu
+                if [ "${{1:-}}" = "--version" ]; then
+                    printf '%s\\n' 'unpin {version}'
+                    exit 0
+                fi
+                while IFS= read -r request; do
+                    case "$request" in
+                        *archive-handshake*)
+                            printf '%s\\n' '{{"version":2,"id":"archive-handshake","result":{{"protocolVersion":2,"binaryVersion":"{version}","capabilities":["snapshot"]}}}}'
+                            ;;
+                        *archive-snapshot*)
+                            printf '%s\\n' '{{"version":2,"id":"archive-snapshot","result":{{"capturedAtUnix":1,"inventory":[{{"provider":true,"kind":"skill","category":"skill","layer":"global","id":"item-id","displayName":"Item","enabled":true,"mutability":"read-write"}}],"warnings":[],"groups":[],"groupWarnings":[]}}}}'
+                            ;;
+                        *archive-shutdown*)
+                            printf '%s\\n' '{{"version":2,"id":"archive-shutdown","result":{{"shutdown":true}}}}'
+                            ;;
+                    esac
+                done
+                """,
+            )
+            (app / "Contents" / "Info.plist").write_text("{}", encoding="utf-8")
+            bridge = macos / "unpin"
+            (resources / "unpin-bridge-manifest.json").write_text(
+                json.dumps(
+                    {
+                        "bridgeProtocolVersion": 2,
+                        "unpinVersion": version,
+                        "sha256": hashlib.sha256(bridge.read_bytes()).hexdigest(),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            archive = root / f"{release_name}.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                bundle.add(root / release_name, arcname=release_name)
+
+            self._write_executable(
+                command_bin / "lipo",
+                "#!/bin/sh\nprintf '%s\\n' arm64\n",
+            )
+            self._write_executable(command_bin / "codesign", "#!/bin/sh\nexit 0\n")
+            self._write_executable(
+                command_bin / "plutil",
+                f"#!/bin/sh\nprintf '%s\\n' '{version}'\n",
+            )
+            environment = os.environ.copy()
+            environment["PATH"] = os.pathsep.join(
+                [str(command_bin), environment.get("PATH", "")]
+            )
+
+            completed = subprocess.run(
+                [str(VERIFY_SCRIPT), str(archive), target, version],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("desktop archive inventory projection is invalid", completed.stderr)
+
     @staticmethod
     def _write_executable(path: Path, content: str) -> None:
-        path.write_text(content, encoding="utf-8")
+        path.write_text(textwrap.dedent(content).lstrip(), encoding="utf-8")
         path.chmod(0o755)
 
 
