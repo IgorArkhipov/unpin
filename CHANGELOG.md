@@ -20,14 +20,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Verification
 
-- The promotion changes release versions, distribution policy, and
-  documentation only. The exact preceding implementation commit passed the
-  finalized 31/31 CLI, 31/31 TUI, and 31/31 MCP provider matrix, 35 native
-  XCTest cases, both macOS architecture archive smokes, and live Pi/OpenCode
-  validation without provider-state mutation.
-- The stable promotion commit must additionally pass locked metadata and
-  workspace gates, release-tool tests, workflow lint, Linux compatibility, and
-  exact-version desktop artifact verification before publication.
+- The finalized provider matrix at implementation baseline `6877cd2` passed
+  31/31 CLI, 31/31 TUI, and 31/31 MCP cases, alongside the full locked Rust
+  workspace gates, 35 native XCTest cases, both macOS architecture archive
+  smokes, and live Pi/OpenCode validation without provider-state mutation.
+- Subsequent release hardening and the stable promotion tree passed locked
+  metadata, the `unpin 1.0.0` version smoke, workflow lint, the focused desktop
+  release tests (9/9), and `git diff --check`. Protected-branch CI, clean
+  merged-head Linux compatibility, and exact-version desktop artifact
+  verification remain required before publication.
 
 ## [1.0.0-rc.1] - 2026-08-04
 
