@@ -138,12 +138,11 @@ final class WorkspaceStore: ObservableObject {
             return
         }
         let preserveRecovery = recovery != nil || recoveryBlocker != nil
-        let loadRecovery = recovery != nil || recoveryBlocker != nil
         connectionGeneration &+= 1
         await connectWorkspace(
             root: workspaceRoot,
             generation: connectionGeneration,
-            loadRecovery: loadRecovery,
+            loadRecovery: preserveRecovery,
             preserveRecovery: preserveRecovery
         )
     }
