@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 import tarfile
 import tempfile
 import textwrap
@@ -14,6 +15,9 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_desktop_release.sh"
 VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify_desktop_release_artifact.sh"
+PROJECTION_VALIDATOR = (
+    REPOSITORY_ROOT / "scripts" / "validate_desktop_release_projection.py"
+)
 
 
 class DesktopReleaseScriptTests(unittest.TestCase):
@@ -89,7 +93,10 @@ class DesktopReleaseScriptTests(unittest.TestCase):
             self.assertTrue(archive.is_file(), stdout_lines[0])
             self.assertIn("synthetic xcodebuild diagnostic", completed.stderr)
 
-    def test_verifier_rejects_boolean_inventory_identity(self) -> None:
+    def test_full_verifier_rejects_boolean_inventory_identity(self) -> None:
+        if sys.platform != "darwin":
+            self.skipTest("full desktop artifact verification requires macOS")
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             command_bin = root / "bin"
@@ -165,6 +172,67 @@ class DesktopReleaseScriptTests(unittest.TestCase):
                 [str(VERIFY_SCRIPT), str(archive), target, version],
                 cwd=REPOSITORY_ROOT,
                 env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertNotEqual(completed.returncode, 0, completed.stdout)
+            self.assertIn("desktop archive inventory projection is invalid", completed.stderr)
+
+    def test_projection_validator_rejects_boolean_inventory_identity(self) -> None:
+        version = "1.0.0-rc.1"
+        with tempfile.TemporaryDirectory() as temporary:
+            response_file = Path(temporary) / "bridge-responses.jsonl"
+            response_file.write_text(
+                "\n".join(
+                    json.dumps(response)
+                    for response in (
+                        {
+                            "version": 2,
+                            "id": "archive-handshake",
+                            "result": {
+                                "protocolVersion": 2,
+                                "binaryVersion": version,
+                                "capabilities": ["snapshot"],
+                            },
+                        },
+                        {
+                            "version": 2,
+                            "id": "archive-snapshot",
+                            "result": {
+                                "capturedAtUnix": 1,
+                                "inventory": [
+                                    {
+                                        "provider": True,
+                                        "kind": "skill",
+                                        "category": "skill",
+                                        "layer": "global",
+                                        "id": "item-id",
+                                        "displayName": "Item",
+                                        "enabled": True,
+                                        "mutability": "read-write",
+                                    }
+                                ],
+                                "warnings": [],
+                                "groups": [],
+                                "groupWarnings": [],
+                            },
+                        },
+                        {
+                            "version": 2,
+                            "id": "archive-shutdown",
+                            "result": {"shutdown": True},
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [sys.executable, str(PROJECTION_VALIDATOR), str(response_file), version],
+                cwd=REPOSITORY_ROOT,
                 capture_output=True,
                 text=True,
                 check=False,

@@ -143,6 +143,11 @@ jobs:
           -derivedDataPath /tmp/unpin-desktop-ci-derived-data
           CODE_SIGNING_ALLOWED=NO
 
+      - name: Test desktop release verifier
+        run: >
+          python3 -m unittest
+          scripts.test_desktop_release_scripts.DesktopReleaseScriptTests.test_full_verifier_rejects_boolean_inventory_identity
+
   msrv:
     name: Rust 1.96.1 MSRV
     runs-on: ubuntu-latest
