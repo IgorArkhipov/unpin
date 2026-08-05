@@ -11539,6 +11539,33 @@ mod backup_index_tests {
         );
     }
 
+    #[test]
+    fn complete_authenticated_backup_index_resolves_direct_and_retired_alias_digests() {
+        let temporary = tempfile::tempdir().expect("temporary app state");
+        let app_state_root = temporary.path();
+        let backups_root = app_state_root.join("backups");
+        let target_path = app_state_root.join("workspace").join("settings.json");
+        let authentication_key = BackupAuthenticationKey::new([0x42; 32]);
+        authenticate_test_backup(
+            &backups_root.join("backup-current"),
+            "backup-current",
+            &target_path,
+            vec!["backup-retired".to_string()],
+            &authentication_key,
+        );
+
+        let index = load_backup_index_authenticated(app_state_root, Some(&authentication_key));
+
+        assert!(index.is_complete());
+        let current_digest = index
+            .authenticated_manifest_digest("backup-current")
+            .expect("current backup digest");
+        assert_eq!(
+            index.authenticated_manifest_digest("backup-retired"),
+            Some(current_digest)
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn authenticated_backup_index_does_not_follow_backup_symlinks() {
