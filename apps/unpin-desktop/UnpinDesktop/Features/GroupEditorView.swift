@@ -75,20 +75,40 @@ struct GroupEditorView: View {
                 }
             }
 
-            HStack(spacing: 8) {
-                TextField("Filter members", text: $search).frame(minWidth: 220)
-                filter("Provider", selection: $selectedProvider, values: facets.providers)
-                filter("Layer", selection: $selectedLayer, values: facets.layers)
-                filter("Category", selection: $selectedCategory, values: facets.categories)
-                Picker("State", selection: $selectedState) {
-                    Text("Any state").tag("all")
-                    Text("On").tag("on")
-                    Text("Off").tag("off")
-                }
-                Picker("Membership", selection: $membership) {
-                    Text("All items").tag("all")
-                    Text("Included").tag("included")
-                    Text("Not included").tag("excluded")
+            VStack(alignment: .leading, spacing: 8) {
+                TextField("Filter members", text: $search)
+                    .frame(maxWidth: .infinity)
+
+                HStack(alignment: .bottom, spacing: 12) {
+                    filter("Provider", selection: $selectedProvider, values: facets.providers)
+                    filter("Layer", selection: $selectedLayer, values: facets.layers)
+                    filter("Category", selection: $selectedCategory, values: facets.categories)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("State")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Picker("", selection: $selectedState) {
+                            Text("Any state").tag("all")
+                            Text("On").tag("on")
+                            Text("Off").tag("off")
+                        }
+                        .labelsHidden()
+                        .frame(minWidth: 150, maxWidth: .infinity)
+                    }
+                    .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Membership")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                        Picker("", selection: $membership) {
+                            Text("All items").tag("all")
+                            Text("Included").tag("included")
+                            Text("Not included").tag("excluded")
+                        }
+                        .labelsHidden()
+                        .frame(minWidth: 150, maxWidth: .infinity)
+                    }
+                    .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
                 }
             }
 
@@ -282,11 +302,18 @@ struct GroupEditorView: View {
         selection: Binding<String>,
         values: [String]
     ) -> some View {
-        Picker(title, selection: selection) {
-            Text("All \(title.lowercased())").tag("all")
-            ForEach(values, id: \.self) { Text($0).tag($0) }
+        VStack(alignment: .leading, spacing: 4) {
+            Text(title)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            Picker("", selection: selection) {
+                Text("All \(title.lowercased())").tag("all")
+                ForEach(values, id: \.self) { Text($0).tag($0) }
+            }
+            .labelsHidden()
+            .frame(minWidth: 150, maxWidth: .infinity)
         }
-        .frame(width: 130)
+        .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
     }
 
     private static func key(for identity: GroupMemberIdentity) -> String {
