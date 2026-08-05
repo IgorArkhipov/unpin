@@ -15,6 +15,9 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 BUILD_SCRIPT = REPOSITORY_ROOT / "scripts" / "build_desktop_release.sh"
+BUNDLE_SCRIPT = (
+    REPOSITORY_ROOT / "apps" / "unpin-desktop" / "Scripts" / "bundle-unpin.sh"
+)
 VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify_desktop_release_artifact.sh"
 PROJECTION_VALIDATOR = (
     REPOSITORY_ROOT / "scripts" / "validate_desktop_release_projection.py"
@@ -93,6 +96,225 @@ class DesktopReleaseScriptTests(unittest.TestCase):
             archive = Path(stdout_lines[0])
             self.assertTrue(archive.is_file(), stdout_lines[0])
             self.assertIn("synthetic xcodebuild diagnostic", completed.stderr)
+
+    def test_bundle_script_does_not_execute_cross_compiled_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command_bin = root / "bin"
+            command_bin.mkdir()
+            source_root = root / "apps" / "unpin-desktop"
+            source_root.mkdir(parents=True)
+            target_binary = (
+                root / "target" / "x86_64-apple-darwin" / "release" / "unpin"
+            )
+            target_binary.parent.mkdir(parents=True)
+            execution_marker = root / "cross-compiled-binary-executed"
+            self._write_executable(
+                target_binary,
+                f"""\
+                #!/bin/sh
+                # arch: x86_64
+                printf '%s' executed > '{execution_marker}'
+                exit 99
+                """,
+            )
+            self._write_executable(
+                command_bin / "cargo",
+                """\
+                #!/bin/sh
+                set -eu
+                case "${1:-}" in
+                  build)
+                    shift
+                    test "$#" -eq 8
+                    test "$1" = "--locked"
+                    test "$2" = "--manifest-path"
+                    test "$3" = "$FAKE_WORKSPACE_ROOT/Cargo.toml"
+                    test "$4" = "-p"
+                    test "$5" = "unpin-cli"
+                    test "$6" = "--target"
+                    test "$7" = "x86_64-apple-darwin"
+                    test "$8" = "--release"
+                    exit 0
+                    ;;
+                  pkgid)
+                    shift
+                    test "$#" -eq 4
+                    test "$1" = "--manifest-path"
+                    test "$2" = "$FAKE_WORKSPACE_ROOT/Cargo.toml"
+                    test "$3" = "-p"
+                    test "$4" = "unpin-cli"
+                    printf '%s\\n' "$FAKE_PACKAGE_ID"
+                    ;;
+                  *)
+                    echo "unexpected cargo command: ${1:-missing}" >&2
+                    exit 2
+                    ;;
+                esac
+                """,
+            )
+            self._write_executable(
+                command_bin / "lipo",
+                """\
+                #!/bin/sh
+                set -eu
+                test "$#" -eq 2
+                test "$1" = "-archs"
+                sed -n '2s/^# arch: //p' "$2"
+                """,
+            )
+            self._write_executable(
+                command_bin / "ditto",
+                """\
+                #!/bin/sh
+                set -eu
+                cp "$1" "$2"
+                """,
+            )
+
+            build_root = root / "build"
+            environment = os.environ.copy()
+            environment.update(
+                {
+                    "PATH": os.pathsep.join(
+                        [str(command_bin), environment.get("PATH", "")]
+                    ),
+                    "SRCROOT": str(source_root),
+                    "CONFIGURATION": "Release",
+                    "UNPIN_RUST_TARGET": "x86_64-apple-darwin",
+                    "CONTENTS_FOLDER_PATH": "UnpinDesktop.app/Contents",
+                    "FAKE_WORKSPACE_ROOT": str(root),
+                }
+            )
+
+            def run_bundle(
+                build_directory: Path,
+                package_id: str = (
+                    "path+file:///workspace/crates/unpin-cli#1.0.0-rc.1"
+                ),
+                marketing_version: str = "1.0.0-rc.1",
+            ) -> subprocess.CompletedProcess[str]:
+                invocation_environment = environment.copy()
+                invocation_environment.update(
+                    {
+                        "FAKE_PACKAGE_ID": package_id,
+                        "TARGET_BUILD_DIR": str(build_directory),
+                        "MARKETING_VERSION": marketing_version,
+                    }
+                )
+                return subprocess.run(
+                    ["/bin/sh", str(BUNDLE_SCRIPT)],
+                    cwd=REPOSITORY_ROOT,
+                    env=invocation_environment,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+
+            completed = run_bundle(build_root)
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertFalse(
+                execution_marker.exists(),
+                "bundle script executed the cross-compiled target binary",
+            )
+            manifest = json.loads(
+                (
+                    build_root
+                    / "UnpinDesktop.app"
+                    / "Contents"
+                    / "Resources"
+                    / "unpin-bridge-manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(manifest["unpinVersion"], "1.0.0-rc.1")
+
+            named_package_build = root / "build-named-package"
+            named_package_completed = run_bundle(
+                named_package_build,
+                "path+file:///workspace/crates/unpin-cli#unpin-cli@1.0.0-rc.1",
+            )
+            self.assertEqual(
+                named_package_completed.returncode,
+                0,
+                named_package_completed.stderr,
+            )
+            named_package_manifest = json.loads(
+                (
+                    named_package_build
+                    / "UnpinDesktop.app"
+                    / "Contents"
+                    / "Resources"
+                    / "unpin-bridge-manifest.json"
+                ).read_text(encoding="utf-8")
+            )
+            self.assertEqual(named_package_manifest["unpinVersion"], "1.0.0-rc.1")
+
+            rejection_cases = (
+                (
+                    "version-mismatch",
+                    "path+file:///workspace/crates/unpin-cli#1.0.0-rc.1",
+                    "9.9.9",
+                    "does not match app version",
+                ),
+                (
+                    "missing-version-fragment",
+                    "path+file:///workspace/crates/unpin-cli",
+                    "1.0.0-rc.1",
+                    "could not determine bundled Unpin version",
+                ),
+                (
+                    "empty-version-fragment",
+                    "path+file:///workspace/crates/unpin-cli#",
+                    "1.0.0-rc.1",
+                    "returned an empty bundled Unpin version",
+                ),
+            )
+            for build_name, package_id, marketing_version, expected_error in (
+                rejection_cases
+            ):
+                with self.subTest(build_name=build_name):
+                    rejected_build = root / f"build-{build_name}"
+                    rejected = run_bundle(
+                        rejected_build,
+                        package_id,
+                        marketing_version,
+                    )
+                    self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+                    self.assertIn(expected_error, rejected.stderr)
+                    self.assertFalse(
+                        (
+                            rejected_build
+                            / "UnpinDesktop.app"
+                            / "Contents"
+                            / "Resources"
+                            / "unpin-bridge-manifest.json"
+                        ).exists()
+                    )
+
+            self._write_executable(
+                target_binary,
+                f"""\
+                #!/bin/sh
+                # arch: arm64
+                printf '%s' executed > '{execution_marker}'
+                exit 99
+                """,
+            )
+            wrong_architecture = run_bundle(root / "build-wrong-architecture")
+            self.assertNotEqual(
+                wrong_architecture.returncode,
+                0,
+                wrong_architecture.stdout,
+            )
+            self.assertIn(
+                "bundled Unpin binary architecture does not match x86_64",
+                wrong_architecture.stderr,
+            )
+            self.assertFalse(
+                execution_marker.exists(),
+                "bundle script executed the wrong-architecture target binary",
+            )
 
     def test_full_verifier_rejects_boolean_inventory_identity(self) -> None:
         if sys.platform != "darwin":

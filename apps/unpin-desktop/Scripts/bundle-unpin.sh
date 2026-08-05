@@ -62,12 +62,24 @@ if [ "$(lipo -archs "$binary")" != "$expected_architecture" ]; then
   exit 1
 fi
 
-mkdir -p "$bundle_macos" "$bundle_resources"
-ditto "$binary" "$bundle_macos/unpin"
-version="$($binary --version | awk '{print $2}')"
+package_id="$(cargo pkgid --manifest-path "$workspace_root/Cargo.toml" -p unpin-cli)"
+case "$package_id" in
+  *'#'*) version_fragment="${package_id##*#}" ;;
+  *)
+    echo "could not determine bundled Unpin version from Cargo package ID" >&2
+    exit 1
+    ;;
+esac
+version="${version_fragment##*@}"
+if [ -z "$version" ]; then
+  echo "Cargo package ID returned an empty bundled Unpin version" >&2
+  exit 1
+fi
 if [ -n "${MARKETING_VERSION:-}" ] && [ "$version" != "$MARKETING_VERSION" ]; then
   echo "bundled Unpin version $version does not match app version $MARKETING_VERSION" >&2
   exit 1
 fi
+mkdir -p "$bundle_macos" "$bundle_resources"
+ditto "$binary" "$bundle_macos/unpin"
 digest="$(shasum -a 256 "$bundle_macos/unpin" | awk '{print $1}')"
 printf '{"bridgeProtocolVersion":2,"unpinVersion":"%s","sha256":"%s"}\n' "$version" "$digest" > "$bundle_resources/unpin-bridge-manifest.json"
