@@ -180,11 +180,27 @@ fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
 
 #[test]
 fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request() {
+    let root = TempDir::new().expect("tempdir");
+    let fixture_root = root.path().join("fixtures");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    let project_root = root.path().join("workspace");
+    let app_state_root = root.path().join("state");
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(&app_state_root).expect("app state");
+
     let oversized = "x".repeat(1_048_577);
     let handshake = serde_json::json!({"version": 2, "id": "after-large", "method": "handshake"});
     let output = Command::cargo_bin("unpin")
         .expect("unpin binary")
         .args(["desktop", "bridge"])
+        .arg("--fixture-root")
+        .arg(&fixture_root)
+        .arg("--home-root")
+        .arg(&fixture_root)
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--app-state-root")
+        .arg(&app_state_root)
         .write_stdin(format!("{oversized}\n{handshake}\n"))
         .output()
         .expect("desktop bridge output");
