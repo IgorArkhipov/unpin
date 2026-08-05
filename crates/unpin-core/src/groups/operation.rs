@@ -13,7 +13,7 @@ use crate::{
     fs_support::read_optional_dir,
     groups::{GroupMemberIdentity, GroupState, GroupTargetState, GroupTogglePlan},
     mutation::{
-        AuthenticatedBackupIndex, BackupAuthenticationKey, authenticated_backup_manifest_digest,
+        AuthenticatedBackupIndex, BackupAuthenticationKey, load_backup_index_authenticated,
     },
     provider_reach::{ProviderReach, ProviderReachCoverage, ProviderReachLifecycle},
     providers::ProviderId,
@@ -452,13 +452,15 @@ pub fn load_group_operation_inspection(
     repository_key: &str,
     workspace_key: &str,
 ) -> Result<Option<GroupOperationInspection>, GroupOperationError> {
+    let app_state_root = app_state_root.into();
+    let backup_index = load_backup_index_authenticated(&app_state_root, Some(&authentication_key));
     load_group_operation_inspection_inner(
         app_state_root,
         authentication_key,
         operation_id,
         repository_key,
         workspace_key,
-        None,
+        &backup_index,
     )
 }
 
@@ -468,7 +470,7 @@ fn load_group_operation_inspection_inner(
     operation_id: &str,
     repository_key: &str,
     workspace_key: &str,
-    backup_index: Option<&AuthenticatedBackupIndex>,
+    backup_index: &AuthenticatedBackupIndex,
 ) -> Result<Option<GroupOperationInspection>, GroupOperationError> {
     let app_state_root = app_state_root.into();
     let store = GroupOperationStore::new(app_state_root.clone(), authentication_key.clone());
@@ -489,21 +491,9 @@ fn load_group_operation_inspection_inner(
     let manifests_available = indexes_available
         && backup_indexes.iter().all(|index| {
             index.backup_ids.iter().all(|backup_id| {
-                backup_index.map_or_else(
-                    || {
-                        authenticated_backup_manifest_digest(
-                            &app_state_root,
-                            backup_id,
-                            &authentication_key,
-                        )
-                        .is_ok()
-                    },
-                    |backup_index| {
-                        backup_index
-                            .authenticated_manifest_digest(backup_id)
-                            .is_some()
-                    },
-                )
+                backup_index
+                    .authenticated_manifest_digest(backup_id)
+                    .is_some()
             })
         });
     let evidence_available = manifests_available
@@ -554,12 +544,14 @@ pub fn list_group_operation_inspections(
     repository_key: &str,
     workspace_key: &str,
 ) -> Result<Vec<GroupOperationInspection>, GroupOperationError> {
+    let app_state_root = app_state_root.into();
+    let backup_index = load_backup_index_authenticated(&app_state_root, Some(&authentication_key));
     list_group_operation_inspections_inner(
         app_state_root,
         authentication_key,
         repository_key,
         workspace_key,
-        None,
+        &backup_index,
     )
 }
 
@@ -575,7 +567,7 @@ pub fn list_group_operation_inspections_with_backup_index(
         authentication_key,
         repository_key,
         workspace_key,
-        Some(backup_index),
+        backup_index,
     )
 }
 
@@ -584,7 +576,7 @@ fn list_group_operation_inspections_inner(
     authentication_key: BackupAuthenticationKey,
     repository_key: &str,
     workspace_key: &str,
-    backup_index: Option<&AuthenticatedBackupIndex>,
+    backup_index: &AuthenticatedBackupIndex,
 ) -> Result<Vec<GroupOperationInspection>, GroupOperationError> {
     let app_state_root = app_state_root.into();
     let Some(entries) = read_optional_dir(&operations_root(&app_state_root))

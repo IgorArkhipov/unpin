@@ -20,11 +20,12 @@ use unpin_core::{
     discovery::{DiscoveryCategory, DiscoveryKind, DiscoveryLayer, DiscoveryRoots, discover_all},
     groups::{
         GroupAccessContext, GroupApprovalArtifactStore, GroupCohortBackupIndexV1, GroupController,
-        GroupDefinitionV1, GroupMemberIdentity, GroupPlanDisposition, GroupPlanMode, GroupPlanner,
-        GroupReachAwareApplyContext, GroupRef, GroupResolver, GroupScope, GroupTargetState,
-        McpGroupSessionBinding, McpGroupSessionIdentity, McpGroupSessionLeaseStore,
-        PersonalGroupStore, RepositoryGroupStore, authenticate_group_approval_challenge,
-        issue_group_approval_challenge, verify_group_approval_challenge,
+        GroupDefinitionV1, GroupMemberIdentity, GroupOperationLifecycle, GroupPlanDisposition,
+        GroupPlanMode, GroupPlanner, GroupReachAwareApplyContext, GroupRef, GroupResolver,
+        GroupScope, GroupTargetState, McpGroupSessionBinding, McpGroupSessionIdentity,
+        McpGroupSessionLeaseStore, PersonalGroupStore, RepositoryGroupStore,
+        authenticate_group_approval_challenge, issue_group_approval_challenge,
+        load_group_operation_inspection, verify_group_approval_challenge,
     },
     mutation::{BackupAuthenticationKey, RestoreController, RestoreStatus},
     provider_reach::{ConnectionBoundary, ProviderReach, SelectedProviderProvenance},
@@ -386,6 +387,58 @@ fn reach_aware_group_apply_attaches_v2_journal_and_replays_without_writes() {
             .expect("backup directory after retry")
             .count(),
         backup_count
+    );
+}
+
+#[test]
+fn public_group_operation_inspection_withholds_evidence_when_backup_index_is_incomplete() {
+    let harness = GroupHarness::new();
+    let authority_key = SessionAuthorityKey::new([0x53; 32]);
+    let plan = harness.plan(GroupTargetState::Disable, GroupPlanMode::TuiDirect);
+    let expectation = harness.expectation(&plan);
+    let result = harness
+        .controller
+        .apply_with_reach_aware(
+            &plan,
+            control_authorization(
+                harness.context.app_state_root(),
+                &expectation,
+                "group-incomplete-backup-index",
+                NOW_UNIX,
+            ),
+            harness.reach_context(
+                &authority_key,
+                harness.codex_roots(harness.context.app_state_root()),
+                ConnectionBoundary::All,
+                "unpin-core-inventory-group-apply-v1",
+                NOW_UNIX,
+                NOW_UNIX + 60,
+            ),
+        )
+        .expect("reach-aware group apply");
+    let malformed_sibling = harness
+        .context
+        .app_state_root()
+        .join("backups")
+        .join("backup-malformed");
+    fs::create_dir_all(&malformed_sibling).expect("malformed backup directory");
+    fs::write(malformed_sibling.join("manifest.json"), b"not-json")
+        .expect("malformed backup manifest");
+
+    let inspection = load_group_operation_inspection(
+        harness.context.app_state_root(),
+        harness.backup_key.clone(),
+        &result.operation_id,
+        harness.context.repository_key(),
+        harness.context.workspace_key(),
+    )
+    .expect("group operation inspection")
+    .expect("durable group operation");
+
+    assert!(!inspection.evidence_available);
+    assert_eq!(
+        inspection.operation.lifecycle,
+        GroupOperationLifecycle::RecoveryRequired
     );
 }
 
