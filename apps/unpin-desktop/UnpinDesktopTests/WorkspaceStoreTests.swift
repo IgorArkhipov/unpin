@@ -228,6 +228,47 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(store.statusMessage, store.recoveryBlocker)
     }
 
+    func testDefinitionApplyRejectionPreservesDiagnosisAndDefinitionBlocker() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        await store.planDefinition(makeCreateParameters(name: "rejected-definition"))
+        XCTAssertNotNil(store.reviewedDefinition)
+
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeDefinitionApply: { [weak store] in
+                await store?.discardReviewedDefinition()
+            }
+        ))
+        let applied = await store.applyDefinition()
+
+        XCTAssertFalse(applied)
+        XCTAssertNil(store.reviewedDefinition)
+        XCTAssertNil(store.recoveryBlocker)
+        XCTAssertNotNil(store.lastDefinitionBlocker)
+        guard case .blocked(let message) = store.state else {
+            return XCTFail("a rejected definition apply should preserve its bridge diagnosis")
+        }
+        XCTAssertEqual(
+            message,
+            BridgeClientError.requestFailed("group-definition-plan-unavailable").localizedDescription
+        )
+
+        await store.loadDefinitionHistory(scope: "personal")
+        XCTAssertNotNil(store.lastDefinitionBlocker)
+        guard case .blocked = store.state else {
+            return XCTFail("definition uncertainty should remain visible after a history read")
+        }
+
+        await store.planDefinition(makeCreateParameters(name: "recovered-definition"))
+        XCTAssertNil(store.lastDefinitionBlocker)
+        XCTAssertNotNil(store.reviewedDefinition)
+        guard case .ready = store.state else {
+            return XCTFail("a fresh definition plan should clear the durable blocker")
+        }
+    }
+
     func testSameWorkspaceReloadPreservesRecoveryOnFailureButSwitchClearsIt() async throws {
         let fixture = try makeFixtureStore()
         defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
@@ -244,15 +285,28 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(store.recovery?.backups.map(\.backupId), previousRecovery.backups.map(\.backupId))
         XCTAssertNotNil(store.recoveryBlocker)
         XCTAssertTrue(store.actionsBlocked)
-        guard case .blocked = store.state else {
+        guard case .blocked(let message) = store.state else {
             return XCTFail("a failed same-workspace reload should block the workspace")
         }
+        XCTAssertEqual(message, BridgeClientError.childStopped.localizedDescription)
 
         let switchedWorkspace = fixture.temporaryRoot.appendingPathComponent("different-workspace", isDirectory: true)
         try FileManager.default.createDirectory(
             at: switchedWorkspace.appendingPathComponent(".git", isDirectory: true),
             withIntermediateDirectories: true
         )
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeWorkspaceConnect: { throw BridgeClientError.childStopped }
+        ))
+        await store.selectWorkspace(switchedWorkspace)
+
+        XCTAssertNil(store.recovery)
+        XCTAssertNil(store.recoveryBlocker)
+        guard case .blocked(let message) = store.state else {
+            return XCTFail("a failed different-workspace connect should block")
+        }
+        XCTAssertEqual(message, BridgeClientError.childStopped.localizedDescription)
+
         store.installTestHooksForTesting(WorkspaceStoreTestHooks())
         await store.selectWorkspace(switchedWorkspace)
 
