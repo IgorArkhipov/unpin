@@ -24,9 +24,11 @@ struct RestoreReviewView: View {
                             .foregroundStyle(.green)
                         Button("Apply reviewed restore") { Task { await workspace.applyApprovedRestore() } }
                             .buttonStyle(.borderedProminent)
+                            .disabled(workspace.actionsBlocked)
                     } else {
                         Button("Approve with macOS") { Task { await workspace.approveReviewedRestore() } }
                             .buttonStyle(.borderedProminent)
+                            .disabled(workspace.actionsBlocked)
                     }
                 }
             }

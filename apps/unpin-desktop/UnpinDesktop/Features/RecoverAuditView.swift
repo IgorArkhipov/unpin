@@ -73,7 +73,7 @@ struct RecoverAuditView: View {
                 Button("Review restore") {
                     Task { await workspace.planRestore(backupID: backup.backupId) }
                 }
-                .disabled(!backup.restorable)
+                .disabled(!backup.restorable || workspace.actionsBlocked)
                 if !backup.restorable {
                     Text("This backup cannot be restored with the current authenticated evidence.")
                         .font(.caption)

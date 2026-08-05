@@ -45,10 +45,11 @@ struct PlanReviewView: View {
                             .foregroundStyle(.green)
                         Button("Apply reviewed change") { Task { await workspace.applyApprovedPlan() } }
                             .buttonStyle(.borderedProminent)
+                            .disabled(workspace.actionsBlocked)
                     } else {
                         Button("Approve with macOS") { Task { await workspace.approveReviewedPlan() } }
                             .buttonStyle(.borderedProminent)
-                            .disabled(!isActionable)
+                            .disabled(!isActionable || workspace.actionsBlocked)
                     }
                 }
             }

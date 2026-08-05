@@ -21,9 +21,25 @@ struct InventoryFacets {
     }
 }
 
+struct WorkspaceStoreTestHooks {
+    var beforeReadResponse: (() async -> Void)?
+    var beforeReadError: (() async -> Void)?
+
+    init(
+        beforeReadResponse: (() async -> Void)? = nil,
+        beforeReadError: (() async -> Void)? = nil
+    ) {
+        self.beforeReadResponse = beforeReadResponse
+        self.beforeReadError = beforeReadError
+    }
+}
+
 @MainActor
 final class WorkspaceStore: ObservableObject {
     enum State { case needsWorkspace, loading, ready, blocked(String) }
+
+    private static let recoveryUnavailableMessage =
+        "Recovery evidence is unavailable. The last known evidence is preserved; refresh Recover and Audit or reload the workspace before trying another change."
 
     @Published private(set) var state: State = .needsWorkspace
     @Published private(set) var snapshot: BridgeSnapshot?
@@ -34,6 +50,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var reviewedDefinition: GroupDefinitionPlanEnvelope?
     @Published private(set) var definitionHistory: [GroupDefinitionHistory] = []
     @Published private(set) var recovery: RecoverySnapshot?
+    @Published private(set) var recoveryBlocker: String?
     @Published private(set) var reviewedRestore: RestorePlanEnvelope?
     @Published private(set) var approvedRestoreFingerprint: String?
     @Published private(set) var lastRestoreBlocker: String?
@@ -44,10 +61,15 @@ final class WorkspaceStore: ObservableObject {
     private var workspaceRoot: URL?
     private var connectionGeneration = 0
     private let bridgeRoots: BridgeLaunchRoots
+    private var testHooks = WorkspaceStoreTestHooks()
     @Published private(set) var controlRequestInFlight = false
 
     init(bridgeRoots: BridgeLaunchRoots = BridgeLaunchRoots()) {
         self.bridgeRoots = bridgeRoots
+    }
+
+    func installTestHooksForTesting(_ hooks: WorkspaceStoreTestHooks) {
+        testHooks = hooks
     }
 
     var statusMessage: String? {
@@ -68,6 +90,8 @@ final class WorkspaceStore: ObservableObject {
     }
 
     var hasWorkspace: Bool { workspaceRoot != nil }
+
+    var actionsBlocked: Bool { recoveryBlocker != nil }
 
     var isBusy: Bool {
         if case .loading = state { return true }
@@ -140,6 +164,8 @@ final class WorkspaceStore: ObservableObject {
             }
             self.bridge = bridge
             try await refresh(connectionGeneration: generation)
+            guard connectionIsCurrent(generation) else { return }
+            recoveryBlocker = nil
             if loadRecovery {
                 await refreshRecovery(connectionGeneration: generation)
             }
@@ -154,6 +180,18 @@ final class WorkspaceStore: ObservableObject {
 
     private func connectionIsCurrent(_ generation: Int) -> Bool {
         generation == connectionGeneration
+    }
+
+    private func awaitReadResponseHook() async {
+        if let hook = testHooks.beforeReadResponse {
+            await hook()
+        }
+    }
+
+    private func awaitReadErrorHook() async {
+        if let hook = testHooks.beforeReadError {
+            await hook()
+        }
     }
 
     private func clearWorkspaceState() {
@@ -187,30 +225,42 @@ final class WorkspaceStore: ObservableObject {
             let freshRecovery = try await bridge.recoverySnapshot()
             guard connectionIsCurrent(expectedGeneration) else { return }
             recovery = freshRecovery
+            recoveryBlocker = nil
             state = .ready
         } catch {
             guard connectionIsCurrent(expectedGeneration) else { return }
-            recovery = nil
-            state = .blocked(error.localizedDescription)
+            setRecoveryUnavailable()
         }
     }
 
     func plan(group: GroupSummary, target: String) async {
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
         await discardReviewedPlan()
+        guard connectionIsCurrent(expectedGeneration) else { return }
         lastApply = nil
         lastChangeBlocker = nil
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
-            reviewedPlan = try await bridge.planGroup(name: group.qualifiedName, target: target).plan
+            let freshPlan = try await bridge.planGroup(name: group.qualifiedName, target: target).plan
+            await awaitReadResponseHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            reviewedPlan = freshPlan
             approvedPlanFingerprint = nil
             lastChangeBlocker = nil
             lastApply = nil
             state = .ready
-        } catch { state = .blocked(error.localizedDescription) }
+        } catch {
+            await awaitReadErrorHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            state = .blocked(error.localizedDescription)
+        }
     }
 
     func approveReviewedPlan() async {
         guard controlRequestInFlight == false else { return }
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
         controlRequestInFlight = true
         defer { controlRequestInFlight = false }
         do {
@@ -218,14 +268,20 @@ final class WorkspaceStore: ObservableObject {
                 throw BridgeClientError.malformedResponse
             }
             _ = try await bridge.approveGroup(operationID: operationID, fingerprint: plan.planFingerprint)
+            guard connectionIsCurrent(expectedGeneration) else { return }
             approvedPlanFingerprint = plan.planFingerprint
             lastChangeBlocker = nil
             state = .ready
-        } catch { state = .blocked(error.localizedDescription) }
+        } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            state = .blocked(error.localizedDescription)
+        }
     }
 
     func applyApprovedPlan() async {
         guard controlRequestInFlight == false else { return }
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
         controlRequestInFlight = true
         defer { controlRequestInFlight = false }
         do {
@@ -234,21 +290,28 @@ final class WorkspaceStore: ObservableObject {
                 throw BridgeClientError.requestFailed("desktop-approval-required")
             }
             let result = try await bridge.applyGroup(operationID: operationID, fingerprint: plan.planFingerprint).result
+            guard connectionIsCurrent(expectedGeneration) else { return }
             lastApply = result
             self.reviewedPlan = nil
             approvedPlanFingerprint = nil
             do {
-                try await refresh()
+                try await refresh(connectionGeneration: expectedGeneration)
+                guard connectionIsCurrent(expectedGeneration) else { return }
             } catch {
+                guard connectionIsCurrent(expectedGeneration) else { return }
                 lastChangeBlocker = "The change completed, but its fresh observation could not be loaded. Reload the workspace or inspect Recover and Audit."
                 state = .blocked(error.localizedDescription)
             }
         } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
             reviewedPlan = nil
             approvedPlanFingerprint = nil
             lastChangeBlocker = "Unpin did not confirm this change. It may have written configuration; inspect Recover and Audit before creating another plan."
-            await refreshRecoveryAfterUnconfirmedChange()
-            state = .blocked(error.localizedDescription)
+            let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(connectionGeneration: expectedGeneration)
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            if recoveryRefreshed {
+                state = .blocked(error.localizedDescription)
+            }
         }
     }
 
@@ -263,15 +326,28 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func planDefinition(_ parameters: GroupDefinitionPlanParameters) async {
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
         await discardReviewedDefinition()
+        guard connectionIsCurrent(expectedGeneration) else { return }
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
-            reviewedDefinition = try await bridge.planDefinition(parameters)
-        } catch { state = .blocked(error.localizedDescription) }
+            let freshDefinition = try await bridge.planDefinition(parameters)
+            await awaitReadResponseHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            reviewedDefinition = freshDefinition
+            state = .ready
+        } catch {
+            await awaitReadErrorHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            state = .blocked(error.localizedDescription)
+        }
     }
 
     func applyDefinition() async -> Bool {
         guard controlRequestInFlight == false else { return false }
+        guard guardActionsAllowed() else { return false }
+        let expectedGeneration = connectionGeneration
         controlRequestInFlight = true
         defer { controlRequestInFlight = false }
         do {
@@ -282,10 +358,13 @@ final class WorkspaceStore: ObservableObject {
                 operationID: reviewedDefinition.operationId,
                 fingerprint: reviewedDefinition.plan.planFingerprint
             )
+            guard connectionIsCurrent(expectedGeneration) else { return false }
             self.reviewedDefinition = nil
-            try await refresh()
+            try await refresh(connectionGeneration: expectedGeneration)
+            guard connectionIsCurrent(expectedGeneration) else { return false }
             return true
         } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return false }
             state = .blocked(error.localizedDescription)
             return false
         }
@@ -302,29 +381,50 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func loadDefinitionHistory(scope: String) async {
+        let expectedGeneration = connectionGeneration
         definitionHistory = []
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
-            definitionHistory = try await bridge.definitionHistory(scope: scope).history
-        } catch { state = .blocked(error.localizedDescription) }
+            let freshHistory = try await bridge.definitionHistory(scope: scope).history
+            await awaitReadResponseHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            definitionHistory = freshHistory
+            state = .ready
+        } catch {
+            await awaitReadErrorHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            state = .blocked(error.localizedDescription)
+        }
     }
 
     func planRestore(backupID: String) async {
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
         await discardReviewedRestore()
+        guard connectionIsCurrent(expectedGeneration) else { return }
         lastRestore = nil
         lastRestoreBlocker = nil
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
-            reviewedRestore = try await bridge.planRestore(backupID: backupID)
+            let freshRestore = try await bridge.planRestore(backupID: backupID)
+            await awaitReadResponseHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            reviewedRestore = freshRestore
             approvedRestoreFingerprint = nil
             lastRestoreBlocker = nil
             lastRestore = nil
             state = .ready
-        } catch { state = .blocked(error.localizedDescription) }
+        } catch {
+            await awaitReadErrorHook()
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            state = .blocked(error.localizedDescription)
+        }
     }
 
     func approveReviewedRestore() async {
         guard controlRequestInFlight == false else { return }
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
         controlRequestInFlight = true
         defer { controlRequestInFlight = false }
         do {
@@ -335,14 +435,20 @@ final class WorkspaceStore: ObservableObject {
                 operationID: reviewedRestore.operationId,
                 fingerprint: reviewedRestore.plan.planFingerprint
             )
+            guard connectionIsCurrent(expectedGeneration) else { return }
             approvedRestoreFingerprint = reviewedRestore.plan.planFingerprint
             lastRestoreBlocker = nil
             state = .ready
-        } catch { state = .blocked(error.localizedDescription) }
+        } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            state = .blocked(error.localizedDescription)
+        }
     }
 
     func applyApprovedRestore() async {
         guard controlRequestInFlight == false else { return }
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
         controlRequestInFlight = true
         defer { controlRequestInFlight = false }
         do {
@@ -354,22 +460,30 @@ final class WorkspaceStore: ObservableObject {
                 operationID: reviewedRestore.operationId,
                 fingerprint: reviewedRestore.plan.planFingerprint
             ).result
+            guard connectionIsCurrent(expectedGeneration) else { return }
             lastRestore = result
             self.reviewedRestore = nil
             approvedRestoreFingerprint = nil
             do {
-                try await refresh()
-                await refreshRecovery()
+                try await refresh(connectionGeneration: expectedGeneration)
+                guard connectionIsCurrent(expectedGeneration) else { return }
+                await refreshRecovery(connectionGeneration: expectedGeneration)
+                guard connectionIsCurrent(expectedGeneration) else { return }
             } catch {
+                guard connectionIsCurrent(expectedGeneration) else { return }
                 lastRestoreBlocker = "The restore completed, but its fresh observation could not be loaded. Reload the workspace before another change."
                 state = .blocked(error.localizedDescription)
             }
         } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
             reviewedRestore = nil
             approvedRestoreFingerprint = nil
             lastRestoreBlocker = "Unpin did not confirm this restore. Inspect Recover and Audit before creating another restore plan."
-            await refreshRecoveryAfterUnconfirmedChange()
-            state = .blocked(error.localizedDescription)
+            let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(connectionGeneration: expectedGeneration)
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            if recoveryRefreshed {
+                state = .blocked(error.localizedDescription)
+            }
         }
     }
 
@@ -385,13 +499,40 @@ final class WorkspaceStore: ObservableObject {
         )
     }
 
-    private func refreshRecoveryAfterUnconfirmedChange() async {
+    private func refreshRecoveryAfterUnconfirmedChange(connectionGeneration expectedGeneration: Int) async -> Bool {
         do {
-            guard let bridge else { return }
-            recovery = try await bridge.recoverySnapshot()
+            guard let bridge else {
+                guard connectionIsCurrent(expectedGeneration) else { return false }
+                setRecoveryUnavailable()
+                return false
+            }
+            let freshRecovery = try await bridge.recoverySnapshot()
+            guard connectionIsCurrent(expectedGeneration) else { return false }
+            recovery = freshRecovery
+            recoveryBlocker = nil
+            return true
         } catch {
-            recovery = nil
+            guard connectionIsCurrent(expectedGeneration) else { return false }
+            setRecoveryUnavailable()
+            return false
         }
+    }
+
+    private func guardActionsAllowed() -> Bool {
+        guard actionsBlocked == false else {
+            state = .blocked(recoveryBlocker ?? Self.recoveryUnavailableMessage)
+            return false
+        }
+        return true
+    }
+
+    private func setRecoveryUnavailable() {
+        recoveryBlocker = Self.recoveryUnavailableMessage
+        state = .blocked(Self.recoveryUnavailableMessage)
+    }
+
+    func stopBridgeForTesting() async {
+        _ = await bridge?.stop()
     }
 
     private static func bundledBridge() throws -> (executable: URL, manifest: BundledBridgeManifest) {
