@@ -46,6 +46,10 @@ final class WorkspaceStore: ObservableObject {
 
     private static let recoveryUnavailableMessage =
         "Recovery evidence is unavailable. The last known evidence is preserved; refresh Recover and Audit or reload the workspace before trying another change."
+    private static let configurationChangeInProgressMessage =
+        "Unpin is still confirming a configuration change. Wait for it to finish before reloading the workspace."
+    private static let definitionChangeUnconfirmedMessage =
+        "Unpin did not confirm this definition change. It may have written configuration; inspect Recover and Audit before creating another definition change."
 
     @Published private(set) var state: State = .needsWorkspace
     @Published private(set) var snapshot: BridgeSnapshot?
@@ -55,6 +59,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var lastApply: GroupApplyResult?
     @Published private(set) var reviewedDefinition: GroupDefinitionPlanEnvelope?
     @Published private(set) var definitionHistory: [GroupDefinitionHistory] = []
+    @Published private(set) var lastDefinitionBlocker: String?
     @Published private(set) var recovery: RecoverySnapshot?
     @Published private(set) var recoveryBlocker: String?
     @Published private(set) var reviewedRestore: RestorePlanEnvelope?
@@ -159,9 +164,9 @@ final class WorkspaceStore: ObservableObject {
         if let previousBridge, await previousBridge.stop() == false {
             guard connectionIsCurrent(generation) else { return }
             if preserveRecovery {
-                setRecoveryUnavailable()
+                setRecoveryUnavailable(message: Self.configurationChangeInProgressMessage)
             } else {
-                state = .blocked("Unpin is still confirming a configuration change. Wait for it to finish before reloading the workspace.")
+                state = .blocked(Self.configurationChangeInProgressMessage)
             }
             return
         }
@@ -205,7 +210,7 @@ final class WorkspaceStore: ObservableObject {
             }
             guard connectionIsCurrent(generation) else { return }
             if preserveRecovery {
-                setRecoveryUnavailable()
+                setRecoveryUnavailable(message: error.localizedDescription)
             } else {
                 state = .blocked(error.localizedDescription)
             }
@@ -236,6 +241,7 @@ final class WorkspaceStore: ObservableObject {
         lastApply = nil
         reviewedDefinition = nil
         definitionHistory = []
+        lastDefinitionBlocker = nil
         if preservingRecovery == false {
             recovery = nil
             recoveryBlocker = nil
@@ -252,7 +258,7 @@ final class WorkspaceStore: ObservableObject {
         let freshSnapshot = try await bridge.snapshot()
         guard connectionIsCurrent(expectedGeneration) else { return }
         snapshot = freshSnapshot
-        state = .ready
+        setReadyUnlessDefinitionBlocked()
     }
 
     func refreshRecovery(connectionGeneration: Int? = nil) async {
@@ -263,7 +269,7 @@ final class WorkspaceStore: ObservableObject {
             guard connectionIsCurrent(expectedGeneration) else { return }
             recovery = freshRecovery
             recoveryBlocker = nil
-            state = .ready
+            setReadyUnlessDefinitionBlocked()
         } catch {
             guard connectionIsCurrent(expectedGeneration) else { return }
             setRecoveryUnavailable()
@@ -286,7 +292,7 @@ final class WorkspaceStore: ObservableObject {
             approvedPlanFingerprint = nil
             lastChangeBlocker = nil
             lastApply = nil
-            state = .ready
+            setReadyUnlessDefinitionBlocked()
         } catch {
             await awaitReadErrorHook()
             guard connectionIsCurrent(expectedGeneration) else { return }
@@ -308,7 +314,7 @@ final class WorkspaceStore: ObservableObject {
             guard connectionIsCurrent(expectedGeneration) else { return }
             approvedPlanFingerprint = plan.planFingerprint
             lastChangeBlocker = nil
-            state = .ready
+            setReadyUnlessDefinitionBlocked()
         } catch {
             guard connectionIsCurrent(expectedGeneration) else { return }
             state = .blocked(error.localizedDescription)
@@ -373,7 +379,8 @@ final class WorkspaceStore: ObservableObject {
             await awaitReadResponseHook()
             guard connectionIsCurrent(expectedGeneration) else { return }
             reviewedDefinition = freshDefinition
-            state = .ready
+            lastDefinitionBlocker = nil
+            setReadyUnlessDefinitionBlocked()
         } catch {
             await awaitReadErrorHook()
             guard connectionIsCurrent(expectedGeneration) else { return }
@@ -406,6 +413,7 @@ final class WorkspaceStore: ObservableObject {
         } catch {
             guard connectionIsCurrent(expectedGeneration) else { return false }
             self.reviewedDefinition = nil
+            lastDefinitionBlocker = Self.definitionChangeUnconfirmedMessage
             let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(
                 connectionGeneration: expectedGeneration
             )
@@ -436,7 +444,7 @@ final class WorkspaceStore: ObservableObject {
             await awaitReadResponseHook()
             guard connectionIsCurrent(expectedGeneration) else { return }
             definitionHistory = freshHistory
-            state = .ready
+            setReadyUnlessDefinitionBlocked()
         } catch {
             await awaitReadErrorHook()
             guard connectionIsCurrent(expectedGeneration) else { return }
@@ -460,7 +468,7 @@ final class WorkspaceStore: ObservableObject {
             approvedRestoreFingerprint = nil
             lastRestoreBlocker = nil
             lastRestore = nil
-            state = .ready
+            setReadyUnlessDefinitionBlocked()
         } catch {
             await awaitReadErrorHook()
             guard connectionIsCurrent(expectedGeneration) else { return }
@@ -485,7 +493,7 @@ final class WorkspaceStore: ObservableObject {
             guard connectionIsCurrent(expectedGeneration) else { return }
             approvedRestoreFingerprint = reviewedRestore.plan.planFingerprint
             lastRestoreBlocker = nil
-            state = .ready
+            setReadyUnlessDefinitionBlocked()
         } catch {
             guard connectionIsCurrent(expectedGeneration) else { return }
             state = .blocked(error.localizedDescription)
@@ -573,9 +581,14 @@ final class WorkspaceStore: ObservableObject {
         return true
     }
 
-    private func setRecoveryUnavailable() {
+    private func setReadyUnlessDefinitionBlocked() {
+        guard lastDefinitionBlocker == nil else { return }
+        state = .ready
+    }
+
+    private func setRecoveryUnavailable(message: String? = nil) {
         recoveryBlocker = Self.recoveryUnavailableMessage
-        state = .blocked(Self.recoveryUnavailableMessage)
+        state = .blocked(message ?? Self.recoveryUnavailableMessage)
     }
 
     func stopBridgeForTesting() async {
