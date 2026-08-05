@@ -28,6 +28,7 @@ from local_provider_matrix_support import (
     read_inventory,
     run_command,
     validate_audit,
+    validate_fixture_temporary_root,
     validate_manifest,
     write_json,
 )
@@ -259,15 +260,34 @@ class McpSession:
             raise MatrixFailure(f"MCP process exited {return_code}: {stderr[-1000:]}")
 
 
+def matrix_case_roots(
+    artifact_root: Path,
+    fixture_workspace_root: Path,
+    directory: str,
+    slug: str,
+) -> tuple[Path, Path, Path]:
+    case_root = artifact_root / directory / slug
+    workspace_root = validate_fixture_temporary_root(
+        fixture_workspace_root / directory / slug
+    )
+    fixture_root = validate_fixture_temporary_root(workspace_root / "fixtures")
+    app_state_root = validate_fixture_temporary_root(workspace_root / "state")
+    return case_root, fixture_root, app_state_root
+
+
 def run_cli_scenario(
     binary: Path,
     artifact_root: Path,
+    fixture_workspace_root: Path,
     scenario: dict[str, Any],
     canonical_fixture_digest: str,
 ) -> dict[str, Any]:
-    case_root = artifact_root / "cases" / scenario["slug"]
-    fixture_root = (case_root / "fixtures").resolve()
-    app_state_root = (case_root / "state").resolve()
+    case_root, fixture_root, app_state_root = matrix_case_roots(
+        artifact_root,
+        fixture_workspace_root,
+        "cases",
+        scenario["slug"],
+    )
     copy_fixture_tree(fixture_root)
     app_state_root.mkdir(parents=True)
 
@@ -576,12 +596,16 @@ def create_matrix_inventory_group(
 def run_mcp_scenario(
     binary: Path,
     artifact_root: Path,
+    fixture_workspace_root: Path,
     scenario: dict[str, Any],
     canonical_fixture_digest: str,
 ) -> dict[str, Any]:
-    case_root = artifact_root / "mcp-cases" / scenario["slug"]
-    fixture_root = (case_root / "fixtures").resolve()
-    app_state_root = (case_root / "state").resolve()
+    case_root, fixture_root, app_state_root = matrix_case_roots(
+        artifact_root,
+        fixture_workspace_root,
+        "mcp-cases",
+        scenario["slug"],
+    )
     copy_fixture_tree(fixture_root)
     app_state_root.mkdir(parents=True)
 
@@ -1166,12 +1190,16 @@ def new_backup_id(before: set[str], app_state_root: Path, slug: str) -> str:
 def run_tui_scenario(
     binary: Path,
     artifact_root: Path,
+    fixture_workspace_root: Path,
     scenario: dict[str, Any],
     canonical_fixture_digest: str,
 ) -> dict[str, Any]:
-    case_root = artifact_root / "tui-cases" / scenario["slug"]
-    fixture_root = (case_root / "fixtures").resolve()
-    app_state_root = (case_root / "state").resolve()
+    case_root, fixture_root, app_state_root = matrix_case_roots(
+        artifact_root,
+        fixture_workspace_root,
+        "tui-cases",
+        scenario["slug"],
+    )
     copy_fixture_tree(fixture_root)
     app_state_root.mkdir(parents=True)
 
@@ -1389,6 +1417,7 @@ def run_matrix_cases(
     worker: Any,
     binary: Path,
     artifact_root: Path,
+    fixture_workspace_root: Path,
     canonical_fixture_digest: str,
 ) -> list[dict[str, Any]]:
     worker_count = min(4, len(MATRIX))
@@ -1398,6 +1427,7 @@ def run_matrix_cases(
                 lambda scenario: worker(
                     binary,
                     artifact_root,
+                    fixture_workspace_root,
                     scenario,
                     canonical_fixture_digest,
                 ),

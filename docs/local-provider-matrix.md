@@ -451,5 +451,8 @@ Full live inventory is aggregated in memory and never persisted. Saved live plan
 contain only provider/kind/layer, operation types, and path classes. Keep case
 directories, backup payloads, and audit logs local. The runner creates the
 evidence root with owner-only permissions under the repository's ignored `tmp/`
-directory. Preserve those permissions and attach only manifest-listed files
+directory. Per-scenario CLI, TUI, and MCP fixture and app-state working copies
+remain in a separate, owner-only system-temporary workspace and are removed
+when the run finishes.
+Preserve the evidence-root permissions and attach only manifest-listed files
 instead of committing machine-local output.

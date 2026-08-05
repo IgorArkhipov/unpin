@@ -38,13 +38,8 @@ class ArtifactRootTests(unittest.TestCase):
             matrix_support.validate_artifact_root(artifact_root),
             artifact_root.resolve(),
         )
-        matrix_support.validate_fixture_temporary_root(artifact_root.resolve())
         with self.assertRaisesRegex(MatrixFailure, "repository tmp"):
             matrix_support.validate_artifact_root(
-                Path("/tmp/2026-08-05-test-provider-matrix")
-            )
-        with self.assertRaisesRegex(MatrixFailure, "repository temporary root"):
-            matrix_support.validate_fixture_temporary_root(
                 Path("/tmp/2026-08-05-test-provider-matrix")
             )
 
@@ -129,6 +124,179 @@ class ArtifactRootTests(unittest.TestCase):
         )
 
         self.assertEqual(ignored.returncode, 0)
+
+
+class FixtureWorkspaceTests(unittest.TestCase):
+    def test_accepts_system_temporary_root_and_rejects_repository_tmp(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-matrix-test-",
+            dir=matrix_support.FIXTURE_TEMP_ROOT,
+        ) as temporary_directory:
+            matrix_support.validate_fixture_temporary_root(
+                Path(temporary_directory).resolve()
+            )
+
+        with self.assertRaisesRegex(MatrixFailure, "system temporary root"):
+            matrix_support.validate_fixture_temporary_root(
+                (REPO_ROOT / "tmp/2026-08-05-test-provider-matrix").resolve()
+            )
+
+    def test_private_fixture_workspace_is_confined_and_removed(self) -> None:
+        with matrix_support.private_fixture_workspace() as workspace_root:
+            self.assertTrue(
+                workspace_root.is_relative_to(matrix_support.FIXTURE_TEMP_ROOT)
+            )
+            self.assertEqual(workspace_root.stat().st_mode & 0o777, 0o700)
+            self.assertTrue(workspace_root.is_dir())
+
+        self.assertFalse(workspace_root.exists())
+
+    def test_private_fixture_workspace_is_removed_after_failure(self) -> None:
+        workspace_root: Path | None = None
+
+        with self.assertRaisesRegex(MatrixFailure, "scenario failed"):
+            with matrix_support.private_fixture_workspace() as temporary_root:
+                workspace_root = temporary_root
+                raise MatrixFailure("scenario failed")
+
+        self.assertIsNotNone(workspace_root)
+        self.assertFalse(workspace_root.exists())
+
+
+class MatrixCaseWorkspaceTests(unittest.TestCase):
+    def test_matrix_case_roots_keep_mutable_state_outside_evidence(self) -> None:
+        evidence_root = REPO_ROOT / "tmp/2026-08-05-test-provider-matrix"
+
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-matrix-test-",
+            dir=matrix_support.FIXTURE_TEMP_ROOT,
+        ) as temporary_directory:
+            fixture_workspace_root = Path(temporary_directory).resolve()
+
+            for directory in ("cases", "tui-cases", "mcp-cases"):
+                with self.subTest(directory=directory):
+                    case_root, fixture_root, app_state_root = (
+                        matrix_cases.matrix_case_roots(
+                            evidence_root,
+                            fixture_workspace_root,
+                            directory,
+                            "test-scenario",
+                        )
+                    )
+
+                    self.assertEqual(
+                        case_root,
+                        evidence_root / directory / "test-scenario",
+                    )
+                    self.assertTrue(
+                        fixture_root.is_relative_to(fixture_workspace_root)
+                    )
+                    self.assertTrue(
+                        app_state_root.is_relative_to(fixture_workspace_root)
+                    )
+                    self.assertFalse(fixture_root.is_relative_to(evidence_root))
+                    self.assertFalse(app_state_root.is_relative_to(evidence_root))
+
+    def test_matrix_case_roots_reject_evidence_as_fixture_workspace(self) -> None:
+        evidence_root = REPO_ROOT / "tmp/2026-08-05-test-provider-matrix"
+
+        with self.assertRaisesRegex(MatrixFailure, "system temporary root"):
+            matrix_cases.matrix_case_roots(
+                evidence_root,
+                evidence_root,
+                "cases",
+                "test-scenario",
+            )
+
+    def test_run_matrix_cases_passes_separate_evidence_and_fixture_roots(self) -> None:
+        evidence_root = REPO_ROOT / "tmp/2026-08-05-test-provider-matrix"
+        fixture_workspace_root = matrix_support.FIXTURE_TEMP_ROOT / "matrix-test"
+        scenario = {"slug": "test-scenario"}
+        observed: list[tuple[Path, Path]] = []
+
+        def worker(
+            binary: Path,
+            artifact_root: Path,
+            workspace_root: Path,
+            worker_scenario: dict[str, str],
+            canonical_fixture_digest: str,
+        ) -> dict[str, str]:
+            self.assertEqual(binary, Path("/test/unpin"))
+            self.assertEqual(worker_scenario, scenario)
+            self.assertEqual(canonical_fixture_digest, "sha256:fixtures")
+            observed.append((artifact_root, workspace_root))
+            return worker_scenario
+
+        with mock.patch.object(matrix_cases, "MATRIX", [scenario]):
+            results = matrix_cases.run_matrix_cases(
+                worker,
+                Path("/test/unpin"),
+                evidence_root,
+                fixture_workspace_root,
+                "sha256:fixtures",
+            )
+
+        self.assertEqual(results, [scenario])
+        self.assertEqual(observed, [(evidence_root, fixture_workspace_root)])
+
+    def test_fixture_surface_runner_uses_one_private_workspace_for_all_surfaces(
+        self,
+    ) -> None:
+        evidence_root = REPO_ROOT / "tmp/2026-08-05-test-provider-matrix"
+        fixture_workspace_root = matrix_support.FIXTURE_TEMP_ROOT / "matrix-test"
+        workspace_context = mock.MagicMock()
+        workspace_context.__enter__.return_value = fixture_workspace_root
+        workspace_context.__exit__.return_value = False
+        expected_results = (
+            [{"surface": "cli"}],
+            [{"surface": "tui"}],
+            [{"surface": "mcp"}],
+        )
+
+        with (
+            mock.patch.object(
+                matrix_runner,
+                "private_fixture_workspace",
+                return_value=workspace_context,
+            ),
+            mock.patch.object(
+                matrix_runner,
+                "run_matrix_cases",
+                side_effect=expected_results,
+            ) as run_cases,
+            mock.patch.object(matrix_runner, "write_json") as write_json,
+        ):
+            results = matrix_runner.run_fixture_matrix_surfaces(
+                Path("/test/unpin"),
+                evidence_root,
+                "sha256:fixtures",
+            )
+
+        self.assertEqual(results, expected_results)
+        self.assertEqual(
+            [call.args[0] for call in run_cases.call_args_list],
+            [
+                matrix_runner.run_cli_scenario,
+                matrix_runner.run_tui_scenario,
+                matrix_runner.run_mcp_scenario,
+            ],
+        )
+        for call in run_cases.call_args_list:
+            self.assertEqual(call.args[2], evidence_root)
+            self.assertEqual(call.args[3], fixture_workspace_root)
+            self.assertEqual(call.args[4], "sha256:fixtures")
+        self.assertEqual(
+            write_json.call_args_list,
+            [
+                mock.call(evidence_root / "raw/results.json", expected_results[0]),
+                mock.call(
+                    evidence_root / "raw/tui-results.json", expected_results[1]
+                ),
+                mock.call(
+                    evidence_root / "raw/mcp-results.json", expected_results[2]
+                ),
+            ],
+        )
 
 
 class McpFinalizationContractTests(unittest.TestCase):
