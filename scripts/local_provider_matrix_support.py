@@ -22,6 +22,7 @@ from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = (REPO_ROOT / "crates/unpin-core/tests/fixtures").resolve()
+EVIDENCE_ROOT = REPO_ROOT / "tmp"
 FIXTURE_TEMP_ROOT = Path("/tmp").resolve()
 _PLATFORM = os.name
 _GRACEFUL_TERMINATION_SECONDS = 2
@@ -377,8 +378,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--artifact-root",
         type=Path,
-        default=Path("/tmp") / f"{timestamp}-local-matrix",
-        help="Private evidence directory under system /tmp.",
+        default=EVIDENCE_ROOT / f"{timestamp}-provider-matrix",
+        help="Private evidence directory under the repository tmp/ directory.",
     )
     parser.add_argument(
         "--binary",
@@ -441,11 +442,19 @@ def default_cargo_path() -> Path:
 
 
 def validate_artifact_root(path: Path) -> Path:
+    if EVIDENCE_ROOT.is_symlink():
+        raise MatrixFailure("repository tmp must not be a symlink")
+    evidence_root = EVIDENCE_ROOT.resolve()
     resolved = path.expanduser().resolve()
-    if not resolved.is_relative_to(FIXTURE_TEMP_ROOT):
-        raise MatrixFailure("artifact root must be under system /tmp")
-    if "local-matrix" not in resolved.name:
-        raise MatrixFailure("artifact directory name must contain 'local-matrix'")
+    if not resolved.is_relative_to(evidence_root):
+        raise MatrixFailure("artifact root must be under repository tmp")
+    if not any(
+        marker in resolved.name for marker in ("provider-matrix", "local-matrix")
+    ):
+        raise MatrixFailure(
+            "artifact directory name must contain 'provider-matrix' "
+            "or legacy 'local-matrix'"
+        )
     return resolved
 
 
@@ -456,8 +465,10 @@ def fixture_subprocess_environment() -> dict[str, str]:
 
 
 def validate_fixture_temporary_root(artifact_root: Path) -> None:
-    if not artifact_root.is_relative_to(FIXTURE_TEMP_ROOT):
-        raise MatrixFailure("fixture temporary root does not contain artifact root")
+    if EVIDENCE_ROOT.is_symlink():
+        raise MatrixFailure("repository tmp must not be a symlink")
+    if not artifact_root.is_relative_to(EVIDENCE_ROOT.resolve()):
+        raise MatrixFailure("repository temporary root does not contain artifact root")
 
 
 def prepare_artifact_root(path: Path, overwrite: bool) -> Path:

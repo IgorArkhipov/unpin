@@ -358,7 +358,8 @@ release-evidence run on a known-slow host, pass
 `--quality-gate-timeout-seconds 0`; this disables only the quality-gate timeout
 and preserves the runner's per-case safety limits.
 
-Runner prints a private evidence directory outside the checkout. The
+Runner prints a private evidence directory under the repository's ignored
+`tmp/` directory. The
 pre-release baseline run `2026-07-24-184505-local-matrix` was archived under the
 repository's ignored `tmp/2026-07-24-184505-local-matrix` directory. It was
 bound to clean workspace commit
@@ -425,7 +426,7 @@ Finalize after screenshots exist:
 
 ```bash
 python3 scripts/run_local_provider_matrix.py \
-  --artifact-root /tmp/YOUR-RUN-local-matrix \
+  --artifact-root tmp/YOUR-RUN-provider-matrix \
   --finalize
 ```
 
@@ -449,7 +450,6 @@ Safe files to share are listed in `evidence-manifest.json`:
 Full live inventory is aggregated in memory and never persisted. Saved live plans
 contain only provider/kind/layer, operation types, and path classes. Keep case
 directories, backup payloads, and audit logs local. The runner creates the
-evidence root with owner-only permissions under the system temporary directory.
-If a finalized run is archived under the repository's ignored `tmp/` directory,
-preserve those permissions and attach only manifest-listed files instead of
-committing machine-local output.
+evidence root with owner-only permissions under the repository's ignored `tmp/`
+directory. Preserve those permissions and attach only manifest-listed files
+instead of committing machine-local output.
