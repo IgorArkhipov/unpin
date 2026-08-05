@@ -30,6 +30,107 @@ from run_local_provider_matrix import (
 )
 
 
+class ArtifactRootTests(unittest.TestCase):
+    def test_accepts_repository_tmp_and_rejects_system_tmp(self) -> None:
+        artifact_root = REPO_ROOT / "tmp/2026-08-05-test-provider-matrix"
+
+        self.assertEqual(
+            matrix_support.validate_artifact_root(artifact_root),
+            artifact_root.resolve(),
+        )
+        matrix_support.validate_fixture_temporary_root(artifact_root.resolve())
+        with self.assertRaisesRegex(MatrixFailure, "repository tmp"):
+            matrix_support.validate_artifact_root(
+                Path("/tmp/2026-08-05-test-provider-matrix")
+            )
+        with self.assertRaisesRegex(MatrixFailure, "repository temporary root"):
+            matrix_support.validate_fixture_temporary_root(
+                Path("/tmp/2026-08-05-test-provider-matrix")
+            )
+
+    def test_accepts_legacy_local_matrix_directory_name(self) -> None:
+        artifact_root = REPO_ROOT / "tmp/2026-08-05-test-local-matrix"
+
+        self.assertEqual(
+            matrix_support.validate_artifact_root(artifact_root),
+            artifact_root.resolve(),
+        )
+
+    def test_rejects_unrelated_repository_tmp_directory_name(self) -> None:
+        with self.assertRaisesRegex(MatrixFailure, "directory name"):
+            matrix_support.validate_artifact_root(
+                REPO_ROOT / "tmp/2026-08-05-test-matrix"
+            )
+
+    def test_rejects_symlinked_repository_tmp_before_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            external_root = temporary_root / "external"
+            external_root.mkdir()
+            sentinel = external_root / "sentinel.txt"
+            sentinel.write_text("preserve", encoding="utf-8")
+            evidence_root = temporary_root / "tmp"
+            evidence_root.symlink_to(external_root, target_is_directory=True)
+
+            with mock.patch.object(
+                matrix_support, "EVIDENCE_ROOT", evidence_root
+            ):
+                with self.assertRaisesRegex(MatrixFailure, "must not be a symlink"):
+                    matrix_support.prepare_artifact_root(
+                        evidence_root / "test-provider-matrix",
+                        overwrite=True,
+                    )
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
+    def test_rejects_symlinked_artifact_root_before_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            evidence_root = temporary_root / "tmp"
+            evidence_root.mkdir()
+            external_root = temporary_root / "external"
+            external_root.mkdir()
+            sentinel = external_root / "sentinel.txt"
+            sentinel.write_text("preserve", encoding="utf-8")
+            artifact_root = evidence_root / "test-provider-matrix"
+            artifact_root.symlink_to(external_root, target_is_directory=True)
+
+            with mock.patch.object(
+                matrix_support, "EVIDENCE_ROOT", evidence_root
+            ):
+                with self.assertRaisesRegex(MatrixFailure, "repository tmp"):
+                    matrix_support.prepare_artifact_root(
+                        artifact_root,
+                        overwrite=True,
+                    )
+
+            self.assertEqual(sentinel.read_text(encoding="utf-8"), "preserve")
+
+    def test_default_artifact_root_is_repository_local(self) -> None:
+        with mock.patch("sys.argv", ["run_local_provider_matrix.py"]):
+            args = matrix_support.parse_args()
+
+        self.assertTrue(
+            args.artifact_root.resolve().is_relative_to(
+                (REPO_ROOT / "tmp").resolve()
+            )
+        )
+
+    def test_repository_tmp_artifacts_are_ignored(self) -> None:
+        ignored = subprocess.run(
+            [
+                "git",
+                "check-ignore",
+                "--quiet",
+                "tmp/2026-08-05-test-provider-matrix/summary.json",
+            ],
+            cwd=REPO_ROOT,
+            check=False,
+        )
+
+        self.assertEqual(ignored.returncode, 0)
+
+
 class McpFinalizationContractTests(unittest.TestCase):
     def test_accepts_handoffs_and_shared_source_prewrite_blocks(self) -> None:
         standard_case = {
