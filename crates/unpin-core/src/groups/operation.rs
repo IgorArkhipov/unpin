@@ -12,7 +12,9 @@ use crate::{
     },
     fs_support::read_optional_dir,
     groups::{GroupMemberIdentity, GroupState, GroupTargetState, GroupTogglePlan},
-    mutation::{BackupAuthenticationKey, authenticated_backup_manifest_digest},
+    mutation::{
+        AuthenticatedBackupIndex, BackupAuthenticationKey, authenticated_backup_manifest_digest,
+    },
     provider_reach::{ProviderReach, ProviderReachCoverage, ProviderReachLifecycle},
     providers::ProviderId,
     state::atomic_json::{
@@ -450,6 +452,24 @@ pub fn load_group_operation_inspection(
     repository_key: &str,
     workspace_key: &str,
 ) -> Result<Option<GroupOperationInspection>, GroupOperationError> {
+    load_group_operation_inspection_inner(
+        app_state_root,
+        authentication_key,
+        operation_id,
+        repository_key,
+        workspace_key,
+        None,
+    )
+}
+
+fn load_group_operation_inspection_inner(
+    app_state_root: impl Into<PathBuf>,
+    authentication_key: BackupAuthenticationKey,
+    operation_id: &str,
+    repository_key: &str,
+    workspace_key: &str,
+    backup_index: Option<&AuthenticatedBackupIndex>,
+) -> Result<Option<GroupOperationInspection>, GroupOperationError> {
     let app_state_root = app_state_root.into();
     let store = GroupOperationStore::new(app_state_root.clone(), authentication_key.clone());
     let Some(snapshot) = store.load(operation_id)? else {
@@ -469,12 +489,21 @@ pub fn load_group_operation_inspection(
     let manifests_available = indexes_available
         && backup_indexes.iter().all(|index| {
             index.backup_ids.iter().all(|backup_id| {
-                authenticated_backup_manifest_digest(
-                    &app_state_root,
-                    backup_id,
-                    &authentication_key,
+                backup_index.map_or_else(
+                    || {
+                        authenticated_backup_manifest_digest(
+                            &app_state_root,
+                            backup_id,
+                            &authentication_key,
+                        )
+                        .is_ok()
+                    },
+                    |backup_index| {
+                        backup_index
+                            .authenticated_manifest_digest(backup_id)
+                            .is_some()
+                    },
                 )
-                .is_ok()
             })
         });
     let evidence_available = manifests_available
@@ -525,6 +554,38 @@ pub fn list_group_operation_inspections(
     repository_key: &str,
     workspace_key: &str,
 ) -> Result<Vec<GroupOperationInspection>, GroupOperationError> {
+    list_group_operation_inspections_inner(
+        app_state_root,
+        authentication_key,
+        repository_key,
+        workspace_key,
+        None,
+    )
+}
+
+pub fn list_group_operation_inspections_with_backup_index(
+    app_state_root: impl Into<PathBuf>,
+    authentication_key: BackupAuthenticationKey,
+    repository_key: &str,
+    workspace_key: &str,
+    backup_index: &AuthenticatedBackupIndex,
+) -> Result<Vec<GroupOperationInspection>, GroupOperationError> {
+    list_group_operation_inspections_inner(
+        app_state_root,
+        authentication_key,
+        repository_key,
+        workspace_key,
+        Some(backup_index),
+    )
+}
+
+fn list_group_operation_inspections_inner(
+    app_state_root: impl Into<PathBuf>,
+    authentication_key: BackupAuthenticationKey,
+    repository_key: &str,
+    workspace_key: &str,
+    backup_index: Option<&AuthenticatedBackupIndex>,
+) -> Result<Vec<GroupOperationInspection>, GroupOperationError> {
     let app_state_root = app_state_root.into();
     let Some(entries) = read_optional_dir(&operations_root(&app_state_root))
         .map_err(|error| GroupOperationError::Io(error.to_string()))?
@@ -545,12 +606,13 @@ pub fn list_group_operation_inspections(
     }
     let mut inspections = Vec::new();
     for operation_id in operation_ids {
-        match load_group_operation_inspection(
+        match load_group_operation_inspection_inner(
             app_state_root.clone(),
             authentication_key.clone(),
             &operation_id,
             repository_key,
             workspace_key,
+            backup_index,
         ) {
             Ok(Some(inspection)) => inspections.push(inspection),
             Ok(None) | Err(GroupOperationError::ContextMismatch) => {}

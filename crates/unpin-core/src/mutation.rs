@@ -1,6 +1,6 @@
 use std::{
     cell::RefCell,
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions, TryLockError},
     io::{self, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
@@ -1883,61 +1883,253 @@ pub fn load_backup_summaries(app_state_root: &Path) -> Vec<BackupSummary> {
     load_backup_summaries_authenticated(app_state_root, None)
 }
 
-pub fn load_backup_summaries_authenticated(
+/// Authenticated backup metadata and manifest digests discovered in one
+/// directory pass.
+///
+/// Retirement aliases are resolved from the same pass that loads summaries so
+/// callers that need to inspect recovery evidence do not rescan every backup
+/// directory once per backup ID. Only manifests that pass the complete
+/// structure, payload, and HMAC checks receive an authenticated digest.
+#[derive(Debug, Clone, Default)]
+pub struct AuthenticatedBackupIndex {
+    summaries: Vec<BackupSummary>,
+    manifest_digests: BTreeMap<String, String>,
+    available: bool,
+    candidate_directories: usize,
+    unreadable_entry: bool,
+    #[allow(dead_code)]
+    directory_scan_count: usize,
+}
+
+impl AuthenticatedBackupIndex {
+    #[must_use]
+    pub fn summaries(&self) -> &[BackupSummary] {
+        &self.summaries
+    }
+
+    /// Reports whether the scan saw every candidate directory and produced a
+    /// summary for each readable manifest, matching the recovery status
+    /// contract used by the desktop bridge.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.available
+            && !self.unreadable_entry
+            && self.summaries.len() == self.candidate_directories
+    }
+
+    pub(crate) fn authenticated_manifest_digest(&self, backup_id: &str) -> Option<&str> {
+        self.manifest_digests.get(backup_id).map(String::as_str)
+    }
+}
+
+pub fn load_backup_index_authenticated(
     app_state_root: &Path,
     backup_authentication_key: Option<&BackupAuthenticationKey>,
-) -> Vec<BackupSummary> {
+) -> AuthenticatedBackupIndex {
     let backups_root = app_state_root.join("backups");
-    let mut backups = Vec::new();
-
-    let Ok(entries) = fs::read_dir(backups_root) else {
-        return backups;
-    };
-
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+    let entries = match fs::read_dir(&backups_root) {
+        Ok(entries) => {
+            let mut values = Vec::new();
+            let mut unreadable_entry = false;
+            for entry in entries {
+                match entry {
+                    Ok(entry) => values.push(entry),
+                    Err(_) => unreadable_entry = true,
+                }
+            }
+            (values, true, unreadable_entry)
         }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return AuthenticatedBackupIndex {
+                available: true,
+                directory_scan_count: 1,
+                ..AuthenticatedBackupIndex::default()
+            };
+        }
+        Err(_) => {
+            return AuthenticatedBackupIndex {
+                directory_scan_count: 1,
+                ..AuthenticatedBackupIndex::default()
+            };
+        }
+    };
+    let (entries, available, mut unreadable_entry) = entries;
 
-        let backup_dir_name = entry.file_name();
-        let Some(backup_dir_name) = backup_dir_name.to_str() else {
+    struct ScannedBackupEntry {
+        name: Option<String>,
+        path: PathBuf,
+        summary_directory: bool,
+        resolution_directory: bool,
+        manifest: Option<BackupManifest>,
+    }
+
+    let scanned = entries
+        .into_iter()
+        .map(|entry| {
+            let path = entry.path();
+            let summary_directory = path.is_dir();
+            let resolution_directory = match entry.file_type() {
+                Ok(file_type) => file_type.is_dir(),
+                Err(_) => {
+                    unreadable_entry = true;
+                    false
+                }
+            };
+            let name = entry.file_name().to_str().map(ToOwned::to_owned);
+            let manifest = if resolution_directory {
+                read_optional_string(&path.join("manifest.json"))
+                    .ok()
+                    .flatten()
+                    .and_then(|raw| serde_json::from_str::<BackupManifest>(&raw).ok())
+            } else {
+                None
+            };
+            ScannedBackupEntry {
+                name,
+                path,
+                summary_directory,
+                resolution_directory,
+                manifest,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let candidate_directories = scanned
+        .iter()
+        .filter(|entry| entry.summary_directory && entry.name.as_deref() != Some(".quarantine"))
+        .count();
+    let direct_backup_ids = scanned
+        .iter()
+        .filter(|entry| entry.summary_directory && entry.resolution_directory)
+        .filter_map(|entry| entry.name.clone())
+        .collect::<BTreeSet<_>>();
+
+    let mut manifest_digests = BTreeMap::new();
+    for entry in &scanned {
+        let Some(name) = entry.name.as_deref() else {
             continue;
         };
-        if valid_backup_id(backup_dir_name) {
-            let Ok(resolved_backup_id) =
-                resolve_backup_id(app_state_root, backup_dir_name, backup_authentication_key)
-            else {
-                continue;
+        let Some(manifest) = entry.manifest.as_ref() else {
+            continue;
+        };
+        let Some(key) = backup_authentication_key else {
+            continue;
+        };
+        if !entry.resolution_directory
+            || !valid_backup_id(name)
+            || manifest.backup_id != name
+            || manifest.version != BACKUP_MANIFEST_VERSION
+            || validate_backup_manifest_structure(name, manifest).is_err()
+            || validate_backup_payload_evidence(&entry.path, manifest).is_err()
+            || verify_backup_authentication(&entry.path, manifest, key).is_err()
+        {
+            continue;
+        }
+        let Ok(bytes) = serde_json::to_vec(manifest) else {
+            continue;
+        };
+        manifest_digests.insert(name.to_string(), transition_digest(&bytes));
+    }
+
+    let mut retirement_aliases = BTreeMap::<String, Vec<String>>::new();
+    let mut retirement_alias_present = BTreeSet::new();
+    for entry in &scanned {
+        let Some(name) = entry.name.as_deref() else {
+            continue;
+        };
+        let Some(manifest) = entry.manifest.as_ref() else {
+            continue;
+        };
+        if !entry.resolution_directory
+            || !valid_backup_id(name)
+            || manifest.backup_id != name
+            || validate_backup_manifest_structure(name, manifest).is_err()
+        {
+            continue;
+        }
+        let Some(authenticity) = manifest.authenticity.as_ref() else {
+            continue;
+        };
+        let authenticated = manifest_digests.contains_key(name);
+        for retired_backup_id in &authenticity.retired_backup_ids {
+            retirement_alias_present.insert(retired_backup_id.clone());
+            if authenticated {
+                retirement_aliases
+                    .entry(retired_backup_id.clone())
+                    .or_default()
+                    .push(name.to_string());
+            }
+        }
+    }
+
+    let mut summaries = Vec::new();
+    for entry in &scanned {
+        // Never follow backup-directory aliases while collecting summaries.
+        // `Path::is_dir` intentionally still counts such a candidate so the
+        // index reports incomplete evidence instead of silently ignoring it.
+        if !entry.summary_directory || !entry.resolution_directory {
+            continue;
+        }
+        let Some(name) = entry.name.as_deref() else {
+            continue;
+        };
+        if valid_backup_id(name) {
+            let resolves_to_self = match retirement_aliases.get(name) {
+                Some(bundles) if bundles.len() == 1 => bundles[0] == name,
+                Some(_) => false,
+                None if retirement_alias_present.contains(name) => false,
+                None => direct_backup_ids.contains(name),
             };
-            if resolved_backup_id != backup_dir_name {
+            if !resolves_to_self {
                 continue;
             }
         }
-
-        let manifest_path = path.join("manifest.json");
-        let Ok(raw) = fs::read_to_string(manifest_path) else {
+        let Some(manifest) = entry.manifest.clone() else {
             continue;
         };
-        let Ok(manifest) = serde_json::from_str::<BackupManifest>(&raw) else {
-            continue;
-        };
-
-        backups.push(backup_summary_from_manifest(
-            backup_dir_name,
-            &path,
+        summaries.push(backup_summary_from_manifest(
+            name,
+            &entry.path,
             manifest,
             backup_authentication_key,
         ));
     }
-
-    backups.sort_by(|left, right| {
+    summaries.sort_by(|left, right| {
         right
             .created_at
             .cmp(&left.created_at)
             .then_with(|| left.backup_id.cmp(&right.backup_id))
     });
-    backups
+
+    for retired_backup_id in retirement_alias_present {
+        let Some(bundles) = retirement_aliases.get(&retired_backup_id) else {
+            manifest_digests.remove(&retired_backup_id);
+            continue;
+        };
+        if let [bundle_backup_id] = bundles.as_slice()
+            && let Some(digest) = manifest_digests.get(bundle_backup_id).cloned()
+        {
+            manifest_digests.insert(retired_backup_id, digest);
+        } else {
+            manifest_digests.remove(&retired_backup_id);
+        }
+    }
+
+    AuthenticatedBackupIndex {
+        summaries,
+        manifest_digests,
+        available,
+        candidate_directories,
+        unreadable_entry,
+        directory_scan_count: 1,
+    }
+}
+
+pub fn load_backup_summaries_authenticated(
+    app_state_root: &Path,
+    backup_authentication_key: Option<&BackupAuthenticationKey>,
+) -> Vec<BackupSummary> {
+    load_backup_index_authenticated(app_state_root, backup_authentication_key).summaries
 }
 
 pub fn load_backup_summary_authenticated(
@@ -11211,4 +11403,101 @@ fn current_backup_id() -> Result<String, String> {
         return Ok(backup_id);
     }
     unix_nanos_id("backup")
+}
+
+#[cfg(test)]
+mod backup_index_tests {
+    use super::*;
+
+    fn write_test_backup(backup_root: &Path, backup_id: &str, target_path: &Path) {
+        fs::create_dir_all(backup_root).expect("backup directory");
+        let item = DiscoveryItem {
+            provider: ProviderId::Codex,
+            kind: crate::discovery::DiscoveryKind::Skill,
+            category: DiscoveryCategory::Skill,
+            layer: DiscoveryLayer::Global,
+            id: "codex:global:skill:scan-count".to_string(),
+            display_name: "scan-count".to_string(),
+            enabled: true,
+            mutability: DiscoveryMutability::ReadWrite,
+            source_path: target_path.to_string_lossy().into_owned(),
+            state_path: target_path.to_string_lossy().into_owned(),
+            source_fingerprint: None,
+            hook: None,
+        };
+        let manifest = BackupManifest {
+            version: 1,
+            authenticity: None,
+            backup_id: backup_id.to_string(),
+            created_at: "2026-08-04T00:00:00Z".to_string(),
+            selection: item,
+            target_enabled: false,
+            affected_targets: vec![MutationTarget {
+                target_type: "path".to_string(),
+                path: target_path.to_string_lossy().into_owned(),
+            }],
+            entries: vec![BackupEntry {
+                entry_id: "entry-1".to_string(),
+                target: MutationTarget {
+                    target_type: "path".to_string(),
+                    path: target_path.to_string_lossy().into_owned(),
+                },
+                existed: false,
+                path_kind: None,
+                payload: None,
+            }],
+        };
+        fs::write(
+            backup_root.join("manifest.json"),
+            serde_json::to_vec(&manifest).expect("backup manifest JSON"),
+        )
+        .expect("backup manifest");
+    }
+
+    #[test]
+    fn authenticated_backup_index_scans_hundreds_of_backups_once() {
+        let temporary = tempfile::tempdir().expect("temporary app state");
+        let app_state_root = temporary.path();
+        let backups_root = app_state_root.join("backups");
+        let target_path = app_state_root.join("workspace").join("settings.json");
+        let backup_count = 256;
+        for index in 0..backup_count {
+            let backup_id = format!("backup-{index}");
+            let backup_root = backups_root.join(&backup_id);
+            write_test_backup(&backup_root, &backup_id, &target_path);
+        }
+
+        let index = load_backup_index_authenticated(
+            app_state_root,
+            Some(&BackupAuthenticationKey::new([0x42; 32])),
+        );
+
+        assert_eq!(index.directory_scan_count, 1);
+        assert_eq!(index.candidate_directories, backup_count);
+        assert_eq!(index.summaries.len(), backup_count);
+        assert!(index.is_complete());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authenticated_backup_index_does_not_follow_backup_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temporary = tempfile::tempdir().expect("temporary app state");
+        let app_state_root = temporary.path();
+        let backups_root = app_state_root.join("backups");
+        fs::create_dir_all(&backups_root).expect("backups root");
+        let target_path = app_state_root.join("workspace").join("settings.json");
+        let outside_backup = app_state_root.join("outside-backup");
+        write_test_backup(&outside_backup, "backup-link", &target_path);
+        symlink(&outside_backup, backups_root.join("backup-link")).expect("backup symlink");
+
+        let index = load_backup_index_authenticated(
+            app_state_root,
+            Some(&BackupAuthenticationKey::new([0x42; 32])),
+        );
+
+        assert!(index.summaries.is_empty());
+        assert!(!index.is_complete());
+    }
 }

@@ -1,6 +1,5 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    fs,
     io::{self, BufRead, Write},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -17,11 +16,12 @@ use unpin_core::{
         GroupMemberIdentity, GroupPlanDisposition, GroupPlanMode, GroupPlanner, GroupRef,
         GroupResolver, GroupRevision, GroupScope, GroupTargetState, GroupTogglePlan,
         MAX_GROUP_MEMBERS, PersonalGroupStore, RepositoryGroupStore,
-        list_group_operation_inspections, validate_new_group_members,
+        list_group_operation_inspections, list_group_operation_inspections_with_backup_index,
+        validate_new_group_members,
     },
     mutation::{
-        BackupAuthenticationKey, RestoreControlPlan, RestoreController, RestoreResult,
-        load_backup_summaries_authenticated,
+        AuthenticatedBackupIndex, BackupAuthenticationKey, RestoreControlPlan, RestoreController,
+        RestoreResult, load_backup_index_authenticated,
     },
     provider_reach::ProviderReach,
     sessions::SessionAuthorityKey,
@@ -1217,13 +1217,28 @@ fn session_authority_key(
 
 fn recovery_snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &'static str> {
     let backup_key = backup_authentication_key(context);
-    let (backups, backup_status) = match backup_key.as_ref() {
-        Ok(key) => recovery_backup_summaries(context, key),
-        Err(_) => (Vec::new(), "unavailable"),
+    let backup_index = backup_key
+        .as_ref()
+        .ok()
+        .map(|key| load_backup_index_authenticated(&context.config.app_state_root, Some(key)));
+    let (backups, backup_status) = match backup_index.as_ref() {
+        Some(index) => (
+            index
+                .summaries()
+                .iter()
+                .map(redacted_backup_summary)
+                .collect::<Vec<_>>(),
+            if index.is_complete() {
+                "available"
+            } else {
+                "unavailable"
+            },
+        ),
+        None => (Vec::new(), "unavailable"),
     };
     let (mut operations, control_operation_status) = control_operation_summaries(context);
     let (group_operations, group_operation_status) =
-        group_operation_summaries(context, backup_key.as_ref().ok());
+        group_operation_summaries(context, backup_key.as_ref().ok(), backup_index.as_ref());
     operations.extend(group_operations);
     operations.sort_by(|left, right| {
         left["operationId"]
@@ -1243,42 +1258,6 @@ fn recovery_snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &
         "operationStatus": operation_status,
         "groupOperationStatus": group_operation_status,
     }))
-}
-
-fn recovery_backup_summaries(
-    context: &DesktopBridgeContext,
-    backup_key: &BackupAuthenticationKey,
-) -> (Vec<Value>, &'static str) {
-    let backups_root = context.config.app_state_root.join("backups");
-    let entries = match fs::read_dir(&backups_root) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return (Vec::new(), "available"),
-        Err(_) => return (Vec::new(), "unavailable"),
-    };
-    let mut candidate_directories = 0;
-    let mut unreadable_entry = false;
-    for entry in entries {
-        match entry {
-            Ok(entry) if entry.file_name() == ".quarantine" => {}
-            Ok(entry) if entry.path().is_dir() => candidate_directories += 1,
-            Ok(_) => {}
-            Err(_) => unreadable_entry = true,
-        }
-    }
-    let summaries =
-        load_backup_summaries_authenticated(&context.config.app_state_root, Some(backup_key));
-    let status = if unreadable_entry || summaries.len() != candidate_directories {
-        "unavailable"
-    } else {
-        "available"
-    };
-    (
-        summaries
-            .iter()
-            .map(redacted_backup_summary)
-            .collect::<Vec<_>>(),
-        status,
-    )
 }
 
 fn control_operation_summaries(context: &DesktopBridgeContext) -> (Vec<Value>, &'static str) {
@@ -1309,6 +1288,7 @@ fn control_operation_summaries(context: &DesktopBridgeContext) -> (Vec<Value>, &
 fn group_operation_summaries(
     context: &DesktopBridgeContext,
     backup_key: Option<&BackupAuthenticationKey>,
+    backup_index: Option<&AuthenticatedBackupIndex>,
 ) -> (Vec<Value>, &'static str) {
     let Some(backup_key) = backup_key else {
         return (Vec::new(), "unavailable");
@@ -1316,12 +1296,22 @@ fn group_operation_summaries(
     let Ok(group_context) = group_access_context(context) else {
         return (Vec::new(), "unavailable");
     };
-    match list_group_operation_inspections(
-        group_context.app_state_root(),
-        backup_key.clone(),
-        group_context.repository_key(),
-        group_context.workspace_key(),
-    ) {
+    let inspections = match backup_index {
+        Some(backup_index) => list_group_operation_inspections_with_backup_index(
+            group_context.app_state_root(),
+            backup_key.clone(),
+            group_context.repository_key(),
+            group_context.workspace_key(),
+            backup_index,
+        ),
+        None => list_group_operation_inspections(
+            group_context.app_state_root(),
+            backup_key.clone(),
+            group_context.repository_key(),
+            group_context.workspace_key(),
+        ),
+    };
+    match inspections {
         Ok(operations) => (
             operations
                 .iter()
@@ -1556,6 +1546,334 @@ fn discard_to_newline(input: &mut impl BufRead) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bridge_test_context(root: &std::path::Path) -> DesktopBridgeContext {
+        let config = UnpinConfig {
+            version: 1,
+            app_state_root: root.join("state"),
+            cursor_root: root.join("cursor"),
+            project_root: root.join("project"),
+            config_paths: unpin_core::config::UnpinConfigPaths {
+                user_config_path: root.join("user-config.json"),
+                project_config_path: root.join("project-config.json"),
+            },
+        };
+        DesktopBridgeContext::new(config, DiscoveryRoots::fixture_root(root), true)
+    }
+
+    fn encoded_request(id: &str, method: &str, params: Option<Value>) -> Vec<u8> {
+        let mut request = serde_json::Map::new();
+        request.insert("version".to_string(), json!(PROTOCOL_VERSION));
+        request.insert("id".to_string(), json!(id));
+        request.insert("method".to_string(), json!(method));
+        if let Some(params) = params {
+            request.insert("params".to_string(), params);
+        }
+        serde_json::to_vec(&Value::Object(request)).expect("encode bridge request")
+    }
+
+    #[test]
+    fn parser_rejects_malformed_contracts_with_stable_codes() {
+        let too_long_id = "i".repeat(MAX_REQUEST_ID_BYTES + 1);
+        let too_long_method = "m".repeat(129);
+        let cases = vec![
+            ("malformed-json", b"{".to_vec(), None, "malformed-request"),
+            (
+                "unknown-field",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "unknown-field",
+                    "method": METHOD_HANDSHAKE,
+                    "extra": true,
+                }))
+                .expect("unknown field request"),
+                Some("unknown-field"),
+                "unknown-request-field",
+            ),
+            (
+                "missing-id",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "method": METHOD_HANDSHAKE,
+                }))
+                .expect("missing id request"),
+                None,
+                "missing-request-id",
+            ),
+            (
+                "empty-id",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "",
+                    "method": METHOD_HANDSHAKE,
+                }))
+                .expect("empty id request"),
+                Some(""),
+                "invalid-request-id",
+            ),
+            (
+                "control-id",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "bad\nrequest",
+                    "method": METHOD_HANDSHAKE,
+                }))
+                .expect("control id request"),
+                Some("bad\nrequest"),
+                "invalid-request-id",
+            ),
+            (
+                "too-long-id",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": too_long_id.clone(),
+                    "method": METHOD_HANDSHAKE,
+                }))
+                .expect("long id request"),
+                Some(too_long_id.as_str()),
+                "invalid-request-id",
+            ),
+            (
+                "unsupported-version",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION + 1,
+                    "id": "unsupported-version",
+                    "method": METHOD_HANDSHAKE,
+                }))
+                .expect("unsupported version request"),
+                Some("unsupported-version"),
+                "unsupported-protocol-version",
+            ),
+            (
+                "missing-method",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "missing-method",
+                }))
+                .expect("missing method request"),
+                Some("missing-method"),
+                "invalid-method",
+            ),
+            (
+                "empty-method",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "empty-method",
+                    "method": "",
+                }))
+                .expect("empty method request"),
+                Some("empty-method"),
+                "invalid-method",
+            ),
+            (
+                "too-long-method",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "too-long-method",
+                    "method": too_long_method,
+                }))
+                .expect("long method request"),
+                Some("too-long-method"),
+                "invalid-method",
+            ),
+            (
+                "invalid-params",
+                serde_json::to_vec(&json!({
+                    "version": PROTOCOL_VERSION,
+                    "id": "invalid-params",
+                    "method": METHOD_HANDSHAKE,
+                    "params": [],
+                }))
+                .expect("invalid params request"),
+                Some("invalid-params"),
+                "invalid-params",
+            ),
+        ];
+
+        for (name, frame, expected_id, expected_code) in cases {
+            let error = match parse_request(&frame) {
+                Ok(_) => panic!("{name} should be rejected"),
+                Err(error) => error,
+            };
+            assert_eq!(error.id.as_deref(), expected_id, "{name} id");
+            assert_eq!(error.code, expected_code, "{name} code");
+        }
+    }
+
+    #[test]
+    fn stdio_contract_errors_recover_on_the_following_valid_request() {
+        let cases = vec![
+            (
+                "malformed-json",
+                vec![b"{".to_vec()],
+                None,
+                "malformed-request",
+                0,
+            ),
+            (
+                "unknown-field",
+                vec![
+                    serde_json::to_vec(&json!({
+                        "version": PROTOCOL_VERSION,
+                        "id": "unknown-field",
+                        "method": METHOD_HANDSHAKE,
+                        "extra": true,
+                    }))
+                    .expect("unknown field request"),
+                ],
+                Some("unknown-field"),
+                "unknown-request-field",
+                0,
+            ),
+            (
+                "missing-id",
+                vec![
+                    serde_json::to_vec(&json!({
+                        "version": PROTOCOL_VERSION,
+                        "method": METHOD_HANDSHAKE,
+                    }))
+                    .expect("missing id request"),
+                ],
+                None,
+                "missing-request-id",
+                0,
+            ),
+            (
+                "invalid-id",
+                vec![
+                    serde_json::to_vec(&json!({
+                        "version": PROTOCOL_VERSION,
+                        "id": "",
+                        "method": METHOD_HANDSHAKE,
+                    }))
+                    .expect("invalid id request"),
+                ],
+                Some(""),
+                "invalid-request-id",
+                0,
+            ),
+            (
+                "unsupported-version",
+                vec![
+                    serde_json::to_vec(&json!({
+                        "version": PROTOCOL_VERSION + 1,
+                        "id": "unsupported-version",
+                        "method": METHOD_HANDSHAKE,
+                    }))
+                    .expect("unsupported version request"),
+                ],
+                Some("unsupported-version"),
+                "unsupported-protocol-version",
+                0,
+            ),
+            (
+                "missing-method",
+                vec![
+                    serde_json::to_vec(&json!({
+                        "version": PROTOCOL_VERSION,
+                        "id": "missing-method",
+                    }))
+                    .expect("missing method request"),
+                ],
+                Some("missing-method"),
+                "invalid-method",
+                0,
+            ),
+            (
+                "invalid-method",
+                vec![
+                    serde_json::to_vec(&json!({
+                        "version": PROTOCOL_VERSION,
+                        "id": "invalid-method",
+                        "method": "",
+                    }))
+                    .expect("invalid method request"),
+                ],
+                Some("invalid-method"),
+                "invalid-method",
+                0,
+            ),
+            (
+                "unknown-method",
+                vec![encoded_request("unknown-method", "unknown.method", None)],
+                Some("unknown-method"),
+                "unknown-method",
+                0,
+            ),
+            (
+                "invalid-params",
+                vec![
+                    serde_json::to_vec(&json!({
+                        "version": PROTOCOL_VERSION,
+                        "id": "invalid-params",
+                        "method": METHOD_HANDSHAKE,
+                        "params": [],
+                    }))
+                    .expect("invalid params request"),
+                ],
+                Some("invalid-params"),
+                "invalid-params",
+                0,
+            ),
+            (
+                "duplicate-id",
+                vec![
+                    encoded_request("duplicate-id", METHOD_HANDSHAKE, None),
+                    encoded_request("duplicate-id", METHOD_HANDSHAKE, None),
+                ],
+                Some("duplicate-id"),
+                "duplicate-request-id",
+                1,
+            ),
+        ];
+
+        for (name, prefix, expected_id, expected_code, error_index) in cases {
+            let temporary = tempfile::tempdir().expect("temporary bridge state");
+            let mut input = Vec::new();
+            for frame in prefix {
+                input.extend_from_slice(&frame);
+                input.push(b'\n');
+            }
+            input.extend_from_slice(&encoded_request("recovery", METHOD_HANDSHAKE, None));
+            input.push(b'\n');
+            input.extend_from_slice(&encoded_request("shutdown", METHOD_SHUTDOWN, None));
+            input.push(b'\n');
+            let mut output = Vec::new();
+            run_with_io(
+                bridge_test_context(temporary.path()),
+                input.as_slice(),
+                &mut output,
+            )
+            .expect(name);
+            let output = String::from_utf8(output).expect("bridge UTF-8 responses");
+            let responses = output
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).expect("bridge response JSON"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                responses[error_index]["id"].as_str(),
+                expected_id,
+                "{name} error id"
+            );
+            assert_eq!(
+                responses[error_index]["error"]["code"], expected_code,
+                "{name} error code"
+            );
+            let recovery_index = error_index + 1;
+            assert_eq!(
+                responses[recovery_index]["id"], "recovery",
+                "{name} recovery id"
+            );
+            assert_eq!(
+                responses[recovery_index]["result"]["protocolVersion"], PROTOCOL_VERSION,
+                "{name} recovery result"
+            );
+            assert_eq!(
+                responses.last().expect("shutdown response")["id"],
+                "shutdown"
+            );
+        }
+    }
 
     #[test]
     fn request_ids_are_bounded_without_hiding_duplicates() {
