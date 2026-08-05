@@ -16,6 +16,7 @@ import signal
 import shutil
 import subprocess
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +24,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 FIXTURE_ROOT = (REPO_ROOT / "crates/unpin-core/tests/fixtures").resolve()
 EVIDENCE_ROOT = REPO_ROOT / "tmp"
-FIXTURE_TEMP_ROOT = Path("/tmp").resolve()
+FIXTURE_TEMP_ROOT = Path(tempfile.gettempdir()).resolve()
 _PLATFORM = os.name
 _GRACEFUL_TERMINATION_SECONDS = 2
 CAPABILITY_MATRIX = json.loads(
@@ -464,11 +465,22 @@ def fixture_subprocess_environment() -> dict[str, str]:
     return environment
 
 
-def validate_fixture_temporary_root(artifact_root: Path) -> None:
-    if EVIDENCE_ROOT.is_symlink():
-        raise MatrixFailure("repository tmp must not be a symlink")
-    if not artifact_root.is_relative_to(EVIDENCE_ROOT.resolve()):
-        raise MatrixFailure("repository temporary root does not contain artifact root")
+def validate_fixture_temporary_root(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.is_relative_to(FIXTURE_TEMP_ROOT):
+        raise MatrixFailure("fixture workspace must be under the system temporary root")
+    return resolved
+
+
+@contextlib.contextmanager
+def private_fixture_workspace() -> Iterator[Path]:
+    with tempfile.TemporaryDirectory(
+        prefix="unpin-provider-matrix-",
+        dir=FIXTURE_TEMP_ROOT,
+    ) as temporary_directory:
+        workspace_root = validate_fixture_temporary_root(Path(temporary_directory))
+        workspace_root.chmod(0o700)
+        yield workspace_root
 
 
 def prepare_artifact_root(path: Path, overwrite: bool) -> Path:

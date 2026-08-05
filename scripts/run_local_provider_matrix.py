@@ -38,11 +38,11 @@ from local_provider_matrix_support import (
     parse_args,
     parse_json_output,
     prepare_artifact_root,
+    private_fixture_workspace,
     run_command,
     sanitize_path,
     sha256_file,
     validate_artifact_root,
-    validate_fixture_temporary_root,
     write_json,
     write_text,
 )
@@ -723,7 +723,7 @@ def render_report(
             "- `raw/mcp-results.json`: MCP plan/review/handoff summaries plus CLI completion evidence.",
             "- `raw/live-inventory-summary.json`: sanitized installed-library counts and dry-run cells.",
             "- Full live inventory is aggregated in memory and is not persisted.",
-            "- `cases/`, `tui-cases/`, and `mcp-cases/`: per-step applies, restores, manifests, and audit logs.",
+            "- `cases/`, `tui-cases/`, and `mcp-cases/`: per-step apply/restore captures plus validated backup-manifest and audit-event summaries.",
             "- `raw/verification.json`: format, Clippy, tests, build, help, diff, and runner compile gates.",
             "",
             "Interactive local dashboard: [dashboard.html](dashboard.html).",
@@ -890,10 +890,42 @@ def build_summary(
     }
 
 
+def run_fixture_matrix_surfaces(
+    binary: Path,
+    artifact_root: Path,
+    canonical_fixture_digest: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+    with private_fixture_workspace() as fixture_workspace_root:
+        cli_results = run_matrix_cases(
+            run_cli_scenario,
+            binary,
+            artifact_root,
+            fixture_workspace_root,
+            canonical_fixture_digest,
+        )
+        write_json(artifact_root / "raw/results.json", cli_results)
+        tui_results = run_matrix_cases(
+            run_tui_scenario,
+            binary,
+            artifact_root,
+            fixture_workspace_root,
+            canonical_fixture_digest,
+        )
+        write_json(artifact_root / "raw/tui-results.json", tui_results)
+        mcp_results = run_matrix_cases(
+            run_mcp_scenario,
+            binary,
+            artifact_root,
+            fixture_workspace_root,
+            canonical_fixture_digest,
+        )
+        write_json(artifact_root / "raw/mcp-results.json", mcp_results)
+    return cli_results, tui_results, mcp_results
+
+
 def main() -> int:
     args = parse_args()
     artifact_root = validate_artifact_root(args.artifact_root)
-    validate_fixture_temporary_root(artifact_root)
     if args.finalize:
         manifest = finalize_artifacts(artifact_root)
         print(json.dumps({"status": "finalized", "artifactRoot": str(artifact_root), **manifest["counts"]}))
@@ -930,27 +962,11 @@ def main() -> int:
             )
 
         canonical_fixture_digest = digest_path(FIXTURE_ROOT)
-        cli_results = run_matrix_cases(
-            run_cli_scenario,
+        cli_results, tui_results, mcp_results = run_fixture_matrix_surfaces(
             binary,
             artifact_root,
             canonical_fixture_digest,
         )
-        tui_results = run_matrix_cases(
-            run_tui_scenario,
-            binary,
-            artifact_root,
-            canonical_fixture_digest,
-        )
-        mcp_results = run_matrix_cases(
-            run_mcp_scenario,
-            binary,
-            artifact_root,
-            canonical_fixture_digest,
-        )
-        write_json(artifact_root / "raw/results.json", cli_results)
-        write_json(artifact_root / "raw/tui-results.json", tui_results)
-        write_json(artifact_root / "raw/mcp-results.json", mcp_results)
         write_json(artifact_root / "raw/scenario-matrix.json", MATRIX)
 
         static_surfaces = capture_static_surfaces(binary, artifact_root)
