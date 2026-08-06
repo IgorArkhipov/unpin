@@ -93,9 +93,144 @@ final class WorkbenchFlowTests: XCTestCase {
         )
     }
 
+    func testDiscoverClassifierPrioritizesWorkspaceAndConnectionState() {
+        let inventory = [inventoryItem(name: "Alpha", provider: "codex", id: "alpha")]
+        let filters = DiscoverFilterState(search: "missing")
+
+        XCTAssertEqual(
+            classifyDiscoverPresentation(
+                presentation: .fixture(
+                    state: .needsWorkspace,
+                    hasWorkspace: false,
+                    isBusy: false,
+                    workspaceName: nil
+                ),
+                inventory: inventory,
+                filters: filters
+            ),
+            .needsWorkspace
+        )
+        XCTAssertEqual(
+            classifyDiscoverPresentation(
+                presentation: .fixture(
+                    state: .loading,
+                    hasWorkspace: true,
+                    isBusy: true,
+                    workspaceName: "fixture"
+                ),
+                inventory: inventory,
+                filters: filters
+            ),
+            .loading
+        )
+        XCTAssertEqual(
+            classifyDiscoverPresentation(
+                presentation: .fixture(
+                    state: .blocked("bridge unavailable"),
+                    hasWorkspace: true,
+                    isBusy: false,
+                    workspaceName: "fixture"
+                ),
+                inventory: [],
+                filters: DiscoverFilterState()
+            ),
+            .blocked("bridge unavailable")
+        )
+    }
+
+    func testDiscoverClassifierDistinguishesEmptyInventoryAndFilterZero() {
+        let ready = WorkbenchPresentationInputs.fixture(
+            state: .ready,
+            hasWorkspace: true,
+            isBusy: false,
+            workspaceName: "fixture"
+        )
+        let inventory = [inventoryItem(name: "Alpha", provider: "codex", id: "alpha")]
+
+        XCTAssertEqual(
+            classifyDiscoverPresentation(
+                presentation: ready,
+                inventory: [],
+                filters: DiscoverFilterState()
+            ),
+            .emptyInventory
+        )
+        XCTAssertEqual(
+            classifyDiscoverPresentation(
+                presentation: ready,
+                inventory: inventory,
+                filters: DiscoverFilterState(search: "missing")
+            ),
+            .filterZero
+        )
+
+        let facetFilters = [
+            DiscoverFilterState(provider: "zed"),
+            DiscoverFilterState(layer: "project"),
+            DiscoverFilterState(category: "mcp"),
+            DiscoverFilterState(state: "off"),
+        ]
+        for filters in facetFilters {
+            XCTAssertEqual(
+                classifyDiscoverPresentation(
+                    presentation: ready,
+                    inventory: inventory,
+                    filters: filters
+                ),
+                .filterZero
+            )
+        }
+        XCTAssertEqual(
+            classifyDiscoverPresentation(
+                presentation: ready,
+                inventory: inventory,
+                filters: DiscoverFilterState()
+            ),
+            .ready
+        )
+    }
+
+    func testDiscoverFiltersClearAllFiveDimensions() {
+        let inventory = [inventoryItem(name: "Alpha", provider: "codex", id: "alpha")]
+        var filters = DiscoverFilterState(
+            search: "skill",
+            provider: "codex",
+            layer: "project",
+            category: "skill",
+            state: "on"
+        )
+
+        XCTAssertTrue(filters.isActive)
+        XCTAssertTrue(inventory.filter(filters.matches).isEmpty)
+        filters.clear()
+
+        XCTAssertEqual(filters, DiscoverFilterState())
+        XCTAssertFalse(filters.isActive)
+        XCTAssertEqual(
+            inventory.filter(filters.matches).map(\.id),
+            inventory.map(\.id)
+        )
+    }
+
+    func testGroupCreationRouteSelectsDiscoverAndPresentsOnce() {
+        var navigation = WorkbenchNavigationState(workArea: .change)
+
+        navigation.presentGroupCreation()
+
+        XCTAssertEqual(navigation.workArea, .discover)
+        XCTAssertTrue(navigation.isPresentingGroupEditor)
+
+        navigation.isPresentingGroupEditor = false
+        XCTAssertFalse(navigation.isPresentingGroupEditor)
+    }
+
     func testInventoryFilterSelectionsFitAtDefaultWindowWidth() {
         let host = NSHostingView(
-            rootView: DiscoverOrganizeView()
+            rootView: DiscoverOrganizeView(
+                inventoryOverride: [
+                    inventoryItem(name: "Alpha", provider: "codex", id: "alpha"),
+                ]
+            )
                 .environmentObject(WorkspaceStore())
         )
         host.frame = NSRect(x: 0, y: 0, width: 1_180, height: 760)

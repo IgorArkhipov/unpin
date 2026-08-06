@@ -188,6 +188,66 @@ struct InventoryFacetSelection: Equatable {
     var category: String = "all"
 }
 
+struct DiscoverFilterState: Equatable {
+    var search = ""
+    var provider = "all"
+    var layer = "all"
+    var category = "all"
+    var state = "all"
+
+    var isActive: Bool {
+        !search.isEmpty
+            || provider != "all"
+            || layer != "all"
+            || category != "all"
+            || state != "all"
+    }
+
+    func matches(_ item: InventoryItem) -> Bool {
+        (provider == "all" || item.provider == provider)
+            && (layer == "all" || item.layer == layer)
+            && (category == "all" || item.category == category)
+            && (state == "all" || (state == "on") == item.enabled)
+            && (search.isEmpty
+                || item.displayName.localizedCaseInsensitiveContains(search)
+                || item.id.localizedCaseInsensitiveContains(search))
+    }
+
+    mutating func clear() {
+        self = Self()
+    }
+}
+
+enum DiscoverPresentationState: Equatable {
+    case needsWorkspace
+    case loading
+    case blocked(String)
+    case emptyInventory
+    case filterZero
+    case ready
+}
+
+func classifyDiscoverPresentation(
+    presentation: WorkbenchPresentationInputs,
+    inventory: [InventoryItem],
+    filters: DiscoverFilterState
+) -> DiscoverPresentationState {
+    switch presentation.state {
+    case .needsWorkspace:
+        return .needsWorkspace
+    case .loading:
+        return .loading
+    case .blocked(let message):
+        return .blocked(message)
+    case .ready:
+        guard !inventory.isEmpty else { return .emptyInventory }
+        if filters.isActive, !inventory.contains(where: filters.matches) {
+            return .filterZero
+        }
+        return .ready
+    }
+}
+
 enum WorkbenchFilterAccessibility {
     static let provider = "Provider"
     static let layer = "Layer"
@@ -223,6 +283,8 @@ struct DiscoverOrganizeView: View {
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.workbenchPresentation) private var presentation
     @Environment(\.workbenchChooseWorkspace) private var chooseWorkspace
+    @Environment(\.workbenchCreateGroup) private var createGroup
+    let inventoryOverride: [InventoryItem]?
     @State private var search = ""
     @State private var selectedProvider = "all"
     @State private var selectedLayer = "all"
@@ -230,10 +292,18 @@ struct DiscoverOrganizeView: View {
     @State private var selectedState = "all"
     @State private var sort = InventorySortState()
     @State private var editingGroup: GroupSummary?
-    @State private var creatingGroup = false
+
+    init(inventoryOverride: [InventoryItem]? = nil) {
+        self.inventoryOverride = inventoryOverride
+    }
 
     var body: some View {
-        switch presentation.state {
+        let inventory = inventoryOverride ?? workspace.snapshot?.inventory ?? []
+        switch classifyDiscoverPresentation(
+            presentation: presentation,
+            inventory: inventory,
+            filters: filterState
+        ) {
         case .needsWorkspace:
             WorkbenchWorkspaceStateView(
                 title: "Choose a workspace",
@@ -255,25 +325,30 @@ struct DiscoverOrganizeView: View {
                 actionTitle: "Retry",
                 action: { Task { await workspace.reloadWorkspace() } }
             )
+        case .emptyInventory:
+            WorkbenchWorkspaceStateView(
+                title: "No supported inventory found",
+                message: "Discovery completed without supported skills, MCP servers, instructions, or hooks. Reload the selected workspace or review its status below for diagnostics.",
+                actionTitle: "Reload discovery",
+                action: { Task { await workspace.reloadWorkspace() } }
+            )
+        case .filterZero:
+            WorkbenchWorkspaceStateView(
+                title: "No inventory matches these filters",
+                message: "The workspace has discovered inventory, but the current search and filters exclude every item.",
+                actionTitle: "Clear filters",
+                action: clearFilters
+            )
         case .ready:
-            inventoryContent
+            inventoryContent(inventory)
         }
     }
 
-    private var inventoryContent: some View {
-        let inventory = workspace.snapshot?.inventory ?? []
+    private func inventoryContent(_ inventory: [InventoryItem]) -> some View {
         let facets = InventoryFacets(inventory: inventory)
         let filterRevision = InventoryFilterRevision(inventory: inventory)
         let palette = WorkbenchPalette.resolve(for: colorScheme)
-        let items = sort.sorted(inventory.filter { item in
-            (selectedProvider == "all" || item.provider == selectedProvider)
-                && (selectedLayer == "all" || item.layer == selectedLayer)
-                && (selectedCategory == "all" || item.category == selectedCategory)
-                && (selectedState == "all" || (selectedState == "on") == item.enabled)
-                && (search.isEmpty
-                    || item.displayName.localizedCaseInsensitiveContains(search)
-                    || item.id.localizedCaseInsensitiveContains(search))
-        })
+        let items = sort.sorted(inventory.filter(filterState.matches))
         return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Text("Discover and Organize").font(.title2)
@@ -284,8 +359,10 @@ struct DiscoverOrganizeView: View {
                     }
                 }
                 .disabled(workspace.isBusy || workspace.actionsBlocked)
-                Button("New group") { creatingGroup = true }
-                    .disabled(workspace.isBusy || workspace.actionsBlocked)
+                Button("New group") { createGroup?() }
+                    .disabled(
+                        createGroup == nil || workspace.isBusy || workspace.actionsBlocked
+                    )
                 Button("Reload") { Task { await workspace.reloadWorkspace() } }
                     .disabled(workspace.isBusy)
             }
@@ -363,12 +440,27 @@ struct DiscoverOrganizeView: View {
         .sheet(item: $editingGroup) { group in
             GroupEditorView(group: group)
         }
-        .sheet(isPresented: $creatingGroup) {
-            GroupEditorView(group: nil)
-        }
         .onChange(of: filterRevision) { _, _ in
             normalizeInventoryFilters(inventory)
         }
+    }
+
+    private var filterState: DiscoverFilterState {
+        DiscoverFilterState(
+            search: search,
+            provider: selectedProvider,
+            layer: selectedLayer,
+            category: selectedCategory,
+            state: selectedState
+        )
+    }
+
+    private func clearFilters() {
+        search = ""
+        selectedProvider = "all"
+        selectedLayer = "all"
+        selectedCategory = "all"
+        selectedState = "all"
     }
 
     private var sortControls: some View {
