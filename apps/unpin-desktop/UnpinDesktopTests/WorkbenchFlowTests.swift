@@ -467,6 +467,40 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertFalse(matchesGroupMemberFilter(target, selectedMemberKeys: selectedKeys, filter: filter))
     }
 
+    func testGovernHandoffCatalogSeparatesVerifiedAndUnavailablePaths() {
+        XCTAssertEqual(
+            GovernHandoff.catalog.map(\.id),
+            ["profiles", "gateways", "sessions", "hooks", "native-controls"]
+        )
+
+        for handoff in GovernHandoff.catalog.prefix(4) {
+            guard case .verified(let cliCommand, let mcpToolIDs) = handoff.availability else {
+                return XCTFail("\(handoff.id) should provide a verified CLI and MCP handoff")
+            }
+            XCTAssertTrue(cliCommand.hasPrefix("unpin "))
+            XCTAssertFalse(mcpToolIDs.isEmpty)
+            XCTAssertEqual(handoff.copyableValues, [cliCommand] + mcpToolIDs)
+        }
+
+        guard case .unavailable(let reason) = GovernHandoff.catalog.last?.availability else {
+            return XCTFail("native desktop automation should remain explicitly unavailable")
+        }
+        XCTAssertFalse(reason.isEmpty)
+        XCTAssertTrue(GovernHandoff.catalog.last?.copyableValues.isEmpty == true)
+    }
+
+    func testGovernViewCopiesEveryVerifiedValueExactlyOnce() {
+        var copiedValues = [String]()
+        let view = GovernAutomateView(
+            clipboardWriter: GovernClipboardWriter { copiedValues.append($0) }
+        )
+        let expectedValues = GovernHandoff.catalog.flatMap(\.copyableValues)
+
+        expectedValues.forEach { view.copy($0, statusLabel: $0) }
+
+        XCTAssertEqual(copiedValues, expectedValues)
+    }
+
     private func inventoryItem(
         name: String,
         provider: String,
