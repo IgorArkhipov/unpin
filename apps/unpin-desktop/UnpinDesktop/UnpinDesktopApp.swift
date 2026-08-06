@@ -176,6 +176,9 @@ struct WorkbenchView: View {
                 .environment(\.workbenchCreateGroup, {
                     navigation.presentGroupCreation()
                 })
+                .environment(\.workbenchOpenChange, {
+                    navigation.presentChange()
+                })
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(palette.panel.opacity(0.96))
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
@@ -259,6 +262,10 @@ struct WorkbenchNavigationState: Equatable {
     mutating func presentGroupCreation() {
         workArea = .discover
         isPresentingGroupEditor = true
+    }
+
+    mutating func presentChange() {
+        workArea = .change
     }
 }
 
