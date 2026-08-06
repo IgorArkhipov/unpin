@@ -65,10 +65,6 @@ struct GroupEditorView: View {
         selectedMembers.values.sorted { groupMemberKey(for: $0) < groupMemberKey(for: $1) }
     }
 
-    private var controlsDisabled: Bool {
-        workspace.mutationsBlocked
-    }
-
     var body: some View {
         let inventory = workspace.snapshot?.inventory ?? []
         let facets = InventoryFacets(inventory: inventory)
@@ -113,7 +109,7 @@ struct GroupEditorView: View {
                         .foregroundStyle(.secondary)
                 }
             }
-            .disabled(controlsDisabled)
+            .disabled(workspace.mutationsBlocked)
 
             VStack(alignment: .leading, spacing: 8) {
                 TextField("Filter members", text: $search)
@@ -170,7 +166,7 @@ struct GroupEditorView: View {
                     Task { await reviewDefinition() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(name.isEmpty || selectedMembers.isEmpty || controlsDisabled)
+                    .disabled(name.isEmpty || selectedMembers.isEmpty || workspace.mutationsBlocked)
                 if let group {
                     Menu("Plan change") {
                         Button("Enable") {
@@ -186,11 +182,11 @@ struct GroupEditorView: View {
                             }
                         }
                     }
-                    .disabled(!group.contextCompatible || controlsDisabled)
+                        .disabled(!group.contextCompatible || workspace.mutationsBlocked)
                     Button("Review delete", role: .destructive) {
                         Task { await reviewDelete(group) }
                     }
-                    .disabled(controlsDisabled)
+                    .disabled(workspace.mutationsBlocked)
                 }
             }
 
@@ -206,7 +202,7 @@ struct GroupEditorView: View {
                 TableColumn("State") { Text($0.enabled ? "On" : "Off") }
                 TableColumn("Access") { Text($0.mutability) }
             }
-            .disabled(controlsDisabled)
+            .disabled(workspace.mutationsBlocked)
             .frame(minHeight: 300)
 
             if let review = workspace.reviewedDefinition {
@@ -226,7 +222,7 @@ struct GroupEditorView: View {
                                 Button("Review restore") {
                                     Task { await reviewRestore(record, group: group) }
                                 }
-                                .disabled(controlsDisabled)
+                                    .disabled(workspace.mutationsBlocked)
                             }
                         }
                     }
@@ -295,7 +291,7 @@ struct GroupEditorView: View {
                 Button("Discard review") {
                     Task { await workspace.discardReviewedDefinition() }
                 }
-                .disabled(controlsDisabled)
+                .disabled(workspace.mutationsBlocked)
                 Button("Confirm \(review.plan.action)") {
                     Task {
                         if await workspace.applyDefinition() {
@@ -304,7 +300,7 @@ struct GroupEditorView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(controlsDisabled)
+                .disabled(workspace.mutationsBlocked)
             }
         }
     }

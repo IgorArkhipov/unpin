@@ -320,11 +320,9 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
         size: CGSize
     ) throws -> Data {
         let workspace = WorkspaceStore()
-        let root = AnyView(
-            WorkbenchView(fixture: fixture)
-                .environmentObject(workspace)
-                .frame(width: size.width, height: size.height)
-        )
+        let root = WorkbenchView(fixture: fixture)
+            .environmentObject(workspace)
+            .frame(width: size.width, height: size.height)
         let hostingView = NSHostingView(rootView: root)
         hostingView.frame = NSRect(origin: .zero, size: size)
         hostingView.appearance = NSAppearance(

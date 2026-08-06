@@ -206,7 +206,6 @@ extension EnvironmentValues {
 }
 
 struct WorkbenchRenderBoundary<Content: View>: View {
-    let workArea: WorkArea
     let presentation: WorkbenchPresentationInputs
     let guidanceDescriptor: WorkbenchGuidanceDescriptor
     @Binding var isGuidanceExpanded: Bool
@@ -218,7 +217,6 @@ struct WorkbenchRenderBoundary<Content: View>: View {
         isGuidanceExpanded: Binding<Bool>,
         @ViewBuilder content: () -> Content
     ) {
-        self.workArea = workArea
         self.presentation = presentation
         guidanceDescriptor = WorkbenchGuidanceDescriptor(area: workArea)
         _isGuidanceExpanded = isGuidanceExpanded

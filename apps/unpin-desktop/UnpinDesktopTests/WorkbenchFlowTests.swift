@@ -106,7 +106,8 @@ final class WorkbenchFlowTests: XCTestCase {
                     workspaceName: nil
                 ),
                 inventory: inventory,
-                filters: filters
+                filters: filters,
+                matchingInventory: []
             ),
             .needsWorkspace
         )
@@ -119,7 +120,8 @@ final class WorkbenchFlowTests: XCTestCase {
                     workspaceName: "fixture"
                 ),
                 inventory: inventory,
-                filters: filters
+                filters: filters,
+                matchingInventory: []
             ),
             .loading
         )
@@ -132,7 +134,8 @@ final class WorkbenchFlowTests: XCTestCase {
                     workspaceName: "fixture"
                 ),
                 inventory: [],
-                filters: DiscoverFilterState()
+                filters: DiscoverFilterState(),
+                matchingInventory: []
             ),
             .blocked("bridge unavailable")
         )
@@ -151,7 +154,8 @@ final class WorkbenchFlowTests: XCTestCase {
             classifyDiscoverPresentation(
                 presentation: ready,
                 inventory: [],
-                filters: DiscoverFilterState()
+                filters: DiscoverFilterState(),
+                matchingInventory: []
             ),
             .emptyInventory
         )
@@ -159,7 +163,8 @@ final class WorkbenchFlowTests: XCTestCase {
             classifyDiscoverPresentation(
                 presentation: ready,
                 inventory: inventory,
-                filters: DiscoverFilterState(search: "missing")
+                filters: DiscoverFilterState(search: "missing"),
+                matchingInventory: []
             ),
             .filterZero
         )
@@ -175,7 +180,8 @@ final class WorkbenchFlowTests: XCTestCase {
                 classifyDiscoverPresentation(
                     presentation: ready,
                     inventory: inventory,
-                    filters: filters
+                    filters: filters,
+                    matchingInventory: []
                 ),
                 .filterZero
             )
@@ -184,7 +190,8 @@ final class WorkbenchFlowTests: XCTestCase {
             classifyDiscoverPresentation(
                 presentation: ready,
                 inventory: inventory,
-                filters: DiscoverFilterState()
+                filters: DiscoverFilterState(),
+                matchingInventory: inventory
             ),
             .ready
         )
