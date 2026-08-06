@@ -178,6 +178,10 @@ private struct WorkbenchChooseWorkspaceKey: EnvironmentKey {
     static let defaultValue: (@MainActor @Sendable () -> Void)? = nil
 }
 
+private struct WorkbenchCreateGroupKey: EnvironmentKey {
+    static let defaultValue: (@MainActor @Sendable () -> Void)? = nil
+}
+
 extension EnvironmentValues {
     var workbenchPresentation: WorkbenchPresentationInputs {
         get { self[WorkbenchPresentationInputsKey.self] }
@@ -187,6 +191,11 @@ extension EnvironmentValues {
     var workbenchChooseWorkspace: (@MainActor @Sendable () -> Void)? {
         get { self[WorkbenchChooseWorkspaceKey.self] }
         set { self[WorkbenchChooseWorkspaceKey.self] = newValue }
+    }
+
+    var workbenchCreateGroup: (@MainActor @Sendable () -> Void)? {
+        get { self[WorkbenchCreateGroupKey.self] }
+        set { self[WorkbenchCreateGroupKey.self] = newValue }
     }
 }
 

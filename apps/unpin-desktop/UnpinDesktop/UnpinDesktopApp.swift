@@ -102,7 +102,7 @@ struct WorkbenchView: View {
     private var changeGuidanceExpanded = true
     @AppStorage(WorkbenchGuidanceStorage.recoverKey)
     private var recoverGuidanceExpanded = true
-    @State private var workArea = WorkArea.discover
+    @State private var navigation = WorkbenchNavigationState()
     @State private var choosingWorkspace = false
 
     var body: some View {
@@ -150,7 +150,7 @@ struct WorkbenchView: View {
                         }
                     }
 
-                    Picker("Work area", selection: $workArea) {
+                    Picker("Work area", selection: $navigation.workArea) {
                         ForEach(WorkArea.allCases) { area in
                             Text(area.title).tag(area)
                         }
@@ -165,14 +165,17 @@ struct WorkbenchView: View {
                     .overlay(palette.border)
 
                 WorkbenchRenderBoundary(
-                    workArea: workArea,
+                    workArea: navigation.workArea,
                     presentation: presentation,
-                    isPrimerExpanded: guidanceBinding(for: workArea)
+                    isPrimerExpanded: guidanceBinding(for: navigation.workArea)
                 ) {
                     selectedWorkAreaView
                 }
                 .environment(\.workbenchChooseWorkspace, { choosingWorkspace = true })
-                .onChange(of: workArea) { _, area in
+                .environment(\.workbenchCreateGroup, {
+                    navigation.presentGroupCreation()
+                })
+                .onChange(of: navigation.workArea) { _, area in
                     if area == .recover, workspace.hasWorkspace {
                         Task { await workspace.refreshRecovery() }
                     }
@@ -204,6 +207,9 @@ struct WorkbenchView: View {
         .environment(\.colorScheme, selectedColorScheme.colorScheme)
         .preferredColorScheme(selectedColorScheme.colorScheme)
         .tint(palette.cyan)
+        .sheet(isPresented: $navigation.isPresentingGroupEditor) {
+            GroupEditorView(group: nil)
+        }
         .fileImporter(
             isPresented: $choosingWorkspace,
             allowedContentTypes: [.folder],
@@ -224,7 +230,7 @@ struct WorkbenchView: View {
 
     @ViewBuilder
     private var selectedWorkAreaView: some View {
-        switch workArea {
+        switch navigation.workArea {
         case .discover:
             DiscoverOrganizeView()
         case .govern:
@@ -247,6 +253,16 @@ struct WorkbenchView: View {
         case .recover:
             $recoverGuidanceExpanded
         }
+    }
+}
+
+struct WorkbenchNavigationState: Equatable {
+    var workArea: WorkArea = .discover
+    var isPresentingGroupEditor = false
+
+    mutating func presentGroupCreation() {
+        workArea = .discover
+        isPresentingGroupEditor = true
     }
 }
 
