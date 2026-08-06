@@ -84,7 +84,7 @@ struct SafeChangeView: View {
                         Button("Disable") { Task { await workspace.plan(group: group, target: "disable") } }
                     }
                 .disabled(
-                    !group.contextCompatible || workspace.isBusy || workspace.actionsBlocked
+        !group.contextCompatible || workspace.mutationsBlocked
                 )
                 }
                 .frame(minHeight: 220)

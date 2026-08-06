@@ -18,18 +18,18 @@ struct RestoreReviewView: View {
                 }
                 HStack {
                 Button("Discard review") { Task { await workspace.discardReviewedRestore() } }
-                    .disabled(workspace.isBusy || workspace.actionsBlocked)
+            .disabled(workspace.mutationsBlocked)
                     Spacer()
                     if workspace.reviewedRestoreIsApproved {
                         Label("Local approval is current", systemImage: "checkmark.shield")
                             .foregroundStyle(.green)
                         Button("Apply reviewed restore") { Task { await workspace.applyApprovedRestore() } }
                             .buttonStyle(.borderedProminent)
-                        .disabled(workspace.isBusy || workspace.actionsBlocked)
+            .disabled(workspace.mutationsBlocked)
                     } else {
                         Button("Approve with macOS") { Task { await workspace.approveReviewedRestore() } }
                             .buttonStyle(.borderedProminent)
-                        .disabled(workspace.isBusy || workspace.actionsBlocked)
+            .disabled(workspace.mutationsBlocked)
                     }
                 }
             }

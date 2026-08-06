@@ -8,30 +8,38 @@ struct RecoverAuditView: View {
     @State private var selectedOperationID: String?
 
     var body: some View {
-        switch presentation.state {
-        case .needsWorkspace:
-            WorkbenchWorkspaceStateView(
-                title: "Choose a workspace",
-                message: "Select a repository or project before reviewing backup and operation evidence.",
-                actionTitle: chooseWorkspace == nil ? nil : "Choose workspace",
-                action: chooseWorkspace
-            )
-        case .loading:
-            WorkbenchWorkspaceStateView(
-                title: "Loading recovery evidence",
-                message: "Unpin is refreshing authenticated backups and durable operation evidence.",
-                actionTitle: nil,
-                action: nil
-            )
-        case .blocked(let message):
-            WorkbenchWorkspaceStateView(
-                title: "Recovery evidence is unavailable",
-                message: message,
-                actionTitle: "Retry",
-                action: { Task { await workspace.refreshRecovery() } }
-            )
-        case .ready:
-            recoveryContent
+        Group {
+            switch presentation.state {
+            case .needsWorkspace:
+                WorkbenchWorkspaceStateView(
+                    title: "Choose a workspace",
+                    message: "Select a repository or project before reviewing backup and operation evidence.",
+                    actionTitle: chooseWorkspace == nil ? nil : "Choose workspace",
+                    action: chooseWorkspace
+                )
+            case .loading:
+                WorkbenchWorkspaceStateView(
+                    title: "Loading recovery evidence",
+                    message: "Unpin is refreshing authenticated backups and durable operation evidence.",
+                    actionTitle: nil,
+                    action: nil
+                )
+            case .blocked(let message):
+                WorkbenchWorkspaceStateView(
+                    title: "Recovery evidence is unavailable",
+                    message: message,
+                    actionTitle: "Retry",
+                    action: { Task { await workspace.refreshRecovery() } }
+                )
+            case .ready:
+                recoveryContent
+            }
+        }
+        .task(id: presentation.state) {
+            guard presentation.state == .ready,
+                  workspace.recovery == nil,
+                  workspace.recoveryRequestInFlight == false else { return }
+            await workspace.refreshRecovery()
         }
     }
 
@@ -104,7 +112,7 @@ struct RecoverAuditView: View {
             Button("Review restore") {
                 Task { await workspace.planRestore(backupID: backup.backupId) }
             }
-            .disabled(!backup.restorable || workspace.isBusy || workspace.actionsBlocked)
+            .disabled(!backup.restorable || workspace.mutationsBlocked)
                 if !backup.restorable {
                     Text("This backup cannot be restored with the current authenticated evidence.")
                         .font(.caption)

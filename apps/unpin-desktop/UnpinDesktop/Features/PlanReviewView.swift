@@ -40,17 +40,17 @@ struct PlanReviewView: View {
                         .foregroundStyle(.secondary)
                     Spacer()
                 Button("Discard review") { Task { await workspace.discardReviewedPlan() } }
-                    .disabled(workspace.isBusy || workspace.actionsBlocked)
+            .disabled(workspace.mutationsBlocked)
                     if workspace.reviewedPlanIsApproved {
                         Label("Local approval is current", systemImage: "checkmark.shield")
                             .foregroundStyle(.green)
                         Button("Apply reviewed change") { Task { await workspace.applyApprovedPlan() } }
                             .buttonStyle(.borderedProminent)
-                        .disabled(workspace.isBusy || workspace.actionsBlocked)
+            .disabled(workspace.mutationsBlocked)
                     } else {
                         Button("Approve with macOS") { Task { await workspace.approveReviewedPlan() } }
                             .buttonStyle(.borderedProminent)
-                        .disabled(!isActionable || workspace.isBusy || workspace.actionsBlocked)
+            .disabled(!isActionable || workspace.mutationsBlocked)
                     }
                 }
             }

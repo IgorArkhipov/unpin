@@ -23,14 +23,15 @@ func matchesGroupMemberFilter(
     filter: GroupMemberFilterState
 ) -> Bool {
     let included = selectedMemberKeys.contains(groupMemberKey(for: item))
-    return (filter.provider == "all" || item.provider == filter.provider)
-        && (filter.layer == "all" || item.layer == filter.layer)
-        && (filter.category == "all" || item.category == filter.category)
-        && (filter.state == "all" || (filter.state == "on") == item.enabled)
+    return matchesInventoryFilter(
+        item,
+        search: filter.search,
+        provider: filter.provider,
+        layer: filter.layer,
+        category: filter.category,
+        state: filter.state
+    )
         && (filter.membership == "all" || (filter.membership == "included") == included)
-        && (filter.search.isEmpty
-            || item.displayName.localizedCaseInsensitiveContains(filter.search)
-            || item.id.localizedCaseInsensitiveContains(filter.search))
 }
 
 struct GroupEditorView: View {
@@ -65,7 +66,7 @@ struct GroupEditorView: View {
     }
 
     private var controlsDisabled: Bool {
-        workspace.isBusy || workspace.actionsBlocked
+        workspace.mutationsBlocked
     }
 
     var body: some View {

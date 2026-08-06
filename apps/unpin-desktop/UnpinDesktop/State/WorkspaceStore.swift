@@ -28,6 +28,7 @@ struct WorkspaceStoreTestHooks {
     var beforeGroupApply: (() async -> Void)?
     var beforeDefinitionApply: (() async -> Void)?
     var beforeRestoreApply: (() async -> Void)?
+    var beforeRecoveryRefresh: (() async -> Void)?
     var beforeWorkspaceConnect: (() async throws -> Void)?
 
     init(
@@ -37,6 +38,7 @@ struct WorkspaceStoreTestHooks {
         beforeGroupApply: (() async -> Void)? = nil,
         beforeDefinitionApply: (() async -> Void)? = nil,
         beforeRestoreApply: (() async -> Void)? = nil,
+        beforeRecoveryRefresh: (() async -> Void)? = nil,
         beforeWorkspaceConnect: (() async throws -> Void)? = nil
     ) {
         self.beforeReadResponse = beforeReadResponse
@@ -45,6 +47,7 @@ struct WorkspaceStoreTestHooks {
         self.beforeGroupApply = beforeGroupApply
         self.beforeDefinitionApply = beforeDefinitionApply
         self.beforeRestoreApply = beforeRestoreApply
+        self.beforeRecoveryRefresh = beforeRecoveryRefresh
         self.beforeWorkspaceConnect = beforeWorkspaceConnect
     }
 }
@@ -87,6 +90,7 @@ final class WorkspaceStore: ObservableObject {
     private var testHooks = WorkspaceStoreTestHooks()
     private var groupPlanRequestGeneration = 0
     @Published private(set) var controlRequestInFlight = false
+    @Published private(set) var recoveryRequestInFlight = false
 
     init(bridgeRoots: BridgeLaunchRoots = BridgeLaunchRoots()) {
         self.bridgeRoots = bridgeRoots
@@ -119,9 +123,13 @@ final class WorkspaceStore: ObservableObject {
         recoveryBlocker != nil || mutationUncertaintyBlocker != nil
     }
 
+    var mutationsBlocked: Bool {
+        isBusy || actionsBlocked
+    }
+
     var isBusy: Bool {
         if case .loading = state { return true }
-        return controlRequestInFlight
+        return controlRequestInFlight || recoveryRequestInFlight
     }
 
     func launch() async {
@@ -129,7 +137,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func selectWorkspace(_ root: URL) async {
-        guard controlRequestInFlight == false else { return }
+        guard isBusy == false else { return }
         let selectedRoot = root.standardizedFileURL
         guard selectedRoot.hasDirectoryPath else {
             state = .blocked("Choose a workspace folder, not a file.")
@@ -153,7 +161,7 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func reloadWorkspace() async {
-        guard controlRequestInFlight == false else { return }
+        guard isBusy == false else { return }
         guard let workspaceRoot else {
             state = .needsWorkspace
             return
@@ -279,9 +287,15 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func refreshRecovery(connectionGeneration: Int? = nil) async {
+        guard recoveryRequestInFlight == false else { return }
+        recoveryRequestInFlight = true
+        defer { recoveryRequestInFlight = false }
         let expectedGeneration = connectionGeneration ?? self.connectionGeneration
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeRecoveryRefresh {
+                await hook()
+            }
             let freshRecovery = try await bridge.recoverySnapshot()
             guard connectionIsCurrent(expectedGeneration) else { return }
             recovery = freshRecovery
