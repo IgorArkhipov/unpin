@@ -162,6 +162,90 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertEqual(WorkbenchAppearanceStorageProbe(defaults: defaults).value, "dark")
     }
 
+    func testWorkbenchGuidanceDefaultsExpandEachAreaAndPersistIndependently() throws {
+        let suiteName = "unpin-workbench-guidance-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        let discover = WorkbenchGuidanceStorageProbe(area: .discover, defaults: defaults)
+        let govern = WorkbenchGuidanceStorageProbe(area: .govern, defaults: defaults)
+        let change = WorkbenchGuidanceStorageProbe(area: .change, defaults: defaults)
+        let recover = WorkbenchGuidanceStorageProbe(area: .recover, defaults: defaults)
+
+        XCTAssertTrue(discover.value)
+        XCTAssertTrue(govern.value)
+        XCTAssertTrue(change.value)
+        XCTAssertTrue(recover.value)
+
+        discover.value = false
+
+        XCTAssertFalse(WorkbenchGuidanceStorageProbe(area: .discover, defaults: defaults).value)
+        XCTAssertTrue(WorkbenchGuidanceStorageProbe(area: .govern, defaults: defaults).value)
+        XCTAssertTrue(WorkbenchGuidanceStorageProbe(area: .change, defaults: defaults).value)
+        XCTAssertTrue(WorkbenchGuidanceStorageProbe(area: .recover, defaults: defaults).value)
+    }
+
+    func testWorkbenchGuidanceCollapsedRestoreControlIsAccessible() {
+        var expanded = false
+        let descriptor = WorkbenchGuidanceDescriptor(area: .discover)
+        let binding = Binding(
+            get: { expanded },
+            set: { expanded = $0 }
+        )
+
+        XCTAssertEqual(descriptor.showGuidanceLabel, "Show Discover and Organize guidance")
+        XCTAssertFalse(descriptor.showGuidanceLabel.isEmpty)
+
+        binding.wrappedValue = true
+
+        XCTAssertTrue(expanded)
+    }
+
+    func testWorkbenchRenderBoundaryKeepsPrimerVisibleWithoutWorkspace() {
+        var expanded = true
+        let boundary = WorkbenchRenderBoundary(
+            workArea: .discover,
+            presentation: .fixture(
+                state: .needsWorkspace,
+                hasWorkspace: false,
+                isBusy: false,
+                workspaceName: nil
+            ),
+            isPrimerExpanded: Binding(
+                get: { expanded },
+                set: { expanded = $0 }
+            )
+        ) {
+            WorkbenchWorkspaceStateView(
+                title: "Choose a workspace",
+                message: "Workspace evidence is unavailable.",
+                actionTitle: nil,
+                action: nil
+            )
+        }
+        XCTAssertEqual(boundary.presentation.state, .needsWorkspace)
+        XCTAssertEqual(
+            boundary.guidanceDescriptor,
+            WorkbenchGuidanceDescriptor(area: .discover)
+        )
+    }
+
+    func testWorkbenchBusyPresentationKeepsSafeControlsAvailable() {
+        let inputs = WorkbenchPresentationInputs.fixture(
+            state: .loading,
+            hasWorkspace: true,
+            isBusy: true,
+            workspaceName: "fixture"
+        )
+
+        XCTAssertTrue(inputs.allowsNavigation)
+        XCTAssertTrue(inputs.allowsGuidanceDisclosure)
+        XCTAssertTrue(inputs.allowsCopy)
+        XCTAssertFalse(inputs.allowsWorkspaceMutation)
+        XCTAssertFalse(inputs.allowsMutation)
+    }
+
     func testGroupEditorFilterSelectionsFitAtCaptureWidth() {
         let host = NSHostingView(
             rootView: GroupEditorView(group: nil)
@@ -280,6 +364,19 @@ private struct WorkbenchAppearanceStorageProbe {
         _value = AppStorage(
             wrappedValue: WorkbenchColorScheme.defaultValue.rawValue,
             WorkbenchColorScheme.storageKey,
+            store: defaults
+        )
+    }
+}
+
+private struct WorkbenchGuidanceStorageProbe {
+    @AppStorage(WorkbenchGuidanceStorage.key(for: .discover))
+    var value = true
+
+    init(area: WorkArea, defaults: UserDefaults) {
+        _value = AppStorage(
+            wrappedValue: true,
+            WorkbenchGuidanceStorage.key(for: area),
             store: defaults
         )
     }

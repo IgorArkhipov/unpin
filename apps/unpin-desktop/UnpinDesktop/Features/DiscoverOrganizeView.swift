@@ -221,6 +221,8 @@ func normalizedInventoryFacetSelection(
 struct DiscoverOrganizeView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @Environment(\.colorScheme) private var colorScheme
+    @Environment(\.workbenchPresentation) private var presentation
+    @Environment(\.workbenchChooseWorkspace) private var chooseWorkspace
     @State private var search = ""
     @State private var selectedProvider = "all"
     @State private var selectedLayer = "all"
@@ -231,6 +233,34 @@ struct DiscoverOrganizeView: View {
     @State private var creatingGroup = false
 
     var body: some View {
+        switch presentation.state {
+        case .needsWorkspace:
+            WorkbenchWorkspaceStateView(
+                title: "Choose a workspace",
+                message: "Select a repository or project before reviewing discovered inventory.",
+                actionTitle: chooseWorkspace == nil ? nil : "Choose workspace",
+                action: chooseWorkspace
+            )
+        case .loading:
+            WorkbenchWorkspaceStateView(
+                title: "Loading workspace inventory",
+                message: "Unpin is connecting to the bundled bridge and refreshing discovery evidence.",
+                actionTitle: nil,
+                action: nil
+            )
+        case .blocked(let message):
+            WorkbenchWorkspaceStateView(
+                title: "Workspace inventory is unavailable",
+                message: message,
+                actionTitle: "Retry",
+                action: { Task { await workspace.reloadWorkspace() } }
+            )
+        case .ready:
+            inventoryContent
+        }
+    }
+
+    private var inventoryContent: some View {
         let inventory = workspace.snapshot?.inventory ?? []
         let facets = InventoryFacets(inventory: inventory)
         let filterRevision = InventoryFilterRevision(inventory: inventory)
@@ -244,7 +274,7 @@ struct DiscoverOrganizeView: View {
                     || item.displayName.localizedCaseInsensitiveContains(search)
                     || item.id.localizedCaseInsensitiveContains(search))
         })
-        VStack(alignment: .leading, spacing: 12) {
+        return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Text("Discover and Organize").font(.title2)
                 Spacer()
@@ -253,8 +283,11 @@ struct DiscoverOrganizeView: View {
                         Button(group.qualifiedName) { editingGroup = group }
                     }
                 }
+                .disabled(workspace.isBusy || workspace.actionsBlocked)
                 Button("New group") { creatingGroup = true }
+                    .disabled(workspace.isBusy || workspace.actionsBlocked)
                 Button("Reload") { Task { await workspace.reloadWorkspace() } }
+                    .disabled(workspace.isBusy)
             }
 
             VStack(alignment: .leading, spacing: 8) {
