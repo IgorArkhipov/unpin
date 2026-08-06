@@ -308,8 +308,12 @@ struct DiscoverOrganizeView: View {
     @State private var sort = InventorySortState()
     @State private var editingGroup: GroupSummary?
 
-    init(inventoryOverride: [InventoryItem]? = nil) {
+    init(
+        inventoryOverride: [InventoryItem]? = nil,
+        filtersOverride: DiscoverFilterState? = nil
+    ) {
         self.inventoryOverride = inventoryOverride
+        _filters = State(initialValue: filtersOverride ?? DiscoverFilterState())
     }
 
     var body: some View {

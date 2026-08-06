@@ -47,6 +47,45 @@ At launch, select the repository workspace to manage. The app passes exactly
 that folder to its bundled bridge and does not infer a repository from the app
 bundle.
 
+## Use the workbench guidance
+
+Each work area starts with a collapsible primer that explains its task and the
+result to expect. Primer disclosure is stored independently for Discover and
+Organize, Govern and Automate, Change Safely, and Recover and Audit. The app
+also explains no-workspace, loading, blocked, prerequisite, empty-evidence, and
+selection states next to one safe action when one is available.
+
+Guidance does not run CLI commands, call MCP tools, apply changes, or approve a
+restore. Govern handoffs are selectable and copyable; Change Safely and Recover
+and Audit continue to use the existing plan, approval, backup, recovery, and
+restore boundaries. Choose Light or Dark from the title bar appearance control.
+
+## Regenerate the guidance matrix
+
+Maintainers can capture the 26 authoritative workbench scenarios in both Light
+and Dark at the default 1180 by 760 window size:
+
+```bash
+python3 scripts/test_run_desktop_guidance_matrix.py
+python3 scripts/run_desktop_guidance_matrix.py
+```
+
+The capture command creates a timestamped directory below repository `tmp/`
+with 52 native PNG files, `manifest.json`, `report.md`, and `SHA256SUMS`. The
+ordinary Xcode test action skips file capture when the matrix environment is
+absent, while still exercising the compact 1040 by 720 render assertions.
+
+After reviewing every scenario in both themes against the macOS design system,
+record the result through the same script so the report and manifest retain the
+review evidence:
+
+```bash
+python3 scripts/run_desktop_guidance_matrix.py \
+  --output-dir tmp/YYYY-MM-DD-HHMMSS-desktop-first-run-guidance-matrix \
+  --record-review passed \
+  --review-notes "All scenarios are readable and visually consistent in Light and Dark."
+```
+
 ## Update
 
 Updates are manual in `1.0.0`:
