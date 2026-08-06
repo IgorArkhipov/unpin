@@ -7,6 +7,24 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-08-06
+
+### Added
+
+- Added persistent, collapsible first-run guidance and actionable workspace, loading, empty, filtered, blocked, and selection states across every native desktop work area.
+- Added exact copy-only CLI and MCP handoffs for profiles, gateways, sessions, and hooks while keeping those workflows outside native desktop authority.
+- Added a reproducible 52-image Light/Dark desktop guidance matrix with authoritative scenario metadata and mandatory visual review.
+
+### Fixed
+
+- Discover and Organize now keeps provider, layer, category, state, and access filters readable, supports prioritized multi-column sorting, and clears facet selections that disappear after inventory refresh.
+- Recover and Audit now refreshes on activation without tying bridge reads to view lifetime, prevents stale recovery responses from overwriting post-mutation evidence, and keeps reviewed restore discard available under recovery blockers.
+- Desktop release evidence now rejects blank or incomplete screenshot inventories, bounds Xcode subprocesses, validates Python and XCTest scenario metadata, and checks handoffs against the real built CLI in CI.
+
+### Verification
+
+- Implementation commit `bc64f0a` passed the full locked Rust workspace gates, macOS XCTest bridge and workbench suite, desktop handoff and release-script tests, a reviewed 52-image native Light/Dark matrix, a finalized 31/31 CLI, 31/31 TUI, 31/31 MCP provider matrix, and live Pi/OpenCode validation with provider state unchanged.
+
 ## [1.0.0] - 2026-08-05
 
 ### Changed
@@ -315,7 +333,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.0.1...HEAD
+[1.0.1]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0-rc.1...v1.0.0
 [1.0.0-rc.1]: https://github.com/IgorArkhipov/unpin/compare/v0.6.2...v1.0.0-rc.1
 [0.6.2]: https://github.com/IgorArkhipov/unpin/compare/v0.6.1...v0.6.2
