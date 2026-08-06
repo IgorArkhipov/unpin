@@ -489,6 +489,223 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertTrue(GovernHandoff.catalog.last?.copyableValues.isEmpty == true)
     }
 
+    func testChangeClassifierDistinguishesPrerequisiteStates() {
+        XCTAssertEqual(
+            classifyChangePresentation(
+                presentation: .fixture(
+                    state: .needsWorkspace,
+                    hasWorkspace: false,
+                    isBusy: false,
+                    workspaceName: nil
+                ),
+                snapshotAvailable: false,
+                groupCount: 0
+            ),
+            .needsWorkspace
+        )
+        XCTAssertEqual(
+            classifyChangePresentation(
+                presentation: .fixture(
+                    state: .loading,
+                    hasWorkspace: true,
+                    isBusy: true,
+                    workspaceName: "fixture"
+                ),
+                snapshotAvailable: false,
+                groupCount: 0
+            ),
+            .loading
+        )
+        XCTAssertEqual(
+            classifyChangePresentation(
+                presentation: .fixture(
+                    state: .blocked("bridge unavailable"),
+                    hasWorkspace: true,
+                    isBusy: false,
+                    workspaceName: "fixture"
+                ),
+                snapshotAvailable: false,
+                groupCount: 0
+            ),
+            .blocked("bridge unavailable")
+        )
+        let ready = WorkbenchPresentationInputs.fixture(
+            state: .ready,
+            hasWorkspace: true,
+            isBusy: false,
+            workspaceName: "fixture"
+        )
+        XCTAssertEqual(
+            classifyChangePresentation(
+                presentation: ready,
+                snapshotAvailable: true,
+                groupCount: 0
+            ),
+            .noGroups
+        )
+        XCTAssertEqual(
+            classifyChangePresentation(
+                presentation: ready,
+                snapshotAvailable: true,
+                groupCount: 1
+            ),
+            .ready
+        )
+    }
+
+    func testRecoverClassifierPreservesEvidenceAndSelectionStates() {
+        let ready = WorkbenchPresentationInputs.fixture(
+            state: .ready,
+            hasWorkspace: true,
+            isBusy: false,
+            workspaceName: "fixture"
+        )
+
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: .fixture(
+                    state: .needsWorkspace,
+                    hasWorkspace: false,
+                    isBusy: false,
+                    workspaceName: nil
+                ),
+                facts: RecoverPresentationFacts()
+            ),
+            .needsWorkspace
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: .fixture(
+                    state: .loading,
+                    hasWorkspace: true,
+                    isBusy: true,
+                    workspaceName: "fixture"
+                ),
+                facts: RecoverPresentationFacts()
+            ),
+            .loading
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: ready,
+                facts: RecoverPresentationFacts(hasRecovery: true)
+            ),
+            .emptyEvidence
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: ready,
+                facts: RecoverPresentationFacts(hasRecovery: true, hasEvidence: true)
+            ),
+            .noSelection
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: ready,
+                facts: RecoverPresentationFacts(
+                    hasRecovery: true,
+                    hasEvidence: true,
+                    selectedBackupExists: true
+                )
+            ),
+            .backupSelected
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: ready,
+                facts: RecoverPresentationFacts(
+                    hasRecovery: true,
+                    hasEvidence: true,
+                    selectedOperationExists: true
+                )
+            ),
+            .operationSelected
+        )
+
+        let unavailable = classifyRecoverPresentation(
+            presentation: .fixture(
+                state: .blocked("recovery unavailable"),
+                hasWorkspace: true,
+                isBusy: false,
+                workspaceName: "fixture"
+            ),
+            facts: RecoverPresentationFacts(hasRecovery: true, hasEvidence: true)
+        )
+        XCTAssertEqual(
+            unavailable,
+            .unavailable(message: "recovery unavailable", preservesEvidence: true)
+        )
+    }
+
+    func testRecoverClassifierCoversRefreshBlockersAndSelectionPrecedence() {
+        let ready = WorkbenchPresentationInputs.fixture(
+            state: .ready,
+            hasWorkspace: true,
+            isBusy: false,
+            workspaceName: "fixture"
+        )
+        let refreshing = WorkbenchPresentationInputs.fixture(
+            state: .ready,
+            hasWorkspace: true,
+            isBusy: true,
+            workspaceName: "fixture"
+        )
+
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: refreshing,
+                facts: RecoverPresentationFacts(hasRecovery: false)
+            ),
+            .loading
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: ready,
+                facts: RecoverPresentationFacts(
+                    blocker: "Recovery refresh failed"
+                )
+            ),
+            .unavailable(
+                message: "Recovery refresh failed",
+                preservesEvidence: false
+            )
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: ready,
+                facts: RecoverPresentationFacts(
+                    hasRecovery: true,
+                    hasEvidence: true,
+                    evidenceAvailable: false
+                )
+            ),
+            .unavailable(
+                message: "Some authenticated backup or durable operation evidence is unavailable.",
+                preservesEvidence: true
+            )
+        )
+        XCTAssertEqual(
+            classifyRecoverPresentation(
+                presentation: ready,
+                facts: RecoverPresentationFacts(
+                    hasRecovery: true,
+                    hasEvidence: true,
+                    selectedBackupExists: true,
+                    selectedOperationExists: true
+                )
+            ),
+            .backupSelected
+        )
+    }
+
+    func testRecoverEmptyEvidenceRouteSelectsChangeSafely() {
+        var navigation = WorkbenchNavigationState(workArea: .recover)
+
+        navigation.presentChange()
+
+        XCTAssertEqual(navigation.workArea, .change)
+    }
+
     func testGovernViewCopiesEveryVerifiedValueExactlyOnce() {
         var copiedValues = [String]()
         let view = GovernAutomateView(
