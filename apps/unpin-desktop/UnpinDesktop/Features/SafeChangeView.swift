@@ -2,8 +2,38 @@ import SwiftUI
 
 struct SafeChangeView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
+    @Environment(\.workbenchPresentation) private var presentation
+    @Environment(\.workbenchChooseWorkspace) private var chooseWorkspace
 
     var body: some View {
+        switch presentation.state {
+        case .needsWorkspace:
+            WorkbenchWorkspaceStateView(
+                title: "Choose a workspace",
+                message: "Select a repository or project before planning a group change.",
+                actionTitle: chooseWorkspace == nil ? nil : "Choose workspace",
+                action: chooseWorkspace
+            )
+        case .loading:
+            WorkbenchWorkspaceStateView(
+                title: "Loading change prerequisites",
+                message: "Unpin is refreshing workspace groups and safety evidence.",
+                actionTitle: nil,
+                action: nil
+            )
+        case .blocked(let message):
+            WorkbenchWorkspaceStateView(
+                title: "Change planning is unavailable",
+                message: message,
+                actionTitle: "Retry",
+                action: { Task { await workspace.reloadWorkspace() } }
+            )
+        case .ready:
+            changeContent
+        }
+    }
+
+    private var changeContent: some View {
         VStack(alignment: .leading, spacing: 16) {
             HStack {
                 VStack(alignment: .leading, spacing: 4) {
@@ -11,8 +41,9 @@ struct SafeChangeView: View {
                     Text("Review the exact group plan before issuing local approval.")
                         .foregroundStyle(.secondary)
                 }
-                Spacer()
-                Button("Reload") { Task { await workspace.reloadWorkspace() } }
+            Spacer()
+            Button("Reload") { Task { await workspace.reloadWorkspace() } }
+                .disabled(workspace.isBusy)
             }
 
             if let blocker = workspace.lastChangeBlocker {
@@ -52,7 +83,9 @@ struct SafeChangeView: View {
                         Button("Enable") { Task { await workspace.plan(group: group, target: "enable") } }
                         Button("Disable") { Task { await workspace.plan(group: group, target: "disable") } }
                     }
-                    .disabled(!group.contextCompatible || workspace.actionsBlocked)
+                .disabled(
+                    !group.contextCompatible || workspace.isBusy || workspace.actionsBlocked
+                )
                 }
                 .frame(minHeight: 220)
             } else {

@@ -64,6 +64,10 @@ struct GroupEditorView: View {
         selectedMembers.values.sorted { groupMemberKey(for: $0) < groupMemberKey(for: $1) }
     }
 
+    private var controlsDisabled: Bool {
+        workspace.isBusy || workspace.actionsBlocked
+    }
+
     var body: some View {
         let inventory = workspace.snapshot?.inventory ?? []
         let facets = InventoryFacets(inventory: inventory)
@@ -108,6 +112,7 @@ struct GroupEditorView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .disabled(controlsDisabled)
 
             VStack(alignment: .leading, spacing: 8) {
                 TextField("Filter members", text: $search)
@@ -164,7 +169,7 @@ struct GroupEditorView: View {
                     Task { await reviewDefinition() }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(name.isEmpty || selectedMembers.isEmpty || workspace.actionsBlocked)
+                .disabled(name.isEmpty || selectedMembers.isEmpty || controlsDisabled)
                 if let group {
                     Menu("Plan change") {
                         Button("Enable") {
@@ -180,11 +185,11 @@ struct GroupEditorView: View {
                             }
                         }
                     }
-                    .disabled(!group.contextCompatible || workspace.actionsBlocked)
+                    .disabled(!group.contextCompatible || controlsDisabled)
                     Button("Review delete", role: .destructive) {
                         Task { await reviewDelete(group) }
                     }
-                    .disabled(workspace.actionsBlocked)
+                    .disabled(controlsDisabled)
                 }
             }
 
@@ -200,6 +205,7 @@ struct GroupEditorView: View {
                 TableColumn("State") { Text($0.enabled ? "On" : "Off") }
                 TableColumn("Access") { Text($0.mutability) }
             }
+            .disabled(controlsDisabled)
             .frame(minHeight: 300)
 
             if let review = workspace.reviewedDefinition {
@@ -209,6 +215,7 @@ struct GroupEditorView: View {
             if let group {
                 DisclosureGroup("Definition history", isExpanded: $historyVisible) {
                     Button("Load history") { Task { await workspace.loadDefinitionHistory(scope: group.scope) } }
+                        .disabled(workspace.isBusy)
                     ForEach(workspace.definitionHistory.filter { $0.scope == group.scope }) { record in
                         HStack {
                             Text("\(record.change) · \(record.nameAfter ?? record.nameBefore ?? "group")")
@@ -218,6 +225,7 @@ struct GroupEditorView: View {
                                 Button("Review restore") {
                                     Task { await reviewRestore(record, group: group) }
                                 }
+                                .disabled(controlsDisabled)
                             }
                         }
                     }
@@ -286,6 +294,7 @@ struct GroupEditorView: View {
                 Button("Discard review") {
                     Task { await workspace.discardReviewedDefinition() }
                 }
+                .disabled(controlsDisabled)
                 Button("Confirm \(review.plan.action)") {
                     Task {
                         if await workspace.applyDefinition() {
@@ -294,7 +303,7 @@ struct GroupEditorView: View {
                     }
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(workspace.actionsBlocked)
+                .disabled(controlsDisabled)
             }
         }
     }

@@ -90,16 +90,25 @@ struct UnpinDesktopApp: App {
     }
 }
 
-private struct WorkbenchView: View {
+struct WorkbenchView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @AppStorage(WorkbenchColorScheme.storageKey)
     private var storedColorScheme = WorkbenchColorScheme.defaultValue.rawValue
+    @AppStorage(WorkbenchGuidanceStorage.discoverKey)
+    private var discoverGuidanceExpanded = true
+    @AppStorage(WorkbenchGuidanceStorage.governKey)
+    private var governGuidanceExpanded = true
+    @AppStorage(WorkbenchGuidanceStorage.changeKey)
+    private var changeGuidanceExpanded = true
+    @AppStorage(WorkbenchGuidanceStorage.recoverKey)
+    private var recoverGuidanceExpanded = true
     @State private var workArea = WorkArea.discover
     @State private var choosingWorkspace = false
 
     var body: some View {
         let selectedColorScheme = WorkbenchColorScheme.resolve(storedValue: storedColorScheme)
         let palette = WorkbenchPalette.resolve(for: selectedColorScheme.colorScheme)
+        let presentation = WorkbenchPresentationInputs.runtime(workspace)
 
         ZStack {
             palette.background
@@ -134,8 +143,10 @@ private struct WorkbenchView: View {
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                         Button("Choose workspace") { choosingWorkspace = true }
+                            .disabled(!presentation.allowsWorkspaceMutation)
                         if workspace.hasWorkspace {
                             Button("Reload workspace") { Task { await workspace.reloadWorkspace() } }
+                                .disabled(!presentation.allowsWorkspaceMutation)
                         }
                     }
 
@@ -153,31 +164,17 @@ private struct WorkbenchView: View {
                 Divider()
                     .overlay(palette.border)
 
-                Group {
-                    if workspace.hasWorkspace {
-                        Group {
-                            switch workArea {
-                            case .discover:
-                                DiscoverOrganizeView()
-                            case .govern:
-                                GovernAutomateView()
-                            case .change:
-                                SafeChangeView()
-                            case .recover:
-                                RecoverAuditView()
-                            }
-                        }
-                        .onChange(of: workArea) { _, area in
-                            if area == .recover {
-                                Task { await workspace.refreshRecovery() }
-                            }
-                        }
-                    } else {
-                        ContentUnavailableView(
-                            "Choose a workspace",
-                            systemImage: "folder.badge.gearshape",
-                            description: Text("Select the repository or project configuration you want to inspect. Unpin passes that exact folder to its bundled bridge.")
-                        )
+                WorkbenchRenderBoundary(
+                    workArea: workArea,
+                    presentation: presentation,
+                    isPrimerExpanded: guidanceBinding(for: workArea)
+                ) {
+                    selectedWorkAreaView
+                }
+                .environment(\.workbenchChooseWorkspace, { choosingWorkspace = true })
+                .onChange(of: workArea) { _, area in
+                    if area == .recover, workspace.hasWorkspace {
+                        Task { await workspace.refreshRecovery() }
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -203,7 +200,6 @@ private struct WorkbenchView: View {
                     .padding(.bottom, 12)
                 }
             }
-            .disabled(workspace.isBusy)
         }
         .environment(\.colorScheme, selectedColorScheme.colorScheme)
         .preferredColorScheme(selectedColorScheme.colorScheme)
@@ -224,6 +220,33 @@ private struct WorkbenchView: View {
             get: { WorkbenchColorScheme.resolve(storedValue: storedColorScheme) },
             set: { storedColorScheme = $0.rawValue }
         )
+    }
+
+    @ViewBuilder
+    private var selectedWorkAreaView: some View {
+        switch workArea {
+        case .discover:
+            DiscoverOrganizeView()
+        case .govern:
+            GovernAutomateView()
+        case .change:
+            SafeChangeView()
+        case .recover:
+            RecoverAuditView()
+        }
+    }
+
+    private func guidanceBinding(for area: WorkArea) -> Binding<Bool> {
+        switch area {
+        case .discover:
+            $discoverGuidanceExpanded
+        case .govern:
+            $governGuidanceExpanded
+        case .change:
+            $changeGuidanceExpanded
+        case .recover:
+            $recoverGuidanceExpanded
+        }
     }
 }
 
