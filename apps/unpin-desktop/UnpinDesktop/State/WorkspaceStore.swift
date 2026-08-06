@@ -1,6 +1,11 @@
 import Combine
 import Foundation
 
+enum WorkspaceStatusText {
+    static let chooseWorkspace = "Choose a workspace folder to begin."
+    static let connecting = "Connecting to the bundled Unpin bridge…"
+}
+
 struct InventoryFacets {
     let providers: [String]
     let layers: [String]
@@ -19,6 +24,25 @@ struct InventoryFacets {
         self.layers = layers.sorted()
         self.categories = categories.sorted()
     }
+}
+
+func matchesInventoryFilter(
+    _ item: InventoryItem,
+    search: String,
+    provider: String,
+    layer: String,
+    category: String,
+    state: String
+) -> Bool {
+    (provider == "all" || item.provider == provider)
+        && (layer == "all" || item.layer == layer)
+        && (category == "all" || item.category == category)
+        && (state == "all" || (state == "on") == item.enabled)
+        && (
+            search.isEmpty
+                || item.displayName.localizedCaseInsensitiveContains(search)
+                || item.id.localizedCaseInsensitiveContains(search)
+        )
 }
 
 struct WorkspaceStoreTestHooks {
@@ -89,6 +113,7 @@ final class WorkspaceStore: ObservableObject {
     private let bridgeRoots: BridgeLaunchRoots
     private var testHooks = WorkspaceStoreTestHooks()
     private var groupPlanRequestGeneration = 0
+    private var recoveryRequestGeneration = 0
     @Published private(set) var controlRequestInFlight = false
     @Published private(set) var recoveryRequestInFlight = false
 
@@ -102,8 +127,8 @@ final class WorkspaceStore: ObservableObject {
 
     var statusMessage: String? {
         switch state {
-        case .needsWorkspace: "Choose a workspace folder to begin."
-        case .loading: "Connecting to the bundled Unpin bridge…"
+        case .needsWorkspace: WorkspaceStatusText.chooseWorkspace
+        case .loading: WorkspaceStatusText.connecting
         case .ready: nil
         case .blocked(let message): message
         }
@@ -288,8 +313,14 @@ final class WorkspaceStore: ObservableObject {
 
     func refreshRecovery(connectionGeneration: Int? = nil) async {
         guard recoveryRequestInFlight == false else { return }
+        recoveryRequestGeneration &+= 1
+        let requestGeneration = recoveryRequestGeneration
         recoveryRequestInFlight = true
-        defer { recoveryRequestInFlight = false }
+        defer {
+            if recoveryRequestGeneration == requestGeneration {
+                recoveryRequestInFlight = false
+            }
+        }
         let expectedGeneration = connectionGeneration ?? self.connectionGeneration
         do {
             guard let bridge else { throw BridgeClientError.childStopped }
@@ -297,13 +328,23 @@ final class WorkspaceStore: ObservableObject {
                 await hook()
             }
             let freshRecovery = try await bridge.recoverySnapshot()
-            guard connectionIsCurrent(expectedGeneration) else { return }
+            guard recoveryRequestIsCurrent(
+                requestGeneration,
+                connectionGeneration: expectedGeneration
+            ) else { return }
             recovery = freshRecovery
             recoveryBlocker = nil
             mutationUncertaintyBlocker = nil
             setReadyUnlessDefinitionBlocked()
+        } catch is CancellationError {
+            // View/task cancellation is an expected interruption of a read-only
+            // refresh. Leave the last-known evidence and workspace state unchanged.
+            return
         } catch {
-            guard connectionIsCurrent(expectedGeneration) else { return }
+            guard recoveryRequestIsCurrent(
+                requestGeneration,
+                connectionGeneration: expectedGeneration
+            ) else { return }
             setRecoveryUnavailable()
         }
     }
@@ -620,22 +661,50 @@ final class WorkspaceStore: ObservableObject {
     }
 
     private func refreshRecoveryAfterUnconfirmedChange(connectionGeneration expectedGeneration: Int) async -> Bool {
+        recoveryRequestGeneration &+= 1
+        let requestGeneration = recoveryRequestGeneration
+        recoveryRequestInFlight = true
+        defer {
+            if recoveryRequestGeneration == requestGeneration {
+                recoveryRequestInFlight = false
+            }
+        }
         do {
             guard let bridge else {
-                guard connectionIsCurrent(expectedGeneration) else { return false }
+                guard recoveryRequestIsCurrent(
+                    requestGeneration,
+                    connectionGeneration: expectedGeneration
+                ) else { return false }
                 setRecoveryUnavailable()
                 return false
             }
+            if let hook = testHooks.beforeRecoveryRefresh {
+                await hook()
+            }
             let freshRecovery = try await bridge.recoverySnapshot()
-            guard connectionIsCurrent(expectedGeneration) else { return false }
+            guard recoveryRequestIsCurrent(
+                requestGeneration,
+                connectionGeneration: expectedGeneration
+            ) else { return false }
             recovery = freshRecovery
             recoveryBlocker = nil
             return true
         } catch {
-            guard connectionIsCurrent(expectedGeneration) else { return false }
+            guard recoveryRequestIsCurrent(
+                requestGeneration,
+                connectionGeneration: expectedGeneration
+            ) else { return false }
             setRecoveryUnavailable()
             return false
         }
+    }
+
+    private func recoveryRequestIsCurrent(
+        _ requestGeneration: Int,
+        connectionGeneration: Int
+    ) -> Bool {
+        self.recoveryRequestGeneration == requestGeneration
+            && connectionIsCurrent(connectionGeneration)
     }
 
     private func mutationMayBeUnconfirmed(_ error: Error) -> Bool {

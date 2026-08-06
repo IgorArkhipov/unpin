@@ -219,23 +219,6 @@ struct DiscoverFilterState: Equatable {
     }
 }
 
-func matchesInventoryFilter(
-    _ item: InventoryItem,
-    search: String,
-    provider: String,
-    layer: String,
-    category: String,
-    state: String
-) -> Bool {
-    (provider == "all" || item.provider == provider)
-        && (layer == "all" || item.layer == layer)
-        && (category == "all" || item.category == category)
-        && (state == "all" || (state == "on") == item.enabled)
-        && (search.isEmpty
-            || item.displayName.localizedCaseInsensitiveContains(search)
-            || item.id.localizedCaseInsensitiveContains(search))
-}
-
 enum DiscoverPresentationState: Equatable {
     case needsWorkspace
     case loading
@@ -318,53 +301,59 @@ struct DiscoverOrganizeView: View {
 
     var body: some View {
         let inventory = inventoryOverride ?? workspace.snapshot?.inventory ?? []
+        let filterRevision = InventoryFilterRevision(inventory: inventory)
         let matchingInventory: [InventoryItem] = {
             guard case .ready = presentation.state else { return [] }
             return inventory.filter(filters.matches)
         }()
-        switch classifyDiscoverPresentation(
-            presentation: presentation,
-            inventory: inventory,
-            filters: filters,
-            matchingInventory: matchingInventory
-        ) {
-        case .needsWorkspace:
-            WorkbenchWorkspaceStateView(
-                title: "Choose a workspace",
-                message: "Select a repository or project before reviewing discovered inventory.",
-                actionTitle: chooseWorkspace == nil ? nil : "Choose workspace",
-                action: chooseWorkspace
-            )
-        case .loading:
-            WorkbenchWorkspaceStateView(
-                title: "Loading workspace inventory",
-                message: "Unpin is connecting to the bundled bridge and refreshing discovery evidence.",
-                actionTitle: nil,
-                action: nil
-            )
-        case .blocked(let message):
-            WorkbenchWorkspaceStateView(
-                title: "Workspace inventory is unavailable",
-                message: message,
-                actionTitle: "Retry",
-                action: { Task { await workspace.reloadWorkspace() } }
-            )
-        case .emptyInventory:
-            WorkbenchWorkspaceStateView(
-                title: "No supported inventory found",
-                message: "Discovery completed without supported skills, MCP servers, instructions, or hooks. Reload the selected workspace or review its status below for diagnostics.",
-                actionTitle: "Reload discovery",
-                action: { Task { await workspace.reloadWorkspace() } }
-            )
-        case .filterZero:
-            WorkbenchWorkspaceStateView(
-                title: "No inventory matches these filters",
-                message: "The workspace has discovered inventory, but the current search and filters exclude every item.",
-                actionTitle: "Clear filters",
-                action: clearFilters
-            )
-        case .ready:
-            inventoryContent(inventory, matchingInventory: matchingInventory)
+        Group {
+            switch classifyDiscoverPresentation(
+                presentation: presentation,
+                inventory: inventory,
+                filters: filters,
+                matchingInventory: matchingInventory
+            ) {
+            case .needsWorkspace:
+                WorkbenchWorkspaceStateView(
+                    title: "Choose a workspace",
+                    message: "Select a repository or project before reviewing discovered inventory.",
+                    actionTitle: chooseWorkspace == nil ? nil : "Choose workspace",
+                    action: chooseWorkspace
+                )
+            case .loading:
+                WorkbenchWorkspaceStateView(
+                    title: "Loading workspace inventory",
+                    message: "Unpin is connecting to the bundled bridge and refreshing discovery evidence.",
+                    actionTitle: nil,
+                    action: nil
+                )
+            case .blocked(let message):
+                WorkbenchWorkspaceStateView(
+                    title: "Workspace inventory is unavailable",
+                    message: message,
+                    actionTitle: "Retry",
+                    action: { Task { await workspace.reloadWorkspace() } }
+                )
+            case .emptyInventory:
+                WorkbenchWorkspaceStateView(
+                    title: "No supported inventory found",
+                    message: "Discovery completed without supported skills, MCP servers, instructions, or hooks. Reload the selected workspace or review its status below for diagnostics.",
+                    actionTitle: "Reload discovery",
+                    action: { Task { await workspace.reloadWorkspace() } }
+                )
+            case .filterZero:
+                WorkbenchWorkspaceStateView(
+                    title: "No inventory matches these filters",
+                    message: "The workspace has discovered inventory, but the current search and filters exclude every item.",
+                    actionTitle: "Clear filters",
+                    action: clearFilters
+                )
+            case .ready:
+                inventoryContent(inventory, matchingInventory: matchingInventory)
+            }
+        }
+        .onChange(of: filterRevision) { _, _ in
+            normalizeInventoryFilters(inventory)
         }
     }
 
@@ -373,7 +362,6 @@ struct DiscoverOrganizeView: View {
         matchingInventory: [InventoryItem]
     ) -> some View {
         let facets = InventoryFacets(inventory: inventory)
-        let filterRevision = InventoryFilterRevision(inventory: inventory)
         let palette = WorkbenchPalette.resolve(for: colorScheme)
         let items = sort.sorted(matchingInventory)
         return VStack(alignment: .leading, spacing: 12) {
@@ -465,9 +453,6 @@ struct DiscoverOrganizeView: View {
         .sheet(item: $editingGroup) { group in
             GroupEditorView(group: group)
         }
-        .onChange(of: filterRevision) { _, _ in
-            normalizeInventoryFilters(inventory)
-        }
     }
 
     private func clearFilters() {
@@ -542,9 +527,12 @@ struct DiscoverOrganizeView: View {
             ),
             facets: InventoryFacets(inventory: inventory)
         )
-        filters.provider = normalized.provider
-        filters.layer = normalized.layer
-        filters.category = normalized.category
+        var normalizedFilters = filters
+        normalizedFilters.provider = normalized.provider
+        normalizedFilters.layer = normalized.layer
+        normalizedFilters.category = normalized.category
+        guard normalizedFilters != filters else { return }
+        filters = normalizedFilters
     }
 
     private func filter(

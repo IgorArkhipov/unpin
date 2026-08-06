@@ -144,12 +144,11 @@ struct RecoverAuditView: View {
                 }
             }
         }
-        .task(id: presentation.state) {
-            guard fixture == nil,
-                  presentation.state == .ready,
-                  workspace.recovery == nil,
-                  workspace.recoveryRequestInFlight == false else { return }
-            await workspace.refreshRecovery()
+        .onAppear {
+            refreshRecoveryOnActivation()
+        }
+        .onChange(of: presentation.state) { _, _ in
+            refreshRecoveryOnActivation()
         }
         .onChange(of: selectedBackupID) { _, backupID in
             if backupID != nil, selectedOperationID != nil {
@@ -161,6 +160,15 @@ struct RecoverAuditView: View {
                 selectedBackupID = nil
             }
         }
+    }
+
+    private func refreshRecoveryOnActivation() {
+        guard fixture == nil, presentation.state == .ready else { return }
+        // Keep the read owned by the workspace instead of the SwiftUI view task. A
+        // navigation change can tear down this view while the bridge read is still
+        // in flight; the store's in-flight and connection-generation fences handle
+        // duplicate and stale responses.
+        Task { await workspace.refreshRecovery() }
     }
 
     private func presentationFacts(
@@ -230,13 +238,9 @@ struct RecoverAuditView: View {
                     operationList(recovery)
                 }
 
-                if let selectedBackup = selectedBackup(in: recovery),
-                    selectedBackup.restorable,
-                    let reviewed = workspace.reviewedRestore,
-                    reviewed.plan.backupId == selectedBackup.backupId
-                {
+                if let reviewed = workspace.reviewedRestore {
                     Divider()
-                    RestoreReviewView(reviewed: reviewed)
+                    restoreReviewContent(reviewed: reviewed, recovery: recovery)
                 }
 
                 if let blocker = workspace.lastRestoreBlocker {
@@ -254,6 +258,38 @@ struct RecoverAuditView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding()
+        }
+    }
+
+    private func restoreReviewContent(
+        reviewed: RestorePlanEnvelope,
+        recovery: RecoverySnapshot
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                if let targetBackup = recovery.backups.first(where: {
+                    $0.backupId == reviewed.plan.backupId
+                }) {
+                    Label(
+                        "Restore target: \(targetBackup.backupId)",
+                        systemImage: "externaldrive.badge.checkmark"
+                    )
+                    if selectedBackupID != targetBackup.id {
+                        Button("Select target backup") {
+                            selectedBackupID = targetBackup.id
+                            selectedOperationID = nil
+                        }
+                        .buttonStyle(.bordered)
+                    }
+                } else {
+                    Label(
+                        "Restore target: \(reviewed.plan.backupId) (not in latest evidence)",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .foregroundStyle(.orange)
+                }
+            }
+            RestoreReviewView(reviewed: reviewed)
         }
     }
 

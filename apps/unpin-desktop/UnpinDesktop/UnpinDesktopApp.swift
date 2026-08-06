@@ -215,7 +215,7 @@ struct WorkbenchView: View {
                 }
                 .padding(16)
 
-                if fixture == nil, let message = workspace.statusMessage {
+                    if let message = presentation.statusMessage {
                     HStack(spacing: 8) {
                         Circle()
                             .fill(palette.green)
