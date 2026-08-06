@@ -3,36 +3,51 @@ import SwiftUI
 import XCTest
 @testable import UnpinDesktop
 
+private struct GuidanceMatrixScenarioMetadata: Codable, Equatable {
+    let id: String
+    let area: String
+    let primerState: String
+    let sourceFixture: String
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case area
+        case primerState = "primer_state"
+        case sourceFixture = "source_fixture"
+    }
+}
+
 @MainActor
 final class WorkbenchGuidanceMatrixTests: XCTestCase {
-    static let scenarioIDs = [
-        "discover-ready-expanded",
-        "discover-ready-collapsed",
-        "discover-no-workspace",
-        "discover-loading",
-        "discover-blocked",
-        "discover-empty",
-        "discover-filter-zero",
-        "govern-no-workspace-expanded",
-        "govern-no-workspace-collapsed",
-        "govern-workspace-context-expanded",
-        "govern-workspace-context-collapsed",
-        "change-ready-expanded",
-        "change-ready-collapsed",
-        "change-no-workspace",
-        "change-loading",
-        "change-blocked",
-        "change-no-groups",
-        "recover-ready-selected-expanded",
-        "recover-ready-selected-collapsed",
-        "recover-no-workspace",
-        "recover-loading",
-        "recover-unavailable",
-        "recover-unavailable-preserved",
-        "recover-empty",
-        "recover-no-selection",
-        "recover-operation-selected",
+    private static let scenarioMetadata = [
+        GuidanceMatrixScenarioMetadata(id: "discover-ready-expanded", area: "discover", primerState: "expanded", sourceFixture: "inventory-ready"),
+        GuidanceMatrixScenarioMetadata(id: "discover-ready-collapsed", area: "discover", primerState: "collapsed", sourceFixture: "inventory-ready"),
+        GuidanceMatrixScenarioMetadata(id: "discover-no-workspace", area: "discover", primerState: "expanded", sourceFixture: "no-workspace"),
+        GuidanceMatrixScenarioMetadata(id: "discover-loading", area: "discover", primerState: "expanded", sourceFixture: "workspace-loading"),
+        GuidanceMatrixScenarioMetadata(id: "discover-blocked", area: "discover", primerState: "expanded", sourceFixture: "bridge-blocked"),
+        GuidanceMatrixScenarioMetadata(id: "discover-empty", area: "discover", primerState: "expanded", sourceFixture: "empty-inventory"),
+        GuidanceMatrixScenarioMetadata(id: "discover-filter-zero", area: "discover", primerState: "expanded", sourceFixture: "active-filter-zero"),
+        GuidanceMatrixScenarioMetadata(id: "govern-no-workspace-expanded", area: "govern", primerState: "expanded", sourceFixture: "no-workspace"),
+        GuidanceMatrixScenarioMetadata(id: "govern-no-workspace-collapsed", area: "govern", primerState: "collapsed", sourceFixture: "no-workspace"),
+        GuidanceMatrixScenarioMetadata(id: "govern-workspace-context-expanded", area: "govern", primerState: "expanded", sourceFixture: "workspace-context"),
+        GuidanceMatrixScenarioMetadata(id: "govern-workspace-context-collapsed", area: "govern", primerState: "collapsed", sourceFixture: "workspace-context"),
+        GuidanceMatrixScenarioMetadata(id: "change-ready-expanded", area: "change", primerState: "expanded", sourceFixture: "groups-ready"),
+        GuidanceMatrixScenarioMetadata(id: "change-ready-collapsed", area: "change", primerState: "collapsed", sourceFixture: "groups-ready"),
+        GuidanceMatrixScenarioMetadata(id: "change-no-workspace", area: "change", primerState: "expanded", sourceFixture: "no-workspace"),
+        GuidanceMatrixScenarioMetadata(id: "change-loading", area: "change", primerState: "expanded", sourceFixture: "workspace-loading"),
+        GuidanceMatrixScenarioMetadata(id: "change-blocked", area: "change", primerState: "expanded", sourceFixture: "bridge-blocked"),
+        GuidanceMatrixScenarioMetadata(id: "change-no-groups", area: "change", primerState: "expanded", sourceFixture: "no-groups"),
+        GuidanceMatrixScenarioMetadata(id: "recover-ready-selected-expanded", area: "recover", primerState: "expanded", sourceFixture: "selected-restorable-backup"),
+        GuidanceMatrixScenarioMetadata(id: "recover-ready-selected-collapsed", area: "recover", primerState: "collapsed", sourceFixture: "selected-restorable-backup"),
+        GuidanceMatrixScenarioMetadata(id: "recover-no-workspace", area: "recover", primerState: "expanded", sourceFixture: "no-workspace"),
+        GuidanceMatrixScenarioMetadata(id: "recover-loading", area: "recover", primerState: "expanded", sourceFixture: "recovery-loading"),
+        GuidanceMatrixScenarioMetadata(id: "recover-unavailable", area: "recover", primerState: "expanded", sourceFixture: "evidence-unavailable"),
+        GuidanceMatrixScenarioMetadata(id: "recover-unavailable-preserved", area: "recover", primerState: "expanded", sourceFixture: "preserved-evidence-unavailable"),
+        GuidanceMatrixScenarioMetadata(id: "recover-empty", area: "recover", primerState: "expanded", sourceFixture: "empty-evidence"),
+        GuidanceMatrixScenarioMetadata(id: "recover-no-selection", area: "recover", primerState: "expanded", sourceFixture: "evidence-no-selection"),
+        GuidanceMatrixScenarioMetadata(id: "recover-operation-selected", area: "recover", primerState: "expanded", sourceFixture: "selected-operation"),
     ]
+    static let scenarioIDs = scenarioMetadata.map(\.id)
 
     func testCaptureGuidanceMatrix() throws {
         let environment = ProcessInfo.processInfo.environment
@@ -42,19 +57,35 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
         let optionalScenariosValue = nonEmptyEnvironmentValue(
             environment["UNPIN_GUIDANCE_MATRIX_SCENARIOS"]
         )
+        let optionalMetadataValue = nonEmptyEnvironmentValue(
+            environment["UNPIN_GUIDANCE_MATRIX_METADATA"]
+        )
 
-        if optionalOutputValue == nil, optionalScenariosValue == nil {
+        if optionalOutputValue == nil,
+           optionalScenariosValue == nil,
+           optionalMetadataValue == nil
+        {
             throw XCTSkip("Guidance matrix capture is enabled only by the repository orchestrator")
         }
 
         let outputValue = try XCTUnwrap(optionalOutputValue)
         let scenariosValue = try XCTUnwrap(optionalScenariosValue)
+        let metadataValue = try XCTUnwrap(optionalMetadataValue)
         let requested = try JSONDecoder().decode(
             [String].self,
             from: Data(scenariosValue.utf8)
         )
+        let requestedMetadata = try JSONDecoder().decode(
+            [GuidanceMatrixScenarioMetadata].self,
+            from: Data(metadataValue.utf8)
+        )
         XCTAssertEqual(Set(requested).count, requested.count, "Scenario IDs must be unique")
         XCTAssertEqual(Set(requested), Set(Self.scenarioIDs), "Scenario inventory must be complete")
+        XCTAssertEqual(
+            requestedMetadata,
+            Self.scenarioMetadata,
+            "Python matrix metadata must match Swift fixture routing"
+        )
 
         let outputRoot = URL(fileURLWithPath: outputValue, isDirectory: true)
         for theme in WorkbenchColorScheme.allCases {
@@ -91,6 +122,28 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
             let image = try XCTUnwrap(NSBitmapImageRep(data: png))
             XCTAssertEqual(image.pixelsWide, 1040, scenarioID)
             XCTAssertEqual(image.pixelsHigh, 720, scenarioID)
+        }
+    }
+
+    func testScenarioFamiliesRenderDistinctPresentationContent() throws {
+        let expectedDistinctPairs = [
+            ("discover-ready-expanded", "discover-no-workspace"),
+            ("discover-no-workspace", "discover-loading"),
+            ("govern-no-workspace-expanded", "govern-workspace-context-expanded"),
+            ("change-ready-expanded", "change-no-groups"),
+            ("recover-loading", "recover-empty"),
+        ]
+
+        for (leftID, rightID) in expectedDistinctPairs {
+            let left = try renderPNG(
+                fixture: fixture(for: leftID, theme: .dark),
+                size: CGSize(width: 1040, height: 720)
+            )
+            let right = try renderPNG(
+                fixture: fixture(for: rightID, theme: .dark),
+                size: CGSize(width: 1040, height: 720)
+            )
+            XCTAssertNotEqual(left, right, "\(leftID) must render differently from \(rightID)")
         }
     }
 

@@ -133,6 +133,12 @@ jobs:
         with:
           key: desktop-ci-aarch64-apple-darwin
 
+      - name: Build desktop CLI handoff target
+        run: cargo build -p unpin-cli --locked
+
+      - name: Validate desktop handoffs against built CLI
+        run: python3 scripts/validate_desktop_handoff_contract.py --unpin target/debug/unpin
+
       - name: Test desktop workbench
         run: >
           xcodebuild test

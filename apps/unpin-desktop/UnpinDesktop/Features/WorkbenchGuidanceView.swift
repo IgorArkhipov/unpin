@@ -52,6 +52,29 @@ struct WorkbenchGuidanceDescriptor: Equatable {
     }
 }
 
+struct WorkbenchGuidanceToggleButton: View {
+    let title: String
+    let systemImage: String
+    let accessibilityIdentifier: String
+    let allowsDisclosure: Bool
+    let targetExpanded: Bool
+    @Binding var isExpanded: Bool
+
+    var body: some View {
+        Button(title, systemImage: systemImage, action: activate)
+            .labelStyle(.titleAndIcon)
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .disabled(!allowsDisclosure)
+            .accessibilityLabel(title)
+            .accessibilityIdentifier(accessibilityIdentifier)
+    }
+
+    func activate() {
+        isExpanded = targetExpanded
+    }
+}
+
 struct WorkbenchGuidanceView: View {
     let descriptor: WorkbenchGuidanceDescriptor
     let allowsDisclosure: Bool
@@ -71,14 +94,14 @@ struct WorkbenchGuidanceView: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer(minLength: 12)
-                    Button(descriptor.hideGuidanceLabel, systemImage: "chevron.up") {
-                        isExpanded = false
-                    }
-                    .labelStyle(.titleAndIcon)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(!allowsDisclosure)
-                    .accessibilityLabel(descriptor.hideGuidanceLabel)
+                    WorkbenchGuidanceToggleButton(
+                        title: descriptor.hideGuidanceLabel,
+                        systemImage: "chevron.up",
+                        accessibilityIdentifier: "workbench-guidance-\(descriptor.area.rawValue)-hide",
+                        allowsDisclosure: allowsDisclosure,
+                        targetExpanded: false,
+                        isExpanded: $isExpanded
+                    )
                 }
                 .padding(.vertical, 2)
             } label: {
@@ -88,15 +111,14 @@ struct WorkbenchGuidanceView: View {
             .accessibilityIdentifier("workbench-guidance-\(descriptor.area.rawValue)")
         } else {
             HStack {
-                Button(descriptor.showGuidanceLabel, systemImage: "questionmark.circle") {
-                    isExpanded = true
-                }
-                .labelStyle(.titleAndIcon)
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .disabled(!allowsDisclosure)
-                .accessibilityLabel(descriptor.showGuidanceLabel)
-                .accessibilityIdentifier("workbench-guidance-\(descriptor.area.rawValue)-restore")
+                WorkbenchGuidanceToggleButton(
+                    title: descriptor.showGuidanceLabel,
+                    systemImage: "questionmark.circle",
+                    accessibilityIdentifier: "workbench-guidance-\(descriptor.area.rawValue)-restore",
+                    allowsDisclosure: allowsDisclosure,
+                    targetExpanded: true,
+                    isExpanded: $isExpanded
+                )
                 Spacer()
             }
         }
@@ -120,6 +142,18 @@ struct WorkbenchPresentationInputs: Equatable {
     var allowsGuidanceDisclosure: Bool { true }
     var allowsCopy: Bool { true }
     var allowsWorkspaceMutation: Bool { !isBusy }
+    var statusMessage: String? {
+        switch state {
+        case .needsWorkspace:
+            WorkspaceStatusText.chooseWorkspace
+        case .loading:
+            WorkspaceStatusText.connecting
+        case .ready:
+            nil
+        case .blocked(let message):
+            message
+        }
+    }
 
     @MainActor
     static func runtime(_ workspace: WorkspaceStore) -> Self {

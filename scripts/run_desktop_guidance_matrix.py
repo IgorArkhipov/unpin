@@ -25,6 +25,31 @@ CAPTURE_TEST = (
     "-only-testing:UnpinDesktopTests/WorkbenchGuidanceMatrixTests/"
     "testCaptureGuidanceMatrix"
 )
+XCODEBUILD_TIMEOUT_SECONDS = 900
+
+# The matrix is evidence of the rendered workbench, not just a set of files
+# with the expected dimensions.  Keep the regions broad enough to tolerate
+# normal layout changes while excluding the shared app header and background.
+# Multiple scenarios intentionally share a region: visual identity is checked
+# by the presence of rendered content, not by assuming every image is unique.
+CONTENT_REGION_FRACTIONS = {
+    "inventory-ready": (0.01, 0.28, 0.98, 0.66),
+    "groups-ready": (0.01, 0.28, 0.98, 0.66),
+    "workspace-context": (0.01, 0.28, 0.98, 0.66),
+    "selected-restorable-backup": (0.01, 0.28, 0.98, 0.66),
+    "selected-operation": (0.01, 0.28, 0.98, 0.66),
+    "no-workspace": (0.14, 0.30, 0.72, 0.56),
+    "workspace-loading": (0.14, 0.30, 0.72, 0.56),
+    "bridge-blocked": (0.14, 0.30, 0.72, 0.56),
+    "empty-inventory": (0.14, 0.30, 0.72, 0.56),
+    "active-filter-zero": (0.14, 0.30, 0.72, 0.56),
+    "no-groups": (0.14, 0.30, 0.72, 0.56),
+    "recovery-loading": (0.14, 0.30, 0.72, 0.56),
+    "evidence-unavailable": (0.14, 0.30, 0.72, 0.56),
+    "preserved-evidence-unavailable": (0.14, 0.30, 0.72, 0.56),
+    "empty-evidence": (0.14, 0.30, 0.72, 0.56),
+    "evidence-no-selection": (0.01, 0.28, 0.98, 0.66),
+}
 
 
 class Scenario(NamedTuple):
@@ -94,6 +119,18 @@ SCENARIOS = (
 )
 
 
+def scenario_metadata(scenarios: Sequence[Scenario] = SCENARIOS) -> list[dict[str, str]]:
+    return [
+        {
+            "id": scenario.id,
+            "area": scenario.area,
+            "primer_state": scenario.primer_state,
+            "source_fixture": scenario.source_fixture,
+        }
+        for scenario in scenarios
+    ]
+
+
 class MatrixError(RuntimeError):
     pass
 
@@ -156,6 +193,28 @@ def default_output_root(repo_root: Path) -> Path:
     return repo_root / "tmp" / f"{stamp}-desktop-first-run-guidance-matrix"
 
 
+def _run_xcodebuild(
+    command: list[str],
+    *,
+    repo_root: Path,
+    environment: dict[str, str],
+    runner,
+) -> None:
+    try:
+        runner(
+            command,
+            cwd=repo_root,
+            env=environment,
+            check=True,
+            timeout=XCODEBUILD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise MatrixError(
+            f"xcodebuild timed out after {XCODEBUILD_TIMEOUT_SECONDS} seconds: "
+            f"{' '.join(command)}"
+        ) from error
+
+
 def run_xcode_capture(
     repo_root: Path,
     output_root: Path,
@@ -163,9 +222,11 @@ def run_xcode_capture(
     runner=subprocess.run,
 ) -> None:
     scenario_ids = validate_scenario_ids([scenario.id for scenario in SCENARIOS])
+    metadata = scenario_metadata()
     environment = os.environ.copy()
     environment["UNPIN_GUIDANCE_MATRIX_DIR"] = str(output_root)
     environment["UNPIN_GUIDANCE_MATRIX_SCENARIOS"] = json.dumps(scenario_ids)
+    environment["UNPIN_GUIDANCE_MATRIX_METADATA"] = json.dumps(metadata)
     with tempfile.TemporaryDirectory(prefix="unpin-guidance-xcode-") as temporary:
         derived_data = Path(temporary)
         build_command = [
@@ -180,7 +241,12 @@ def run_xcode_capture(
             "-derivedDataPath",
             str(derived_data),
         ]
-        runner(build_command, cwd=repo_root, env=environment, check=True)
+        _run_xcodebuild(
+            build_command,
+            repo_root=repo_root,
+            environment=environment,
+            runner=runner,
+        )
 
         xctestrun_files = sorted((derived_data / "Build" / "Products").glob("*.xctestrun"))
         if len(xctestrun_files) != 1:
@@ -204,6 +270,7 @@ def run_xcode_capture(
         target_environment = targets[0].setdefault("EnvironmentVariables", {})
         target_environment["UNPIN_GUIDANCE_MATRIX_DIR"] = str(output_root)
         target_environment["UNPIN_GUIDANCE_MATRIX_SCENARIOS"] = json.dumps(scenario_ids)
+        target_environment["UNPIN_GUIDANCE_MATRIX_METADATA"] = json.dumps(metadata)
         with xctestrun_path.open("wb") as handle:
             plistlib.dump(xctestrun, handle)
 
@@ -216,10 +283,148 @@ def run_xcode_capture(
             "platform=macOS",
             CAPTURE_TEST,
         ]
-        runner(test_command, cwd=repo_root, env=environment, check=True)
+        _run_xcodebuild(
+            test_command,
+            repo_root=repo_root,
+            environment=environment,
+            runner=runner,
+        )
 
 
-def _read_png(path: Path) -> tuple[int, int]:
+def _content_region(
+    scenario: Scenario,
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    fractions = CONTENT_REGION_FRACTIONS.get(scenario.source_fixture)
+    if fractions is None:
+        raise MatrixError(
+            f"no rendered-content region is defined for fixture: {scenario.source_fixture}"
+        )
+    left, top, region_width, region_height = fractions
+    return (
+        max(0, min(width - 1, round(width * left))),
+        max(0, min(height - 1, round(height * top))),
+        max(1, min(width, round(width * region_width))),
+        max(1, min(height, round(height * region_height))),
+    )
+
+
+def _unfilter_rows(
+    decoded: bytes,
+    *,
+    row_bytes: int,
+    height: int,
+    bytes_per_pixel: int,
+    path: Path,
+) -> list[bytes]:
+    rows: list[bytes] = []
+    offset = 0
+    previous = bytearray(row_bytes)
+    for _ in range(height):
+        row_end = offset + row_bytes + 1
+        if row_end > len(decoded):
+            raise MatrixError(f"PNG decoded image rows are truncated: {path}")
+        filter_type = decoded[offset]
+        encoded = decoded[offset + 1 : row_end]
+        row = bytearray(row_bytes)
+        for index, value in enumerate(encoded):
+            left = row[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            above = previous[index]
+            upper_left = (
+                previous[index - bytes_per_pixel] if index >= bytes_per_pixel else 0
+            )
+            if filter_type == 0:
+                reconstructed = value
+            elif filter_type == 1:
+                reconstructed = value + left
+            elif filter_type == 2:
+                reconstructed = value + above
+            elif filter_type == 3:
+                reconstructed = value + ((left + above) // 2)
+            elif filter_type == 4:
+                prediction = left + above - upper_left
+                pa = abs(prediction - left)
+                pb = abs(prediction - above)
+                pc = abs(prediction - upper_left)
+                predictor = left if pa <= pb and pa <= pc else above if pb <= pc else upper_left
+                reconstructed = value + predictor
+            else:
+                raise MatrixError(f"PNG filter type is unsupported: {path}")
+            row[index] = reconstructed & 0xFF
+        rows.append(bytes(row))
+        previous = row
+        offset = row_end
+    if offset != len(decoded):
+        raise MatrixError(f"PNG decoded image has trailing bytes: {path}")
+    return rows
+
+
+def _validate_rendered_content(
+    rows: Sequence[bytes],
+    *,
+    width: int,
+    height: int,
+    channels: int,
+    content_region: tuple[int, int, int, int],
+    path: Path,
+) -> None:
+    left, top, region_width, region_height = content_region
+    right = min(width, left + region_width)
+    bottom = min(height, top + region_height)
+    visible_pixels = 0
+    edge_pixels = 0
+    # A local contrast check rejects both transparent captures and a flat or
+    # background-only view while tolerating legitimate scenarios that render
+    # identical pixels.  It is deliberately independent of image hashes.
+    contrast_threshold = 12
+    sample_step = 4
+    for y in range(top, bottom, sample_step):
+        row = rows[y]
+        next_y = min(y + sample_step, bottom - 1)
+        next_row = rows[next_y] if next_y > y else None
+        for x in range(left, right, sample_step):
+            index = x * channels
+            alpha = row[index + 3] if channels >= 4 else 255
+            if alpha > 0:
+                visible_pixels += 1
+            next_x = min(x + sample_step, right - 1)
+            if next_x > x:
+                neighbor_index = next_x * channels
+                horizontal = max(
+                    abs(row[index + channel] - row[neighbor_index + channel])
+                    for channel in range(min(3, channels))
+                )
+            else:
+                horizontal = 0
+            if next_row is not None:
+                vertical_index = x * channels
+                vertical = max(
+                    abs(row[index + channel] - next_row[vertical_index + channel])
+                    for channel in range(min(3, channels))
+                )
+            else:
+                vertical = 0
+            if max(horizontal, vertical) >= contrast_threshold:
+                edge_pixels += 1
+
+    if visible_pixels == 0:
+        raise MatrixError(f"PNG rendered content is fully transparent: {path}")
+    minimum_edges = max(8, (right - left) * (bottom - top) // (20_000 * sample_step**2))
+    if edge_pixels < minimum_edges:
+        raise MatrixError(
+            "PNG rendered content is background-only or empty: "
+            f"{path} has {edge_pixels} high-contrast pixels, expected at least "
+            f"{minimum_edges} in its scenario region"
+        )
+
+
+def _read_png(
+    path: Path,
+    *,
+    content_region: tuple[int, int, int, int] | None = None,
+    expected_dimensions: tuple[int, int] | None = None,
+) -> tuple[int, int]:
     data = path.read_bytes()
     if not data:
         raise MatrixError(f"PNG is zero bytes: {path}")
@@ -268,6 +473,15 @@ def _read_png(path: Path) -> tuple[int, int]:
     channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
     if channels is None:
         raise MatrixError(f"PNG color type is unsupported: {path}")
+    if expected_dimensions is not None and (width, height) != expected_dimensions:
+        raise MatrixError(
+            f"capture dimensions must be {expected_dimensions[0]}x{expected_dimensions[1]}: "
+            f"{path} is {width}x{height}"
+        )
+    if bit_depth != 8:
+        raise MatrixError(
+            f"PNG bit depth must be 8 for rendered-content validation: {path}"
+        )
     row_bytes = math.ceil(width * channels * bit_depth / 8)
     try:
         decoded = zlib.decompress(bytes(compressed))
@@ -275,6 +489,23 @@ def _read_png(path: Path) -> tuple[int, int]:
         raise MatrixError(f"PNG image data cannot be decoded: {path}") from error
     if len(decoded) != (row_bytes + 1) * height:
         raise MatrixError(f"PNG decoded image length is invalid: {path}")
+    rows = _unfilter_rows(
+        decoded,
+        row_bytes=row_bytes,
+        height=height,
+        bytes_per_pixel=channels,
+        path=path,
+    )
+    if content_region is None:
+        content_region = (0, 0, width, height)
+    _validate_rendered_content(
+        rows,
+        width=width,
+        height=height,
+        channels=channels,
+        content_region=content_region,
+        path=path,
+    )
     return width, height
 
 
@@ -316,14 +547,13 @@ def validate_capture(
             resolved.relative_to(output_root.resolve())
         except ValueError as error:
             raise MatrixError(f"capture escapes output root: {relative_path}") from error
-        width, height = _read_png(absolute_path)
-        if (width, height) != (WIDTH, HEIGHT):
-            raise MatrixError(
-                f"capture dimensions must be {WIDTH}x{HEIGHT}: "
-                f"{relative_path} is {width}x{height}"
-            )
         scenario_id = relative_path.stem
         scenario = by_id[scenario_id]
+        width, height = _read_png(
+            absolute_path,
+            content_region=_content_region(scenario, WIDTH, HEIGHT),
+            expected_dimensions=(WIDTH, HEIGHT),
+        )
         images.append(
             {
                 "path": relative_path.as_posix(),
@@ -464,6 +694,43 @@ def verify_checksums(output_root: Path) -> None:
             raise MatrixError("SHA256SUMS paths do not match manifest image paths")
 
 
+def _validate_manifest_inventory(
+    manifest: object,
+    validated_images: Sequence[dict[str, object]],
+) -> None:
+    if not isinstance(manifest, dict):
+        raise MatrixError("manifest must contain a JSON object")
+    expected_scenario_ids = [scenario.id for scenario in SCENARIOS]
+    if manifest.get("scenario_ids") != expected_scenario_ids:
+        raise MatrixError("manifest scenario inventory is not authoritative")
+    if manifest.get("themes") != list(THEMES):
+        raise MatrixError("manifest theme inventory is not authoritative")
+    if manifest.get("scenario_count") != len(SCENARIOS):
+        raise MatrixError("manifest scenario count is not authoritative")
+    if manifest.get("image_count") != len(SCENARIOS) * len(THEMES):
+        raise MatrixError("manifest image count is not authoritative")
+    if manifest.get("dimensions") != {"width": WIDTH, "height": HEIGHT}:
+        raise MatrixError("manifest dimensions are not authoritative")
+
+    manifest_images = manifest.get("images")
+    if not isinstance(manifest_images, list):
+        raise MatrixError("manifest image inventory is missing")
+    expected_by_path = {str(image["path"]): image for image in validated_images}
+    actual_by_path: dict[str, dict[str, object]] = {}
+    for image in manifest_images:
+        if not isinstance(image, dict) or not isinstance(image.get("path"), str):
+            raise MatrixError("manifest image inventory contains an invalid entry")
+        path = str(image["path"])
+        if path in actual_by_path:
+            raise MatrixError(f"manifest image inventory has duplicate path: {path}")
+        actual_by_path[path] = image
+    if set(actual_by_path) != set(expected_by_path):
+        raise MatrixError("manifest image inventory does not cover the authoritative matrix")
+    for path, expected in expected_by_path.items():
+        if actual_by_path[path] != expected:
+            raise MatrixError(f"manifest image metadata is stale: {path}")
+
+
 def record_review(
     output_root: Path,
     *,
@@ -474,11 +741,17 @@ def record_review(
         raise MatrixError("review status must be passed or failed")
     if not notes.strip():
         raise MatrixError("review notes must not be empty")
-    verify_checksums(output_root)
+    validated_images = validate_capture(output_root)
     manifest_path = output_root / "manifest.json"
     if not manifest_path.is_file():
         raise MatrixError(f"missing manifest: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise MatrixError(f"manifest is not valid JSON: {manifest_path}") from error
+    _validate_manifest_inventory(manifest, validated_images)
+    verify_checksums(output_root)
+    assert isinstance(manifest, dict)
     manifest["screenshot_review"] = {
         "status": status,
         "reviewed_at_utc": datetime.now(timezone.utc).isoformat(),

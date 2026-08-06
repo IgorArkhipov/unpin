@@ -183,6 +183,33 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertTrue(store.lastRestore?.status.isRestored == true)
     }
 
+    func testDiscardRestoreReviewRemainsAvailableWhenRecoveryIsBlocked() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let group = try await createGroup(in: store, name: "discard-blocked-restore")
+        await store.plan(group: group, target: "disable")
+        await store.approveReviewedPlan()
+        await store.applyApprovedPlan()
+        await store.refreshRecovery()
+        let backup = try XCTUnwrap(store.recovery?.backups.first(where: \.restorable))
+        await store.planRestore(backupID: backup.backupId)
+        let reviewed = try XCTUnwrap(store.reviewedRestore)
+
+        await store.stopBridgeForTesting()
+        await store.refreshRecovery()
+        XCTAssertTrue(store.actionsBlocked)
+        XCTAssertFalse(store.isBusy)
+        XCTAssertEqual(
+            store.reviewedRestore?.plan.planFingerprint,
+            reviewed.plan.planFingerprint
+        )
+
+        await store.discardReviewedRestore()
+        XCTAssertNil(store.reviewedRestore)
+    }
+
     func testConcurrentGroupPlansKeepTheLatestUserIntent() async throws {
         let fixture = try makeFixtureStore()
         defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
@@ -421,6 +448,76 @@ final class WorkspaceStoreTests: XCTestCase {
         await recoveryBarrier.release()
         await refreshTask.value
         XCTAssertNotNil(store.recovery)
+
+        await store.refreshRecovery()
+        let refreshedRecoveryCount = await recoveryBarrier.count()
+        XCTAssertEqual(refreshedRecoveryCount, 2)
+    }
+
+    func testUnconfirmedChangeRecoverySupersedesOlderRefresh() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let group = try await createGroup(in: store, name: "recovery-ordering")
+        await store.plan(group: group, target: "disable")
+        await store.approveReviewedPlan()
+
+        let recoveryBarrier = FirstInvocationBarrier()
+        let applyBarrier = ReadBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeGroupApply: { await applyBarrier.pause() },
+            beforeRecoveryRefresh: { await recoveryBarrier.pauseFirstInvocation() }
+        ))
+
+        let olderRefresh = Task { await store.refreshRecovery() }
+        await recoveryBarrier.waitUntilFirstInvocation()
+
+        let applyTask = Task { await store.applyApprovedPlan() }
+        await applyBarrier.waitUntilReached()
+        applyTask.cancel()
+        await applyBarrier.release()
+        await applyTask.value
+
+        XCTAssertNotNil(store.mutationUncertaintyBlocker)
+        XCTAssertTrue(store.actionsBlocked)
+        XCTAssertFalse(store.recoveryRequestInFlight)
+
+        await recoveryBarrier.release()
+        await olderRefresh.value
+
+        XCTAssertNotNil(store.mutationUncertaintyBlocker)
+        XCTAssertTrue(store.actionsBlocked)
+    }
+
+    func testCancelledRecoveryRefreshPreservesEvidenceAndWorkspaceState() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        await store.refreshRecovery()
+        let previousRecovery = try XCTUnwrap(store.recovery)
+
+        let recoveryBarrier = ReadBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeRecoveryRefresh: { await recoveryBarrier.pause() }
+        ))
+
+        let refreshTask = Task { await store.refreshRecovery() }
+        await recoveryBarrier.waitUntilReached()
+        refreshTask.cancel()
+        await recoveryBarrier.release()
+        await refreshTask.value
+
+        XCTAssertEqual(
+            store.recovery?.backups.map(\.backupId),
+            previousRecovery.backups.map(\.backupId)
+        )
+        XCTAssertNil(store.recoveryBlocker)
+        XCTAssertFalse(store.recoveryRequestInFlight)
+        guard case .ready = store.state else {
+            return XCTFail("a cancelled read-only recovery refresh should leave the workspace ready")
+        }
     }
 
     func testDefinitionApplyUncertaintyClearsReviewAndBlocksWhenRecoveryUnavailable() async throws {

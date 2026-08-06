@@ -197,6 +197,44 @@ final class WorkbenchFlowTests: XCTestCase {
         )
     }
 
+    func testPresentationStatusMessageMatchesRuntimeStatesForFixtures() {
+        XCTAssertEqual(
+            WorkbenchPresentationInputs.fixture(
+                state: .needsWorkspace,
+                hasWorkspace: false,
+                isBusy: false,
+                workspaceName: nil
+            ).statusMessage,
+            "Choose a workspace folder to begin."
+        )
+        XCTAssertEqual(
+            WorkbenchPresentationInputs.fixture(
+                state: .loading,
+                hasWorkspace: true,
+                isBusy: true,
+                workspaceName: "fixture"
+            ).statusMessage,
+            "Connecting to the bundled Unpin bridge…"
+        )
+        XCTAssertNil(
+            WorkbenchPresentationInputs.fixture(
+                state: .ready,
+                hasWorkspace: true,
+                isBusy: false,
+                workspaceName: "fixture"
+            ).statusMessage
+        )
+        XCTAssertEqual(
+            WorkbenchPresentationInputs.fixture(
+                state: .blocked("bridge unavailable"),
+                hasWorkspace: true,
+                isBusy: false,
+                workspaceName: "fixture"
+            ).statusMessage,
+            "bridge unavailable"
+        )
+    }
+
     func testDiscoverFiltersClearAllFiveDimensions() {
         let inventory = [inventoryItem(name: "Alpha", provider: "codex", id: "alpha")]
         var filters = DiscoverFilterState(
@@ -241,7 +279,19 @@ final class WorkbenchFlowTests: XCTestCase {
                 .environmentObject(WorkspaceStore())
         )
         host.frame = NSRect(x: 0, y: 0, width: 1_180, height: 760)
+        let window = NSWindow(
+            contentRect: host.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.makeKeyAndOrderFront(nil)
+        defer { window.close() }
         host.layoutSubtreeIfNeeded()
+        host.displayIfNeeded()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
 
         let popupButtons = host.descendants(of: NSPopUpButton.self)
         let expectedTitles = ["All provider", "All layer", "All category", "Any state"]
@@ -328,20 +378,51 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertTrue(WorkbenchGuidanceStorageProbe(area: .recover, defaults: defaults).value)
     }
 
-    func testWorkbenchGuidanceCollapsedRestoreControlIsAccessible() {
-        var expanded = false
+    func testWorkbenchGuidanceDisclosureControlPersistsCollapseAndRestore() throws {
+        let suiteName = "unpin-workbench-guidance-control-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suiteName))
+        defaults.removePersistentDomain(forName: suiteName)
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+
+        var isExpanded = true
+        let guidanceBinding = Binding(
+            get: { isExpanded },
+            set: { value in
+                isExpanded = value
+                defaults.set(value, forKey: WorkbenchGuidanceStorage.key(for: .discover))
+            }
+        )
         let descriptor = WorkbenchGuidanceDescriptor(area: .discover)
-        let binding = Binding(
-            get: { expanded },
-            set: { expanded = $0 }
+        let hideControl = WorkbenchGuidanceToggleButton(
+            title: descriptor.hideGuidanceLabel,
+            systemImage: "chevron.up",
+            accessibilityIdentifier: "workbench-guidance-discover-hide",
+            allowsDisclosure: true,
+            targetExpanded: false,
+            isExpanded: guidanceBinding
+        )
+        hideControl.activate()
+        XCTAssertFalse(isExpanded)
+        XCTAssertEqual(
+            defaults.object(forKey: WorkbenchGuidanceStorage.key(for: .discover)) as? Bool,
+            false
         )
 
-        XCTAssertEqual(descriptor.showGuidanceLabel, "Show Discover and Organize guidance")
-        XCTAssertFalse(descriptor.showGuidanceLabel.isEmpty)
+        let showControl = WorkbenchGuidanceToggleButton(
+            title: descriptor.showGuidanceLabel,
+            systemImage: "questionmark.circle",
+            accessibilityIdentifier: "workbench-guidance-discover-restore",
+            allowsDisclosure: true,
+            targetExpanded: true,
+            isExpanded: guidanceBinding
+        )
+        showControl.activate()
+        XCTAssertTrue(isExpanded)
 
-        binding.wrappedValue = true
-
-        XCTAssertTrue(expanded)
+        XCTAssertEqual(
+            defaults.object(forKey: WorkbenchGuidanceStorage.key(for: .discover)) as? Bool,
+            true
+        )
     }
 
     func testWorkbenchRenderBoundaryKeepsPrimerVisibleWithoutWorkspace() {
@@ -438,6 +519,55 @@ final class WorkbenchFlowTests: XCTestCase {
             facets: InventoryFacets(inventory: replacement)
         )
         XCTAssertEqual(normalized, InventoryFacetSelection())
+    }
+
+    func testDiscoverFacetReplacementDoesNotRemainInStaleFilterZeroState() {
+        let original = [inventoryItem(name: "Claude skill", provider: "claude", id: "old")]
+        let replacement = [inventoryItem(
+            name: "Zed MCP",
+            provider: "zed",
+            id: "new",
+            category: "mcp",
+            layer: "project"
+        )]
+        let workspace = WorkspaceStore()
+        let host = NSHostingView(
+            rootView: DiscoverOrganizeView(
+                inventoryOverride: original,
+                filtersOverride: DiscoverFilterState(
+                    provider: "claude",
+                    layer: "global",
+                    category: "skill"
+                )
+            )
+                .environmentObject(workspace)
+        )
+        host.frame = NSRect(x: 0, y: 0, width: 1_180, height: 760)
+        host.layoutSubtreeIfNeeded()
+
+        host.rootView = DiscoverOrganizeView(inventoryOverride: replacement)
+            .environmentObject(workspace)
+        host.layoutSubtreeIfNeeded()
+        let deadline = Date(timeIntervalSinceNow: 1)
+        var selectedTitles = Set<String>()
+        repeat {
+            host.layoutSubtreeIfNeeded()
+            selectedTitles = Set(
+                host.descendants(of: NSPopUpButton.self).compactMap(\.titleOfSelectedItem)
+            )
+            if selectedTitles.isSuperset(of: ["All provider", "All layer", "All category"]) {
+                break
+            }
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
+        } while Date() < deadline
+
+        XCTAssertTrue(selectedTitles.contains("All provider"))
+        XCTAssertTrue(selectedTitles.contains("All layer"))
+        XCTAssertTrue(selectedTitles.contains("All category"))
+        XCTAssertFalse(
+            host.descendants(of: NSButton.self).contains { $0.title == "Clear filters" },
+            "a removed facet must be normalized before the view settles in filterZero"
+        )
     }
 
     func testGroupMemberFilterCoversEveryDimension() {
