@@ -152,12 +152,12 @@ struct RecoverAuditView: View {
             await workspace.refreshRecovery()
         }
         .onChange(of: selectedBackupID) { _, backupID in
-            if backupID != nil {
+            if backupID != nil, selectedOperationID != nil {
                 selectedOperationID = nil
             }
         }
         .onChange(of: selectedOperationID) { _, operationID in
-            if operationID != nil {
+            if operationID != nil, selectedBackupID != nil {
                 selectedBackupID = nil
             }
         }

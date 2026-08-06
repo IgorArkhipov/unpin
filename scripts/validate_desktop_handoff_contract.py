@@ -315,7 +315,7 @@ def main() -> int:
         for error in errors:
             print(f"- {error}")
         return 1
-    print("desktop handoff contract validated: 4 verified workflows, 12 MCP tools")
+    print("desktop handoff contract validated")
     return 0
 
 

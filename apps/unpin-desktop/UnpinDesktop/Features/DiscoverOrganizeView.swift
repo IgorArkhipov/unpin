@@ -249,7 +249,7 @@ func classifyDiscoverPresentation(
     presentation: WorkbenchPresentationInputs,
     inventory: [InventoryItem],
     filters: DiscoverFilterState,
-    matchingInventory: [InventoryItem]? = nil
+    matchingInventory: [InventoryItem]
 ) -> DiscoverPresentationState {
     switch presentation.state {
     case .needsWorkspace:
@@ -260,7 +260,7 @@ func classifyDiscoverPresentation(
         return .blocked(message)
     case .ready:
         guard !inventory.isEmpty else { return .emptyInventory }
-        if filters.isActive, (matchingInventory ?? inventory.filter(filters.matches)).isEmpty {
+        if filters.isActive, matchingInventory.isEmpty {
             return .filterZero
         }
         return .ready
@@ -318,7 +318,10 @@ struct DiscoverOrganizeView: View {
 
     var body: some View {
         let inventory = inventoryOverride ?? workspace.snapshot?.inventory ?? []
-        let matchingInventory = inventory.filter(filters.matches)
+        let matchingInventory: [InventoryItem] = {
+            guard case .ready = presentation.state else { return [] }
+            return inventory.filter(filters.matches)
+        }()
         switch classifyDiscoverPresentation(
             presentation: presentation,
             inventory: inventory,
