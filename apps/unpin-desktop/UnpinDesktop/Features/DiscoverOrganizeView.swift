@@ -204,18 +204,36 @@ struct DiscoverFilterState: Equatable {
     }
 
     func matches(_ item: InventoryItem) -> Bool {
-        (provider == "all" || item.provider == provider)
-            && (layer == "all" || item.layer == layer)
-            && (category == "all" || item.category == category)
-            && (state == "all" || (state == "on") == item.enabled)
-            && (search.isEmpty
-                || item.displayName.localizedCaseInsensitiveContains(search)
-                || item.id.localizedCaseInsensitiveContains(search))
+        matchesInventoryFilter(
+            item,
+            search: search,
+            provider: provider,
+            layer: layer,
+            category: category,
+            state: state
+        )
     }
 
     mutating func clear() {
         self = Self()
     }
+}
+
+func matchesInventoryFilter(
+    _ item: InventoryItem,
+    search: String,
+    provider: String,
+    layer: String,
+    category: String,
+    state: String
+) -> Bool {
+    (provider == "all" || item.provider == provider)
+        && (layer == "all" || item.layer == layer)
+        && (category == "all" || item.category == category)
+        && (state == "all" || (state == "on") == item.enabled)
+        && (search.isEmpty
+            || item.displayName.localizedCaseInsensitiveContains(search)
+            || item.id.localizedCaseInsensitiveContains(search))
 }
 
 enum DiscoverPresentationState: Equatable {
@@ -230,7 +248,8 @@ enum DiscoverPresentationState: Equatable {
 func classifyDiscoverPresentation(
     presentation: WorkbenchPresentationInputs,
     inventory: [InventoryItem],
-    filters: DiscoverFilterState
+    filters: DiscoverFilterState,
+    matchingInventory: [InventoryItem]? = nil
 ) -> DiscoverPresentationState {
     switch presentation.state {
     case .needsWorkspace:
@@ -241,7 +260,7 @@ func classifyDiscoverPresentation(
         return .blocked(message)
     case .ready:
         guard !inventory.isEmpty else { return .emptyInventory }
-        if filters.isActive, !inventory.contains(where: filters.matches) {
+        if filters.isActive, (matchingInventory ?? inventory.filter(filters.matches)).isEmpty {
             return .filterZero
         }
         return .ready
@@ -285,11 +304,7 @@ struct DiscoverOrganizeView: View {
     @Environment(\.workbenchChooseWorkspace) private var chooseWorkspace
     @Environment(\.workbenchCreateGroup) private var createGroup
     let inventoryOverride: [InventoryItem]?
-    @State private var search = ""
-    @State private var selectedProvider = "all"
-    @State private var selectedLayer = "all"
-    @State private var selectedCategory = "all"
-    @State private var selectedState = "all"
+    @State private var filters = DiscoverFilterState()
     @State private var sort = InventorySortState()
     @State private var editingGroup: GroupSummary?
 
@@ -299,10 +314,12 @@ struct DiscoverOrganizeView: View {
 
     var body: some View {
         let inventory = inventoryOverride ?? workspace.snapshot?.inventory ?? []
+        let matchingInventory = inventory.filter(filters.matches)
         switch classifyDiscoverPresentation(
             presentation: presentation,
             inventory: inventory,
-            filters: filterState
+            filters: filters,
+            matchingInventory: matchingInventory
         ) {
         case .needsWorkspace:
             WorkbenchWorkspaceStateView(
@@ -340,15 +357,18 @@ struct DiscoverOrganizeView: View {
                 action: clearFilters
             )
         case .ready:
-            inventoryContent(inventory)
+            inventoryContent(inventory, matchingInventory: matchingInventory)
         }
     }
 
-    private func inventoryContent(_ inventory: [InventoryItem]) -> some View {
+    private func inventoryContent(
+        _ inventory: [InventoryItem],
+        matchingInventory: [InventoryItem]
+    ) -> some View {
         let facets = InventoryFacets(inventory: inventory)
         let filterRevision = InventoryFilterRevision(inventory: inventory)
         let palette = WorkbenchPalette.resolve(for: colorScheme)
-        let items = sort.sorted(inventory.filter(filterState.matches))
+        let items = sort.sorted(matchingInventory)
         return VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 10) {
                 Text("Discover and Organize").font(.title2)
@@ -358,28 +378,26 @@ struct DiscoverOrganizeView: View {
                         Button(group.qualifiedName) { editingGroup = group }
                     }
                 }
-                .disabled(workspace.isBusy || workspace.actionsBlocked)
+                .disabled(workspace.mutationsBlocked)
                 Button("New group") { createGroup?() }
-                    .disabled(
-                        createGroup == nil || workspace.isBusy || workspace.actionsBlocked
-                    )
+                    .disabled(createGroup == nil || workspace.mutationsBlocked)
                 Button("Reload") { Task { await workspace.reloadWorkspace() } }
                     .disabled(workspace.isBusy)
             }
 
             VStack(alignment: .leading, spacing: 8) {
-                TextField("Search inventory", text: $search)
+                TextField("Search inventory", text: $filters.search)
                     .frame(maxWidth: .infinity)
 
                 HStack(alignment: .bottom, spacing: 12) {
-                    filter("Provider", selection: $selectedProvider, values: facets.providers)
-                    filter("Layer", selection: $selectedLayer, values: facets.layers)
-                    filter("Category", selection: $selectedCategory, values: facets.categories)
+                    filter("Provider", selection: $filters.provider, values: facets.providers)
+                    filter("Layer", selection: $filters.layer, values: facets.layers)
+                    filter("Category", selection: $filters.category, values: facets.categories)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("State")
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                        Picker("State", selection: $selectedState) {
+                        Picker("State", selection: $filters.state) {
                             Text("Any state").tag("all")
                             Text("On").tag("on")
                             Text("Off").tag("off")
@@ -445,22 +463,8 @@ struct DiscoverOrganizeView: View {
         }
     }
 
-    private var filterState: DiscoverFilterState {
-        DiscoverFilterState(
-            search: search,
-            provider: selectedProvider,
-            layer: selectedLayer,
-            category: selectedCategory,
-            state: selectedState
-        )
-    }
-
     private func clearFilters() {
-        search = ""
-        selectedProvider = "all"
-        selectedLayer = "all"
-        selectedCategory = "all"
-        selectedState = "all"
+        filters.clear()
     }
 
     private var sortControls: some View {
@@ -525,15 +529,15 @@ struct DiscoverOrganizeView: View {
     private func normalizeInventoryFilters(_ inventory: [InventoryItem]) {
         let normalized = normalizedInventoryFacetSelection(
             InventoryFacetSelection(
-                provider: selectedProvider,
-                layer: selectedLayer,
-                category: selectedCategory
+                provider: filters.provider,
+                layer: filters.layer,
+                category: filters.category
             ),
             facets: InventoryFacets(inventory: inventory)
         )
-        selectedProvider = normalized.provider
-        selectedLayer = normalized.layer
-        selectedCategory = normalized.category
+        filters.provider = normalized.provider
+        filters.layer = normalized.layer
+        filters.category = normalized.category
     }
 
     private func filter(

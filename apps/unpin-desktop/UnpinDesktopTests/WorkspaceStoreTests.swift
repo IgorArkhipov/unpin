@@ -36,11 +36,13 @@ private actor ReadBarrier {
 
 private actor FirstInvocationBarrier {
     private var firstInvocationReached = false
+    private var invocationCount = 0
     private var released = false
     private var reachWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseWaiters: [CheckedContinuation<Void, Never>] = []
 
     func pauseFirstInvocation() async {
+        invocationCount += 1
         guard firstInvocationReached == false else { return }
         firstInvocationReached = true
         let reachWaiters = self.reachWaiters
@@ -64,6 +66,10 @@ private actor FirstInvocationBarrier {
         let releaseWaiters = self.releaseWaiters
         self.releaseWaiters.removeAll()
         releaseWaiters.forEach { $0.resume() }
+    }
+
+    func count() -> Int {
+        invocationCount
     }
 }
 
@@ -357,6 +363,64 @@ final class WorkspaceStoreTests: XCTestCase {
         guard case .ready = store.state else {
             return XCTFail("a successful workspace reload should clear the recovery blocker")
         }
+    }
+
+    func testReloadAndWorkspaceSelectionDoNotOverlapAnActiveConnection() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let switchedWorkspace = fixture.temporaryRoot
+            .appendingPathComponent("concurrent-workspace", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: switchedWorkspace.appendingPathComponent(".git", isDirectory: true),
+            withIntermediateDirectories: true
+        )
+
+        let connectionBarrier = FirstInvocationBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeWorkspaceConnect: { await connectionBarrier.pauseFirstInvocation() }
+        ))
+
+        let reloadTask = Task { await store.reloadWorkspace() }
+        await connectionBarrier.waitUntilFirstInvocation()
+
+        await store.reloadWorkspace()
+        await store.selectWorkspace(switchedWorkspace)
+
+        let connectionCount = await connectionBarrier.count()
+        XCTAssertEqual(connectionCount, 1)
+        XCTAssertEqual(store.workspaceName, fixture.workspaceRoot.lastPathComponent)
+
+        await connectionBarrier.release()
+        await reloadTask.value
+        guard case .ready = store.state else {
+            return XCTFail("the original reload should finish after overlapping requests are ignored")
+        }
+    }
+
+    func testRecoveryRefreshesDoNotOverlap() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+
+        let recoveryBarrier = FirstInvocationBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeRecoveryRefresh: { await recoveryBarrier.pauseFirstInvocation() }
+        ))
+
+        let refreshTask = Task { await store.refreshRecovery() }
+        await recoveryBarrier.waitUntilFirstInvocation()
+
+        await store.refreshRecovery()
+
+        let recoveryCount = await recoveryBarrier.count()
+        XCTAssertEqual(recoveryCount, 1)
+
+        await recoveryBarrier.release()
+        await refreshTask.value
+        XCTAssertNotNil(store.recovery)
     }
 
     func testDefinitionApplyUncertaintyClearsReviewAndBlocksWhenRecoveryUnavailable() async throws {

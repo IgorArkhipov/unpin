@@ -54,6 +54,7 @@ struct WorkbenchGuidanceDescriptor: Equatable {
 
 struct WorkbenchGuidanceView: View {
     let descriptor: WorkbenchGuidanceDescriptor
+    let allowsDisclosure: Bool
     @Binding var isExpanded: Bool
 
     var body: some View {
@@ -76,6 +77,7 @@ struct WorkbenchGuidanceView: View {
                     .labelStyle(.titleAndIcon)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(!allowsDisclosure)
                     .accessibilityLabel(descriptor.hideGuidanceLabel)
                 }
                 .padding(.vertical, 2)
@@ -92,6 +94,7 @@ struct WorkbenchGuidanceView: View {
                 .labelStyle(.titleAndIcon)
                 .buttonStyle(.bordered)
                 .controlSize(.small)
+                .disabled(!allowsDisclosure)
                 .accessibilityLabel(descriptor.showGuidanceLabel)
                 .accessibilityIdentifier("workbench-guidance-\(descriptor.area.rawValue)-restore")
                 Spacer()
@@ -117,12 +120,6 @@ struct WorkbenchPresentationInputs: Equatable {
     var allowsGuidanceDisclosure: Bool { true }
     var allowsCopy: Bool { true }
     var allowsWorkspaceMutation: Bool { !isBusy }
-
-    var allowsMutation: Bool {
-        guard hasWorkspace, isBusy == false else { return false }
-        if case .ready = state { return true }
-        return false
-    }
 
     @MainActor
     static func runtime(_ workspace: WorkspaceStore) -> Self {
@@ -203,19 +200,19 @@ struct WorkbenchRenderBoundary<Content: View>: View {
     let workArea: WorkArea
     let presentation: WorkbenchPresentationInputs
     let guidanceDescriptor: WorkbenchGuidanceDescriptor
-    @Binding var isPrimerExpanded: Bool
+    @Binding var isGuidanceExpanded: Bool
     private let content: Content
 
     init(
         workArea: WorkArea,
         presentation: WorkbenchPresentationInputs,
-        isPrimerExpanded: Binding<Bool>,
+        isGuidanceExpanded: Binding<Bool>,
         @ViewBuilder content: () -> Content
     ) {
         self.workArea = workArea
         self.presentation = presentation
         guidanceDescriptor = WorkbenchGuidanceDescriptor(area: workArea)
-        _isPrimerExpanded = isPrimerExpanded
+        _isGuidanceExpanded = isGuidanceExpanded
         self.content = content()
     }
 
@@ -223,7 +220,8 @@ struct WorkbenchRenderBoundary<Content: View>: View {
         VStack(alignment: .leading, spacing: 12) {
             WorkbenchGuidanceView(
                 descriptor: guidanceDescriptor,
-                isExpanded: $isPrimerExpanded
+                allowsDisclosure: presentation.allowsGuidanceDisclosure,
+                isExpanded: $isGuidanceExpanded
             )
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)

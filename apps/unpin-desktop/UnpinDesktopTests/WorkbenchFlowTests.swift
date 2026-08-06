@@ -347,7 +347,7 @@ final class WorkbenchFlowTests: XCTestCase {
                 isBusy: false,
                 workspaceName: nil
             ),
-            isPrimerExpanded: Binding(
+            isGuidanceExpanded: Binding(
                 get: { expanded },
                 set: { expanded = $0 }
             )
@@ -378,7 +378,6 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertTrue(inputs.allowsGuidanceDisclosure)
         XCTAssertTrue(inputs.allowsCopy)
         XCTAssertFalse(inputs.allowsWorkspaceMutation)
-        XCTAssertFalse(inputs.allowsMutation)
     }
 
     func testGroupEditorFilterSelectionsFitAtCaptureWidth() {

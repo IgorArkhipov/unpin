@@ -94,13 +94,13 @@ struct WorkbenchView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @AppStorage(WorkbenchColorScheme.storageKey)
     private var storedColorScheme = WorkbenchColorScheme.defaultValue.rawValue
-    @AppStorage(WorkbenchGuidanceStorage.discoverKey)
+    @AppStorage(WorkbenchGuidanceStorage.key(for: .discover))
     private var discoverGuidanceExpanded = true
-    @AppStorage(WorkbenchGuidanceStorage.governKey)
+    @AppStorage(WorkbenchGuidanceStorage.key(for: .govern))
     private var governGuidanceExpanded = true
-    @AppStorage(WorkbenchGuidanceStorage.changeKey)
+    @AppStorage(WorkbenchGuidanceStorage.key(for: .change))
     private var changeGuidanceExpanded = true
-    @AppStorage(WorkbenchGuidanceStorage.recoverKey)
+    @AppStorage(WorkbenchGuidanceStorage.key(for: .recover))
     private var recoverGuidanceExpanded = true
     @State private var navigation = WorkbenchNavigationState()
     @State private var choosingWorkspace = false
@@ -156,6 +156,7 @@ struct WorkbenchView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .disabled(!presentation.allowsNavigation)
                 }
                 .padding(.horizontal, 18)
                 .padding(.vertical, 14)
@@ -167,7 +168,7 @@ struct WorkbenchView: View {
                 WorkbenchRenderBoundary(
                     workArea: navigation.workArea,
                     presentation: presentation,
-                    isPrimerExpanded: guidanceBinding(for: navigation.workArea)
+                    isGuidanceExpanded: guidanceBinding(for: navigation.workArea)
                 ) {
                     selectedWorkAreaView
                 }
@@ -175,11 +176,6 @@ struct WorkbenchView: View {
                 .environment(\.workbenchCreateGroup, {
                     navigation.presentGroupCreation()
                 })
-                .onChange(of: navigation.workArea) { _, area in
-                    if area == .recover, workspace.hasWorkspace {
-                        Task { await workspace.refreshRecovery() }
-                    }
-                }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(palette.panel.opacity(0.96))
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
