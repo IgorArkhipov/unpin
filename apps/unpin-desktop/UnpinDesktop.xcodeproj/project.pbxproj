@@ -22,6 +22,7 @@
 		B10000000000000000000003 /* WorkbenchFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000004 /* WorkbenchFlowTests.swift */; };
 		B10000000000000000000004 /* FixtureResources.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000005 /* FixtureResources.swift */; };
 		B10000000000000000000005 /* fixtures in Resources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000006 /* fixtures */; };
+		B10000000000000000000006 /* WorkbenchGuidanceMatrixTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B20000000000000000000007 /* WorkbenchGuidanceMatrixTests.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -48,6 +49,7 @@
 		B20000000000000000000004 /* WorkbenchFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkbenchFlowTests.swift; sourceTree = "<group>"; };
 		B20000000000000000000005 /* FixtureResources.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FixtureResources.swift; sourceTree = "<group>"; };
 		B20000000000000000000006 /* fixtures */ = {isa = PBXFileReference; lastKnownFileType = folder; name = fixtures; path = ../../crates/unpin-core/tests/fixtures; sourceTree = "<group>"; };
+		B20000000000000000000007 /* WorkbenchGuidanceMatrixTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WorkbenchGuidanceMatrixTests.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXGroup section */
@@ -57,7 +59,7 @@
 		A30000000000000000000004 /* State */ = {isa = PBXGroup; children = (A20000000000000000000003 /* WorkspaceStore.swift */); path = State; sourceTree = "<group>"; };
 		A30000000000000000000005 /* Features */ = {isa = PBXGroup; children = (A20000000000000000000004 /* DiscoverOrganizeView.swift */, A20000000000000000000005 /* GroupEditorView.swift */, A20000000000000000000006 /* SafeChangeView.swift */, A20000000000000000000007 /* PlanReviewView.swift */, A20000000000000000000008 /* RecoverAuditView.swift */, A20000000000000000000009 /* GovernAutomateView.swift */, A2000000000000000000000C /* RestoreReviewView.swift */, A2000000000000000000000D /* WorkbenchGuidanceView.swift */); path = Features; sourceTree = "<group>"; };
 		A30000000000000000000006 /* Products */ = {isa = PBXGroup; children = (A2000000000000000000000B /* UnpinDesktop.app */, B20000000000000000000002 /* UnpinDesktopTests.xctest */); name = Products; sourceTree = "<group>"; };
-		B30000000000000000000001 /* UnpinDesktopTests */ = {isa = PBXGroup; children = (B20000000000000000000005 /* FixtureResources.swift */, B20000000000000000000001 /* BridgeClientTests.swift */, B20000000000000000000003 /* WorkspaceStoreTests.swift */, B20000000000000000000004 /* WorkbenchFlowTests.swift */); path = UnpinDesktopTests; sourceTree = "<group>"; };
+		B30000000000000000000001 /* UnpinDesktopTests */ = {isa = PBXGroup; children = (B20000000000000000000005 /* FixtureResources.swift */, B20000000000000000000001 /* BridgeClientTests.swift */, B20000000000000000000003 /* WorkspaceStoreTests.swift */, B20000000000000000000004 /* WorkbenchFlowTests.swift */, B20000000000000000000007 /* WorkbenchGuidanceMatrixTests.swift */); path = UnpinDesktopTests; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -79,7 +81,7 @@
 
 /* Begin PBXSourcesBuildPhase section */
 		A60000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (A10000000000000000000001 /* UnpinDesktopApp.swift in Sources */, A10000000000000000000002 /* BridgeClient.swift in Sources */, A10000000000000000000003 /* WorkspaceStore.swift in Sources */, A10000000000000000000004 /* DiscoverOrganizeView.swift in Sources */, A10000000000000000000005 /* GroupEditorView.swift in Sources */, A10000000000000000000006 /* SafeChangeView.swift in Sources */, A10000000000000000000007 /* PlanReviewView.swift in Sources */, A10000000000000000000008 /* RecoverAuditView.swift in Sources */, A10000000000000000000009 /* GovernAutomateView.swift in Sources */, A1000000000000000000000A /* RestoreReviewView.swift in Sources */, A1000000000000000000000B /* WorkbenchGuidanceView.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
-		B60000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000004 /* FixtureResources.swift in Sources */, B10000000000000000000001 /* BridgeClientTests.swift in Sources */, B10000000000000000000002 /* WorkspaceStoreTests.swift in Sources */, B10000000000000000000003 /* WorkbenchFlowTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
+		B60000000000000000000001 /* Sources */ = {isa = PBXSourcesBuildPhase; buildActionMask = 2147483647; files = (B10000000000000000000004 /* FixtureResources.swift in Sources */, B10000000000000000000001 /* BridgeClientTests.swift in Sources */, B10000000000000000000002 /* WorkspaceStoreTests.swift in Sources */, B10000000000000000000003 /* WorkbenchFlowTests.swift in Sources */, B10000000000000000000006 /* WorkbenchGuidanceMatrixTests.swift in Sources */); runOnlyForDeploymentPostprocessing = 0; };
 /* End PBXSourcesBuildPhase section */
 
 /* Begin PBXFrameworksBuildPhase section */

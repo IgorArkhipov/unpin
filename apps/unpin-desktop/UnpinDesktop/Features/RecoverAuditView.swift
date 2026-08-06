@@ -194,60 +194,67 @@ struct RecoverAuditView: View {
         state: RecoverPresentationState,
         warning: String?
     ) -> some View {
-        VStack(alignment: .leading, spacing: 16) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Recover and Audit").font(.title2)
-                    Text("Authenticated backups and durable operation evidence.")
-                        .foregroundStyle(.secondary)
+        ScrollView {
+            VStack(alignment: .leading, spacing: 16) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Recover and Audit").font(.title2)
+                        Text("Authenticated backups and durable operation evidence.")
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Reload") { Task { await workspace.refreshRecovery() } }
+                        .disabled(workspace.isBusy)
                 }
-                Spacer()
-                Button("Reload") { Task { await workspace.refreshRecovery() } }
-                    .disabled(workspace.isBusy)
-            }
 
-            if let warning {
-                Label(warning, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            } else if state == .noSelection {
-                Text("Select a backup to review restore evidence or an operation to inspect its durable lifecycle.")
+                if let warning {
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                } else if state == .noSelection {
+                    Text(
+                        "Select a backup to review restore evidence or an operation to inspect its durable lifecycle."
+                    )
                     .foregroundStyle(.secondary)
-            }
+                }
 
-            if !recovery.backupStatus.isAvailable
-                || !recovery.operationStatus.isAvailable
-                || !recovery.groupOperationStatus.isAvailable {
-                Label(recoveryWarning(recovery), systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
+                if !recovery.backupStatus.isAvailable
+                    || !recovery.operationStatus.isAvailable
+                    || !recovery.groupOperationStatus.isAvailable
+                {
+                    Label(recoveryWarning(recovery), systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
 
-            HStack(alignment: .top, spacing: 24) {
-                backupList(recovery)
-                operationList(recovery)
-            }
+                HStack(alignment: .top, spacing: 24) {
+                    backupList(recovery)
+                    operationList(recovery)
+                }
 
-            if let selectedBackup = selectedBackup(in: recovery),
-               selectedBackup.restorable,
-               let reviewed = workspace.reviewedRestore,
-               reviewed.plan.backupId == selectedBackup.backupId {
-                Divider()
-                RestoreReviewView(reviewed: reviewed)
-            }
+                if let selectedBackup = selectedBackup(in: recovery),
+                    selectedBackup.restorable,
+                    let reviewed = workspace.reviewedRestore,
+                    reviewed.plan.backupId == selectedBackup.backupId
+                {
+                    Divider()
+                    RestoreReviewView(reviewed: reviewed)
+                }
 
-            if let blocker = workspace.lastRestoreBlocker {
-                Label(blocker, systemImage: "exclamationmark.triangle")
-                    .foregroundStyle(.orange)
-            }
+                if let blocker = workspace.lastRestoreBlocker {
+                    Label(blocker, systemImage: "exclamationmark.triangle")
+                        .foregroundStyle(.orange)
+                }
 
-            if let result = workspace.lastRestore {
-                Label(
-                    "Restore \(result.status.displayName): \(result.affectedTargetCount) target(s)",
-                    systemImage: "checkmark.shield"
-                )
-                .foregroundStyle(result.status.isRestored ? .green : .orange)
+                if let result = workspace.lastRestore {
+                    Label(
+                        "Restore \(result.status.displayName): \(result.affectedTargetCount) target(s)",
+                        systemImage: "checkmark.shield"
+                    )
+                    .foregroundStyle(result.status.isRestored ? .green : .orange)
+                }
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding()
         }
-        .padding()
     }
 
     private func backupList(_ recovery: RecoverySnapshot) -> some View {

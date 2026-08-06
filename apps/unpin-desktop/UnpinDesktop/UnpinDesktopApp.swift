@@ -90,8 +90,20 @@ struct UnpinDesktopApp: App {
     }
 }
 
+struct WorkbenchViewFixture {
+    let workArea: WorkArea
+    let colorScheme: WorkbenchColorScheme
+    let guidanceExpanded: Bool
+    let presentation: WorkbenchPresentationInputs
+    let inventory: [InventoryItem]?
+    let discoverFilters: DiscoverFilterState?
+    let groups: [GroupSummary]?
+    let recovery: RecoverAuditFixture?
+}
+
 struct WorkbenchView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
+    private let fixture: WorkbenchViewFixture?
     @AppStorage(WorkbenchColorScheme.storageKey)
     private var storedColorScheme = WorkbenchColorScheme.defaultValue.rawValue
     @AppStorage(WorkbenchGuidanceStorage.key(for: .discover))
@@ -102,13 +114,28 @@ struct WorkbenchView: View {
     private var changeGuidanceExpanded = true
     @AppStorage(WorkbenchGuidanceStorage.key(for: .recover))
     private var recoverGuidanceExpanded = true
-    @State private var navigation = WorkbenchNavigationState()
+    @State private var navigation: WorkbenchNavigationState
+    @State private var fixtureGuidanceExpanded: Bool
     @State private var choosingWorkspace = false
 
+    init(fixture: WorkbenchViewFixture? = nil) {
+        self.fixture = fixture
+        _navigation = State(
+            initialValue: WorkbenchNavigationState(
+                workArea: fixture?.workArea ?? .discover
+            )
+        )
+        _fixtureGuidanceExpanded = State(
+            initialValue: fixture?.guidanceExpanded ?? true
+        )
+    }
+
     var body: some View {
-        let selectedColorScheme = WorkbenchColorScheme.resolve(storedValue: storedColorScheme)
+        let selectedColorScheme = fixture?.colorScheme
+            ?? WorkbenchColorScheme.resolve(storedValue: storedColorScheme)
         let palette = WorkbenchPalette.resolve(for: selectedColorScheme.colorScheme)
-        let presentation = WorkbenchPresentationInputs.runtime(workspace)
+        let presentation = fixture?.presentation
+            ?? WorkbenchPresentationInputs.runtime(workspace)
 
         ZStack {
             palette.background
@@ -139,12 +166,12 @@ struct WorkbenchView: View {
                         .frame(width: 132)
                         .help("Choose light or dark appearance")
 
-                        Text(workspace.workspaceName ?? "No workspace selected")
+                        Text(presentation.workspaceName ?? "No workspace selected")
                             .font(.caption.monospaced())
                             .foregroundStyle(.secondary)
                         Button("Choose workspace") { choosingWorkspace = true }
                             .disabled(!presentation.allowsWorkspaceMutation)
-                        if workspace.hasWorkspace {
+                        if presentation.hasWorkspace {
                             Button("Reload workspace") { Task { await workspace.reloadWorkspace() } }
                                 .disabled(!presentation.allowsWorkspaceMutation)
                         }
@@ -188,7 +215,7 @@ struct WorkbenchView: View {
                 }
                 .padding(16)
 
-                if let message = workspace.statusMessage {
+                if fixture == nil, let message = workspace.statusMessage {
                     HStack(spacing: 8) {
                         Circle()
                             .fill(palette.green)
@@ -221,7 +248,10 @@ struct WorkbenchView: View {
     }
 
     private var colorSchemeSelection: Binding<WorkbenchColorScheme> {
-        Binding(
+        if let fixture {
+            return .constant(fixture.colorScheme)
+        }
+        return Binding(
             get: { WorkbenchColorScheme.resolve(storedValue: storedColorScheme) },
             set: { storedColorScheme = $0.rawValue }
         )
@@ -231,26 +261,32 @@ struct WorkbenchView: View {
     private var selectedWorkAreaView: some View {
         switch navigation.workArea {
         case .discover:
-            DiscoverOrganizeView()
+            DiscoverOrganizeView(
+                inventoryOverride: fixture?.inventory,
+                filtersOverride: fixture?.discoverFilters
+            )
         case .govern:
             GovernAutomateView()
         case .change:
-            SafeChangeView()
+            SafeChangeView(groupsOverride: fixture?.groups)
         case .recover:
-            RecoverAuditView()
+            RecoverAuditView(fixture: fixture?.recovery)
         }
     }
 
     private func guidanceBinding(for area: WorkArea) -> Binding<Bool> {
+        if fixture != nil {
+            return $fixtureGuidanceExpanded
+        }
         switch area {
         case .discover:
-            $discoverGuidanceExpanded
+            return $discoverGuidanceExpanded
         case .govern:
-            $governGuidanceExpanded
+            return $governGuidanceExpanded
         case .change:
-            $changeGuidanceExpanded
+            return $changeGuidanceExpanded
         case .recover:
-            $recoverGuidanceExpanded
+            return $recoverGuidanceExpanded
         }
     }
 }

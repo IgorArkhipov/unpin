@@ -42,7 +42,7 @@
       selectedDebuggerIdentifier = "Xcode.DebuggerFoundation.Debugger.LLDB"
       selectedLauncherIdentifier = "Xcode.DebuggerFoundation.Launcher.LLDB"
       codeCoverageEnabled = "NO"
-      shouldUseLaunchSchemeArgsEnv = "YES"
+      shouldUseLaunchSchemeArgsEnv = "NO"
       shouldAutocreateTestPlan = "YES">
       <Testables>
          <TestableReference
@@ -57,6 +57,18 @@
             </BuildableReference>
          </TestableReference>
       </Testables>
+      <EnvironmentVariables>
+         <EnvironmentVariable
+            key = "UNPIN_GUIDANCE_MATRIX_DIR"
+            value = "$(UNPIN_GUIDANCE_MATRIX_DIR)"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+         <EnvironmentVariable
+            key = "UNPIN_GUIDANCE_MATRIX_SCENARIOS"
+            value = "$(UNPIN_GUIDANCE_MATRIX_SCENARIOS)"
+            isEnabled = "YES">
+         </EnvironmentVariable>
+      </EnvironmentVariables>
    </TestAction>
    <LaunchAction
       buildConfiguration = "Debug"
