@@ -56,6 +56,20 @@ unpin doctor
 unpin list --json
 ```
 
+The CLI can check the latest stable GitHub release without changing files,
+then install the exact version you confirm:
+
+```bash
+unpin update check --target cli
+unpin update apply --target cli --confirm VERSION_FROM_CHECK
+```
+
+Updates download only the matching platform archive and `SHA256SUMS`, enforce
+bounded HTTPS downloads, verify the archive checksum, inspect the candidate
+version, and replace the installed binary atomically. On macOS, the candidate
+must also retain the `dev.unpin.cli` identifier and exactly match the installed
+designated requirement.
+
 Add `$HOME/.local/bin` to your shell's startup configuration if it is not
 already on `PATH`.
 
@@ -110,12 +124,19 @@ tar -xzf unpin-desktop-v1.0.2-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
-to `/Applications` or `~/Applications`. Updates are manual in this release: verify
-the replacement archive, quit the old app, and replace the existing app
-bundle. To uninstall the desktop app, quit it and move `UnpinDesktop.app` to
-Trash. This leaves the CLI and shared Unpin state under `~/.config/unpin`
-untouched; that state can contain backup and recovery evidence and should not
-be removed as part of an ordinary app uninstall.
+to `/Applications` or `~/Applications`. The app checks for a newer stable
+release at launch; choose **Check for Updates…** from the application menu to
+check on demand. Before replacement, Unpin verifies the release checksum, app
+and bridge signatures, exact identifiers, versions, and equality with the
+installed designated requirements. It relaunches only after a successful
+atomic bundle swap. Certificate rotation is intentionally rejected by
+automatic update and requires a separately documented manual installation
+because it cannot preserve an existing Keychain **Always Allow** grant.
+
+To uninstall the desktop app, quit it and move `UnpinDesktop.app` to Trash.
+This leaves the CLI and shared Unpin state under `~/.config/unpin` untouched;
+that state can contain backup and recovery evidence and should not be removed
+as part of an ordinary app uninstall.
 
 Because the desktop app is not Developer ID signed or notarized, the first launch can
 be blocked by Gatekeeper. After verifying both the checksum and GitHub
@@ -245,6 +266,7 @@ operation remains handoff-only.
 - `unpin group` maintains explicit mixed-type inventory groups, their revisions, history, previews, MCP approvals, and operation evidence.
 - `unpin catalog`, `profile`, `gateway`, `session`, and `hook` manage normalized capabilities, reusable policy, optional routing, isolated leases, and reviewed hook trust.
 - `unpin mcp` runs a newline-delimited stdio MCP control plane. Default item, bulk, restore, profile, policy, gateway, session, and hook writes return human-action handoffs; approved group apply is an explicit persistent-mode exception.
+- `unpin update check|apply` checks and installs a confirmed stable CLI or macOS desktop release through the verified updater.
 - `unpin tui` opens the terminal compatibility UI, including item and Groups views. Use it for Profiles, Gateways, Sessions, and Hooks until their desktop workspaces arrive; `unpin dashboard` is an alias for the same command.
 
 ## Provider Coverage

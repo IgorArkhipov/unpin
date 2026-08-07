@@ -79,14 +79,60 @@ struct WorkbenchPalette {
 @main
 struct UnpinDesktopApp: App {
     @StateObject private var workspace = WorkspaceStore()
+    @StateObject private var updates = DesktopUpdateController()
 
     var body: some Scene {
-        WindowGroup("Unpin Workbench") {
+        Window("Unpin Workbench", id: "workbench") {
             WorkbenchView()
                 .environmentObject(workspace)
                 .task { await workspace.launch() }
+                .task { updates.startCheck(interactive: false) }
+                .alert(item: $updates.prompt, content: updateAlert)
         }
         .defaultSize(width: 1180, height: 760)
+        .commands {
+            CommandGroup(after: .appInfo) {
+                Button("Check for Updates…") {
+                    updates.startCheck(interactive: true)
+                }
+                .disabled(updates.isBusy)
+            }
+        }
+    }
+
+    private func updateAlert(_ prompt: DesktopUpdatePrompt) -> Alert {
+        switch prompt {
+        case let .available(status):
+            Alert(
+                title: Text("Unpin \(status.latestVersion) is available"),
+                message: Text(
+                    "Update from \(status.currentVersion), verify its signed release, and relaunch Unpin?"
+                ),
+                primaryButton: .default(Text("Install and Relaunch")) {
+                    updates.dismissPrompt()
+                    updates.startInstall(status)
+                },
+                secondaryButton: .cancel(Text("Later")) {
+                    updates.dismissPrompt()
+                }
+            )
+        case let .current(version):
+            Alert(
+                title: Text("Unpin is up to date"),
+                message: Text("Version \(version) is the latest stable release."),
+                dismissButton: .default(Text("OK")) {
+                    updates.dismissPrompt()
+                }
+            )
+        case let .failure(message):
+            Alert(
+                title: Text("Update failed"),
+                message: Text(message),
+                dismissButton: .default(Text("OK")) {
+                    updates.dismissPrompt()
+                }
+            )
+        }
     }
 }
 

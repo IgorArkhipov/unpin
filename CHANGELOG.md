@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Added `unpin update check` and confirmation-gated `unpin update apply` for verified stable CLI and macOS desktop releases.
+- Added automatic desktop update checks at launch and an on-demand **Check for Updates…** application-menu flow with confirmed install and relaunch.
+
+### Security
+
+- Update downloads are HTTPS-host restricted and bounded, archives are checksum-verified and traversal-safe, and candidates must report the expected version before atomic replacement.
+- macOS updates require exact release identifiers and byte-for-byte equality with the installed designated requirements for the standalone CLI, desktop app, and bundled bridge. Certificate or identifier rotation is rejected so existing Keychain **Always Allow** grants are preserved across normal updates.
+
 ## [1.0.2] - 2026-08-06
 
 ### Changed

@@ -78,6 +78,34 @@ or expose the signing private key; the protected environment is the only
 approved storage used by release automation. This personal certificate remains
 non-Developer-ID and non-notarized, so it does not establish Gatekeeper trust.
 
+### Self-update compatibility gate
+
+The CLI and desktop app discover only GitHub's latest stable release. Keep the
+following contract for every release that should be installable through
+`unpin update`:
+
+- publish the exact CLI and desktop archive names derived from version and
+  target triple, plus `SHA256SUMS` containing each archive;
+- never replace a published archive or checksum asset;
+- sign the standalone CLI, desktop app, and bundled bridge with the configured
+  release certificate and exact identifiers `dev.unpin.cli`,
+  `dev.unpin.workbench`, and `dev.unpin.workbench.bridge`;
+- verify the same expected certificate fingerprint in every macOS signing job;
+- keep each candidate's designated requirement exactly equal to the preceding
+  installed release requirement.
+
+The updater independently verifies the checksum, candidate version, signature,
+identifier, and exact designated-requirement equality before replacement. The
+desktop JSON success response includes `keychainRequirementPreserved: true`,
+and the native app refuses to terminate and relaunch unless that proof is
+present. This is the release boundary that lets a Keychain **Always Allow**
+grant survive normal updates.
+
+A certificate or identifier rotation is deliberately not self-updatable. The
+old installed release rejects it because its designated requirement changes.
+Publish explicit manual replacement instructions and explain that one new
+Keychain authorization is expected after the verified rotation.
+
 ### Certificate expiry and rotation
 
 Inspect the installed certificate before each release and set a reminder well
