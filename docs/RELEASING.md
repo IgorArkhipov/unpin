@@ -24,15 +24,44 @@ has separate GitHub SLSA build-provenance and SBOM attestations. The draft
 workflow generates `SHA256SUMS`; ordinary program releases also attach a
 manifest-approved provider-matrix evidence bundle.
 
-Desktop archives are reproducibly ad-hoc signed with Hardened Runtime and no
-timestamp. They are not Developer ID signed or notarized, and must never be
-described as Gatekeeper-trusted. A stable release may include them only when a
-maintainer explicitly approves the unsigned-GA exception, release-facing
-documentation explains Gatekeeper's manual first-launch requirement, and the
-downloaded archive passes checksum, attestation, signature, bridge-handshake,
-and installed-artifact verification. Developer ID signing and notarization
-remain future distribution hardening rather than a blocker under that explicit
-exception.
+macOS archives default to reproducible ad-hoc signing with Hardened Runtime and
+no timestamp. A maintainer can instead select a stable certificate for both
+desktop and CLI archives. A self-signed certificate preserves the designated
+requirement that Keychain uses across updates, but it is not Developer ID
+signing or notarization and must never be described as Gatekeeper-trusted. A
+stable release may include it only when the maintainer explicitly approves the
+unsigned-GA exception, release-facing documentation explains Gatekeeper's
+manual first-launch requirement, and the downloaded archive passes checksum,
+attestation, signature, bridge-handshake, and installed-artifact verification.
+Developer ID signing and notarization remain future distribution hardening
+rather than a blocker under the explicit exception.
+
+### macOS signing modes
+
+Both macOS release builders use `scripts/sign_macos_artifact.sh`. Without
+configuration it applies an ad-hoc Hardened Runtime signature. To prevent an
+accidental ad-hoc fallback and use an installed certificate, run the builders
+with:
+
+```bash
+UNPIN_CODESIGN_IDENTITY="Certificate Name or SHA-1" \
+UNPIN_CODESIGN_TIMESTAMP_MODE=none \
+UNPIN_REQUIRE_STABLE_CODESIGN=1 \
+scripts/build_desktop_release.sh TARGET VERSION OUTPUT_DIRECTORY
+```
+
+Use `UNPIN_CODESIGN_TIMESTAMP_MODE=secure` for a Developer ID certificate that
+can reach Apple's timestamp service. The builders verify the resulting
+signature and exact identifiers: `dev.unpin.workbench` for the app,
+`dev.unpin.workbench.bridge` for its bundled credential broker, and
+`dev.unpin.cli` for the standalone CLI. The bridge and CLI may each require one
+new Keychain authorization after switching from ad-hoc signing; later builds
+signed by the same certificate and identifier retain the same designated
+requirement.
+
+The GitHub release workflow remains ad-hoc until a maintainer separately
+authorizes secure export of a release signing identity and configures the
+corresponding repository secrets. Never commit or upload a signing private key.
 
 ## Prepare release commit
 

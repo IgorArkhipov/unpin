@@ -115,7 +115,9 @@ full reset, not part of uninstalling the app.
 
 ## Distribution limitations
 
-- No Developer ID signature or Apple notarization.
+- Release tooling supports a stable personal signature for Keychain continuity,
+  but published artifacts are not Developer ID signed or Apple-notarized unless
+  their release notes explicitly say otherwise.
 - No automatic update mechanism; replacement is manual.
 - No Windows, Linux, or universal macOS desktop bundle.
 - Profiles, gateways, sessions, and hooks remain on CLI, TUI, and MCP surfaces.

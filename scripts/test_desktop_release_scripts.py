@@ -67,9 +67,22 @@ class DesktopReleaseScriptTests(unittest.TestCase):
             self._write_executable(
                 command_bin / "codesign",
                 """\
-                #!/bin/sh
-                exit 0
-                """,
+#!/bin/sh
+set -eu
+if [ "${1:-}" = "--display" ]; then
+  artifact=
+  for argument in "$@"; do
+    artifact="$argument"
+  done
+  case "$artifact" in
+    *.app) identifier=dev.unpin.workbench ;;
+    *) identifier=dev.unpin.workbench.bridge ;;
+  esac
+  printf 'Identifier=%s\n' "$identifier" >&2
+  printf 'Signature=adhoc\n' >&2
+fi
+exit 0
+""",
             )
 
             environment = os.environ.copy()

@@ -41,6 +41,14 @@ release_root="$release_stage/$release_name"
 mkdir -p "$release_root" "$release_output"
 
 install -m 0755 "$release_binary" "$release_root/unpin"
+case "$release_target" in
+  aarch64-apple-darwin | x86_64-apple-darwin)
+    repository_root="$(git rev-parse --show-toplevel)"
+    "$repository_root/scripts/sign_macos_artifact.sh" \
+      dev.unpin.cli \
+      "$release_root/unpin" >&2
+    ;;
+esac
 install -m 0644 README.md LICENSE "$release_root/"
 
 tar -czf "$release_output/$release_name.tar.gz" \
