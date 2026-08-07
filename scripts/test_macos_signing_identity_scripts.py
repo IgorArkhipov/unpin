@@ -53,6 +53,21 @@ class MacosSigningIdentityScriptTests(unittest.TestCase):
         self.assertIn("UNPIN_MACOS_SIGNING_CERTIFICATE_P12", completed.stderr)
         self.assertFalse(security_log.exists())
 
+    def test_import_accepts_self_signed_identity_without_valid_only_filter(self) -> None:
+        _, environment, security_log = self._environment()
+        environment["FAKE_CODESIGN_IDENTITY_UNTRUSTED"] = "1"
+
+        completed = self._run_script(IMPORT_SCRIPT, environment)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        identity_calls = [
+            line.split()
+            for line in security_log.read_text(encoding="utf-8").splitlines()
+            if line.startswith("find-identity ")
+        ]
+        self.assertEqual(len(identity_calls), 1)
+        self.assertNotIn("-v", identity_calls[0])
+
     def test_identity_mismatch_removes_temporary_secrets(self) -> None:
         root, environment, security_log = self._environment()
         environment["FAKE_CODESIGN_IDENTITY"] = "0000000000000000000000000000000000000000"
@@ -80,11 +95,12 @@ class MacosSigningIdentityScriptTests(unittest.TestCase):
     def test_multiple_identities_are_rejected(self) -> None:
         root, environment, _ = self._environment()
         environment["FAKE_CODESIGN_MULTIPLE"] = "1"
+        environment["FAKE_CODESIGN_IDENTITY_UNTRUSTED"] = "1"
 
         completed = self._run_script(IMPORT_SCRIPT, environment)
 
         self.assertNotEqual(completed.returncode, 0)
-        self.assertIn("exactly one valid identity", completed.stderr)
+        self.assertIn("exactly one identity", completed.stderr)
         self.assertFalse((root / "unpin-release-signing.keychain-db").exists())
         self.assertFalse((root / "unpin-release-signing.p12").exists())
 
@@ -203,13 +219,34 @@ class MacosSigningIdentityScriptTests(unittest.TestCase):
                     : > "$1"
                     ;;
                   find-identity)
-                    printf '  1) %s "%s"\\n' "$FAKE_CODESIGN_IDENTITY" "${FAKE_CODESIGN_DISPLAY_NAME:-CodeBurn Update Signing}"
+                    valid_only=0
+                    for argument in "$@"; do
+                      if [ "$argument" = -v ]; then
+                        valid_only=1
+                      fi
+                    done
+                    identity_count=1
                     if [ "${FAKE_CODESIGN_MULTIPLE:-0}" = 1 ]; then
-                      printf '  2) 1111111111111111111111111111111111111111 "Second Identity"\\n'
-                      printf '     2 valid identities found\\n'
-                    else
-                      printf '     1 valid identities found\\n'
+                      identity_count=2
                     fi
+                    if [ "$valid_only" = 0 ]; then
+                      printf '\\nPolicy: Code Signing\\n  Matching identities\\n'
+                      printf '  1) %s "%s"\\n' "$FAKE_CODESIGN_IDENTITY" "${FAKE_CODESIGN_DISPLAY_NAME:-CodeBurn Update Signing}"
+                      if [ "$identity_count" = 2 ]; then
+                        printf '  2) 1111111111111111111111111111111111111111 "Second Identity"\\n'
+                      fi
+                      printf '     %s identities found\\n\\n  Valid identities only\\n' "$identity_count"
+                    fi
+                    if [ "${FAKE_CODESIGN_IDENTITY_UNTRUSTED:-0}" != 1 ]; then
+                      printf '  1) %s "%s"\\n' "$FAKE_CODESIGN_IDENTITY" "${FAKE_CODESIGN_DISPLAY_NAME:-CodeBurn Update Signing}"
+                      if [ "$identity_count" = 2 ]; then
+                        printf '  2) 1111111111111111111111111111111111111111 "Second Identity"\\n'
+                      fi
+                      valid_identity_count="$identity_count"
+                    else
+                      valid_identity_count=0
+                    fi
+                    printf '     %s valid identities found\\n' "$valid_identity_count"
                     ;;
                   import)
                     if [ "${FAKE_SECURITY_IMPORT_FAIL:-0}" = 1 ]; then
