@@ -94,7 +94,11 @@ class SignMacosArtifactTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertTrue(
             any(
-                "--extract-certificates" in command
+                "--display" in command
+                and any(
+                    argument.startswith("--extract-certificates=")
+                    for argument in command
+                )
                 for command in self._read_log(log)
             )
         )
@@ -137,25 +141,44 @@ class SignMacosArtifactTests(unittest.TestCase):
                 import sys
 
                 arguments = sys.argv[1:]
+                expected_artifact = os.environ["FAKE_CODESIGN_ARTIFACT"]
                 log = pathlib.Path(os.environ["FAKE_CODESIGN_LOG"])
                 with log.open("a", encoding="utf-8") as handle:
                     handle.write(json.dumps(arguments) + "\\n")
 
                 state = pathlib.Path(os.environ["FAKE_CODESIGN_STATE"])
                 if "--force" in arguments:
+                    if arguments[-1] != expected_artifact:
+                        sys.exit(2)
                     identifier = arguments[arguments.index("--identifier") + 1]
                     state.write_text(
                         json.dumps({"identifier": identifier}),
                         encoding="utf-8",
                     )
-                elif "--extract-certificates" in arguments:
+                elif "--verify" in arguments:
+                    if arguments[-1] != expected_artifact:
+                        sys.exit(2)
+                elif "--display" in arguments and any(
+                    argument.startswith("--extract-certificates=")
+                    for argument in arguments
+                ):
+                    if arguments[-1] != expected_artifact:
+                        sys.exit(2)
                     prefix = pathlib.Path(
-                        arguments[arguments.index("--extract-certificates") + 1]
+                        next(
+                            argument.partition("=")[2]
+                            for argument in arguments
+                            if argument.startswith("--extract-certificates=")
+                        )
                     )
                     prefix.with_name(f"{prefix.name}0").write_bytes(
                         b"synthetic certificate"
                     )
+                elif "--extract-certificates" in arguments:
+                    sys.exit(2)
                 elif "--display" in arguments:
+                    if arguments[-1] != expected_artifact:
+                        sys.exit(2)
                     identifier = os.environ.get("FAKE_CODESIGN_IDENTIFIER")
                     if identifier is None:
                         identifier = json.loads(
@@ -164,6 +187,8 @@ class SignMacosArtifactTests(unittest.TestCase):
                     signature = os.environ.get("FAKE_CODESIGN_SIGNATURE", "signed")
                     print(f"Identifier={identifier}", file=sys.stderr)
                     print(f"Signature={signature}", file=sys.stderr)
+                else:
+                    sys.exit(2)
                 """
             ),
             encoding="utf-8",
@@ -182,6 +207,7 @@ class SignMacosArtifactTests(unittest.TestCase):
         )
         environment["FAKE_CODESIGN_LOG"] = str(log)
         environment["FAKE_CODESIGN_STATE"] = str(state)
+        environment["FAKE_CODESIGN_ARTIFACT"] = str(artifact)
         for variable in (
             "UNPIN_CODESIGN_IDENTITY",
             "UNPIN_CODESIGN_TIMESTAMP_MODE",

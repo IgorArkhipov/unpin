@@ -72,7 +72,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
 
         self.assertIn("UNPIN_CODESIGN_EXPECTED_FINGERPRINT", signature_script)
-        self.assertIn("--extract-certificates", signature_script)
+        self.assertIn("--display --extract-certificates=", signature_script)
         self.assertIn("dev.unpin.workbench", desktop_script)
         self.assertIn("dev.unpin.workbench.bridge", desktop_script)
         self.assertIn("dev.unpin.cli", cli_script)
