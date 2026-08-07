@@ -70,7 +70,13 @@ if [[ -n "$expected_fingerprint" ]]; then
   certificate_root="$(mktemp -d)"
   trap 'rm -rf -- "$certificate_root"' EXIT
   certificate_prefix="$certificate_root/certificate"
-  if ! codesign --extract-certificates "$certificate_prefix" "$artifact" >/dev/null 2>&1; then
+  certificate_output=""
+  if ! certificate_output="$(
+    codesign --display --extract-certificates="$certificate_prefix" "$artifact" 2>&1
+  )"; then
+    if [[ -n "$certificate_output" ]]; then
+      printf '%s\n' "$certificate_output" >&2
+    fi
     echo "unable to extract the macOS signing certificate" >&2
     exit 1
   fi

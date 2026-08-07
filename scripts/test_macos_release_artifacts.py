@@ -71,17 +71,37 @@ class MacosReleaseArtifactTests(unittest.TestCase):
                     import sys
 
                     arguments = sys.argv[1:]
-                    if "--extract-certificates" in arguments:
-                        prefix = pathlib.Path(
-                            arguments[arguments.index("--extract-certificates") + 1]
-                        )
+                    expected_artifact_suffix = os.environ[
+                        "FAKE_CODESIGN_ARTIFACT_SUFFIX"
+                    ]
+                    certificate_prefix = next(
+                        (
+                            argument.partition("=")[2]
+                            for argument in arguments
+                            if argument.startswith("--extract-certificates=")
+                        ),
+                        None,
+                    )
+                    if "--verify" in arguments:
+                        if not arguments[-1].endswith(expected_artifact_suffix):
+                            sys.exit(2)
+                    elif certificate_prefix is not None and "--display" in arguments:
+                        if not arguments[-1].endswith(expected_artifact_suffix):
+                            sys.exit(2)
+                        prefix = pathlib.Path(certificate_prefix)
                         prefix.with_name(f"{prefix.name}0").write_bytes(b"certificate")
+                    elif "--extract-certificates" in arguments:
+                        sys.exit(2)
                     elif "--display" in arguments:
+                        if not arguments[-1].endswith(expected_artifact_suffix):
+                            sys.exit(2)
                         print("Identifier=dev.unpin.cli", file=sys.stderr)
                         print(
                             f"Signature={os.environ.get('FAKE_CODESIGN_SIGNATURE', 'signed')}",
                             file=sys.stderr,
                         )
+                    else:
+                        sys.exit(2)
                     """
                 ),
             )
@@ -99,6 +119,7 @@ class MacosReleaseArtifactTests(unittest.TestCase):
                     "UNPIN_CODESIGN_IDENTITY": FINGERPRINT,
                     "UNPIN_CODESIGN_EXPECTED_FINGERPRINT": FINGERPRINT,
                     "UNPIN_REQUIRE_STABLE_CODESIGN": "1",
+                    "FAKE_CODESIGN_ARTIFACT_SUFFIX": f"{release_name}/unpin",
                     "FAKE_CODESIGN_FINGERPRINT": FINGERPRINT,
                 }
             )
