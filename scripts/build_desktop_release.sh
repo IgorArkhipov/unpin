@@ -69,14 +69,18 @@ if [[ "$(lipo -archs "$bridge_binary")" != "$xcode_architecture" ]]; then
   exit 1
 fi
 
-# Desktop artifacts are intentionally ad-hoc signed. The absent timestamp makes the
-# signing step reproducible, while Hardened Runtime keeps the bundle compatible
-# with a future Developer ID/notarization release process.
-codesign --force --sign - --timestamp=none --options runtime "$bridge_binary" >&2
+# Sign the Keychain-accessing bridge before recording its digest, then sign the
+# outer app last. Defaults remain reproducible ad-hoc signatures; release owners
+# can select a stable identity through the UNPIN_CODESIGN_* environment.
+"$repository_root/scripts/sign_macos_artifact.sh" \
+  dev.unpin.workbench.bridge \
+  "$bridge_binary" >&2
 bridge_digest="$(shasum -a 256 "$bridge_binary" | awk '{print $1}')"
 printf '{"bridgeProtocolVersion":2,"unpinVersion":"%s","sha256":"%s"}\n' \
   "$release_version" "$bridge_digest" > "$manifest"
-codesign --force --sign - --timestamp=none --options runtime "$app" >&2
+"$repository_root/scripts/sign_macos_artifact.sh" \
+  dev.unpin.workbench \
+  "$app" >&2
 codesign --verify --deep --strict --verbose=2 "$app" >&2
 
 archive="$(python3 "$repository_root/scripts/package_desktop_release.py" \
