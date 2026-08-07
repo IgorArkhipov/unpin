@@ -17,19 +17,27 @@ for Apple Silicon and Intel macOS. Each archive has a CycloneDX SBOM
 attestation and is covered by `SHA256SUMS`. The GNU/Linux CLI is built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12.
 
-The `1.0.0` desktop archives are ad-hoc signed with Hardened Runtime, but
-they are not Developer ID signed or Apple-notarized. macOS can therefore show
-an unidentified-developer Gatekeeper warning. This is an explicit
-maintainer-approved GA exception, not a trusted-distribution claim. See the desktop installation
-instructions below before opening the app. crates.io and package-manager
-distribution are deferred.
+The `1.0.0` and `1.0.1` desktop archives are ad-hoc signed. Starting with
+`1.0.2`, official macOS CLI and desktop archives use one stable self-signed
+personal certificate so Keychain authorization can remain valid across updates
+signed by that same certificate and identifiers. Moving from `1.0.1` or earlier
+changes the designated requirement once from the old ad-hoc signature, so the
+first `1.0.2` launch may prompt for Keychain access again; later same-certificate
+updates retain the approved **Always Allow** grants. A future certificate
+rotation resets that requirement and prompts once again. The artifacts are still
+not Developer ID signed or Apple-notarized, so macOS can show an
+unidentified-developer Gatekeeper warning. This is an explicit maintainer-
+approved GA exception, not a trusted-distribution claim. The personal
+certificate is used with timestamp mode `none`; secure timestamping is not
+claimed for it. See the desktop installation instructions below before opening
+the app. crates.io and package-manager distribution are deferred.
 
 After publication, download the archive for your platform from
 [GitHub Releases](https://github.com/IgorArkhipov/unpin/releases), verify it
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v1.0.0-TARGET.tar.gz \
+gh attestation verify unpin-v1.0.2-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -37,7 +45,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v1.0.0-TARGET
+cd unpin-v1.0.2-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"
@@ -96,9 +104,9 @@ archive against `SHA256SUMS` and its GitHub attestation before extracting it:
 
 ```bash
 gh attestation verify \
-  unpin-desktop-v1.0.0-TARGET.tar.gz \
+  unpin-desktop-v1.0.2-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
-tar -xzf unpin-desktop-v1.0.0-TARGET.tar.gz
+tar -xzf unpin-desktop-v1.0.2-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder

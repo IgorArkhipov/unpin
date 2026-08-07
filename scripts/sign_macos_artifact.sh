@@ -55,29 +55,7 @@ codesign \
   "$timestamp_argument" \
   --options runtime \
   "$artifact" >&2
-codesign --verify --strict --verbose=2 "$artifact" >&2
-
-signature_details="$(codesign --display --verbose=4 "$artifact" 2>&1)"
-reported_identifier=""
-while IFS= read -r detail; do
-  case "$detail" in
-    Identifier=*)
-      reported_identifier="${detail#Identifier=}"
-      break
-      ;;
-  esac
-done <<< "$signature_details"
-
-if [[ "$reported_identifier" != "$signing_identifier" ]]; then
-  echo "macOS signature identifier mismatch: expected $signing_identifier, got ${reported_identifier:-<missing>}" >&2
-  exit 1
-fi
-
-if [[ "$require_stable_signing" == "1" ]]; then
-  while IFS= read -r detail; do
-    if [[ "$detail" == "Signature=adhoc" ]]; then
-      echo "stable macOS signing was required, but codesign produced an ad-hoc signature" >&2
-      exit 1
-    fi
-  done <<< "$signature_details"
-fi
+repository_root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
+"$repository_root/scripts/verify_macos_artifact_signature.sh" \
+  "$signing_identifier" \
+  "$artifact" >&2

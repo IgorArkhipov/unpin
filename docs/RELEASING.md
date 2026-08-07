@@ -27,14 +27,18 @@ manifest-approved provider-matrix evidence bundle.
 macOS archives default to reproducible ad-hoc signing with Hardened Runtime and
 no timestamp. A maintainer can instead select a stable certificate for both
 desktop and CLI archives. A self-signed certificate preserves the designated
-requirement that Keychain uses across updates, but it is not Developer ID
-signing or notarization and must never be described as Gatekeeper-trusted. A
+requirement that Keychain uses across later updates signed with that same
+certificate and identifiers, but it is not Developer ID signing or notarization
+and must never be described as Gatekeeper-trusted. A
 stable release may include it only when the maintainer explicitly approves the
 unsigned-GA exception, release-facing documentation explains Gatekeeper's
 manual first-launch requirement, and the downloaded archive passes checksum,
 attestation, signature, bridge-handshake, and installed-artifact verification.
 Developer ID signing and notarization remain future distribution hardening
 rather than a blocker under the explicit exception.
+
+The v1.0.2 tag workflow opts into the stable certificate and fails closed if it
+is unavailable or does not match the expected fingerprint.
 
 ### macOS signing modes
 
@@ -50,18 +54,72 @@ UNPIN_REQUIRE_STABLE_CODESIGN=1 \
 scripts/build_desktop_release.sh TARGET VERSION OUTPUT_DIRECTORY
 ```
 
-Use `UNPIN_CODESIGN_TIMESTAMP_MODE=secure` for a Developer ID certificate that
-can reach Apple's timestamp service. The builders verify the resulting
-signature and exact identifiers: `dev.unpin.workbench` for the app,
+The v1.0.2 workflow uses `UNPIN_CODESIGN_TIMESTAMP_MODE=none` for its personal
+self-signed certificate; do not claim secure timestamping for that certificate
+without separate verification. Use `UNPIN_CODESIGN_TIMESTAMP_MODE=secure` only
+for a Developer ID certificate after confirming that it can reach Apple's
+timestamp service. The builders verify the resulting signature and exact
+identifiers: `dev.unpin.workbench` for the app,
 `dev.unpin.workbench.bridge` for its bundled credential broker, and
 `dev.unpin.cli` for the standalone CLI. The bridge and CLI may each require one
-new Keychain authorization after switching from ad-hoc signing; later builds
-signed by the same certificate and identifier retain the same designated
-requirement.
+new Keychain authorization after switching from ad-hoc signing. In particular,
+the first update from `1.0.1` or earlier can prompt because its designated
+requirement changes once; later builds signed by the same certificate and
+identifier retain that requirement and their **Always Allow** grants.
 
-The GitHub release workflow remains ad-hoc until a maintainer separately
-authorizes secure export of a release signing identity and configures the
-corresponding repository secrets. Never commit or upload a signing private key.
+The GitHub release workflow runs the macOS signing jobs in the protected
+`release-signing` Environment. Its
+`UNPIN_MACOS_SIGNING_CERTIFICATE_P12` and
+`UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD` environment secrets are available
+only after the Environment's required approval. The workflow imports the P12
+into an ephemeral runner Keychain, verifies the exact configured SHA-1 identity,
+and removes the temporary Keychain and P12 after packaging. Never commit, log,
+or expose the signing private key; the protected environment is the only
+approved storage used by release automation. This personal certificate remains
+non-Developer-ID and non-notarized, so it does not establish Gatekeeper trust.
+
+### Certificate expiry and rotation
+
+Inspect the installed certificate before each release and set a reminder well
+before its `notAfter` date (30 days is a useful minimum):
+
+```bash
+security find-certificate -a -p -c "CodeBurn Update Signing" \
+  | openssl x509 -noout -subject -fingerprint -sha1 -dates
+```
+
+Use the `notAfter` value as the expiry date and compare the SHA-1 fingerprint
+with the release workflow. If the P12 exists only in the protected environment,
+inspect it through a temporary, local Keychain and delete that Keychain after
+reading the certificate; never copy the P12 or password into the repository or
+logs.
+
+Before expiry, or immediately if compromise is suspected, rotate all of the
+following as one reviewed change:
+
+1. Create a replacement certificate and password-protected P12, then update
+   `UNPIN_MACOS_SIGNING_CERTIFICATE_P12` and
+   `UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD` in the protected
+   `release-signing` Environment. Keep required approval enabled.
+2. Update the SHA-1 fingerprint in `.github/workflows/release.yml`
+   (`UNPIN_CODESIGN_IDENTITY`),
+   `scripts/test_macos_signing_identity_scripts.py` (`EXPECTED_IDENTITY`),
+   and the versioned release notes (`docs/releases/vVERSION.md`, plus the
+   matching `CHANGELOG.md` entry when applicable).
+3. Keep timestamp mode `none` for this personal self-signed certificate; do not
+   describe it as secure-timestamped or Gatekeeper-trusted.
+4. Run the signing helper and release-tooling tests, then the approved
+   delivery-only or provider-matrix gates. Tag only after the merged commit is
+   verified, and complete the post-tag artifact fingerprint and exact-identifier
+   checks before publication.
+5. Tell users that certificate rotation resets the designated requirement even
+   when bundle identifiers do not change. The first launch of the rotated
+   release therefore requires new Keychain approval; old **Always Allow** grants
+   do not carry over.
+
+Do not wait for the expiry date to discover a stale fingerprint or secret: the
+workflow must fail closed if the imported identity does not match the expected
+fingerprint, and a rotation needs a fresh artifact verification cycle.
 
 ## Prepare release commit
 
@@ -103,6 +161,13 @@ pass from the exact release commit. That job builds the release binary on
 Ubuntu 22.04, verifies that its highest required GNU libc symbol is no newer
 than `GLIBC_2.35`, and runs `--version` and `--help` in Debian 12. The tag
 workflow repeats that artifact check before attestation and draft creation.
+
+The exception does not waive post-tag macOS identity proof. After the tag,
+inspect every CLI and desktop artifact's signature, expected certificate SHA-1
+fingerprint, and exact identifiers (`dev.unpin.workbench`,
+`dev.unpin.workbench.bridge`, and `dev.unpin.cli`) before publication. Delivery
+scope replaces provider-matrix/live-host execution; it does not replace this
+artifact-level signing evidence.
 
 Do not run `scripts/prepare_release_evidence.py` for this exception: it is the
 provider-matrix path and replaces the draft's generated checksum manifest with
@@ -247,8 +312,9 @@ After publication:
    ```
 
    Confirm the app and bundled bridge architectures match the target, the
-   bridge digest and version match the manifest, the ad-hoc Hardened Runtime
-   signature verifies, and the isolated stdio handshake passes.
+   bridge digest and version match the manifest, the Hardened Runtime signature
+   verifies with the expected certificate fingerprint and exact identifiers,
+   and the isolated stdio handshake passes.
 5. Confirm the release notes link to the Gatekeeper, manual update, and
    uninstall guidance in `docs/DESKTOP.md`.
 6. Confirm the GitHub release is immutable.

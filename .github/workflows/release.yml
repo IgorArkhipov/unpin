@@ -19,10 +19,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
-            target: aarch64-apple-darwin
-          - runner: macos-15-intel
-            target: x86_64-apple-darwin
           - runner: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
     runs-on: ${{ matrix.runner }}
@@ -124,8 +120,141 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build-macos:
+    name: Build macOS CLI ${{ matrix.target }}
+    environment: release-signing
+    env:
+      UNPIN_CODESIGN_IDENTITY: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
+      UNPIN_CODESIGN_EXPECTED_FINGERPRINT: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
+      UNPIN_CODESIGN_TIMESTAMP_MODE: none
+      UNPIN_REQUIRE_STABLE_CODESIGN: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: aarch64-apple-darwin
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Verify tag matches package version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_version="${GITHUB_REF_NAME#v}"
+          package_version="$(
+            cargo metadata --no-deps --format-version 1 \
+              | jq -r '.packages[] | select(.name == "unpin-cli") | .version'
+          )"
+          test "v${release_version}" = "${GITHUB_REF_NAME}"
+          test "${release_version}" = "${package_version}"
+          printf 'value=%s\n' "${release_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli
+
+      - name: Install SBOM generator
+        uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
+        with:
+          tool: cargo-cyclonedx@0.5.9
+
+      - name: Generate target SBOM
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo cyclonedx \
+            --manifest-path crates/unpin-cli/Cargo.toml \
+            --format json \
+            --describe binaries \
+            --all-features \
+            --target "${{ matrix.target }}" \
+            --target-in-filename \
+            --spec-version 1.5
+
+      - name: Import stable macOS signing identity
+        env:
+          UNPIN_MACOS_SIGNING_CERTIFICATE_P12: ${{ secrets.UNPIN_MACOS_SIGNING_CERTIFICATE_P12 }}
+          UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: scripts/import_macos_signing_identity.sh
+
+      - name: Package signed release
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          archive="$(
+            scripts/package_release.sh \
+              "${{ matrix.target }}" \
+              "${{ steps.version.outputs.value }}" \
+              dist
+          )"
+          sbom="crates/unpin-cli/unpin_bin_${{ matrix.target }}.cdx.json"
+          test -f "${sbom}"
+          sbom_output="dist/unpin-v${{ steps.version.outputs.value }}-${{ matrix.target }}.cdx.json"
+          mv "${sbom}" "${sbom_output}"
+          printf 'archive=%s\n' "${archive}" >> "${GITHUB_OUTPUT}"
+          printf 'sbom=%s\n' "${sbom_output}" >> "${GITHUB_OUTPUT}"
+
+      - name: Remove stable macOS signing identity
+        if: always()
+        run: scripts/cleanup_macos_signing_identity.sh
+
+      - name: Verify signed macOS CLI artifact
+        if: success()
+        shell: bash
+        run: |
+          scripts/verify_macos_release_artifact.sh \
+            "${{ steps.package.outputs.archive }}" \
+            "${{ matrix.target }}" \
+            "${{ steps.version.outputs.value }}"
+
+      - name: Attest build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+
+      - name: Attest archive SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: ${{ steps.package.outputs.archive }}
+          sbom-path: ${{ steps.package.outputs.sbom }}
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
   desktop:
     name: Build desktop ${{ matrix.target }}
+    environment: release-signing
+    env:
+      UNPIN_CODESIGN_IDENTITY: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
+      UNPIN_CODESIGN_EXPECTED_FINGERPRINT: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
+      UNPIN_CODESIGN_TIMESTAMP_MODE: none
+      UNPIN_REQUIRE_STABLE_CODESIGN: "1"
     strategy:
       fail-fast: false
       matrix:
@@ -176,16 +305,40 @@ jobs:
           test "${release_version}" = "${desktop_version}"
           printf 'value=%s\n' "${release_version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Build, sign, and package desktop workbench
-        id: package
+      - name: Build unsigned desktop workbench
+        id: build
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          export SOURCE_DATE_EPOCH
           SOURCE_DATE_EPOCH="$(git show -s --format=%ct "${GITHUB_SHA}")"
-          archive="$(
+          export SOURCE_DATE_EPOCH
+          staged_app="$(
             scripts/build_desktop_release.sh \
+              "${{ matrix.target }}" \
+              "${{ steps.version.outputs.value }}" \
+              dist \
+              build-only
+          )"
+          if [[ -z "${staged_app}" || "${staged_app}" == *$'\n'* || "${staged_app}" == *$'\r'* || ! -d "${staged_app}" || -L "${staged_app}" ]]; then
+            echo "unsigned desktop builder must print one existing app bundle path" >&2
+            exit 1
+          fi
+          printf 'app=%s\n' "${staged_app}" >> "${GITHUB_OUTPUT}"
+
+      - name: Import stable macOS signing identity
+        env:
+          UNPIN_MACOS_SIGNING_CERTIFICATE_P12: ${{ secrets.UNPIN_MACOS_SIGNING_CERTIFICATE_P12 }}
+          UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD: ${{ secrets.UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD }}
+        run: scripts/import_macos_signing_identity.sh
+
+      - name: Sign and package desktop workbench
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="$(
+            scripts/sign_desktop_release.sh \
               "${{ matrix.target }}" \
               "${{ steps.version.outputs.value }}" \
               dist
@@ -194,11 +347,20 @@ jobs:
             echo "desktop release builder must print one existing archive path" >&2
             exit 1
           fi
+          printf 'archive=%s\n' "${archive}" >> "${GITHUB_OUTPUT}"
+
+      - name: Remove stable macOS signing identity
+        if: always()
+        run: scripts/cleanup_macos_signing_identity.sh
+
+      - name: Verify signed desktop artifact
+        if: success()
+        shell: bash
+        run: |
           scripts/verify_desktop_release_artifact.sh \
-            "${archive}" \
+            "${{ steps.package.outputs.archive }}" \
             "${{ matrix.target }}" \
             "${{ steps.version.outputs.value }}"
-          printf 'archive=%s\n' "${archive}" >> "${GITHUB_OUTPUT}"
 
       - name: Install SBOM generator
         uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
@@ -251,7 +413,7 @@ jobs:
 
   draft:
     name: Create draft release
-    needs: [build, desktop]
+    needs: [build, build-macos, desktop]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
