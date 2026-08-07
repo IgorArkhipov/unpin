@@ -120,10 +120,21 @@ security set-key-partition-list \
   "$signing_keychain" >/dev/null
 security list-keychains -d user -s "$signing_keychain"
 
-identity_output="$(security find-identity -v -p codesigning "$signing_keychain")"
+identity_output="$(security find-identity -p codesigning "$signing_keychain")"
 if ! identity_hash="$(
   awk '
-    /^[[:space:]]*[0-9]+\)[[:space:]]+/ {
+    BEGIN {
+      in_matching_section = 1
+    }
+    /^[[:space:]]*Matching identities[[:space:]]*$/ {
+      in_matching_section = 1
+      next
+    }
+    /^[[:space:]]*Valid identities only[[:space:]]*$/ {
+      in_matching_section = 0
+      next
+    }
+    in_matching_section && /^[[:space:]]*[0-9]+\)[[:space:]]+/ {
       if (NF < 2 || length($2) != 40 || $2 !~ /^[[:xdigit:]]+$/) {
         invalid = 1
         next
@@ -131,7 +142,7 @@ if ! identity_hash="$(
       count++
       hash = $2
     }
-    /^[[:space:]]*[0-9]+[[:space:]]+valid identities found[[:space:]]*$/ {
+    in_matching_section && /^[[:space:]]*[0-9]+[[:space:]]+identities found[[:space:]]*$/ {
       summary_count = $1
     }
     END {
@@ -142,7 +153,7 @@ if ! identity_hash="$(
     }
   ' <<< "$identity_output"
 )"; then
-  echo "temporary signing Keychain must contain exactly one valid identity with a parseable SHA-1" >&2
+  echo "temporary signing Keychain must contain exactly one identity with a parseable SHA-1" >&2
   exit 1
 fi
 if [[ "$identity_hash" != "$UNPIN_CODESIGN_IDENTITY" ]]; then
