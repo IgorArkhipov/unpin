@@ -80,6 +80,38 @@ class SignMacosArtifactTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("produced an ad-hoc signature", completed.stderr)
 
+    def test_expected_certificate_fingerprint_is_verified(self) -> None:
+        fingerprint = "E2AB4267F6B79DF40B8776A2EE9309F64CFD2389"
+        completed, log = self._run(
+            {
+                "UNPIN_CODESIGN_IDENTITY": fingerprint,
+                "UNPIN_CODESIGN_EXPECTED_FINGERPRINT": fingerprint.lower(),
+                "UNPIN_REQUIRE_STABLE_CODESIGN": "1",
+                "FAKE_CODESIGN_FINGERPRINT": fingerprint,
+            }
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(
+            any(
+                "--extract-certificates" in command
+                for command in self._read_log(log)
+            )
+        )
+
+    def test_mismatched_certificate_fingerprint_is_rejected(self) -> None:
+        fingerprint = "E2AB4267F6B79DF40B8776A2EE9309F64CFD2389"
+        completed, _ = self._run(
+            {
+                "UNPIN_CODESIGN_IDENTITY": fingerprint,
+                "UNPIN_CODESIGN_EXPECTED_FINGERPRINT": fingerprint,
+                "FAKE_CODESIGN_FINGERPRINT": "0000000000000000000000000000000000000000",
+            }
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("fingerprint mismatch", completed.stderr)
+
     def _run(
         self, environment_overrides: dict[str, str] | None = None
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
@@ -116,6 +148,13 @@ class SignMacosArtifactTests(unittest.TestCase):
                         json.dumps({"identifier": identifier}),
                         encoding="utf-8",
                     )
+                elif "--extract-certificates" in arguments:
+                    prefix = pathlib.Path(
+                        arguments[arguments.index("--extract-certificates") + 1]
+                    )
+                    prefix.with_name(f"{prefix.name}0").write_bytes(
+                        b"synthetic certificate"
+                    )
                 elif "--display" in arguments:
                     identifier = os.environ.get("FAKE_CODESIGN_IDENTIFIER")
                     if identifier is None:
@@ -130,6 +169,12 @@ class SignMacosArtifactTests(unittest.TestCase):
             encoding="utf-8",
         )
         fake_codesign.chmod(0o755)
+        fake_openssl = command_bin / "openssl"
+        fake_openssl.write_text(
+            "#!/bin/sh\nprintf 'sha1 Fingerprint=%s\\n' \"${FAKE_CODESIGN_FINGERPRINT:-E2AB4267F6B79DF40B8776A2EE9309F64CFD2389}\"\n",
+            encoding="utf-8",
+        )
+        fake_openssl.chmod(0o755)
 
         environment = os.environ.copy()
         environment["PATH"] = os.pathsep.join(
@@ -141,8 +186,10 @@ class SignMacosArtifactTests(unittest.TestCase):
             "UNPIN_CODESIGN_IDENTITY",
             "UNPIN_CODESIGN_TIMESTAMP_MODE",
             "UNPIN_REQUIRE_STABLE_CODESIGN",
+            "UNPIN_CODESIGN_EXPECTED_FINGERPRINT",
             "FAKE_CODESIGN_IDENTIFIER",
             "FAKE_CODESIGN_SIGNATURE",
+            "FAKE_CODESIGN_FINGERPRINT",
         ):
             environment.pop(variable, None)
         environment.update(environment_overrides or {})

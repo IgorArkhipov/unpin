@@ -1,6 +1,6 @@
 # Unpin desktop workbench
 
-Unpin `1.0.0` is the first stable macOS desktop release. It ships as
+Unpin `1.0.0` introduced the stable macOS desktop release. It ships as
 separate native archives for Apple Silicon and Intel Macs. The app supervises
 the bundled `unpin` executable over stdio; SwiftUI does not write provider
 configuration or receive Unpin's secret keys.
@@ -15,7 +15,7 @@ directory, then verify the selected archive's GitHub build provenance:
 ```bash
 shasum -a 256 -c SHA256SUMS
 gh attestation verify \
-  unpin-desktop-v1.0.0-TARGET.tar.gz \
+  unpin-desktop-v1.0.2-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -27,14 +27,24 @@ Extract the archive and move `UnpinDesktop.app` to `/Applications` or
 `~/Applications`:
 
 ```bash
-tar -xzf unpin-desktop-v1.0.0-TARGET.tar.gz
-open unpin-desktop-v1.0.0-TARGET
+tar -xzf unpin-desktop-v1.0.2-TARGET.tar.gz
+open unpin-desktop-v1.0.2-TARGET
 ```
 
-The release is ad-hoc signed with Hardened Runtime. It is not
-Developer ID signed or Apple-notarized, so ad-hoc signing does not establish
-Gatekeeper trust. On first launch, macOS can report that Apple cannot verify
-the developer.
+Starting with `1.0.2`, official releases use a stable self-signed personal
+certificate with Hardened Runtime so Keychain authorization can remain valid
+across updates. The certificate is not Developer ID signing or Apple
+notarization and does not establish Gatekeeper trust. On first launch, macOS can
+report that Apple cannot verify the developer.
+
+Replacing a `1.0.1`-or-earlier ad-hoc build is a one-time transition: the
+designated requirement changes, so the first `1.0.2` launch may ask for
+Keychain access again. Approve it only after the checksum and attestation above
+succeed. Later updates signed by this same certificate and the same app or
+bridge identifier retain the designated requirement and their **Always Allow**
+grants. A future certificate rotation changes that
+requirement again; follow the release notes and the [release runbook](RELEASING.md#certificate-expiry-and-rotation)
+when it happens.
 
 After the checksum and attestation pass, use Finder to Control-click
 `UnpinDesktop.app`, choose **Open**, and confirm **Open**. Alternatively, after
@@ -88,15 +98,17 @@ python3 scripts/run_desktop_guidance_matrix.py \
 
 ## Update
 
-Updates are manual in `1.0.0`:
+Updates are manual in the `1.0.x` series:
 
 1. Download the new architecture-matched desktop archive and its release
    checksum file.
 2. Verify the checksum and GitHub attestation.
-3. Quit Unpin Desktop.
-4. Replace the existing `UnpinDesktop.app` in `/Applications` or
+3. If this is the first `1.0.2` update from `1.0.1` or earlier, expect one new
+   Keychain authorization because the designated requirement changes.
+4. Quit Unpin Desktop.
+5. Replace the existing `UnpinDesktop.app` in `/Applications` or
    `~/Applications` with the newly extracted bundle.
-5. Open the replacement and confirm its version in the release details.
+6. Open the replacement and confirm its version in the release details.
 
 Do not copy a new `unpin` binary into the app bundle. The app verifies its
 bundled bridge against the signed release manifest and requires an exact
@@ -118,6 +130,8 @@ full reset, not part of uninstalling the app.
 - Release tooling supports a stable personal signature for Keychain continuity,
   but published artifacts are not Developer ID signed or Apple-notarized unless
   their release notes explicitly say otherwise.
+- The personal self-signed certificate is released with timestamp mode `none`;
+  secure timestamping is not claimed for it.
 - No automatic update mechanism; replacement is manual.
 - No Windows, Linux, or universal macOS desktop bundle.
 - Profiles, gateways, sessions, and hooks remain on CLI, TUI, and MCP surfaces.

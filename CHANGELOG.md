@@ -7,6 +7,44 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-08-06
+
+### Changed
+
+- Official macOS CLI and desktop archives now use the stable self-signed
+  `CodeBurn Update Signing` certificate, preserving each executable's
+  designated requirement across later updates signed with that certificate so
+  Keychain **Always Allow** grants can remain valid.
+- The release workflow reads the P12 and password from the protected
+  `release-signing` Environment after required approval, imports them into an
+  ephemeral runner Keychain, rejects a missing or mismatched identity instead of
+  falling back to ad-hoc signing, and removes the temporary Keychain and P12
+  after packaging.
+
+### Compatibility
+
+- CLI, terminal TUI, MCP, and desktop behavior are unchanged from `1.0.1`.
+- Updating from `1.0.1` or earlier changes the designated requirement once from
+  the old ad-hoc signature, so macOS may prompt for Keychain access again on the
+  first `1.0.2` launch. Grants made under the stable certificate persist across
+  later updates signed with that certificate and the same identifiers; a future
+  certificate rotation resets the requirement and those **Always Allow** grants.
+- The personal certificate is not Developer ID signing or notarization and does
+  not establish Gatekeeper trust. It uses timestamp mode `none`; secure
+  timestamping is not claimed for this personal self-signed certificate. The
+  documented checksum, attestation, and first-launch verification flow remains
+  required.
+
+### Verification
+
+- This delivery-only release uses the maintainer-approved artifact-evidence
+  exception: signing helper tests, all release-tooling tests, shell syntax,
+  Python compilation, workflow lint, locked metadata, version smoke, protected
+  release CI, GNU/Linux compatibility, and post-tag signature and fresh-download
+  checks replace provider-matrix and live-host reruns. The post-tag checks still
+  require the expected certificate fingerprint and exact app, bridge, and CLI
+  code-signing identifiers for every macOS artifact.
+
 ## [1.0.1] - 2026-08-06
 
 ### Added
@@ -333,7 +371,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.0.1...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.0.2...HEAD
+[1.0.2]: https://github.com/IgorArkhipov/unpin/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0-rc.1...v1.0.0
 [1.0.0-rc.1]: https://github.com/IgorArkhipov/unpin/compare/v0.6.2...v1.0.0-rc.1

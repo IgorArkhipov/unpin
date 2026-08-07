@@ -1,14 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "$#" -ne 3 ]]; then
-  echo "usage: scripts/build_desktop_release.sh TARGET VERSION OUTPUT_DIRECTORY" >&2
+if [[ "$#" -lt 3 || "$#" -gt 4 ]]; then
+  echo "usage: scripts/build_desktop_release.sh TARGET VERSION OUTPUT_DIRECTORY [build-only]" >&2
   exit 2
 fi
 
 release_target="$1"
 release_version="$2"
 release_output="$3"
+build_mode="${4:-full}"
+
+case "$build_mode" in
+  full | build-only) ;;
+  *)
+    echo "unsupported desktop release build mode: $build_mode" >&2
+    exit 2
+    ;;
+esac
 
 case "$release_target" in
   aarch64-apple-darwin) xcode_architecture="arm64" ;;
@@ -25,7 +34,11 @@ if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; the
 fi
 
 repository_root="$(git rev-parse --show-toplevel)"
-source_date_epoch="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct)}"
+if [[ -e "$release_output" && -L "$release_output" ]]; then
+  echo "desktop release output directory is an unsafe symlink: $release_output" >&2
+  exit 1
+fi
+mkdir -p "$release_output"
 build_root="$(mktemp -d)"
 if [[ -z "$build_root" || ! -d "$build_root" ]]; then
   echo "failed to create desktop release build directory" >&2
@@ -69,30 +82,25 @@ if [[ "$(lipo -archs "$bridge_binary")" != "$xcode_architecture" ]]; then
   exit 1
 fi
 
-# Sign the Keychain-accessing bridge before recording its digest, then sign the
-# outer app last. Defaults remain reproducible ad-hoc signatures; release owners
-# can select a stable identity through the UNPIN_CODESIGN_* environment.
-"$repository_root/scripts/sign_macos_artifact.sh" \
-  dev.unpin.workbench.bridge \
-  "$bridge_binary" >&2
-bridge_digest="$(shasum -a 256 "$bridge_binary" | awk '{print $1}')"
-printf '{"bridgeProtocolVersion":2,"unpinVersion":"%s","sha256":"%s"}\n' \
-  "$release_version" "$bridge_digest" > "$manifest"
-"$repository_root/scripts/sign_macos_artifact.sh" \
-  dev.unpin.workbench \
-  "$app" >&2
-codesign --verify --deep --strict --verbose=2 "$app" >&2
-
-archive="$(python3 "$repository_root/scripts/package_desktop_release.py" \
-  --app "$app" \
-  --target "$release_target" \
-  --version "$release_version" \
-  --output-directory "$release_output" \
-  --source-date-epoch "$source_date_epoch" \
-  --resource "$repository_root/README.md" \
-  --resource "$repository_root/LICENSE")"
-if [[ -z "$archive" || "$archive" == *$'\n'* || "$archive" == *$'\r'* || ! -f "$archive" || -L "$archive" ]]; then
-  echo "desktop release packager must print one existing archive path" >&2
+# Keep the unsigned Xcode output outside the temporary build root so a later,
+# isolated signing step can consume the exact same app bundle. The hidden path
+# is intentionally excluded by the workflow's dist/* upload glob.
+staging_root="$release_output/.unpin-desktop-v${release_version}-${release_target}"
+staged_app="$staging_root/UnpinDesktop.app"
+if [[ -e "$staging_root" || -L "$staging_root" ]]; then
+  echo "desktop release staging directory already exists or is unsafe: $staging_root" >&2
   exit 1
 fi
+mkdir -p "$staging_root"
+cp -R "$app" "$staged_app"
+
+if [[ "$build_mode" == "build-only" ]]; then
+  printf '%s\n' "$staged_app"
+  exit 0
+fi
+
+archive="$("$repository_root/scripts/sign_desktop_release.sh" \
+  "$release_target" \
+  "$release_version" \
+  "$release_output")"
 printf '%s\n' "$archive"

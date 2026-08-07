@@ -162,7 +162,12 @@ if [[ "$(lipo -archs "$bridge_binary")" != "$expected_architecture" ]]; then
   exit 1
 fi
 
-codesign --verify --deep --strict --verbose=2 "$app"
+"$repository_root/scripts/verify_macos_artifact_signature.sh" \
+  dev.unpin.workbench \
+  "$app"
+"$repository_root/scripts/verify_macos_artifact_signature.sh" \
+  dev.unpin.workbench.bridge \
+  "$bridge_binary"
 app_version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
 if [[ "$app_version" != "$release_version" ]]; then
   echo "desktop app version $app_version does not match $release_version" >&2

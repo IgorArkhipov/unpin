@@ -25,6 +25,69 @@ PROJECTION_VALIDATOR = (
 
 
 class DesktopReleaseScriptTests(unittest.TestCase):
+    def test_builder_build_only_does_not_invoke_codesign(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            command_bin = root / "bin"
+            command_bin.mkdir()
+            output_directory = root / "dist"
+            signing_marker = root / "codesign-invoked"
+
+            self._write_executable(
+                command_bin / "xcodebuild",
+                """#!/bin/sh
+set -eu
+derived_data=
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "-derivedDataPath" ]; then
+        derived_data="$2"
+        shift 2
+    else
+        shift
+    fi
+done
+app="$derived_data/Build/Products/Release/UnpinDesktop.app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+printf '%s' desktop > "$app/Contents/MacOS/UnpinDesktop"
+printf '%s' bridge > "$app/Contents/MacOS/unpin"
+: > "$app/Contents/Resources/unpin-bridge-manifest.json"
+""",
+            )
+            self._write_executable(
+                command_bin / "lipo",
+                """#!/bin/sh
+printf '%s\\n' arm64
+""",
+            )
+            self._write_executable(
+                command_bin / "codesign",
+                f"#!/bin/sh\nprintf '%s' invoked > '{signing_marker}'\nexit 99\n",
+            )
+
+            environment = os.environ.copy()
+            environment["PATH"] = os.pathsep.join(
+                [str(command_bin), environment.get("PATH", "")]
+            )
+            completed = subprocess.run(
+                [
+                    str(BUILD_SCRIPT),
+                    "aarch64-apple-darwin",
+                    "1.0.0",
+                    str(output_directory),
+                    "build-only",
+                ],
+                cwd=REPOSITORY_ROOT,
+                env=environment,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            staged_app = Path(completed.stdout.strip())
+            self.assertTrue(staged_app.is_dir(), completed.stdout)
+            self.assertFalse(signing_marker.exists())
+
     def test_builder_stdout_is_one_existing_archive_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -394,7 +457,23 @@ exit 0
                 command_bin / "lipo",
                 "#!/bin/sh\nprintf '%s\\n' arm64\n",
             )
-            self._write_executable(command_bin / "codesign", "#!/bin/sh\nexit 0\n")
+            self._write_executable(
+                command_bin / "codesign",
+                """#!/bin/sh
+set -eu
+if [ "${1:-}" = "--display" ]; then
+    artifact=""
+    for argument in "$@"; do artifact="$argument"; done
+    case "$artifact" in
+        *.app) identifier=dev.unpin.workbench ;;
+        *) identifier=dev.unpin.workbench.bridge ;;
+    esac
+    printf 'Identifier=%s\\n' "$identifier" >&2
+    printf 'Signature=signed\\n' >&2
+fi
+exit 0
+""",
+            )
             self._write_executable(
                 command_bin / "plutil",
                 f"#!/bin/sh\nprintf '%s\\n' '{version}'\n",
@@ -472,7 +551,23 @@ exit 0
                 command_bin / "lipo",
                 "#!/bin/sh\nprintf '%s\\n' arm64\n",
             )
-            self._write_executable(command_bin / "codesign", "#!/bin/sh\nexit 0\n")
+            self._write_executable(
+                command_bin / "codesign",
+                """#!/bin/sh
+set -eu
+if [ "${1:-}" = "--display" ]; then
+    artifact=""
+    for argument in "$@"; do artifact="$argument"; done
+    case "$artifact" in
+        *.app) identifier=dev.unpin.workbench ;;
+        *) identifier=dev.unpin.workbench.bridge ;;
+    esac
+    printf 'Identifier=%s\\n' "$identifier" >&2
+    printf 'Signature=signed\\n' >&2
+fi
+exit 0
+""",
+            )
             self._write_executable(
                 command_bin / "plutil",
                 f"#!/bin/sh\nprintf '%s\\n' '{version}'\n",
