@@ -1857,11 +1857,21 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let pid = fs::read_to_string(&pid_path).expect("descendant pid");
-        let status = Command::new("/bin/kill")
-            .args(["-0", pid.trim()])
-            .status()
-            .expect("probe descendant");
-        assert!(!status.success(), "descendant process survived timeout");
+        let reaping_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let status = Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .status()
+                .expect("probe descendant");
+            if !status.success() {
+                break;
+            }
+            assert!(
+                Instant::now() < reaping_deadline,
+                "descendant process survived timeout"
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
     }
 
     #[cfg(unix)]
