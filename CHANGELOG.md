@@ -7,15 +7,28 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-08-07
+
 ### Added
 
 - Added `unpin update check` and confirmation-gated `unpin update apply` for verified stable CLI and macOS desktop releases.
 - Added automatic desktop update checks at launch and an on-demand **Check for Updates…** application-menu flow with confirmed install and relaunch.
+- Added `run_local_provider_matrix.py --capture-screenshots`, enabled by
+  default on macOS, to capture the native provider-matrix dashboard with a
+  documented manual fallback on other platforms.
 
 ### Security
 
 - Update downloads are HTTPS-host restricted and bounded, archives are checksum-verified and traversal-safe, and candidates must report the expected version before atomic replacement.
 - macOS updates require exact release identifiers and byte-for-byte equality with the installed designated requirements for the standalone CLI, desktop app, and bundled bridge. Certificate or identifier rotation is rejected so existing Keychain **Always Allow** grants are preserved across normal updates.
+
+### Compatibility
+
+- `v1.0.2` does not contain the updater, so moving to `v1.1.0` is a final manual
+  installation. Because both releases use the same certificate and identifiers,
+  that replacement preserves the designated requirements and existing Keychain
+  **Always Allow** grants. Later compatible releases can use the built-in update
+  flow.
 
 ## [1.0.2] - 2026-08-06
 
@@ -381,7 +394,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.0.2...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/IgorArkhipov/unpin/compare/v1.0.2...v1.1.0
 [1.0.2]: https://github.com/IgorArkhipov/unpin/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0...v1.0.1
 [1.0.0]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0-rc.1...v1.0.0

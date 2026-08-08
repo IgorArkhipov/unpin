@@ -37,8 +37,8 @@ attestation, signature, bridge-handshake, and installed-artifact verification.
 Developer ID signing and notarization remain future distribution hardening
 rather than a blocker under the explicit exception.
 
-The v1.0.2 tag workflow opts into the stable certificate and fails closed if it
-is unavailable or does not match the expected fingerprint.
+The release workflow opts into the stable certificate and fails closed if it is
+unavailable or does not match the expected fingerprint.
 
 ### macOS signing modes
 
@@ -54,7 +54,7 @@ UNPIN_REQUIRE_STABLE_CODESIGN=1 \
 scripts/build_desktop_release.sh TARGET VERSION OUTPUT_DIRECTORY
 ```
 
-The v1.0.2 workflow uses `UNPIN_CODESIGN_TIMESTAMP_MODE=none` for its personal
+The release workflow uses `UNPIN_CODESIGN_TIMESTAMP_MODE=none` for its personal
 self-signed certificate; do not claim secure timestamping for that certificate
 without separate verification. Use `UNPIN_CODESIGN_TIMESTAMP_MODE=secure` only
 for a Developer ID certificate after confirming that it can reach Apple's
