@@ -34,6 +34,7 @@ const MAX_CHECKSUM_BYTES: u64 = 64 * 1024;
 const MAX_ARCHIVE_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_VERSION_OUTPUT_BYTES: usize = 4 * 1024;
 const CANDIDATE_COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(unix)]
 const CHILD_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 #[cfg(target_os = "macos")]
 const MAX_PLIST_OUTPUT_BYTES: usize = 4 * 1024;
@@ -778,7 +779,7 @@ struct BoundedProcessOutput {
     stderr: Vec<u8>,
 }
 
-#[cfg(any(target_os = "macos", test))]
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn bounded_output(
     command: &mut Command,
     maximum_bytes: usize,
@@ -1441,7 +1442,9 @@ impl UpdateWorkspace {
             getrandom::fill(&mut entropy).map_err(|error| error.to_string())?;
             let suffix = crate::encode_lower_hex(&entropy);
             let path = parent.join(format!(".unpin-update-{suffix}"));
-            let mut builder = fs::DirBuilder::new();
+            let builder = fs::DirBuilder::new();
+            #[cfg(unix)]
+            let mut builder = builder;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::DirBuilderExt as _;

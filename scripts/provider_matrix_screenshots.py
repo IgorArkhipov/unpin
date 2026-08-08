@@ -76,8 +76,9 @@ SCREENSHOT_SECTIONS = tuple(
 
 def preflight_provider_matrix_screenshot_capture(
     *,
-    platform: str = sys.platform,
+    platform: str | None = None,
 ) -> None:
+    platform = sys.platform if platform is None else platform
     if platform != "darwin":
         raise MatrixFailure(
             "native provider-matrix screenshot capture requires macOS; "
@@ -380,7 +381,7 @@ def capture_provider_matrix_screenshots(
     repo_root: Path,
     artifact_root: Path,
     *,
-    platform: str = sys.platform,
+    platform: str | None = None,
     runner=subprocess.run,
 ) -> list[Path]:
     preflight_provider_matrix_screenshot_capture(platform=platform)

@@ -133,6 +133,14 @@ class ArtifactRootTests(unittest.TestCase):
 
 @mock.patch.object(sys, "platform", "darwin")
 class ScreenshotCaptureArgumentTests(unittest.TestCase):
+    def test_capture_preflight_reads_platform_at_call_time(self) -> None:
+        with mock.patch.object(sys, "platform", "darwin"):
+            matrix_screenshots.preflight_provider_matrix_screenshot_capture()
+
+        with mock.patch.object(sys, "platform", "linux"):
+            with self.assertRaisesRegex(MatrixFailure, "requires macOS"):
+                matrix_screenshots.preflight_provider_matrix_screenshot_capture()
+
     def test_capture_screenshot_flag_is_explicitly_selectable(self) -> None:
         with mock.patch(
             "sys.argv",
