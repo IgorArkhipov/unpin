@@ -15,6 +15,7 @@ import plistlib
 import signal
 import shutil
 import subprocess
+import sys
 import tempfile
 from collections.abc import Iterator
 from pathlib import Path
@@ -414,11 +415,29 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument(
+        "--capture-screenshots",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Capture dashboard sections through the native WebKit XCTest renderer. "
+            "Enabled automatically on macOS; use --no-capture-screenshots for the "
+            "documented manual workflow."
+        ),
+    )
+    parser.add_argument(
         "--finalize",
         action="store_true",
         help="Validate screenshots and write evidence-manifest.json for an existing run.",
     )
     return parser.parse_args()
+
+
+def capture_screenshots_enabled(
+    requested: bool | None,
+    *,
+    platform: str = sys.platform,
+) -> bool:
+    return platform == "darwin" if requested is None else requested
 
 
 def quality_gate_timeout_seconds(value: str) -> float | None:

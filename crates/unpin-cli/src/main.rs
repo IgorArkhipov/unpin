@@ -21,6 +21,7 @@ mod group_store;
 mod hook_support;
 mod session_process;
 mod tui;
+mod updater;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unpin_core::{
@@ -317,6 +318,11 @@ enum Commands {
     Desktop {
         #[command(subcommand)]
         command: DesktopCommands,
+    },
+    /// Check for and install verified stable releases.
+    Update {
+        #[command(subcommand)]
+        command: updater::UpdateCommands,
     },
     /// Open the Unpin terminal UI.
     #[command(alias = "dashboard")]
@@ -1425,6 +1431,7 @@ fn main() -> ExitCode {
                 }
             }
         }
+        Some(Commands::Update { command }) => updater::run(command),
         Some(Commands::SessionChildWrapper {
             control_file,
             app_state_root,

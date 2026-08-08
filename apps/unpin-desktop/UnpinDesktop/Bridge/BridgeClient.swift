@@ -30,10 +30,70 @@ enum BridgeClientError: LocalizedError {
     }
 }
 
-struct BundledBridgeManifest: Decodable {
+struct BundledBridgeManifest: Decodable, Sendable {
     let bridgeProtocolVersion: Int
     let unpinVersion: String
     let sha256: String
+}
+
+/// Shared verification for every executable launched from the app bundle.
+/// The updater injects this verifier in tests, while production loads the
+/// bundled manifest through `verifyBundled`.
+struct BundledBridgeVerifier: Sendable {
+    static let protocolVersion = 2
+
+    let manifest: BundledBridgeManifest
+
+    init(manifest: BundledBridgeManifest) {
+        self.manifest = manifest
+    }
+
+    func verify(executableURL: URL) throws {
+        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
+            throw BridgeClientError.bundledExecutableMissing
+        }
+        guard manifest.bridgeProtocolVersion == Self.protocolVersion,
+              manifest.unpinVersion.isEmpty == false,
+              manifest.sha256.count == 64,
+              manifest.sha256.allSatisfy(\.isHexDigit)
+        else {
+            throw BridgeClientError.bundledManifestInvalid
+        }
+        guard try Self.sha256(of: executableURL) == manifest.sha256.lowercased() else {
+            throw BridgeClientError.bundleIntegrityMismatch
+        }
+    }
+
+    static func verifyBundled(executableURL: URL, bundle: Bundle = .main) throws {
+        guard let manifestURL = bundle.url(
+            forResource: "unpin-bridge-manifest",
+            withExtension: "json"
+        ) else {
+            throw BridgeClientError.bundledManifestInvalid
+        }
+        do {
+            let manifest = try JSONDecoder().decode(
+                BundledBridgeManifest.self,
+                from: Data(contentsOf: manifestURL)
+            )
+            try Self(manifest: manifest).verify(executableURL: executableURL)
+        } catch let error as BridgeClientError {
+            throw error
+        } catch {
+            throw BridgeClientError.bundledManifestInvalid
+        }
+    }
+
+    private static func sha256(of url: URL) throws -> String {
+        let file = try FileHandle(forReadingFrom: url)
+        defer { try? file.close() }
+        var hasher = SHA256()
+        while let chunk = try file.read(upToCount: 1_048_576), chunk.isEmpty == false {
+            hasher.update(data: chunk)
+        }
+        let digest = hasher.finalize()
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
 }
 
 struct BridgeLaunchRoots: Sendable {
@@ -68,7 +128,7 @@ struct BridgeTerminationPolicy: Sendable {
 }
 
 actor BridgeClient {
-    static let protocolVersion = 2
+    static let protocolVersion = BundledBridgeVerifier.protocolVersion
     private static let maximumFrameBytes = 1_048_576
     private static let readOnlyRequestTimeoutMilliseconds = 15_000
     private static let defaultControlRequestTimeoutMilliseconds = 180_000
@@ -103,18 +163,7 @@ actor BridgeClient {
     }
 
     func start() throws {
-        guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
-            throw BridgeClientError.bundledExecutableMissing
-        }
-        guard manifest.bridgeProtocolVersion == Self.protocolVersion,
-              manifest.unpinVersion.isEmpty == false,
-              manifest.sha256.count == 64,
-              manifest.sha256.allSatisfy(\.isHexDigit) else {
-            throw BridgeClientError.bundledManifestInvalid
-        }
-        guard try Self.sha256(of: executableURL) == manifest.sha256.lowercased() else {
-            throw BridgeClientError.bundleIntegrityMismatch
-        }
+        try BundledBridgeVerifier(manifest: manifest).verify(executableURL: executableURL)
         let child = Process()
         child.executableURL = executableURL
         var arguments = ["desktop", "bridge", "--project-root", projectRoot.path]
@@ -396,16 +445,6 @@ actor BridgeClient {
         }
     }
 
-    private static func sha256(of url: URL) throws -> String {
-        let file = try FileHandle(forReadingFrom: url)
-        defer { try? file.close() }
-        var hasher = SHA256()
-        while let chunk = try file.read(upToCount: 1_048_576), chunk.isEmpty == false {
-            hasher.update(data: chunk)
-        }
-        let digest = hasher.finalize()
-        return digest.map { String(format: "%02x", $0) }.joined()
-    }
 }
 
 private final class ProcessTerminationCompletion: @unchecked Sendable {

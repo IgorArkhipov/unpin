@@ -98,12 +98,37 @@ python3 scripts/run_desktop_guidance_matrix.py \
 
 ## Update
 
-Updates are manual in the `1.0.x` series:
+Unpin Desktop checks the latest stable GitHub release once per app launch. Use
+**Check for Updates…** from the application menu to run an on-demand check. If
+an update is available, review the exact version and choose **Install and
+Relaunch**.
+
+The bundled bridge performs the update. It accepts only the matching macOS
+archive, bounds every download and extraction, verifies `SHA256SUMS` and any
+GitHub-provided asset digest, checks the candidate app and bridge signatures,
+and requires these designated requirements to be byte-for-byte equal to the
+installed app and bridge requirements:
+
+- `dev.unpin.workbench` for the app;
+- `dev.unpin.workbench.bridge` for the bundled bridge.
+
+The old app bundle is retained beside the installation as a hidden rollback
+bundle, the candidate is swapped into the same path, and the new app is
+relaunched before the old process exits. Exact designated-requirement equality
+is what preserves an existing Keychain **Always Allow** grant across updates.
+An automatic update refuses a certificate or identifier change instead of
+installing a build that would trigger a new Keychain authorization.
+
+## Manual fallback
+
+Use manual replacement if the in-app update cannot write the installation
+directory, or when release notes explicitly require it for a reviewed signing
+certificate rotation:
 
 1. Download the new architecture-matched desktop archive and its release
    checksum file.
 2. Verify the checksum and GitHub attestation.
-3. If this is the first `1.0.2` update from `1.0.1` or earlier, expect one new
+3. If release notes document a signing-certificate rotation, expect one new
    Keychain authorization because the designated requirement changes.
 4. Quit Unpin Desktop.
 5. Replace the existing `UnpinDesktop.app` in `/Applications` or
@@ -132,7 +157,8 @@ full reset, not part of uninstalling the app.
   their release notes explicitly say otherwise.
 - The personal self-signed certificate is released with timestamp mode `none`;
   secure timestamping is not claimed for it.
-- No automatic update mechanism; replacement is manual.
+- Automatic update requires write access to the installed app's parent
+  directory; manual verified replacement remains the fallback.
 - No Windows, Linux, or universal macOS desktop bundle.
 - Profiles, gateways, sessions, and hooks remain on CLI, TUI, and MCP surfaces.
 - The stable `1.0.0` release uses a maintainer-approved unsigned-GA exception.

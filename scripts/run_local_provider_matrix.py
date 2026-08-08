@@ -9,7 +9,9 @@ import html
 import json
 import os
 import re
+import stat
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,7 @@ from local_provider_matrix_support import (
     SCREENSHOTS,
     MatrixCommandTimeout,
     MatrixFailure,
+    capture_screenshots_enabled,
     digest_path,
     installed_hosts,
     list_command,
@@ -45,6 +48,10 @@ from local_provider_matrix_support import (
     validate_artifact_root,
     write_json,
     write_text,
+)
+from provider_matrix_screenshots import (
+    capture_provider_matrix_screenshots,
+    preflight_provider_matrix_screenshot_capture,
 )
 
 REPOSITORY_TMP_ROOT = (REPO_ROOT / "tmp").resolve()
@@ -923,13 +930,126 @@ def run_fixture_matrix_surfaces(
     return cli_results, tui_results, mcp_results
 
 
+def validate_private_json_replacement_path(path: Path) -> None:
+    try:
+        existing = path.lstat()
+    except FileNotFoundError:
+        existing = None
+    except OSError as error:
+        raise MatrixFailure(f"cannot inspect {path.name}: {path}") from error
+    if existing is not None:
+        if stat.S_ISLNK(existing.st_mode):
+            raise MatrixFailure(f"{path.name} must not be a symlink: {path}")
+        if not stat.S_ISREG(existing.st_mode):
+            raise MatrixFailure(f"{path.name} must be a regular file: {path}")
+        if existing.st_nlink != 1:
+            raise MatrixFailure(f"{path.name} must not be a hardlink: {path}")
+
+
+def write_private_json_atomically(path: Path, value: Any, *, prefix: str) -> None:
+    validate_private_json_replacement_path(path)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    temporary_path: Path | None = None
+    file_descriptor, temporary_name = tempfile.mkstemp(
+        prefix=prefix,
+        dir=path.parent,
+    )
+    temporary_path = Path(temporary_name)
+    try:
+        with os.fdopen(file_descriptor, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps(value, indent=2, sort_keys=False) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, path)
+        temporary_path = None
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def write_pending_screenshot_review(artifact_root: Path) -> None:
+    review_path = artifact_root / "screenshot-review.json"
+    value = {
+        "status": "pending",
+        "reviewedBy": None,
+        "reviewedAt": None,
+        "screenshots": SCREENSHOTS,
+        "checksums": {},
+        "assertions": {
+            "matchesExpectedSections": False,
+            "noPrivateNamesVisible": False,
+            "noLocalHomePathsVisible": False,
+            "stateLabelsReadable": False,
+        },
+    }
+    write_private_json_atomically(
+        review_path,
+        value,
+        prefix=".screenshot-review-",
+    )
+
+
+def write_failure_evidence(artifact_root: Path, error: Exception) -> None:
+    write_private_json_atomically(
+        artifact_root / "failure.json",
+        {
+            "status": "failed",
+            "error": "matrix run failed; see terminal output",
+            "type": type(error).__name__,
+            "failedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
+        },
+        prefix=".failure-",
+    )
+
+
 def main() -> int:
     args = parse_args()
     artifact_root = validate_artifact_root(args.artifact_root)
     if args.finalize:
+        if args.capture_screenshots is not None:
+            raise MatrixFailure(
+                "--finalize cannot be combined with --capture-screenshots or "
+                "--no-capture-screenshots"
+            )
         manifest = finalize_artifacts(artifact_root)
         print(json.dumps({"status": "finalized", "artifactRoot": str(artifact_root), **manifest["counts"]}))
         return 0
+
+    capture_screenshots = capture_screenshots_enabled(args.capture_screenshots)
+    if capture_screenshots:
+        preflight_provider_matrix_screenshot_capture()
+
+    if args.capture_screenshots is True and not args.overwrite:
+        try:
+            if not (artifact_root / "dashboard.html").is_file():
+                raise MatrixFailure(
+                    f"no dashboard to capture at {artifact_root}; run the matrix first"
+                )
+            validate_private_json_replacement_path(
+                artifact_root / "screenshot-review.json"
+            )
+            validate_private_json_replacement_path(artifact_root / "failure.json")
+            (artifact_root / "evidence-manifest.json").unlink(missing_ok=True)
+            write_pending_screenshot_review(artifact_root)
+            captured = capture_provider_matrix_screenshots(REPO_ROOT, artifact_root)
+            tighten_artifact_permissions(artifact_root)
+            (artifact_root / "failure.json").unlink(missing_ok=True)
+            print(
+                json.dumps(
+                    {
+                        "status": "screenshots-captured",
+                        "artifactRoot": str(artifact_root),
+                        "screenshots": [path.name for path in captured],
+                        "reviewPending": True,
+                    }
+                )
+            )
+            return 0
+        except Exception as error:
+            write_failure_evidence(artifact_root, error)
+            raise
 
     artifact_root = prepare_artifact_root(artifact_root, args.overwrite)
     binary = args.binary.expanduser().resolve()
@@ -1001,21 +1121,11 @@ def main() -> int:
         write_text(artifact_root / "report.md", report)
         write_text(artifact_root / "dashboard.html", dashboard)
         write_text(artifact_root / "announcement.md", announcement)
-        write_json(
-            artifact_root / "screenshot-review.json",
-            {
-                "status": "pending",
-                "reviewedBy": None,
-                "reviewedAt": None,
-                "screenshots": SCREENSHOTS,
-                "checksums": {},
-                "assertions": {
-                    "matchesExpectedSections": False,
-                    "noPrivateNamesVisible": False,
-                    "noLocalHomePathsVisible": False,
-                    "stateLabelsReadable": False,
-                },
-            },
+        write_pending_screenshot_review(artifact_root)
+        captured_screenshots = (
+            capture_provider_matrix_screenshots(REPO_ROOT, artifact_root)
+            if capture_screenshots
+            else []
         )
         tighten_artifact_permissions(artifact_root)
         print(
@@ -1030,21 +1140,19 @@ def main() -> int:
                     "liveStateUnchanged": (
                         live_summary["providerStateUnchanged"] if live_summary else None
                     ),
+                    "screenshotCapture": (
+                        "native-webkit" if captured_screenshots else "manual"
+                    ),
+                    "screenshotsCaptured": [
+                        path.name for path in captured_screenshots
+                    ],
                     "screenshotsPending": SCREENSHOTS,
                 }
             )
         )
         return 0
     except Exception as error:
-        write_json(
-            artifact_root / "failure.json",
-            {
-                "status": "failed",
-                "error": "matrix run failed; see terminal output",
-                "type": type(error).__name__,
-                "failedAt": dt.datetime.now(dt.timezone.utc).isoformat(),
-            },
-        )
+        write_failure_evidence(artifact_root, error)
         raise
 
 

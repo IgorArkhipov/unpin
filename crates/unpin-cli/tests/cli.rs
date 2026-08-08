@@ -6696,3 +6696,57 @@ fn profile_policy_cli_does_not_offer_migration_for_existing_unmanaged_policy() {
     assert_eq!(status["humanAction"]["code"], "inspect-existing-policy");
     assert!(!status.to_string().contains("review-migration"));
 }
+
+#[test]
+fn update_help_exposes_check_and_apply_workflow() {
+    let output = Command::cargo_bin("unpin")
+        .expect("binary")
+        .args(["update", "--help"])
+        .output()
+        .expect("update help");
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).expect("UTF-8 help");
+    assert!(stdout.contains("check"));
+    assert!(stdout.contains("apply"));
+
+    let apply = Command::cargo_bin("unpin")
+        .expect("binary")
+        .args(["update", "apply", "--help"])
+        .output()
+        .expect("update apply help");
+    assert!(apply.status.success());
+    let stdout = String::from_utf8(apply.stdout).expect("UTF-8 help");
+    assert!(stdout.contains("--confirm"));
+    assert!(stdout.contains("--install-path"));
+
+    let check = Command::cargo_bin("unpin")
+        .expect("binary")
+        .args(["update", "check", "--help"])
+        .output()
+        .expect("update check help");
+    assert!(check.status.success());
+    let stdout = String::from_utf8(check.stdout).expect("UTF-8 help");
+    assert!(stdout.contains("--install-path"));
+}
+
+#[test]
+fn update_json_failures_remain_machine_readable() {
+    let output = Command::cargo_bin("unpin")
+        .expect("binary")
+        .args(["update", "apply", "--confirm", "not-a-version", "--json"])
+        .output()
+        .expect("update apply failure");
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty(), "JSON errors belong on stdout");
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("machine-readable update failure");
+    assert_eq!(
+        value,
+        serde_json::json!({
+            "schemaVersion": 1,
+            "status": "error",
+            "errorCode": "update_failed",
+            "reason": "update failed: invalid release version: not-a-version",
+        })
+    );
+}
