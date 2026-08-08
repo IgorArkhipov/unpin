@@ -1857,13 +1857,34 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(2));
 
         let pid = fs::read_to_string(&pid_path).expect("descendant pid");
-        let reaping_deadline = Instant::now() + Duration::from_secs(1);
-        loop {
-            let status = Command::new("/bin/kill")
+        // Linux runners can retain a terminated orphan as a zombie, which
+        // still makes `kill -0` succeed even though the process is no longer running.
+        #[cfg(target_os = "linux")]
+        let descendant_running = || {
+            let stat_path = format!("/proc/{}/stat", pid.trim());
+            match fs::read_to_string(stat_path) {
+                Ok(stat) => {
+                    let state = stat
+                        .rsplit_once(") ")
+                        .and_then(|(_, fields)| fields.chars().next())
+                        .expect("descendant process state");
+                    state != 'Z'
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+                Err(error) => panic!("probe descendant: {error}"),
+            }
+        };
+        #[cfg(not(target_os = "linux"))]
+        let descendant_running = || {
+            Command::new("/bin/kill")
                 .args(["-0", pid.trim()])
                 .status()
-                .expect("probe descendant");
-            if !status.success() {
+                .expect("probe descendant")
+                .success()
+        };
+        let reaping_deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            if !descendant_running() {
                 break;
             }
             assert!(
