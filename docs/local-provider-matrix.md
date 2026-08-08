@@ -353,6 +353,24 @@ isolated copies of committed fixtures, and restores every copy byte-for-byte:
 python3 scripts/run_local_provider_matrix.py
 ```
 
+On macOS, a full run automatically builds the desktop XCTest target and uses
+native WebKit to capture every dashboard section into `screenshots/`. This
+requires Xcode with the `UnpinDesktop` scheme test action. Use
+`--no-capture-screenshots` to leave capture for the manual workflow below.
+
+To capture or replace screenshots for an existing matrix without rerunning its
+provider cases, pass its repository-local artifact directory explicitly:
+
+```bash
+python3 scripts/run_local_provider_matrix.py \
+  --artifact-root tmp/YOUR-RUN-provider-matrix \
+  --capture-screenshots
+```
+
+Automatic capture is disabled outside macOS. Passing `--capture-screenshots`
+there reports that native capture is unavailable and leaves the documented
+manual dashboard workflow as the fallback.
+
 Each quality gate has a 20-minute default timeout. For an unrestricted
 release-evidence run on a known-slow host, pass
 `--quality-gate-timeout-seconds 0`; this disables only the quality-gate timeout
@@ -398,7 +416,8 @@ Each full run covers:
 - headless TUI, provider doctor, formatter, Clippy, workspace tests, build, CLI
   help, diff, and Python syntax checks.
 
-Open generated `dashboard.html`. Capture these sections into `screenshots/`:
+For manual capture, open generated `dashboard.html` and capture these sections
+into `screenshots/`:
 
 | Section | Filename |
 | --- | --- |

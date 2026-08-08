@@ -2,7 +2,11 @@ import argparse
 import json
 import math
 import os
+import plistlib
+import signal
+import struct
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -11,6 +15,7 @@ from unittest import mock
 
 import local_provider_matrix_support as matrix_support
 import local_provider_matrix_cases as matrix_cases
+import provider_matrix_screenshots as matrix_screenshots
 import run_local_provider_matrix as matrix_runner
 from local_provider_matrix_finalize import mcp_no_write_handoff_contract_complete
 from local_provider_matrix_support import (
@@ -124,6 +129,863 @@ class ArtifactRootTests(unittest.TestCase):
         )
 
         self.assertEqual(ignored.returncode, 0)
+
+
+class ScreenshotCaptureArgumentTests(unittest.TestCase):
+    def test_capture_screenshot_flag_is_explicitly_selectable(self) -> None:
+        with mock.patch(
+            "sys.argv",
+            ["run_local_provider_matrix.py", "--capture-screenshots"],
+        ):
+            enabled = matrix_support.parse_args()
+        with mock.patch(
+            "sys.argv",
+            ["run_local_provider_matrix.py", "--no-capture-screenshots"],
+        ):
+            disabled = matrix_support.parse_args()
+        with mock.patch("sys.argv", ["run_local_provider_matrix.py"]):
+            automatic = matrix_support.parse_args()
+
+        self.assertIs(enabled.capture_screenshots, True)
+        self.assertIs(disabled.capture_screenshots, False)
+        self.assertIsNone(automatic.capture_screenshots)
+
+    def test_capture_screenshots_defaults_to_macos_only(self) -> None:
+        self.assertTrue(
+            matrix_support.capture_screenshots_enabled(None, platform="darwin")
+        )
+        self.assertFalse(
+            matrix_support.capture_screenshots_enabled(None, platform="linux")
+        )
+        self.assertTrue(
+            matrix_support.capture_screenshots_enabled(True, platform="linux")
+        )
+        self.assertFalse(
+            matrix_support.capture_screenshots_enabled(False, platform="darwin")
+        )
+
+    def test_explicit_capture_reuses_an_existing_dashboard(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            (artifact_root / "dashboard.html").write_text(
+                "<!doctype html><section id='overview'>ready</section>",
+                encoding="utf-8",
+            )
+            failure_path = artifact_root / "failure.json"
+            failure_path.write_text('{"status": "failed"}\n', encoding="utf-8")
+            args = argparse.Namespace(
+                artifact_root=artifact_root,
+                finalize=False,
+                capture_screenshots=True,
+                overwrite=False,
+            )
+            captured = [
+                artifact_root / "screenshots" / name
+                for name in matrix_support.SCREENSHOTS
+            ]
+            with (
+                mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                mock.patch.object(
+                    matrix_runner,
+                    "validate_artifact_root",
+                    return_value=artifact_root,
+                ),
+                mock.patch.object(
+                    matrix_runner,
+                    "capture_provider_matrix_screenshots",
+                    return_value=captured,
+                ) as capture,
+                mock.patch.object(matrix_runner, "tighten_artifact_permissions"),
+                mock.patch.object(matrix_runner, "prepare_artifact_root") as prepare,
+                mock.patch("builtins.print"),
+            ):
+                result = matrix_runner.main()
+            review = json.loads(
+                (artifact_root / "screenshot-review.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(result, 0)
+        self.assertFalse(failure_path.exists())
+        capture.assert_called_once_with(REPO_ROOT, artifact_root)
+        prepare.assert_not_called()
+        self.assertEqual(review["status"], "pending")
+        self.assertIsNone(review["reviewedBy"])
+        self.assertIsNone(review["reviewedAt"])
+        self.assertEqual(review["checksums"], {})
+        self.assertTrue(all(value is False for value in review["assertions"].values()))
+
+    def test_recapture_invalidates_manifest_before_reset_and_capture(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            (artifact_root / "dashboard.html").write_text(
+                "<!doctype html><section id='overview'>ready</section>",
+                encoding="utf-8",
+            )
+            manifest_path = artifact_root / "evidence-manifest.json"
+            manifest_path.write_text('{"stale": true}\n', encoding="utf-8")
+            review_path = artifact_root / "screenshot-review.json"
+            review_path.write_text('{"status": "approved"}\n', encoding="utf-8")
+            args = argparse.Namespace(
+                artifact_root=artifact_root,
+                finalize=False,
+                capture_screenshots=True,
+                overwrite=False,
+            )
+
+            def capture(_: Path, captured_root: Path) -> list[Path]:
+                self.assertEqual(captured_root, artifact_root)
+                self.assertFalse(manifest_path.exists())
+                return []
+
+            with (
+                mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                mock.patch.object(
+                    matrix_runner,
+                    "validate_artifact_root",
+                    return_value=artifact_root,
+                ),
+                mock.patch.object(
+                    matrix_runner,
+                    "capture_provider_matrix_screenshots",
+                    side_effect=capture,
+                ),
+                mock.patch.object(matrix_runner, "tighten_artifact_permissions"),
+                mock.patch.object(matrix_runner, "prepare_artifact_root") as prepare,
+                mock.patch("builtins.print"),
+            ):
+                result = matrix_runner.main()
+
+            review = json.loads(review_path.read_text(encoding="utf-8"))
+            self.assertEqual(result, 0)
+            prepare.assert_not_called()
+            self.assertFalse(manifest_path.exists())
+            self.assertEqual(review["status"], "pending")
+
+    def test_finalize_rejects_capture_flags(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            args = argparse.Namespace(
+                artifact_root=artifact_root,
+                finalize=True,
+                capture_screenshots=True,
+            )
+            with (
+                mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                mock.patch.object(
+                    matrix_runner,
+                    "validate_artifact_root",
+                    return_value=artifact_root,
+                ),
+                mock.patch.object(matrix_runner, "finalize_artifacts") as finalize,
+            ):
+                with self.assertRaisesRegex(MatrixFailure, "cannot be combined"):
+                    matrix_runner.main()
+
+            finalize.assert_not_called()
+
+    def test_capture_failure_writes_failure_evidence_and_preserves_previous_screenshots(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            (artifact_root / "dashboard.html").write_text(
+                "<!doctype html><section id='overview'>ready</section>",
+                encoding="utf-8",
+            )
+            screenshots_root = artifact_root / "screenshots"
+            screenshots_root.mkdir()
+            previous_screenshot = screenshots_root / matrix_support.SCREENSHOTS[0]
+            previous_bytes = b"previous screenshot"
+            previous_screenshot.write_bytes(previous_bytes)
+            manifest_path = artifact_root / "evidence-manifest.json"
+            manifest_path.write_text('{"stale": true}\n', encoding="utf-8")
+            args = argparse.Namespace(
+                artifact_root=artifact_root,
+                finalize=False,
+                capture_screenshots=True,
+                overwrite=False,
+            )
+
+            with (
+                mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                mock.patch.object(
+                    matrix_runner,
+                    "validate_artifact_root",
+                    return_value=artifact_root,
+                ),
+                mock.patch.object(
+                    matrix_runner,
+                    "capture_provider_matrix_screenshots",
+                    side_effect=MatrixFailure("capture failed"),
+                ) as capture,
+                mock.patch.object(matrix_runner, "tighten_artifact_permissions"),
+                mock.patch.object(matrix_runner, "prepare_artifact_root") as prepare,
+                mock.patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(MatrixFailure, "capture failed"):
+                    matrix_runner.main()
+
+            failure = json.loads(
+                (artifact_root / "failure.json").read_text(encoding="utf-8")
+            )
+            review = json.loads(
+                (artifact_root / "screenshot-review.json").read_text(encoding="utf-8")
+            )
+            capture.assert_called_once_with(REPO_ROOT, artifact_root)
+            prepare.assert_not_called()
+            self.assertFalse(manifest_path.exists())
+            self.assertEqual(previous_screenshot.read_bytes(), previous_bytes)
+            self.assertEqual(failure["status"], "failed")
+            self.assertEqual(
+                failure["error"], "matrix run failed; see terminal output"
+            )
+            self.assertEqual(failure["type"], "MatrixFailure")
+            self.assertTrue(failure["failedAt"])
+            self.assertEqual(review["status"], "pending")
+
+    def test_unsupported_capture_preserves_approved_evidence(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            (artifact_root / "dashboard.html").write_text(
+                "<!doctype html><section id='overview'>ready</section>",
+                encoding="utf-8",
+            )
+            manifest_path = artifact_root / "evidence-manifest.json"
+            manifest_bytes = b'{"approved": true}\n'
+            manifest_path.write_bytes(manifest_bytes)
+            review_path = artifact_root / "screenshot-review.json"
+            review_bytes = b'{"status": "approved"}\n'
+            review_path.write_bytes(review_bytes)
+            args = argparse.Namespace(
+                artifact_root=artifact_root,
+                finalize=False,
+                capture_screenshots=True,
+                overwrite=False,
+            )
+
+            with (
+                mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                mock.patch.object(
+                    matrix_runner,
+                    "validate_artifact_root",
+                    return_value=artifact_root,
+                ),
+                mock.patch.object(
+                    matrix_runner,
+                    "preflight_provider_matrix_screenshot_capture",
+                    side_effect=MatrixFailure("requires macOS"),
+                ),
+                mock.patch.object(
+                    matrix_runner,
+                    "capture_provider_matrix_screenshots",
+                ) as capture,
+                mock.patch.object(matrix_runner, "prepare_artifact_root") as prepare,
+            ):
+                with self.assertRaisesRegex(MatrixFailure, "requires macOS"):
+                    matrix_runner.main()
+
+            capture.assert_not_called()
+            prepare.assert_not_called()
+            self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+            self.assertEqual(review_path.read_bytes(), review_bytes)
+
+    def test_capture_request_without_dashboard_fails_before_full_matrix(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            args = argparse.Namespace(
+                artifact_root=artifact_root,
+                finalize=False,
+                capture_screenshots=True,
+                overwrite=False,
+            )
+            with (
+                mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                mock.patch.object(
+                    matrix_runner,
+                    "validate_artifact_root",
+                    return_value=artifact_root,
+                ),
+                mock.patch.object(
+                    matrix_runner,
+                    "capture_provider_matrix_screenshots",
+                ) as capture,
+                mock.patch.object(
+                    matrix_runner,
+                    "prepare_artifact_root",
+                    side_effect=MatrixFailure("full matrix unexpectedly started"),
+                ) as prepare,
+                mock.patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(MatrixFailure, "dashboard"):
+                    matrix_runner.main()
+
+            failure = json.loads(
+                (artifact_root / "failure.json").read_text(encoding="utf-8")
+            )
+
+        capture.assert_not_called()
+        prepare.assert_not_called()
+        self.assertEqual(failure["status"], "failed")
+        self.assertEqual(failure["type"], "MatrixFailure")
+
+    def test_capture_request_creates_failure_evidence_when_artifact_root_is_missing(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory) / "missing-provider-matrix"
+            args = argparse.Namespace(
+                artifact_root=artifact_root,
+                finalize=False,
+                capture_screenshots=True,
+                overwrite=False,
+            )
+            with (
+                mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                mock.patch.object(
+                    matrix_runner,
+                    "validate_artifact_root",
+                    return_value=artifact_root,
+                ),
+                mock.patch.object(
+                    matrix_runner,
+                    "capture_provider_matrix_screenshots",
+                ) as capture,
+                mock.patch.object(matrix_runner, "prepare_artifact_root") as prepare,
+                mock.patch("builtins.print"),
+            ):
+                with self.assertRaisesRegex(MatrixFailure, "dashboard"):
+                    matrix_runner.main()
+
+            failure = json.loads(
+                (artifact_root / "failure.json").read_text(encoding="utf-8")
+            )
+
+        capture.assert_not_called()
+        prepare.assert_not_called()
+        self.assertEqual(failure["status"], "failed")
+        self.assertEqual(failure["type"], "MatrixFailure")
+
+    def test_capture_rejects_unsafe_existing_review_metadata(self) -> None:
+        cases = ("symlink", "hardlink", "directory")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix="unpin-provider-screenshot-test-"
+            ) as temporary_directory:
+                temporary_root = Path(temporary_directory)
+                artifact_root = temporary_root / "artifact-provider-matrix"
+                artifact_root.mkdir()
+                (artifact_root / "dashboard.html").write_text(
+                    "<!doctype html><section id='overview'>ready</section>",
+                    encoding="utf-8",
+                )
+                review_path = artifact_root / "screenshot-review.json"
+                manifest_path = artifact_root / "evidence-manifest.json"
+                manifest_bytes = b'{"stale": true}\n'
+                manifest_path.write_bytes(manifest_bytes)
+                external_review = temporary_root / "external-review.json"
+                external_review.write_text('{"sentinel": true}\n', encoding="utf-8")
+                if case == "symlink":
+                    review_path.symlink_to(external_review)
+                elif case == "hardlink":
+                    os.link(external_review, review_path)
+                else:
+                    review_path.mkdir()
+                args = argparse.Namespace(
+                    artifact_root=artifact_root,
+                    finalize=False,
+                    capture_screenshots=True,
+                    overwrite=False,
+                )
+                with (
+                    mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                    mock.patch.object(
+                        matrix_runner,
+                        "validate_artifact_root",
+                        return_value=artifact_root,
+                    ),
+                    mock.patch.object(
+                        matrix_runner,
+                        "capture_provider_matrix_screenshots",
+                    ) as capture,
+                    mock.patch.object(matrix_runner, "tighten_artifact_permissions"),
+                    mock.patch.object(matrix_runner, "prepare_artifact_root") as prepare,
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaisesRegex(MatrixFailure, "screenshot-review"):
+                        matrix_runner.main()
+
+                capture.assert_not_called()
+                prepare.assert_not_called()
+                self.assertEqual(
+                    external_review.read_text(encoding="utf-8"),
+                    '{"sentinel": true}\n',
+                )
+                self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+                if case == "symlink":
+                    self.assertTrue(review_path.is_symlink())
+                elif case == "hardlink":
+                    self.assertEqual(review_path.stat().st_nlink, 2)
+                else:
+                    self.assertTrue(review_path.is_dir())
+
+    def test_capture_rejects_unsafe_existing_failure_metadata(self) -> None:
+        cases = ("symlink", "hardlink", "directory")
+        for case in cases:
+            with self.subTest(case=case), tempfile.TemporaryDirectory(
+                prefix="unpin-provider-screenshot-test-"
+            ) as temporary_directory:
+                temporary_root = Path(temporary_directory)
+                artifact_root = temporary_root / "artifact-provider-matrix"
+                artifact_root.mkdir()
+                (artifact_root / "dashboard.html").write_text(
+                    "<!doctype html><section id='overview'>ready</section>",
+                    encoding="utf-8",
+                )
+                failure_path = artifact_root / "failure.json"
+                manifest_path = artifact_root / "evidence-manifest.json"
+                manifest_bytes = b'{"stale": true}\n'
+                manifest_path.write_bytes(manifest_bytes)
+                external_failure = temporary_root / "external-failure.json"
+                external_failure.write_text(
+                    '{"sentinel": true}\n', encoding="utf-8"
+                )
+                if case == "symlink":
+                    failure_path.symlink_to(external_failure)
+                elif case == "hardlink":
+                    os.link(external_failure, failure_path)
+                else:
+                    failure_path.mkdir()
+                args = argparse.Namespace(
+                    artifact_root=artifact_root,
+                    finalize=False,
+                    capture_screenshots=True,
+                    overwrite=False,
+                )
+                with (
+                    mock.patch.object(matrix_runner, "parse_args", return_value=args),
+                    mock.patch.object(
+                        matrix_runner,
+                        "validate_artifact_root",
+                        return_value=artifact_root,
+                    ),
+                    mock.patch.object(
+                        matrix_runner,
+                        "capture_provider_matrix_screenshots",
+                        return_value=[],
+                    ) as capture,
+                    mock.patch.object(matrix_runner, "tighten_artifact_permissions"),
+                    mock.patch.object(matrix_runner, "prepare_artifact_root") as prepare,
+                    mock.patch("builtins.print"),
+                ):
+                    with self.assertRaisesRegex(MatrixFailure, "failure.json"):
+                        matrix_runner.main()
+
+                capture.assert_not_called()
+                prepare.assert_not_called()
+                self.assertEqual(
+                    external_failure.read_text(encoding="utf-8"),
+                    '{"sentinel": true}\n',
+                )
+                self.assertEqual(manifest_path.read_bytes(), manifest_bytes)
+                if case == "symlink":
+                    self.assertTrue(failure_path.is_symlink())
+                elif case == "hardlink":
+                    self.assertEqual(failure_path.stat().st_nlink, 2)
+                else:
+                    self.assertTrue(failure_path.is_dir())
+
+
+class ProviderMatrixScreenshotCaptureTests(unittest.TestCase):
+    @staticmethod
+    def _fake_png(width: int = 1_480, height: int = 400) -> bytes:
+        return (
+            b"\x89PNG\r\n\x1a\n"
+            + struct.pack(">I", 13)
+            + b"IHDR"
+            + struct.pack(">II", width, height)
+            + b"\x08\x06\x00\x00\x00"
+            + (b"capture" * 200)
+        )
+
+    @staticmethod
+    def _dashboard_html(*, omitted_section=None) -> str:
+        sections = (
+            f"<section class='panel' id='{section_id}'>ready</section>"
+            for section_id in matrix_screenshots.SCREENSHOT_SECTION_IDS
+            if section_id != omitted_section
+        )
+        return "<!doctype html>" + "".join(sections)
+
+    def test_capture_stages_exact_inventory_and_binds_xctest_environment(self) -> None:
+        calls: list[list[str]] = []
+        observed_environment: dict[str, str] = {}
+
+        def runner(
+            command: list[str],
+            *,
+            cwd: Path,
+            env: dict[str, str],
+            check: bool,
+            timeout: int,
+            stdout: int,
+            stderr: int,
+            text: bool,
+        ) -> subprocess.CompletedProcess[str]:
+            del cwd, env, check, timeout
+            self.assertEqual(stdout, subprocess.PIPE)
+            self.assertEqual(stderr, subprocess.STDOUT)
+            self.assertTrue(text)
+            calls.append(command)
+            if "build-for-testing" in command:
+                derived_data = Path(command[command.index("-derivedDataPath") + 1])
+                products = derived_data / "Build/Products"
+                products.mkdir(parents=True)
+                with (products / "UnpinDesktop.xctestrun").open("wb") as handle:
+                    plistlib.dump(
+                        {
+                            "TestConfigurations": [
+                                {
+                                    "TestTargets": [
+                                        {
+                                            "BlueprintName": "UnpinDesktopTests",
+                                            "EnvironmentVariables": {},
+                                        }
+                                    ]
+                                }
+                            ]
+                        },
+                        handle,
+                    )
+            else:
+                xctestrun_path = Path(command[command.index("-xctestrun") + 1])
+                with xctestrun_path.open("rb") as handle:
+                    xctestrun = plistlib.load(handle)
+                target = xctestrun["TestConfigurations"][0]["TestTargets"][0]
+                observed_environment.update(target["EnvironmentVariables"])
+                output_root = Path(
+                    observed_environment[
+                        "UNPIN_PROVIDER_MATRIX_SCREENSHOTS_DIR"
+                    ]
+                )
+                output_root.mkdir(parents=True, exist_ok=True)
+                for section in matrix_screenshots.SCREENSHOT_SECTIONS:
+                    (output_root / section.filename).write_bytes(self._fake_png())
+            return subprocess.CompletedProcess(command, 0)
+
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            (artifact_root / "dashboard.html").write_text(
+                self._dashboard_html(),
+                encoding="utf-8",
+            )
+            captured = matrix_screenshots.capture_provider_matrix_screenshots(
+                REPO_ROOT,
+                artifact_root,
+                platform="darwin",
+                runner=runner,
+            )
+
+            self.assertEqual(
+                [path.name for path in captured],
+                [section.filename for section in matrix_screenshots.SCREENSHOT_SECTIONS],
+            )
+            self.assertTrue(
+                all(
+                    path.parent == artifact_root.resolve() / "screenshots"
+                    for path in captured
+                )
+            )
+
+        self.assertEqual(len(calls), 2)
+        self.assertIn("build-for-testing", calls[0])
+        self.assertIn("test-without-building", calls[1])
+        self.assertIn(matrix_screenshots.CAPTURE_TEST, calls[1])
+        self.assertEqual(
+            json.loads(observed_environment["UNPIN_PROVIDER_MATRIX_SECTIONS"]),
+            [section._asdict() for section in matrix_screenshots.SCREENSHOT_SECTIONS],
+        )
+
+    def test_xcodebuild_failure_reports_bounded_output_tail(self) -> None:
+        command = ["xcodebuild", "build-for-testing"]
+        output = "start-of-output-sentinel" + "discarded-prefix-" * 400
+        output += "compiler diagnostic"
+
+        def runner(*args, **kwargs):
+            del args, kwargs
+            raise subprocess.CalledProcessError(65, command, output=output)
+
+        with self.assertRaisesRegex(MatrixFailure, "compiler diagnostic") as raised:
+            matrix_screenshots._run_xcodebuild(
+                command,
+                repo_root=REPO_ROOT,
+                environment={},
+                runner=runner,
+            )
+
+        self.assertNotIn("start-of-output-sentinel", str(raised.exception))
+
+    def test_default_xcodebuild_process_reports_failure_output(self) -> None:
+        command = [
+            sys.executable,
+            "-c",
+            "import sys; print('xcode diagnostic'); raise SystemExit(7)",
+        ]
+
+        with self.assertRaisesRegex(MatrixFailure, "xcode diagnostic"):
+            matrix_screenshots._run_xcodebuild_process(
+                command,
+                repo_root=REPO_ROOT,
+                environment=os.environ.copy(),
+            )
+
+    def test_default_xcodebuild_process_times_out_and_terminates(self) -> None:
+        command = [sys.executable, "-c", "import time; time.sleep(10)"]
+
+        with (
+            mock.patch.object(
+                matrix_screenshots,
+                "XCODEBUILD_TIMEOUT_SECONDS",
+                0.05,
+            ),
+            self.assertRaisesRegex(MatrixFailure, "timed out"),
+        ):
+            matrix_screenshots._run_xcodebuild_process(
+                command,
+                repo_root=REPO_ROOT,
+                environment=os.environ.copy(),
+            )
+
+    def test_xcodebuild_termination_kills_group_after_parent_exits(self) -> None:
+        process = mock.Mock(pid=12_345)
+        process.poll.side_effect = [None, 0]
+
+        with mock.patch.object(os, "killpg") as kill_group:
+            matrix_screenshots._terminate_xcodebuild(process)
+
+        self.assertEqual(
+            kill_group.call_args_list,
+            [
+                mock.call(12_345, signal.SIGTERM),
+                mock.call(12_345, signal.SIGKILL),
+            ],
+        )
+        process.wait.assert_called_once_with(
+            timeout=matrix_screenshots.XCODEBUILD_TERMINATION_GRACE_SECONDS
+        )
+
+    def test_capture_inventory_rejects_missing_and_unknown_pngs(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            output_root = Path(temporary_directory)
+            for filename in matrix_support.SCREENSHOTS[1:]:
+                (output_root / filename).write_bytes(self._fake_png())
+            (output_root / "unexpected.png").write_bytes(self._fake_png())
+
+            with self.assertRaisesRegex(MatrixFailure, "set mismatch"):
+                matrix_screenshots.validate_capture_inventory(output_root)
+
+    def test_capture_inventory_rejects_unexpected_non_png_entry(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            output_root = Path(temporary_directory)
+            for filename in matrix_support.SCREENSHOTS:
+                (output_root / filename).write_bytes(self._fake_png())
+            (output_root / "capture.log").write_text("unexpected\n", encoding="utf-8")
+
+            with self.assertRaisesRegex(MatrixFailure, "set mismatch"):
+                matrix_screenshots.validate_capture_inventory(output_root)
+
+    def test_capture_inventory_rejects_invalid_dimensions(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            output_root = Path(temporary_directory)
+            for filename in matrix_support.SCREENSHOTS:
+                (output_root / filename).write_bytes(self._fake_png())
+            (output_root / matrix_support.SCREENSHOTS[0]).write_bytes(
+                self._fake_png(width=1_479)
+            )
+
+            with self.assertRaisesRegex(MatrixFailure, "invalid dimensions"):
+                matrix_screenshots.validate_capture_inventory(output_root)
+
+    def test_capture_inventory_rejects_symlinked_png(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            output_root = temporary_root / "screenshots"
+            output_root.mkdir()
+            external = temporary_root / "external.png"
+            external.write_bytes(self._fake_png())
+            for filename in matrix_support.SCREENSHOTS:
+                (output_root / filename).write_bytes(self._fake_png())
+            capture = output_root / matrix_support.SCREENSHOTS[0]
+            capture.unlink()
+            capture.symlink_to(external)
+
+            with self.assertRaisesRegex(MatrixFailure, "private regular file"):
+                matrix_screenshots.validate_capture_inventory(output_root)
+
+    def test_capture_inventory_rejects_hardlinked_png(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            temporary_root = Path(temporary_directory)
+            output_root = temporary_root / "screenshots"
+            output_root.mkdir()
+            external = temporary_root / "external.png"
+            external.write_bytes(self._fake_png())
+            for filename in matrix_support.SCREENSHOTS:
+                (output_root / filename).write_bytes(self._fake_png())
+            capture = output_root / matrix_support.SCREENSHOTS[0]
+            capture.unlink()
+            os.link(external, capture)
+
+            with self.assertRaisesRegex(MatrixFailure, "private regular file"):
+                matrix_screenshots.validate_capture_inventory(output_root)
+
+    def test_capture_rejects_dashboard_section_inventory_drift(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            missing = matrix_screenshots.SCREENSHOT_SECTION_IDS[-1]
+            (artifact_root / "dashboard.html").write_text(
+                self._dashboard_html(omitted_section=missing),
+                encoding="utf-8",
+            )
+            runner = mock.Mock()
+
+            with self.assertRaisesRegex(MatrixFailure, "dashboard section inventory"):
+                matrix_screenshots.capture_provider_matrix_screenshots(
+                    REPO_ROOT,
+                    artifact_root,
+                    platform="darwin",
+                    runner=runner,
+                )
+
+            runner.assert_not_called()
+
+    def test_capture_rolls_back_complete_set_when_publication_fails(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            (artifact_root / "dashboard.html").write_text(
+                self._dashboard_html(),
+                encoding="utf-8",
+            )
+            screenshots_root = artifact_root / "screenshots"
+            screenshots_root.mkdir()
+            previous = self._fake_png(height=401)
+            for filename in matrix_support.SCREENSHOTS:
+                (screenshots_root / filename).write_bytes(previous)
+
+            def runner(command, **kwargs):
+                if "build-for-testing" in command:
+                    derived_data = Path(
+                        command[command.index("-derivedDataPath") + 1]
+                    )
+                    products = derived_data / "Build/Products"
+                    products.mkdir(parents=True)
+                    with (products / "UnpinDesktop.xctestrun").open("wb") as handle:
+                        plistlib.dump(
+                            {
+                                "TestConfigurations": [
+                                    {
+                                        "TestTargets": [
+                                            {
+                                                "BlueprintName": "UnpinDesktopTests",
+                                                "EnvironmentVariables": {},
+                                            }
+                                        ]
+                                    }
+                                ]
+                            },
+                            handle,
+                        )
+                else:
+                    output_root = Path(
+                        kwargs["env"]["UNPIN_PROVIDER_MATRIX_SCREENSHOTS_DIR"]
+                    )
+                    output_root.mkdir(parents=True, exist_ok=True)
+                    for filename in matrix_support.SCREENSHOTS:
+                        (output_root / filename).write_bytes(
+                            self._fake_png(height=402)
+                        )
+                return subprocess.CompletedProcess(command, 0)
+
+            original_replace = Path.replace
+
+            def fail_staged_directory_publish(source: Path, target: Path) -> Path:
+                if (
+                    source.name.startswith(".provider-matrix-screenshots-")
+                    and not source.name.startswith(
+                        ".provider-matrix-screenshots-previous-"
+                    )
+                    and Path(target).name == "screenshots"
+                ):
+                    raise OSError("injected publication failure")
+                return original_replace(source, target)
+
+            with (
+                mock.patch.object(
+                    type(screenshots_root),
+                    "replace",
+                    fail_staged_directory_publish,
+                ),
+                self.assertRaisesRegex(MatrixFailure, "publish captured screenshots"),
+            ):
+                matrix_screenshots.capture_provider_matrix_screenshots(
+                    REPO_ROOT,
+                    artifact_root,
+                    platform="darwin",
+                    runner=runner,
+                )
+
+            self.assertEqual(
+                {
+                    path.name: path.read_bytes()
+                    for path in screenshots_root.glob("*.png")
+                },
+                {filename: previous for filename in matrix_support.SCREENSHOTS},
+            )
+
+    def test_capture_rejects_non_macos_before_running_xcode(self) -> None:
+        with tempfile.TemporaryDirectory(
+            prefix="unpin-provider-screenshot-test-"
+        ) as temporary_directory:
+            artifact_root = Path(temporary_directory)
+            (artifact_root / "dashboard.html").write_text(
+                "<!doctype html><section id='overview'>ready</section>",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(MatrixFailure, "macOS"):
+                matrix_screenshots.capture_provider_matrix_screenshots(
+                    REPO_ROOT,
+                    artifact_root,
+                    platform="linux",
+                    runner=mock.Mock(),
+                )
 
 
 class FixtureWorkspaceTests(unittest.TestCase):
