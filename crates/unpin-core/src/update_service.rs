@@ -600,7 +600,7 @@ fn verify_candidate(
 }
 
 fn verify_cli_candidate(
-    installed: &Path,
+    _installed: &Path,
     candidate: &Path,
     expected_version: &ReleaseVersion,
 ) -> Result<CandidateVerification, String> {
@@ -617,7 +617,7 @@ fn verify_cli_candidate(
     }
     #[cfg(target_os = "macos")]
     verify_matching_code_requirement(
-        installed,
+        _installed,
         candidate,
         CodeSignatureScope::Executable,
         CLI_CODE_IDENTIFIER,
@@ -636,7 +636,7 @@ fn verify_desktop_candidate(
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (installed, candidate, expected_version);
-        return Err("desktop updates require macOS".to_string());
+        Err("desktop updates require macOS".to_string())
     }
     #[cfg(target_os = "macos")]
     {
@@ -778,6 +778,7 @@ struct BoundedProcessOutput {
     stderr: Vec<u8>,
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn bounded_output(
     command: &mut Command,
     maximum_bytes: usize,

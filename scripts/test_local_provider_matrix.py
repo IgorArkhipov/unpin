@@ -131,6 +131,7 @@ class ArtifactRootTests(unittest.TestCase):
         self.assertEqual(ignored.returncode, 0)
 
 
+@mock.patch.object(sys, "platform", "darwin")
 class ScreenshotCaptureArgumentTests(unittest.TestCase):
     def test_capture_screenshot_flag_is_explicitly_selectable(self) -> None:
         with mock.patch(
