@@ -906,7 +906,7 @@ fn terminate_child(child: &mut Child) {
         let process_group = format!("-{}", child.id());
         let signal_group = |signal: &str| {
             let _ = Command::new("/bin/kill")
-                .args([signal, &process_group])
+                .args([signal, "--", &process_group])
                 .env_clear()
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
