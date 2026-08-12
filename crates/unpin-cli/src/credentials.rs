@@ -7,7 +7,7 @@ mod session_authority;
 
 pub(crate) use approval::{
     ApprovalKeyInitialization, ApprovalKeyState, approval_key_status, approval_key_status_for_mode,
-    authorize_control_decision, authorize_desktop_control_decision,
+    authorize_control_decision, authorize_desktop_control_decision, authorize_operator_descriptor,
     authorize_reviewed_control_decision, initialize_approval_key, issue_human_approval,
     issue_inventory_group_approval, resolve_approval_key,
 };

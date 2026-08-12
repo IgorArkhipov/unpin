@@ -6,6 +6,7 @@ pub(crate) mod hook;
 pub(crate) mod profile;
 pub(crate) mod session;
 pub(crate) mod toggle;
+pub(crate) mod workflow;
 
 use clap::ValueEnum;
 use unpin_core::{

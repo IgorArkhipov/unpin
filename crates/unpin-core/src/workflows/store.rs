@@ -70,6 +70,23 @@ impl WorkflowStore {
         .map_err(Into::into)
     }
 
+    /// Remove one global definition only when the reviewed revision remains
+    /// current. Workspace definitions are fixed-source files and are not
+    /// mutable through this store.
+    pub fn delete_global_definition(
+        &self,
+        workflow_id: &str,
+        expected: &StateRevision,
+    ) -> Result<(), WorkflowStoreError> {
+        validate_storage_id(workflow_id)?;
+        AtomicJsonStore::new(
+            global_definition_path(&self.app_state_root, workflow_id),
+            WORKFLOW_STATE_SCHEMA_VERSION,
+        )
+        .remove_if_revision(expected)
+        .map_err(Into::into)
+    }
+
     pub fn list_global_definitions(
         &self,
     ) -> Result<Vec<WorkflowDefinitionEntry>, WorkflowStoreError> {

@@ -15,7 +15,7 @@ use unpin_core::{
         ProfileSourceScope, compile_profile,
     },
     providers::ProviderId,
-    state::atomic_json::{AtomicJsonStore, OwnerGeneration},
+    state::atomic_json::{AtomicJsonStore, OwnerGeneration, StateError},
     workflows::{
         GENERAL_MODE, IMPLEMENTATION_MODE, PLANNING_MODE, REVIEW_MODE, WORKFLOW_DEFINITION_VERSION,
         WorkflowControl, WorkflowControlEffect, WorkflowDefinition, WorkflowModeDefinition,
@@ -468,6 +468,44 @@ fn workflow_store_round_trips_trusted_definitions_and_immutable_revisions() {
     assert_eq!(
         store.load_revision(&compiled.digest).unwrap(),
         Some(compiled)
+    );
+}
+
+#[test]
+fn workflow_store_delete_requires_the_current_revision() {
+    let temp = tempfile::tempdir().unwrap();
+    let root = fs::canonicalize(temp.path()).unwrap();
+    let store = WorkflowStore::new(root.join("state"));
+    let definition = workflow_definition();
+    let first = store
+        .save_global_definition(&definition, None, owner())
+        .unwrap();
+
+    let mut changed = definition.clone();
+    changed.display_name = "Changed".to_string();
+    let second = store
+        .save_global_definition(
+            &changed,
+            Some(&first),
+            OwnerGeneration::new("workflow-test", 2).unwrap(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        store.delete_global_definition(&definition.id, &first),
+        Err(WorkflowStoreError::State(StateError::StaleRevision {
+            expected: Some(expected),
+            actual: Some(actual),
+        })) if expected == first && actual == second
+    ));
+    store
+        .delete_global_definition(&definition.id, &second)
+        .unwrap();
+    assert!(
+        store
+            .load_global_definition(&definition.id)
+            .unwrap()
+            .is_none()
     );
 }
 

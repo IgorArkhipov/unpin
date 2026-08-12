@@ -39,6 +39,13 @@ pub(crate) fn encode_lower_hex(bytes: &[u8]) -> String {
     encoded
 }
 
+/// Return the lower-case SHA-256 digest for a byte sequence.
+pub fn sha256_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+
+    encode_lower_hex(&sha2::Sha256::digest(bytes))
+}
+
 pub(crate) fn is_lower_hex_digest(value: &str) -> bool {
     value.len() == 64
         && value

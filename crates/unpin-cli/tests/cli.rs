@@ -42,6 +42,10 @@ use unpin_core::{
     },
     state::atomic_json::OwnerGeneration,
     state::workspace::resolve_workspace_identity,
+    workflows::{
+        WORKFLOW_DEFINITION_VERSION, WorkflowDefinition, WorkflowModeDefinition, WorkflowStore,
+        workspace_workflows_dir,
+    },
 };
 #[cfg(unix)]
 use unpin_core::{
@@ -115,6 +119,157 @@ fn run_group_command(
         .arg("--json")
         .output()
         .expect("group command output")
+}
+
+fn run_workflow_command(
+    fixture_root: &Path,
+    project_root: &Path,
+    app_state_root: &Path,
+    args: &[&str],
+) -> Output {
+    Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .arg("workflow")
+        .args(args)
+        .arg("--fixture-root")
+        .arg(fixture_root)
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--home-root")
+        .arg(fixture_root)
+        .arg("--app-state-root")
+        .arg(app_state_root)
+        .arg("--json")
+        .output()
+        .expect("workflow command output")
+}
+
+fn cli_workflow_definition() -> WorkflowDefinition {
+    WorkflowDefinition {
+        version: WORKFLOW_DEFINITION_VERSION,
+        id: "delivery".to_string(),
+        display_name: "Delivery".to_string(),
+        description: Some("planning and implementation workflow".to_string()),
+        baseline_profile_id: "baseline".to_string(),
+        entry_mode: "planning".to_string(),
+        modes: vec![WorkflowModeDefinition::new("planning", "baseline")],
+    }
+}
+
+fn cli_workflow_profile() -> ProfileDefinition {
+    ProfileDefinition {
+        version: PROFILE_DEFINITION_VERSION,
+        id: "baseline".to_string(),
+        display_name: "Baseline".to_string(),
+        description: None,
+        members: Vec::new(),
+        provider_members: Default::default(),
+        supported_providers: Default::default(),
+    }
+}
+
+#[test]
+fn workflow_cli_lists_validates_proposes_and_plans_without_private_paths_or_prompt_text() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fs::canonicalize(temp.path()).expect("canonical tempdir");
+    let fixture_root = root.join("fixtures");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    let project_root = root.join("workspace");
+    let app_state_root = root.join("state");
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(&app_state_root).expect("state");
+
+    let definition = cli_workflow_definition();
+    let workspace_definition = workspace_workflows_dir(&project_root).join("delivery.json");
+    write_text(
+        &workspace_definition,
+        &definition.to_export_json().expect("workflow JSON"),
+    );
+    let profile_store = ProfileStore::new(&app_state_root);
+    profile_store
+        .save_global_definition(
+            &cli_workflow_profile(),
+            None,
+            OwnerGeneration::new("cli-workflow-test", 1).expect("profile owner"),
+        )
+        .expect("global profile");
+
+    let listed = assert_success_json(
+        run_workflow_command(&fixture_root, &project_root, &app_state_root, &["list"]),
+        "workflow list",
+    );
+    assert_eq!(listed["workflows"][0]["scope"], "workspace");
+    assert_eq!(listed["workflows"][0]["definition"]["id"], "delivery");
+    assert!(
+        String::from_utf8_lossy(&serde_json::to_vec(&listed).expect("listed JSON"))
+            .contains("delivery")
+    );
+    assert!(
+        !serde_json::to_string(&listed)
+            .expect("listed JSON")
+            .contains(project_root.to_string_lossy().as_ref())
+    );
+
+    let validation = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "validate",
+                "--file",
+                workspace_definition.to_str().expect("workflow path"),
+                "--provider",
+                "codex",
+            ],
+        ),
+        "workflow validate",
+    );
+    assert_eq!(validation["status"], "valid");
+    assert_eq!(validation["revisions"].as_array().unwrap().len(), 1);
+
+    let prompt = "private prompt text should never be returned";
+    let proposal = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &["propose", "--prompt", prompt, "--provider", "codex"],
+        ),
+        "workflow propose",
+    );
+    assert_eq!(proposal["status"], "proposed");
+    let proposal_text = serde_json::to_string(&proposal).expect("proposal JSON");
+    assert!(!proposal_text.contains(prompt));
+    assert!(proposal["proposal"]["proposal"]["promptDigest"].is_string());
+
+    let planned = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "plan",
+                "--file",
+                workspace_definition.to_str().expect("workflow path"),
+            ],
+        ),
+        "workflow plan",
+    );
+    assert_eq!(planned["status"], "planned");
+    assert_eq!(planned["plan"]["action"], "upsert");
+    assert_eq!(planned["plan"]["scope"], "global");
+    assert!(
+        !serde_json::to_string(&planned)
+            .expect("planned JSON")
+            .contains(project_root.to_string_lossy().as_ref())
+    );
+
+    assert!(
+        WorkflowStore::load_workspace_definition(&project_root, "delivery")
+            .expect("workspace workflow")
+            .is_some()
+    );
 }
 
 #[test]

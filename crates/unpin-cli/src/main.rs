@@ -302,6 +302,11 @@ enum Commands {
         #[command(subcommand)]
         command: commands::hook::HookCommands,
     },
+    /// List, validate, propose, and safely mutate reusable workflow definitions.
+    Workflow {
+        #[command(subcommand)]
+        command: commands::workflow::WorkflowCommands,
+    },
     /// Run the Unpin local MCP server over stdio.
     Mcp {
         #[command(flatten)]
@@ -1141,6 +1146,7 @@ fn main() -> ExitCode {
         Some(Commands::Group { command }) => commands::group::run(command),
         Some(Commands::Gateway { command }) => commands::gateway::run(command),
         Some(Commands::Hook { command }) => commands::hook::run(command),
+        Some(Commands::Workflow { command }) => commands::workflow::run(command),
         Some(Commands::Tui {
             roots,
             app_state_root,
