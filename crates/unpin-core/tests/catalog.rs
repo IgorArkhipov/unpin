@@ -115,6 +115,7 @@ fn shared_skill_becomes_one_capability_with_disclosed_provider_fan_out() {
             claude_project,
         ],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     };
 
     let catalog = output.to_catalog().expect("catalog projection");
@@ -199,6 +200,7 @@ fn static_manifest_is_parsed_as_data_and_dynamic_plugin_stays_atomic() {
             ),
         ],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     };
 
     let catalog = output.to_catalog().expect("catalog projection");
@@ -288,6 +290,7 @@ fn discovered_mcp_tools_receive_deterministic_collision_namespaces() {
             ),
         ],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     }
     .to_catalog()
     .expect("tool catalog");
@@ -315,6 +318,7 @@ fn catalog_store_materializes_content_addressed_objects_and_atomic_index() {
             &source,
         )],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     }
     .to_catalog()
     .expect("catalog projection");

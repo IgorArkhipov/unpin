@@ -1,3 +1,4 @@
+pub mod agent_plugins;
 pub mod approval;
 pub mod bridges;
 pub mod capabilities;

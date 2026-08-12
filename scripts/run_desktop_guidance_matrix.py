@@ -34,6 +34,7 @@ XCODEBUILD_TIMEOUT_SECONDS = 900
 # by the presence of rendered content, not by assuming every image is unique.
 CONTENT_REGION_FRACTIONS = {
     "inventory-ready": (0.01, 0.28, 0.98, 0.66),
+    "agent-plugins-ready": (0.01, 0.28, 0.98, 0.66),
     "groups-ready": (0.01, 0.28, 0.98, 0.66),
     "workspace-context": (0.01, 0.28, 0.98, 0.66),
     "selected-restorable-backup": (0.01, 0.28, 0.98, 0.66),
@@ -62,6 +63,7 @@ class Scenario(NamedTuple):
 SCENARIOS = (
     Scenario("discover-ready-expanded", "discover", "expanded", "inventory-ready"),
     Scenario("discover-ready-collapsed", "discover", "collapsed", "inventory-ready"),
+    Scenario("discover-packages-ready", "discover", "expanded", "agent-plugins-ready"),
     Scenario("discover-no-workspace", "discover", "expanded", "no-workspace"),
     Scenario("discover-loading", "discover", "expanded", "workspace-loading"),
     Scenario("discover-blocked", "discover", "expanded", "bridge-blocked"),

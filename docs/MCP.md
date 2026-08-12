@@ -25,11 +25,11 @@ additional mutation permission is introduced by the newer protocol edition.
 
 An MCP-connected agent can:
 
-- inspect providers, skills, configured MCP servers, plugins, and backups;
+- inspect providers, skills, configured MCP servers, plugins, derived Agent Plugin packages, and backups;
 - list and inspect personal or repository inventory groups;
 - inspect authenticated workspace-policy binding and orphan classification;
 - check whether write prerequisites are ready;
-- prepare one-item, bounded bulk, or inventory-group plans;
+- prepare one-item, bounded bulk, inventory-group, or Agent Plugin package plans;
 - return the exact plan fingerprint and affected resources for review.
 
 An MCP-connected agent cannot approve its own persistent write, create or edit
@@ -59,6 +59,18 @@ as an additional boundary.
 
 MCP tool IDs use the `unpin_` prefix. Their titles, descriptions, and server
 identity use Unpin branding.
+
+### Agent Plugin package tools
+
+MCP exposes three path-free package tools:
+
+- `unpin_list_agent_plugins` returns derived logical packages within the server connection's provider scope, including `inventoryComplete` so an unreadable installed cache is distinguishable from no packages;
+- `unpin_inspect_agent_plugin` returns one package's safe metadata, provider coverage, aggregate state, component dispositions, blockers, and fingerprints;
+- `unpin_plan_agent_plugin_toggle` derives a fresh exact-member plan and returns a signed, expiring `human-action-required` handoff for CLI, TUI, or desktop review.
+
+Agent Plugins remain a derived projection over existing provider inventory. MCP cannot install, update, import, delete, or directly apply a package, and it cannot supply internal exact identities or selection-context fingerprints. The plan tool derives those values server-side from fresh discovery and binds explicit provider reach. A provider-scoped MCP connection can select only its pinned provider; use an all-provider connection and `providerReach: "all"` only for deliberate cross-provider review.
+
+Planning may persist sealed handoff metadata under Unpin app state, but it does not modify provider files or create backup payloads. Diagnostics-only packages remain inspectable and reject planning before a durable operation is created. The returned continuation data identifies the CLI and desktop review action. The CLI can adopt the sealed handoff by preserving its operation ID, plan fingerprint, workspace binding, reach, and expiry. Desktop instead starts a fresh local `agentPlugins.plan` review for its current bridge connection before its own approval and apply sequence; it must not represent this as adoption of the MCP operation.
 
 ### Workspace-policy maintenance status
 

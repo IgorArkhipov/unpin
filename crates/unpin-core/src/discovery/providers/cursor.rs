@@ -9,6 +9,7 @@ pub(crate) fn discover_cursor(
         shared_skill_views,
         items,
         warnings,
+        ..
     } = state;
     let global_skill_root = roots.cursor_config.join("skills");
     let live_skill_ids = discover_recursive_skill_dirs(

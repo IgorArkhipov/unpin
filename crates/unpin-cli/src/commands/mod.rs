@@ -1,3 +1,4 @@
+pub(crate) mod agent_plugins;
 pub(crate) mod catalog;
 pub(crate) mod gateway;
 pub(crate) mod group;

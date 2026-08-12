@@ -16,6 +16,7 @@ use unpin_core::{
     },
     catalog::Catalog,
     config::get_hook_trust_path,
+    control_operation::ReachAwareRootScope,
     discovery::{DiscoveryKind, DiscoveryLayer, DiscoveryRoots, ProviderId, discover_all},
     groups::{
         GroupAccessContext, GroupApprovalArtifactStore, GroupDefinitionV1, GroupMemberIdentity,
@@ -29,7 +30,10 @@ use unpin_core::{
         UNPIN_APPROVED_GROUP_APPLY_TOOL_NAME, UNPIN_MCP_TOOL_NAMES, handle_mcp_request,
         handle_stdio_request_once, handle_stdio_requests,
     },
-    mutation::{BackupAuthenticationKey, BulkToggleController, authenticate_legacy_backup},
+    mutation::{
+        BULK_TOGGLE_PROVIDER_ROOT_PROVENANCE, BULK_TOGGLE_ROOT_PROVENANCE, BackupAuthenticationKey,
+        BulkToggleController, authenticate_legacy_backup,
+    },
     profiles::{
         CapabilityLockSnapshot, PROFILE_DEFINITION_VERSION, PolicyStore, PolicyTarget,
         ProfileDefinition, ProfileSourceScope, ProfileStore, ScopePolicy, compile_profile,
@@ -39,6 +43,7 @@ use unpin_core::{
         atomic_json::{AtomicJsonStore, OwnerGeneration},
         workspace::resolve_workspace_identity,
     },
+    transitions::TransitionJournalStore,
 };
 
 fn fixtures_root() -> PathBuf {
@@ -344,6 +349,505 @@ fn response_bodies(output: &[u8]) -> Vec<serde_json::Value> {
         .lines()
         .map(|line| serde_json::from_str(line).expect("MCP line is JSON"))
         .collect()
+}
+
+#[test]
+fn agent_plugin_tools_have_stable_descriptors_and_closed_schemas() {
+    let context = context();
+
+    for (name, required) in [
+        ("unpin_list_agent_plugins", vec![]),
+        ("unpin_inspect_agent_plugin", vec!["logicalId"]),
+        (
+            "unpin_plan_agent_plugin_toggle",
+            vec!["logicalId", "targetEnabled", "providerReach"],
+        ),
+    ] {
+        let descriptor = tool_descriptor(&context, name);
+        assert_eq!(descriptor["name"], name);
+        assert_eq!(
+            descriptor["annotations"]["readOnlyHint"],
+            name != "unpin_plan_agent_plugin_toggle"
+        );
+        assert_eq!(descriptor["inputSchema"]["additionalProperties"], false);
+        assert_eq!(required_input_fields(&descriptor), required);
+    }
+}
+
+#[test]
+fn generic_bulk_tools_reject_internal_and_unknown_selector_capabilities() {
+    let context = context();
+    let base = json!({
+        "targetEnabled": false,
+        "selector": { "categories": ["plugin-config"] }
+    });
+
+    for (field, value) in [
+        ("exactIdentities", json!([])),
+        (
+            "selectionContextFingerprint",
+            json!("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        ),
+        ("unexpected", json!(true)),
+    ] {
+        let mut arguments = base.clone();
+        arguments["selector"][field] = value;
+        let result = call_tool(&context, "unpin_plan_toggle_items", arguments);
+        assert_eq!(
+            result["status"], "blocked",
+            "field {field} must be rejected"
+        );
+        assert_eq!(result["reasonCode"], "invalid-arguments");
+        assert!(
+            result["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains(field)),
+            "rejection should name {field}: {result:#}",
+        );
+    }
+
+    let mut top_level = base;
+    top_level["selectionContextFingerprint"] =
+        json!("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    let result = call_tool(&context, "unpin_plan_toggle_items", top_level);
+    assert_eq!(result["status"], "blocked");
+    assert_eq!(result["reasonCode"], "invalid-arguments");
+    assert!(
+        result["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("selectionContextFingerprint"))
+    );
+}
+
+#[test]
+fn agent_plugin_list_and_inspect_are_stable_path_free_and_provider_scoped() {
+    let context = context();
+    let first = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+    let second = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+
+    assert_eq!(first, second);
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["inventoryComplete"], true);
+    let package = first["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .find(|package| package["name"] == "connector-kit")
+        .expect("connector package");
+    assert_eq!(package["state"], "on");
+    assert_eq!(package["access"], "actionable");
+    assert!(
+        package["componentSignature"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:"))
+    );
+    assert!(
+        package["projectionFingerprint"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("sha256:"))
+    );
+    assert_eq!(package["coverage"]["providers"], json!(["claude", "codex"]));
+    let logical_id = package["logicalId"].as_str().expect("logical id");
+
+    let inspected = call_tool(
+        &context,
+        "unpin_inspect_agent_plugin",
+        json!({ "logicalId": logical_id }),
+    );
+    assert_eq!(inspected["status"], "ok");
+    assert_eq!(inspected["package"]["logicalId"], logical_id);
+    assert_eq!(
+        inspected["package"]["componentSignature"],
+        package["componentSignature"]
+    );
+    assert_eq!(
+        inspected["package"]["projectionFingerprint"],
+        package["projectionFingerprint"]
+    );
+    assert_eq!(
+        inspected["package"]["instances"].as_array().unwrap().len(),
+        2
+    );
+    assert!(
+        inspected["package"]["instances"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|instance| instance.get("activations").is_none())
+    );
+
+    let encoded = inspected.to_string();
+    for forbidden in [
+        fixtures_root().to_string_lossy().as_ref(),
+        "sourcePath",
+        "statePath",
+        "manifest",
+        "sourceFingerprint",
+        "selectionContextFingerprint",
+        "exactIdentities",
+    ] {
+        assert!(
+            !encoded.contains(forbidden),
+            "MCP package leaked {forbidden}"
+        );
+    }
+
+    let scoped = context_for_provider(ProviderId::Claude);
+    let scoped_list = call_tool(&scoped, "unpin_list_agent_plugins", json!({}));
+    let scoped_package = scoped_list["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["logicalId"] == logical_id)
+        .expect("scoped connector package");
+    assert_eq!(scoped_package["coverage"]["providers"], json!(["claude"]));
+    assert_ne!(
+        scoped_package["projectionFingerprint"],
+        package["projectionFingerprint"]
+    );
+    let scoped_inspect = call_tool(
+        &scoped,
+        "unpin_inspect_agent_plugin",
+        json!({ "logicalId": logical_id }),
+    );
+    assert_eq!(
+        scoped_inspect["package"]["instances"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        scoped_inspect["package"]["instances"][0]["provider"],
+        "claude"
+    );
+}
+
+#[test]
+fn agent_plugin_plan_returns_redacted_durable_handoff_without_provider_writes() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let context = context_with_roots(fixture_copy.path(), &app_state_root);
+    let claude_settings = fixture_copy.path().join("claude/global/settings.json");
+    let codex_config = fixture_copy.path().join("codex/global/config.toml");
+    let original_claude = fs::read(&claude_settings).expect("Claude settings");
+    let original_codex = fs::read(&codex_config).expect("Codex config");
+    let listed = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+    let logical_id = listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "connector-kit")
+        .unwrap()["logicalId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    let planned = call_tool(
+        &context,
+        "unpin_plan_agent_plugin_toggle",
+        json!({
+            "logicalId": logical_id,
+            "targetEnabled": false,
+            "providerReach": "all"
+        }),
+    );
+
+    assert_eq!(planned["status"], "human-action-required");
+    assert_eq!(planned["operation"]["operationKind"], "agent-plugin-toggle");
+    assert_eq!(planned["operation"]["lifecycle"], "awaiting-human-action");
+    assert_eq!(planned["providerReach"], "all");
+    assert_eq!(planned["counts"]["included"], 2);
+    assert_eq!(planned["counts"]["writes"], 2);
+    assert_eq!(planned["counts"]["reachExcluded"], 0);
+    assert!(planned["handoff"]["expiresAtUnix"].as_i64().is_some());
+    let operation_id = planned["operation"]["operationId"]
+        .as_str()
+        .expect("operation id");
+    let journal = TransitionJournalStore::new(&context.app_state_root)
+        .list()
+        .expect("handoff journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == operation_id)
+        .expect("package handoff journal");
+    let roots = &journal.reach_aware.expect("reach-aware handoff").roots;
+    assert_eq!(roots.provenance, BULK_TOGGLE_ROOT_PROVENANCE);
+    assert!(
+        roots
+            .provider_roots
+            .iter()
+            .all(|root| { root.provenance == BULK_TOGGLE_PROVIDER_ROOT_PROVENANCE })
+    );
+    let cli_argv = planned["continuation"]["cli"]["argv"]
+        .as_array()
+        .expect("CLI argv");
+    assert_eq!(
+        &cli_argv[..3],
+        &[json!("agent-plugins"), json!("apply"), json!(logical_id)]
+    );
+    assert!(cli_argv.windows(2).any(|arguments| {
+        arguments
+            == [
+                json!("--app-state-root"),
+                json!(app_state_root.to_string_lossy()),
+            ]
+    }));
+    assert!(
+        cli_argv
+            .iter()
+            .any(|argument| argument == "--adopt-sealed-roots")
+    );
+    assert_eq!(
+        planned["continuation"]["desktop"]["action"],
+        "plan-agent-plugin-toggle"
+    );
+    assert_eq!(planned["continuation"]["desktop"]["handoffAdoption"], false);
+    assert!(
+        planned["continuation"]["desktop"]
+            .get("operationId")
+            .is_none()
+    );
+    assert!(
+        planned["continuation"]["desktop"]
+            .get("planFingerprint")
+            .is_none()
+    );
+    assert_eq!(fs::read(&claude_settings).unwrap(), original_claude);
+    assert_eq!(fs::read(&codex_config).unwrap(), original_codex);
+    assert!(!app_state.path().join("backups").exists());
+
+    let encoded = planned.to_string();
+    for forbidden in [
+        fixture_copy.path().to_string_lossy().as_ref(),
+        "sourcePath",
+        "statePath",
+        "manifest",
+        "selector",
+        "selectionContextFingerprint",
+        "exactIdentities",
+        "targetId",
+    ] {
+        assert!(!encoded.contains(forbidden), "MCP plan leaked {forbidden}");
+    }
+
+    let selected = call_tool(
+        &context,
+        "unpin_plan_agent_plugin_toggle",
+        json!({
+            "logicalId": logical_id,
+            "targetEnabled": false,
+            "providerReach": { "mode": "selected", "provider": "codex" }
+        }),
+    );
+    assert_eq!(selected["status"], "human-action-required");
+    assert_eq!(selected["counts"]["included"], 1);
+    assert_eq!(selected["counts"]["reachExcluded"], 1);
+    assert_eq!(selected["review"]["reachExcluded"][0]["provider"], "claude");
+    assert_eq!(fs::read(&claude_settings).unwrap(), original_claude);
+    assert_eq!(fs::read(&codex_config).unwrap(), original_codex);
+
+    let mut scoped_context = context.clone();
+    scoped_context.provider_scope = McpProviderScope::Provider(ProviderId::Claude);
+    let scoped = call_tool(
+        &scoped_context,
+        "unpin_plan_agent_plugin_toggle",
+        json!({
+            "logicalId": logical_id,
+            "targetEnabled": false,
+            "providerReach": { "mode": "selected" }
+        }),
+    );
+    assert_eq!(scoped["status"], "human-action-required");
+    assert_eq!(scoped["counts"]["included"], 1);
+    assert_eq!(scoped["counts"]["reachExcluded"], 0);
+    assert_eq!(
+        scoped["package"]["coverage"]["providers"],
+        json!(["claude"])
+    );
+    assert!(!scoped.to_string().contains("codex"));
+}
+
+#[test]
+fn agent_plugin_handoff_seals_custom_claude_project_root() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    let project_root = TempDir::new().expect("custom Claude project");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    fs::create_dir_all(project_root.path().join(".claude")).expect("project settings directory");
+    fs::write(
+        project_root.path().join(".claude/settings.json"),
+        r#"{"enabledPlugins":{"connector-kit@example-marketplace":true}}"#,
+    )
+    .expect("project settings");
+
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state");
+    let mut context = context_with_roots(fixture_copy.path(), &app_state_root);
+    context.discovery_roots.claude_project = project_root.path().to_path_buf();
+    let listed = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+    let logical_id = listed["packages"]
+        .as_array()
+        .expect("packages")
+        .iter()
+        .find(|package| package["name"] == "connector-kit")
+        .expect("connector package")["logicalId"]
+        .as_str()
+        .expect("logical id");
+    let planned = call_tool(
+        &context,
+        "unpin_plan_agent_plugin_toggle",
+        json!({
+            "logicalId": logical_id,
+            "targetEnabled": false,
+            "providerReach": { "mode": "selected", "provider": "claude" },
+        }),
+    );
+    assert_eq!(planned["status"], "human-action-required");
+
+    let operation_id = planned["operation"]["operationId"]
+        .as_str()
+        .expect("operation id");
+    let journal = TransitionJournalStore::new(&context.app_state_root)
+        .list()
+        .expect("handoff journals")
+        .into_iter()
+        .find(|journal| journal.operation_id == operation_id)
+        .expect("package handoff journal");
+    let expected_project_root = fs::canonicalize(project_root.path())
+        .expect("canonical custom Claude project")
+        .to_string_lossy()
+        .into_owned();
+    assert!(
+        journal
+            .reach_aware
+            .expect("reach-aware handoff")
+            .roots
+            .provider_roots
+            .iter()
+            .any(|root| {
+                root.provider == ProviderId::Claude
+                    && root.scope == ReachAwareRootScope::Project
+                    && root.root == expected_project_root
+            })
+    );
+}
+
+#[test]
+fn agent_plugin_plan_refreshes_the_discovery_cache_before_planning() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let mut context = context_with_roots(fixture_copy.path(), app_state.path());
+    context.discovery_cache = McpDiscoveryCache::with_ttl(Duration::from_secs(60));
+    let initial = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+    let initial_package = initial["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "connector-kit")
+        .expect("connector package");
+    assert_eq!(initial_package["state"], "on");
+    let logical_id = initial_package["logicalId"].as_str().unwrap().to_string();
+
+    let claude_settings = fixture_copy.path().join("claude/global/settings.json");
+    let mut settings: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claude_settings).unwrap()).unwrap();
+    settings["enabledPlugins"]["connector-kit@example-marketplace"] = json!(false);
+    fs::write(
+        &claude_settings,
+        serde_json::to_vec_pretty(&settings).unwrap(),
+    )
+    .unwrap();
+    let codex_config = fixture_copy.path().join("codex/global/config.toml");
+    let config = fs::read_to_string(&codex_config).unwrap();
+    fs::write(
+        &codex_config,
+        config.replace(
+            "[plugins.\"connector-kit@example-marketplace\"]\nenabled = true",
+            "[plugins.\"connector-kit@example-marketplace\"]\nenabled = false",
+        ),
+    )
+    .unwrap();
+
+    let cached = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+    assert_eq!(
+        cached["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["logicalId"] == logical_id)
+            .unwrap()["state"],
+        "on"
+    );
+    let planned = call_tool(
+        &context,
+        "unpin_plan_agent_plugin_toggle",
+        json!({
+            "logicalId": logical_id,
+            "targetEnabled": false,
+            "providerReach": "all"
+        }),
+    );
+    assert_eq!(planned["status"], "no-op");
+    assert_eq!(planned["counts"]["writes"], 0);
+    assert_eq!(planned["counts"]["noOp"], 2);
+    assert!(planned.get("handoff").is_none());
+
+    let refreshed = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+    assert_eq!(
+        refreshed["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|package| package["logicalId"] == logical_id)
+            .unwrap()["state"],
+        "off"
+    );
+}
+
+#[test]
+fn diagnostics_only_agent_plugin_plan_is_safe_and_non_mutating() {
+    let fixture_copy = TempDir::new().expect("fixture copy");
+    let app_state = TempDir::new().expect("app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let invalid_component = fixture_copy
+        .path()
+        .join("codex/global/plugins/cache/example-marketplace/connector-kit/1.0.0/mcp.json");
+    fs::write(&invalid_component, "{").expect("invalidate standard MCP component");
+    let codex_config = fixture_copy.path().join("codex/global/config.toml");
+    let original_codex = fs::read(&codex_config).expect("Codex config");
+    let mut context = context_with_roots(fixture_copy.path(), app_state.path());
+    context.provider_scope = McpProviderScope::Provider(ProviderId::Codex);
+    let listed = call_tool(&context, "unpin_list_agent_plugins", json!({}));
+    let package = listed["packages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|package| package["name"] == "connector-kit")
+        .expect("diagnostic package");
+    assert_eq!(package["access"], "diagnostics-only");
+    let logical_id = package["logicalId"].as_str().unwrap();
+
+    let planned = call_tool(
+        &context,
+        "unpin_plan_agent_plugin_toggle",
+        json!({
+            "logicalId": logical_id,
+            "targetEnabled": false,
+            "providerReach": { "mode": "selected" }
+        }),
+    );
+    assert_eq!(planned["status"], "blocked");
+    assert_eq!(
+        planned["reasonCode"],
+        "agent-plugin-diagnostics-only-writable-activation-anchors"
+    );
+    assert_eq!(planned["package"]["access"], "diagnostics-only");
+    assert!(planned.get("handoff").is_none());
+    assert_eq!(fs::read(&codex_config).unwrap(), original_codex);
+    assert!(!app_state.path().join("transitions").exists());
+    assert!(!app_state.path().join("backups").exists());
 }
 
 #[test]

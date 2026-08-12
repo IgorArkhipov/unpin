@@ -30,6 +30,12 @@ discovers and safely manages local AI-agent configuration for Claude Code,
 Codex, Cursor, Pi, OpenCode, and Zed. It normalizes provider-specific skills,
 MCP servers, plugins, hooks, agents, and settings into one inventory.
 
+Agent Plugins are not a second package store. Unpin derives package rows from
+supported 1.0.0 manifests and existing provider-native activation records on
+every scan. Package control expands into exact existing inventory identities;
+it does not install components, synthesize rows, or persist desired package
+state.
+
 Unpin `1.0.0` is the stable release channel. Its public stdio MCP
 server supports the stateless 2026-07-28 protocol edition while retaining
 legacy MCP host compatibility; this does not expand its plan-first mutation
@@ -161,6 +167,7 @@ flowchart LR
 | Desktop workbench | Render redacted Discover/Organize, Change Safely, and Recover/Audit state; supervise one bundled bridge child | [`apps/unpin-desktop/`](../apps/unpin-desktop), [`desktop_bridge.rs`](../crates/unpin-cli/src/desktop_bridge.rs) |
 | CLI and terminal TUI | Parse commands, render output, run interactive workflows, and retain compatibility workflows for Profiles, Gateways, Sessions, and Hooks | [`crates/unpin-cli/src/main.rs`](../crates/unpin-cli/src/main.rs), [`crates/unpin-cli/src/tui.rs`](../crates/unpin-cli/src/tui.rs) |
 | Provider inventory | Discover provider-native files and normalize them into typed records | [`discovery.rs`](../crates/unpin-core/src/discovery.rs), [`providers/registry.rs`](../crates/unpin-core/src/providers/registry.rs) |
+| Agent Plugin projection | Group supported package metadata with existing activation rows; derive state, coverage, access, and exact control context without persistence | [`agent_plugins.rs`](../crates/unpin-core/src/agent_plugins.rs), [`bulk_control.rs`](../crates/unpin-core/src/mutation/bulk_control.rs) |
 | Catalog and policy | Track stable capabilities, immutable profiles, layered selection, and global locks | [`catalog/`](../crates/unpin-core/src/catalog), [`profiles/`](../crates/unpin-core/src/profiles) |
 | Approval and transitions | Bind reviewed intent to immutable effects, execute safely, and record recovery state | [`approval.rs`](../crates/unpin-core/src/approval.rs), [`transitions/`](../crates/unpin-core/src/transitions) |
 | Mutation and recovery | Perform format-aware provider changes, authenticated backups, rollback, and restore | [`mutation.rs`](../crates/unpin-core/src/mutation.rs), [`mutation/`](../crates/unpin-core/src/mutation) |
@@ -263,8 +270,12 @@ terminal status is `recovery-required`.
    workspace and command surface.
 3. Follow provider input through
    [`providers/registry.rs`](../crates/unpin-core/src/providers/registry.rs),
-   [`discovery.rs`](../crates/unpin-core/src/discovery.rs), and
-   [`catalog/model.rs`](../crates/unpin-core/src/catalog/model.rs).
+ [`discovery.rs`](../crates/unpin-core/src/discovery.rs), and
+ [`catalog/model.rs`](../crates/unpin-core/src/catalog/model.rs).
+   For package-level inventory, continue through
+   [`agent_plugins.rs`](../crates/unpin-core/src/agent_plugins.rs) and the exact
+   selector path in
+   [`mutation/bulk_control.rs`](../crates/unpin-core/src/mutation/bulk_control.rs).
 4. Follow scope selection through
    [`profiles/policy_store.rs`](../crates/unpin-core/src/profiles/policy_store.rs)
    and [`profiles/resolver.rs`](../crates/unpin-core/src/profiles/resolver.rs).

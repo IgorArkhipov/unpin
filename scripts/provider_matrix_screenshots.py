@@ -53,7 +53,7 @@ class DashboardSectionParser(HTMLParser):
             self.panel_ids.append(section_id)
 
 
-SCREENSHOT_SECTION_IDS = (
+DASHBOARD_SECTION_IDS = (
     "overview",
     "live-library",
     "coverage-matrix",
@@ -65,6 +65,11 @@ SCREENSHOT_SECTION_IDS = (
     "provider-opencode",
     "provider-zed",
     "mcp-states",
+)
+SCREENSHOT_SECTION_IDS = (
+    *DASHBOARD_SECTION_IDS,
+    "desktop-packages-light",
+    "desktop-packages-dark",
 )
 if len(SCREENSHOT_SECTION_IDS) != len(SCREENSHOTS):
     raise RuntimeError("provider screenshot section and filename inventories differ")
@@ -322,8 +327,8 @@ def validate_dashboard_section_inventory(dashboard_path: Path) -> None:
         ) from error
 
     actual = tuple(parser.panel_ids)
-    if actual != SCREENSHOT_SECTION_IDS:
-        expected = set(SCREENSHOT_SECTION_IDS)
+    if actual != DASHBOARD_SECTION_IDS:
+        expected = set(DASHBOARD_SECTION_IDS)
         observed = set(actual)
         raise MatrixFailure(
             "provider matrix dashboard section inventory does not match capture "

@@ -4614,6 +4614,499 @@ fn bulk_handoff_apply_and_status_preserve_reviewed_reach() {
     assert_eq!(status["result"]["lifecycle"], "applied");
 }
 
+fn run_agent_plugin_list(fixture_root: &Path, app_state_root: &Path) -> serde_json::Value {
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "list", "--fixture-root"])
+        .arg(fixture_root)
+        .args(["--app-state-root"])
+        .arg(app_state_root)
+        .arg("--json")
+        .output()
+        .expect("agent plugin list");
+    assert!(
+        output.status.success(),
+        "agent plugin list should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("agent plugin list JSON")
+}
+
+fn assert_agent_plugin_output_is_path_free(value: &serde_json::Value, fixture_root: &Path) {
+    let rendered = serde_json::to_string(value).expect("agent plugin output JSON");
+    for forbidden in [
+        fixture_root.to_string_lossy().as_ref(),
+        "sourcePath",
+        "statePath",
+        "packageRoot",
+        "exactIdentities",
+        "selector",
+        "matched",
+    ] {
+        assert!(
+            !rendered.contains(forbidden),
+            "agent plugin output leaked forbidden field/value {forbidden}: {rendered}"
+        );
+    }
+}
+
+#[test]
+fn agent_plugins_list_show_and_plans_are_stable_path_free_and_reach_explicit() {
+    let app_state = TempDir::new().expect("temp app state");
+    let fixture_root = fs::canonicalize(fixtures_root()).expect("canonical fixtures root");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+
+    let first = run_agent_plugin_list(&fixture_root, &app_state_root);
+    let second = run_agent_plugin_list(&fixture_root, &app_state_root);
+    assert_eq!(
+        first, second,
+        "unchanged package inventory should be stable"
+    );
+    assert_eq!(first["statusVersion"], 1);
+    assert_eq!(first["status"], "ok");
+    assert_eq!(first["inventoryComplete"], true);
+    assert!(
+        first["packageCount"]
+            .as_u64()
+            .is_some_and(|count| count > 0)
+    );
+    assert_agent_plugin_output_is_path_free(&first, &fixture_root);
+
+    let package = first["packages"]
+        .as_array()
+        .and_then(|packages| {
+            packages
+                .iter()
+                .find(|package| package["name"] == "connector-kit")
+        })
+        .expect("connector-kit package");
+    let logical_id = package["logicalId"].as_str().expect("logical package id");
+    assert_eq!(package["state"], "on");
+    assert_eq!(package["access"], "actionable");
+    assert_eq!(package["instanceCount"], 2);
+
+    let shown = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "show", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .arg("--json")
+        .output()
+        .expect("agent plugin show");
+    assert!(shown.status.success());
+    let shown: serde_json::Value =
+        serde_json::from_slice(&shown.stdout).expect("agent plugin show JSON");
+    assert_eq!(shown["package"]["logicalId"], logical_id);
+    assert_eq!(
+        shown["package"]["instances"][0]["components"][0]["kind"],
+        "mcp"
+    );
+    assert!(shown["package"]["instances"][0].get("manifest").is_none());
+    assert_agent_plugin_output_is_path_free(&shown, &fixture_root);
+
+    let missing_reach = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "plan", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--disable", "--json"])
+        .output()
+        .expect("agent plugin plan without reach");
+    assert_eq!(missing_reach.status.code(), Some(3));
+
+    let selected = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "plan", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args([
+            "--reach",
+            "selected",
+            "--provider",
+            "codex",
+            "--disable",
+            "--json",
+        ])
+        .output()
+        .expect("selected-provider package plan");
+    assert_eq!(
+        selected.status.code(),
+        Some(2),
+        "selected plan should report partial reach; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&selected.stdout),
+        String::from_utf8_lossy(&selected.stderr)
+    );
+    let selected: serde_json::Value =
+        serde_json::from_slice(&selected.stdout).expect("selected package plan JSON");
+    assert_eq!(selected["status"], "planned");
+    assert_eq!(selected["lifecycle"], "partial");
+    assert_eq!(selected["providerReach"]["selected"]["provider"], "codex");
+    assert_eq!(
+        selected["providerReach"]["selected"]["provenance"],
+        "explicit-input"
+    );
+    assert_eq!(selected["counts"]["included"], 1);
+    assert_eq!(selected["counts"]["reachExcluded"], 1);
+    assert_agent_plugin_output_is_path_free(&selected, &fixture_root);
+
+    let all = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "plan", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--reach", "all", "--disable", "--json"])
+        .output()
+        .expect("all-provider package plan");
+    assert!(all.status.success());
+    let all: serde_json::Value =
+        serde_json::from_slice(&all.stdout).expect("all-provider package plan JSON");
+    assert_eq!(all["providerReach"], "all");
+    assert_eq!(all["counts"]["included"], 2);
+    assert_eq!(all["counts"]["reachExcluded"], 0);
+    assert_agent_plugin_output_is_path_free(&all, &fixture_root);
+}
+
+#[test]
+fn agent_plugins_handoff_apply_and_status_reuse_redacted_bulk_lifecycle() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let fixture_root = fs::canonicalize(fixture_copy.path()).expect("canonical fixture copy root");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    let listed = run_agent_plugin_list(&fixture_root, &app_state_root);
+    let logical_id = listed["packages"]
+        .as_array()
+        .and_then(|packages| {
+            packages
+                .iter()
+                .find(|package| package["name"] == "connector-kit")
+        })
+        .and_then(|package| package["logicalId"].as_str())
+        .expect("connector-kit logical id");
+
+    let handoff = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "handoff", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--reach", "all", "--disable", "--json"])
+        .output()
+        .expect("agent plugin handoff");
+    assert!(
+        handoff.status.success(),
+        "handoff should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&handoff.stdout),
+        String::from_utf8_lossy(&handoff.stderr)
+    );
+    let handoff: serde_json::Value =
+        serde_json::from_slice(&handoff.stdout).expect("agent plugin handoff JSON");
+    assert_agent_plugin_output_is_path_free(&handoff, &fixture_root);
+    let operation_id = handoff["operationId"].as_str().expect("operation id");
+    let fingerprint = handoff["planFingerprint"]
+        .as_str()
+        .expect("plan fingerprint");
+    assert_eq!(handoff["handoff"]["operationId"], operation_id);
+
+    let applied = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "apply", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id])
+        .args(["--plan-fingerprint", fingerprint, "--confirm", "--json"])
+        .output()
+        .expect("agent plugin apply");
+    assert!(
+        applied.status.success(),
+        "apply should succeed; stdout=\n{}\nstderr=\n{}",
+        String::from_utf8_lossy(&applied.stdout),
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied: serde_json::Value =
+        serde_json::from_slice(&applied.stdout).expect("agent plugin apply JSON");
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["package"]["logicalId"], logical_id);
+    assert_eq!(applied["resultCounts"]["applied"], 2);
+    assert_agent_plugin_output_is_path_free(&applied, &fixture_root);
+
+    let status = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "status", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id, "--json"])
+        .output()
+        .expect("agent plugin status");
+    assert!(status.status.success());
+    let status: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("agent plugin status JSON");
+    assert_eq!(status["status"], "applied");
+    assert_eq!(status["package"]["logicalId"], logical_id);
+    assert_eq!(status["projectionMatchesReview"], false);
+    assert_eq!(status["refreshStatus"], "required");
+    assert_eq!(status["refreshRequired"], true);
+    assert_eq!(status["replanRequired"], true);
+    assert_eq!(status["package"]["state"], "off");
+    assert_agent_plugin_output_is_path_free(&status, &fixture_root);
+}
+
+#[test]
+fn agent_plugin_apply_rejects_exact_activation_drift_without_writes() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let fixture_root = fs::canonicalize(fixture_copy.path()).expect("canonical fixture copy root");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    let listed = run_agent_plugin_list(&fixture_root, &app_state_root);
+    let logical_id = listed["packages"]
+        .as_array()
+        .and_then(|packages| {
+            packages
+                .iter()
+                .find(|package| package["name"] == "connector-kit")
+        })
+        .and_then(|package| package["logicalId"].as_str())
+        .expect("connector-kit logical id");
+
+    let handoff = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "handoff", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--reach", "all", "--disable", "--json"])
+        .output()
+        .expect("agent plugin handoff");
+    assert!(handoff.status.success());
+    let handoff: serde_json::Value =
+        serde_json::from_slice(&handoff.stdout).expect("agent plugin handoff JSON");
+    let operation_id = handoff["operationId"].as_str().expect("operation id");
+    let fingerprint = handoff["planFingerprint"]
+        .as_str()
+        .expect("plan fingerprint");
+
+    let project_settings = fixture_root.join("claude/project/.claude/settings.json");
+    let original = fs::read_to_string(&project_settings).expect("Claude project settings");
+    let drifted = original.replacen(
+        "\"github\": true",
+        "\"github\": true,\n    \"connector-kit@example-marketplace\": true",
+        1,
+    );
+    assert_ne!(
+        drifted, original,
+        "fixture must contain a project plugin map"
+    );
+    fs::write(&project_settings, &drifted).expect("introduce an additional activation");
+
+    let applied = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "apply", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id])
+        .args(["--plan-fingerprint", fingerprint, "--confirm", "--json"])
+        .output()
+        .expect("agent plugin apply");
+    assert_eq!(applied.status.code(), Some(3));
+    let applied: serde_json::Value =
+        serde_json::from_slice(&applied.stdout).expect("blocked agent plugin apply JSON");
+    assert!(
+        applied["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("package projection changed"))
+    );
+    assert_eq!(
+        fs::read_to_string(&project_settings).expect("drifted settings remain untouched"),
+        drifted
+    );
+    assert!(
+        !app_state_root.join("backups").exists(),
+        "a selector-drift rejection must precede every provider write"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn agent_plugin_partial_apply_preserves_backup_evidence_for_restore() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let fixture_root = fs::canonicalize(fixture_copy.path()).expect("canonical fixture copy root");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    let listed = run_agent_plugin_list(&fixture_root, &app_state_root);
+    let logical_id = listed["packages"]
+        .as_array()
+        .and_then(|packages| {
+            packages
+                .iter()
+                .find(|package| package["name"] == "connector-kit")
+        })
+        .and_then(|package| package["logicalId"].as_str())
+        .expect("connector-kit logical id");
+    let claude_settings = fixture_root.join("claude/global/settings.json");
+    let original_claude = fs::read_to_string(&claude_settings).expect("Claude settings");
+
+    let handoff = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "handoff", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--reach", "all", "--disable", "--json"])
+        .output()
+        .expect("agent plugin handoff");
+    assert!(handoff.status.success());
+    let handoff: serde_json::Value =
+        serde_json::from_slice(&handoff.stdout).expect("agent plugin handoff JSON");
+    let operation_id = handoff["operationId"].as_str().expect("operation id");
+    let fingerprint = handoff["planFingerprint"]
+        .as_str()
+        .expect("plan fingerprint");
+
+    let codex_global = fixture_root.join("codex/global");
+    let original_permissions = fs::metadata(&codex_global)
+        .expect("Codex global directory metadata")
+        .permissions();
+    fs::set_permissions(&codex_global, fs::Permissions::from_mode(0o500))
+        .expect("make second provider write path read-only");
+    let probe = codex_global.join(".unpin-package-write-probe");
+    if fs::write(&probe, "probe").is_ok() {
+        let _ = fs::remove_file(&probe);
+        fs::set_permissions(&codex_global, original_permissions)
+            .expect("restore Codex global directory permissions");
+        return;
+    }
+    let codex_config = codex_global.join("config.toml");
+    let original_config_permissions = fs::metadata(&codex_config)
+        .expect("Codex config metadata")
+        .permissions();
+    fs::set_permissions(&codex_config, fs::Permissions::from_mode(0o400))
+        .expect("make second provider state file read-only");
+
+    let applied = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "apply", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--operation-id", operation_id])
+        .args(["--plan-fingerprint", fingerprint, "--confirm", "--json"])
+        .output()
+        .expect("agent plugin apply");
+    fs::set_permissions(&codex_config, original_config_permissions)
+        .expect("restore Codex config permissions");
+    fs::set_permissions(&codex_global, original_permissions)
+        .expect("restore Codex global directory permissions");
+
+    assert_eq!(applied.status.code(), Some(4));
+    let applied: serde_json::Value =
+        serde_json::from_slice(&applied.stdout).expect("partial apply JSON");
+    assert_eq!(applied["status"], "recovery-required");
+    assert_eq!(applied["resultCounts"]["applied"], 1);
+    assert!(
+        applied["resultCounts"]["recoveryRequired"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
+    assert!(applied["resultCounts"]["backupCount"].as_u64().unwrap_or(0) >= 1);
+
+    let claude_settings_path = claude_settings.to_string_lossy();
+    let backup_id = fs::read_dir(app_state_root.join("backups"))
+        .expect("package backup directory")
+        .filter_map(Result::ok)
+        .find_map(|entry| {
+            let manifest = fs::read(entry.path().join("manifest.json")).ok()?;
+            let manifest: serde_json::Value = serde_json::from_slice(&manifest).ok()?;
+            let restores_claude = manifest["entries"].as_array().is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["target"]["path"].as_str() == Some(claude_settings_path.as_ref())
+                })
+            });
+            restores_claude.then(|| entry.file_name().to_string_lossy().into_owned())
+        })
+        .expect("partial package apply retains the Claude backup");
+    let restored = run_reviewed_restore(&backup_id, true, |command| {
+        command
+            .args(["--fixture-root"])
+            .arg(&fixture_root)
+            .args(["--app-state-root"])
+            .arg(&app_state_root);
+    });
+    let restored: serde_json::Value =
+        serde_json::from_slice(&restored.stdout).expect("restore result JSON");
+    assert_eq!(restored["status"], "restored");
+    assert_eq!(
+        fs::read_to_string(&claude_settings).expect("restored Claude settings"),
+        original_claude
+    );
+}
+
+#[test]
+fn diagnostics_only_agent_plugin_rejects_handoff_without_mutation() {
+    let fixture = TempDir::new().expect("temporary diagnostics-only package fixture");
+    let app_state = TempDir::new().expect("temporary app state");
+    let package_root = fixture
+        .path()
+        .join("codex/global/plugins/cache/acme/connector-kit/1.0.0");
+    fs::create_dir_all(package_root.join("skills/review")).expect("create package fixture");
+    fs::write(
+        fixture.path().join("codex/global/config.toml"),
+        "[plugins.\"connector-kit@acme\"]\nenabled = true\n",
+    )
+    .expect("write native activation");
+    fs::write(
+        package_root.join("plugin.json"),
+        r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"connector-kit","version":"1.0.0"}"#,
+    )
+    .expect("write plugin manifest");
+    fs::write(
+        package_root.join("skills/review/SKILL.md"),
+        "---\nname: review\ndescription: Review changes.\n---\n",
+    )
+    .expect("write package skill");
+    fs::write(package_root.join("mcp.json"), "{").expect("write invalid MCP component");
+    let fixture_root = fs::canonicalize(fixture.path()).expect("canonical fixture root");
+    let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+    let listed = run_agent_plugin_list(&fixture_root, &app_state_root);
+    let package = &listed["packages"][0];
+    assert_eq!(package["access"], "diagnostics-only");
+    let logical_id = package["logicalId"].as_str().expect("logical package id");
+
+    let handoff = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .args(["agent-plugins", "handoff", logical_id, "--fixture-root"])
+        .arg(&fixture_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args(["--reach", "all", "--disable", "--json"])
+        .output()
+        .expect("diagnostics-only handoff");
+    assert_eq!(handoff.status.code(), Some(3));
+    let blocked: serde_json::Value =
+        serde_json::from_slice(&handoff.stdout).expect("blocked handoff JSON");
+    assert_eq!(blocked["status"], "blocked");
+    assert_eq!(
+        blocked["reasonCode"],
+        "diagnostics-only-writable-activation"
+    );
+    assert!(
+        !app_state_root.join("operations").exists(),
+        "diagnostics-only handoff must not create a durable operation"
+    );
+}
+
 #[test]
 fn toggle_reports_missing_selector_as_command_error() {
     let output = Command::cargo_bin("unpin")
@@ -6088,6 +6581,9 @@ fn mcp_once_lists_stable_tool_surface() {
         [
             "unpin_get_inventory_summary",
             "unpin_list_items",
+            "unpin_list_agent_plugins",
+            "unpin_inspect_agent_plugin",
+            "unpin_plan_agent_plugin_toggle",
             "unpin_list_inventory_groups",
             "unpin_get_inventory_group",
             "unpin_plan_inventory_group",

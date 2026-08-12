@@ -9,6 +9,7 @@ pub(crate) fn discover_opencode(
         shared_skill_views,
         items,
         warnings,
+        ..
     } = state;
     let native_global_root = roots.opencode_global.join("skills");
     let agents_global_root = roots.shared_global.join(".agents").join("skills");

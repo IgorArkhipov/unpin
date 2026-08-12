@@ -106,6 +106,58 @@ final class BridgeClientTests: XCTestCase {
         }
     }
 
+    func testHandshakeRejectsPartialAgentPluginCapabilities() async throws {
+        let script = """
+        #!/bin/sh
+        IFS= read -r request
+        printf '%s\\n' '{"version":2,"id":"desktop-1","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard"]}}'
+        """
+        let temporary = try temporaryExecutable(script: script)
+        defer { try? FileManager.default.removeItem(at: temporary.root) }
+        let digest = SHA256.hash(data: try Data(contentsOf: temporary.executable))
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let bridge = BridgeClient(
+            executableURL: temporary.executable,
+            projectRoot: temporary.root,
+            manifest: BundledBridgeManifest(
+                bridgeProtocolVersion: BridgeClient.protocolVersion,
+                unpinVersion: "1.0.0",
+                sha256: digest
+            )
+        )
+
+        do {
+            try await bridge.start()
+            _ = try await bridge.handshake()
+            XCTFail("partial Agent Plugin capabilities should fail handshake")
+        } catch BridgeClientError.incompatibleCapabilities {
+            // Expected.
+        } catch {
+            _ = await bridge.stop()
+            XCTFail("unexpected error: \(error)")
+        }
+    }
+
+    func testSnapshotRequiresAgentPluginInventoryFields() {
+        let snapshot = """
+        {"capturedAtUnix":0,"inventory":[],"warnings":[],"groups":[],"groupWarnings":[]}
+        """
+
+        XCTAssertThrowsError(
+            try JSONDecoder().decode(BridgeSnapshot.self, from: Data(snapshot.utf8))
+        )
+    }
+
+    func testAgentPluginInstanceUsesOpaqueBridgeIdentity() throws {
+        let instance = """
+        {"instanceId":"agent-plugin-instance:claude:global:abc123","provider":"claude","layer":"global","state":"on","access":"actionable","version":"1.0.0","components":[],"activations":[],"blockers":[],"diagnostics":[]}
+        """
+
+        let decoded = try JSONDecoder().decode(AgentPluginInstance.self, from: Data(instance.utf8))
+        XCTAssertEqual(decoded.id, "agent-plugin-instance:claude:global:abc123")
+    }
+
     func testStalledControlTimeoutStopsChildAndAllowsRestart() async throws {
         let script = """
         #!/bin/sh
@@ -115,7 +167,7 @@ final class BridgeClientTests: XCTestCase {
                     while :; do sleep 1; done
                     ;;
                 *handshake*)
-                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":[]}}'
+        printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard"]}}'
                     ;;
             esac
         done
@@ -163,7 +215,7 @@ final class BridgeClientTests: XCTestCase {
                     while :; do :; done
                     ;;
                 *handshake*)
-                    printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":[]}}'
+        printf '%s\\n' '{"version":2,"id":"desktop-2","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard"]}}'
                     ;;
             esac
         done
@@ -279,6 +331,80 @@ final class BridgeClientTests: XCTestCase {
         )
 
         XCTAssertNil(operation.providerReach)
+    }
+
+    func testAgentPluginSnapshotAndPlanDTOsDecodeRedactedContract() throws {
+        let snapshot = try JSONDecoder().decode(
+            BridgeSnapshot.self,
+            from: Data(#"""
+            {
+              "capturedAtUnix": 1,
+              "inventory": [],
+              "warnings": [],
+              "groups": [],
+              "groupWarnings": [],
+              "agentPluginInventoryComplete": true,
+              "agentPlugins": [{
+                "logicalId": "agent-plugin:connector-kit:abc",
+                "name": "connector-kit",
+                "componentSignature": "mcp+skill",
+                "projectionFingerprint": "sha256:projection",
+                "state": "mixed",
+                "access": "actionable",
+                "providers": ["claude", "codex"],
+                "componentKinds": ["mcp", "skill"],
+                "instanceCount": 1,
+                "instances": [{
+                  "instanceId": "instance-connector-kit-codex-global",
+                  "provider": "codex",
+                  "layer": "global",
+                  "state": "on",
+                  "access": "actionable",
+                  "version": "1.0.0",
+                  "description": "Portable connector tools",
+                  "components": [{"kind":"skill","name":"review","disposition":"available","reason":null}],
+                  "activations": [{"enabled":true,"mutability":"read-write"}],
+                  "blockers": [],
+                  "diagnostics": []
+                }]
+              }]
+            }
+            """#.utf8)
+        )
+        let package = try XCTUnwrap(snapshot.agentPlugins.first)
+        XCTAssertEqual(package.providerDisplay, "claude, codex")
+        XCTAssertEqual(package.typeDisplay, "mcp + skill")
+        XCTAssertEqual(package.instances.first?.activations.first?.mutability, "read-write")
+
+        let envelope = try JSONDecoder().decode(
+            AgentPluginPlanEnvelope.self,
+            from: Data(#"""
+            {"plan":{
+              "logicalId":"agent-plugin:connector-kit:abc",
+              "name":"connector-kit",
+              "componentSignature":"mcp+skill",
+              "projectionFingerprint":"sha256:projection",
+              "state":"mixed",
+              "access":"actionable",
+              "providers":["claude","codex"],
+              "componentKinds":["mcp","skill"],
+              "instanceCount":0,
+              "instances":[],
+              "operationId":"bulk-toggle-abc",
+              "planFingerprint":"sha256:plan",
+              "target":"off",
+              "providerReach":{"selected":{"provider":"codex","provenance":"explicit-input"}},
+              "coverage":[{"provider":"codex","included":1,"excluded":0,"reasonCodes":[]}],
+              "lifecycle":"applied",
+              "counts":{"instances":2,"activations":2,"components":4,"diagnostics":0,"included":1,"writes":1,"noOp":0,"blocked":0,"reachExcluded":1},
+              "review":{"included":[{"provider":"codex","layer":"global","outcome":"applied"}],"noOp":[],"blocked":[],"reachExcluded":[{"provider":"claude","layer":"global","activationCount":1,"reasonCode":"outside-selected-provider-reach"}],"componentDiagnostics":[]}
+            }}
+            """#.utf8)
+        )
+        XCTAssertEqual(envelope.plan.target, "off")
+        XCTAssertEqual(envelope.plan.providerReach, "selected · codex · explicit-input")
+        XCTAssertEqual(envelope.plan.counts.reachExcluded, 1)
+        XCTAssertEqual(envelope.plan.review.included.first?.outcome, "applied")
     }
 
     private func temporaryExecutable(script: String) throws -> (root: URL, executable: URL) {

@@ -50,6 +50,9 @@ struct WorkspaceStoreTestHooks {
     var beforeReadError: (() async -> Void)?
     var beforeGroupPlan: (() async -> Void)?
     var beforeGroupApply: (() async -> Void)?
+    var beforeAgentPluginPlan: (() async -> Void)?
+    var beforeAgentPluginApply: (() async -> Void)?
+    var beforeAgentPluginDiscard: (() async -> Void)?
     var beforeDefinitionApply: (() async -> Void)?
     var beforeRestoreApply: (() async -> Void)?
     var beforeRecoveryRefresh: (() async -> Void)?
@@ -60,6 +63,9 @@ struct WorkspaceStoreTestHooks {
         beforeReadError: (() async -> Void)? = nil,
         beforeGroupPlan: (() async -> Void)? = nil,
         beforeGroupApply: (() async -> Void)? = nil,
+        beforeAgentPluginPlan: (() async -> Void)? = nil,
+        beforeAgentPluginApply: (() async -> Void)? = nil,
+        beforeAgentPluginDiscard: (() async -> Void)? = nil,
         beforeDefinitionApply: (() async -> Void)? = nil,
         beforeRestoreApply: (() async -> Void)? = nil,
         beforeRecoveryRefresh: (() async -> Void)? = nil,
@@ -69,6 +75,9 @@ struct WorkspaceStoreTestHooks {
         self.beforeReadError = beforeReadError
         self.beforeGroupPlan = beforeGroupPlan
         self.beforeGroupApply = beforeGroupApply
+        self.beforeAgentPluginPlan = beforeAgentPluginPlan
+        self.beforeAgentPluginApply = beforeAgentPluginApply
+        self.beforeAgentPluginDiscard = beforeAgentPluginDiscard
         self.beforeDefinitionApply = beforeDefinitionApply
         self.beforeRestoreApply = beforeRestoreApply
         self.beforeRecoveryRefresh = beforeRecoveryRefresh
@@ -95,6 +104,10 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var approvedPlanFingerprint: String?
     @Published private(set) var lastChangeBlocker: String?
     @Published private(set) var lastApply: GroupApplyResult?
+    @Published private(set) var reviewedAgentPlugin: AgentPluginPlan?
+    @Published private(set) var approvedAgentPluginFingerprint: String?
+    @Published private(set) var lastAgentPluginBlocker: String?
+    @Published private(set) var lastAgentPluginApply: AgentPluginApplyResult?
     @Published private(set) var reviewedDefinition: GroupDefinitionPlanEnvelope?
     @Published private(set) var definitionHistory: [GroupDefinitionHistory] = []
     @Published private(set) var lastDefinitionBlocker: String?
@@ -113,6 +126,7 @@ final class WorkspaceStore: ObservableObject {
     private let bridgeRoots: BridgeLaunchRoots
     private var testHooks = WorkspaceStoreTestHooks()
     private var groupPlanRequestGeneration = 0
+    private var agentPluginPlanRequestGeneration = 0
     private var recoveryRequestGeneration = 0
     @Published private(set) var controlRequestInFlight = false
     @Published private(set) var recoveryRequestInFlight = false
@@ -140,6 +154,10 @@ final class WorkspaceStore: ObservableObject {
 
     var reviewedRestoreIsApproved: Bool {
         reviewedRestore?.plan.planFingerprint == approvedRestoreFingerprint
+    }
+
+    var reviewedAgentPluginIsApproved: Bool {
+        reviewedAgentPlugin?.planFingerprint == approvedAgentPluginFingerprint
     }
 
     var hasWorkspace: Bool { workspaceRoot != nil }
@@ -288,6 +306,11 @@ final class WorkspaceStore: ObservableObject {
         approvedPlanFingerprint = nil
         lastChangeBlocker = nil
         lastApply = nil
+        agentPluginPlanRequestGeneration &+= 1
+        reviewedAgentPlugin = nil
+        approvedAgentPluginFingerprint = nil
+        lastAgentPluginBlocker = nil
+        lastAgentPluginApply = nil
         reviewedDefinition = nil
         definitionHistory = []
         lastDefinitionBlocker = nil
@@ -307,6 +330,23 @@ final class WorkspaceStore: ObservableObject {
         let expectedGeneration = connectionGeneration ?? self.connectionGeneration
         let freshSnapshot = try await bridge.snapshot()
         guard connectionIsCurrent(expectedGeneration) else { return }
+        if let reviewedAgentPlugin,
+           freshSnapshot.agentPlugins.first(where: {
+               $0.logicalId == reviewedAgentPlugin.logicalId
+                   && $0.projectionFingerprint == reviewedAgentPlugin.projectionFingerprint
+           }) == nil {
+            if let hook = testHooks.beforeAgentPluginDiscard {
+                await hook()
+            }
+            try? await bridge.discardAgentPlugin(
+                operationID: reviewedAgentPlugin.operationId,
+                fingerprint: reviewedAgentPlugin.planFingerprint
+            )
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            self.reviewedAgentPlugin = nil
+            approvedAgentPluginFingerprint = nil
+            lastAgentPluginBlocker = "The package changed after review. Create a fresh review before applying."
+        }
         snapshot = freshSnapshot
         setReadyUnlessDefinitionBlocked()
     }
@@ -462,6 +502,174 @@ final class WorkspaceStore: ObservableObject {
 
     private func planRequestIsCurrent(_ requestGeneration: Int, connectionGeneration: Int) -> Bool {
         requestGeneration == groupPlanRequestGeneration
+            && connectionIsCurrent(connectionGeneration)
+    }
+
+    func planAgentPlugin(
+        _ package: AgentPluginSummary,
+        target: String,
+        reach: String,
+        selectedProvider: String?
+    ) async {
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
+        agentPluginPlanRequestGeneration &+= 1
+        let requestGeneration = agentPluginPlanRequestGeneration
+        await discardReviewedAgentPluginContents()
+        guard agentPluginPlanRequestIsCurrent(
+            requestGeneration,
+            connectionGeneration: expectedGeneration
+        ) else { return }
+        lastAgentPluginApply = nil
+        lastAgentPluginBlocker = nil
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeAgentPluginPlan {
+                await hook()
+            }
+            let freshPlan = try await bridge.planAgentPlugin(
+                logicalID: package.logicalId,
+                target: target,
+                reach: reach,
+                selectedProvider: selectedProvider
+        ).plan
+        await awaitReadResponseHook()
+        guard agentPluginPlanRequestIsCurrent(
+            requestGeneration,
+            connectionGeneration: expectedGeneration
+        ) else {
+            try? await bridge.discardAgentPlugin(
+                operationID: freshPlan.operationId,
+                fingerprint: freshPlan.planFingerprint
+            )
+            return
+        }
+            reviewedAgentPlugin = freshPlan
+            approvedAgentPluginFingerprint = nil
+            lastAgentPluginBlocker = nil
+            lastAgentPluginApply = nil
+            setReadyUnlessDefinitionBlocked()
+        } catch {
+            await awaitReadErrorHook()
+            guard agentPluginPlanRequestIsCurrent(
+                requestGeneration,
+                connectionGeneration: expectedGeneration
+            ) else { return }
+            lastAgentPluginBlocker = error.localizedDescription
+            state = .blocked(error.localizedDescription)
+        }
+    }
+
+    func approveReviewedAgentPlugin() async {
+        guard controlRequestInFlight == false else { return }
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
+        controlRequestInFlight = true
+        defer { controlRequestInFlight = false }
+        do {
+            guard let bridge, let plan = reviewedAgentPlugin else {
+                throw BridgeClientError.malformedResponse
+            }
+            _ = try await bridge.approveAgentPlugin(
+                operationID: plan.operationId,
+                fingerprint: plan.planFingerprint
+            )
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            approvedAgentPluginFingerprint = plan.planFingerprint
+            lastAgentPluginBlocker = nil
+            setReadyUnlessDefinitionBlocked()
+        } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            lastAgentPluginBlocker = error.localizedDescription
+            state = .blocked(error.localizedDescription)
+        }
+    }
+
+    func applyApprovedAgentPlugin() async {
+        guard controlRequestInFlight == false else { return }
+        guard guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
+        controlRequestInFlight = true
+        defer { controlRequestInFlight = false }
+        do {
+            guard let bridge, let plan = reviewedAgentPlugin,
+                  approvedAgentPluginFingerprint == plan.planFingerprint else {
+                throw BridgeClientError.requestFailed("desktop-approval-required")
+            }
+            if let hook = testHooks.beforeAgentPluginApply {
+                await hook()
+            }
+            let result = try await bridge.applyAgentPlugin(
+                operationID: plan.operationId,
+                fingerprint: plan.planFingerprint
+            ).result
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            lastAgentPluginApply = result
+            reviewedAgentPlugin = nil
+            approvedAgentPluginFingerprint = nil
+            if result.lifecycle == "recovery-required" || result.counts.recoveryRequired > 0 {
+                lastAgentPluginBlocker = Self.mutationUncertaintyMessage
+                mutationUncertaintyBlocker = Self.mutationUncertaintyMessage
+                let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(
+                    connectionGeneration: expectedGeneration
+                )
+                guard connectionIsCurrent(expectedGeneration) else { return }
+                if recoveryRefreshed {
+                    state = .blocked(Self.mutationUncertaintyMessage)
+                }
+                return
+            }
+            do {
+                try await refresh(connectionGeneration: expectedGeneration)
+                guard connectionIsCurrent(expectedGeneration) else { return }
+            } catch {
+                guard connectionIsCurrent(expectedGeneration) else { return }
+                lastAgentPluginBlocker = "The package change completed, but its fresh observation could not be loaded. Reload the workspace or inspect Recover and Audit."
+                state = .blocked(error.localizedDescription)
+            }
+        } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            reviewedAgentPlugin = nil
+            approvedAgentPluginFingerprint = nil
+            guard mutationMayBeUnconfirmed(error) else {
+                lastAgentPluginBlocker = nil
+                state = .blocked(error.localizedDescription)
+                return
+            }
+            lastAgentPluginBlocker = Self.mutationUncertaintyMessage
+            mutationUncertaintyBlocker = Self.mutationUncertaintyMessage
+            let recoveryRefreshed = await refreshRecoveryAfterUnconfirmedChange(
+                connectionGeneration: expectedGeneration
+            )
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            if recoveryRefreshed {
+                state = .blocked(Self.mutationUncertaintyMessage)
+            }
+        }
+    }
+
+    func discardReviewedAgentPlugin() async {
+        agentPluginPlanRequestGeneration &+= 1
+        await discardReviewedAgentPluginContents()
+    }
+
+    private func discardReviewedAgentPluginContents() async {
+        let review = reviewedAgentPlugin
+        reviewedAgentPlugin = nil
+        approvedAgentPluginFingerprint = nil
+        lastAgentPluginBlocker = nil
+        guard let bridge, let review else { return }
+        try? await bridge.discardAgentPlugin(
+            operationID: review.operationId,
+            fingerprint: review.planFingerprint
+        )
+    }
+
+    private func agentPluginPlanRequestIsCurrent(
+        _ requestGeneration: Int,
+        connectionGeneration: Int
+    ) -> Bool {
+        requestGeneration == agentPluginPlanRequestGeneration
             && connectionIsCurrent(connectionGeneration)
     }
 
@@ -709,8 +917,8 @@ final class WorkspaceStore: ObservableObject {
 
     private func mutationMayBeUnconfirmed(_ error: Error) -> Bool {
         guard let bridgeError = error as? BridgeClientError else { return true }
-        if case .requestFailed = bridgeError {
-            return false
+        if case let .requestFailed(code) = bridgeError {
+            return code == "agent-plugin-recovery-required"
         }
         return true
     }

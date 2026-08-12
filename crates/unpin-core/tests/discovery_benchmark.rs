@@ -11,6 +11,7 @@ const CI_DIRECTORY_COUNT: usize = 192;
 const BENCHMARK_DIRECTORY_COUNTS: [usize; 3] = [256, 2_048, 8_192];
 const SKILL_INTERVAL: usize = 16;
 const WARM_RUNS: usize = 5;
+const AGENT_PLUGIN_PACKAGE_COUNT: usize = 128;
 
 struct ProjectSkillFixture {
     _home_root: tempfile::TempDir,
@@ -51,6 +52,40 @@ fn large_project_scope_fixture_is_complete_and_deterministic() {
             "missing {provider:?} project skills"
         );
     }
+}
+
+#[test]
+fn large_agent_plugin_fixture_projects_deterministically() {
+    let fixture = tempfile::TempDir::new().expect("temporary Agent Plugins benchmark fixture");
+    let mut config = String::new();
+    for index in 0..AGENT_PLUGIN_PACKAGE_COUNT {
+        let native_id = format!("plugin-{index:03}@benchmark");
+        config.push_str(&format!("[plugins.\"{native_id}\"]\nenabled = true\n\n"));
+        let package = fixture.path().join(format!(
+            "codex/global/plugins/cache/benchmark/plugin-{index:03}/1.0.0"
+        ));
+        write_file(
+            &package.join("plugin.json"),
+            &format!(
+                "{{\"$schema\":\"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json\",\"name\":\"plugin-{index:03}\"}}"
+            ),
+        );
+        write_file(
+            &package.join("skills/benchmark/SKILL.md"),
+            "---\nname: benchmark\ndescription: Benchmark package projection.\n---\nBenchmark.\n",
+        );
+    }
+    write_file(&fixture.path().join("codex/global/config.toml"), &config);
+    let roots = DiscoveryRoots::fixture_root(fixture.path());
+
+    let (first, first_duration) = timed_discovery(&roots);
+    let (second, second_duration) = timed_discovery(&roots);
+    assert_discovery_matches(&first, &second);
+    assert_eq!(first.agent_plugins().len(), AGENT_PLUGIN_PACKAGE_COUNT);
+    eprintln!(
+        "Agent Plugins benchmark packages={} first={first_duration:?} second={second_duration:?}",
+        AGENT_PLUGIN_PACKAGE_COUNT
+    );
 }
 
 #[test]

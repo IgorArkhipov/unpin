@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 from local_provider_matrix_cases import (
+    run_agent_plugin_surface_parity,
     run_cli_scenario,
     run_matrix_cases,
     run_mcp_scenario,
@@ -611,6 +612,7 @@ def render_report(
     cli_results = summary["results"]["cliCases"]
     tui_results = summary["results"]["tuiCases"]
     mcp_results = summary["results"]["mcpCases"]
+    agent_plugin_parity = summary["staticSurfaces"]["agentPlugins"]
     live = summary.get("liveInventory")
     matrix = summary["matrix"]
     declared_exceptions = summary["declaredExceptions"]
@@ -688,6 +690,7 @@ def render_report(
             f"- CLI cycles: **{len(cli_results)}/{len(matrix)} passed**",
             f"- Interactive TUI cycles: **{len(tui_results)}/{len(matrix)} passed**",
             f"- MCP plan/review/handoff cycles: **{len(mcp_results)}/{len(matrix)} passed**",
+            f"- Agent Plugin parity: **{agent_plugin_parity['packageCount']} package(s)** matched across CLI, TUI, desktop bridge, and MCP; exact plan included **{agent_plugin_parity['planIncluded']}** native activation anchors with provider state unchanged.",
             "- CLI and TUI cycles verified plan -> first toggle -> inverse toggle -> restore inverse backup -> restore original backup -> byte-exact fixture recovery.",
             "- TUI cycles drove search, staging, confirmation blocking, two confirmed applies, rediscovery, and backups through a real terminal PTY; CLI restore then proved both backups.",
             f"- MCP cycles kept writes disabled in {mcp_writes_disabled}/{len(matrix)} cases, blocked {mcp_unreviewed_blocked}/{len(matrix)} unreviewed applies, and returned {mcp_handoffs}/{len(matrix)} exact-fingerprint human-action handoffs; CLI completed each reviewed handoff and restore.",
@@ -1090,6 +1093,13 @@ def main() -> int:
         write_json(artifact_root / "raw/scenario-matrix.json", MATRIX)
 
         static_surfaces = capture_static_surfaces(binary, artifact_root)
+        with private_fixture_workspace() as agent_plugin_fixture_workspace:
+            static_surfaces["agentPlugins"] = run_agent_plugin_surface_parity(
+                binary,
+                artifact_root,
+                agent_plugin_fixture_workspace,
+                canonical_fixture_digest,
+            )
         verification = (
             {}
             if args.skip_quality_gates

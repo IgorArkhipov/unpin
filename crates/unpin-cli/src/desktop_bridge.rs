@@ -6,6 +6,7 @@ use std::{
 
 use serde_json::{Value, json};
 use unpin_core::{
+    agent_plugins::{AgentPluginComponentDisposition, AgentPluginInstance, AgentPluginSummary},
     approval::ControlApprovalContext,
     config::UnpinConfig,
     control::build_control_status,
@@ -20,15 +21,26 @@ use unpin_core::{
         validate_new_group_members,
     },
     mutation::{
-        AuthenticatedBackupIndex, BackupAuthenticationKey, RestoreControlPlan, RestoreController,
-        RestoreResult, load_backup_index_authenticated,
+        AuthenticatedBackupIndex, BackupAuthenticationKey, BulkToggleApplyResult,
+        BulkToggleController, BulkTogglePlan, BulkTogglePlanError, BulkToggleRequest,
+        RestoreControlPlan, RestoreController, RestoreResult, ToggleStatus,
+        load_backup_index_authenticated,
     },
-    provider_reach::ProviderReach,
+    provider_reach::{
+        ConnectionBoundary, IncludedTargetOutcome, ProviderReach, ProviderReachLifecycle,
+        SelectedProviderAuthority, SelectedProviderProvenance,
+    },
+    providers::ProviderId,
     sessions::SessionAuthorityKey,
     state::atomic_json::OwnerGeneration,
 };
 
-use crate::{credentials, group_store::ScopedGroupStore};
+use crate::{
+    commands::{ProviderReachArg, toggle::durable_context},
+    credentials,
+    group_store::ScopedGroupStore,
+    parse_provider_id,
+};
 
 pub(crate) const PROTOCOL_VERSION: u64 = 2;
 const MAX_FRAME_BYTES: usize = 1_048_576;
@@ -43,6 +55,11 @@ const METHOD_GROUP_PLAN: &str = "group.plan";
 const METHOD_GROUP_APPROVE: &str = "group.approve";
 const METHOD_GROUP_APPLY: &str = "group.apply";
 const METHOD_GROUP_DISCARD: &str = "group.discard";
+const METHOD_AGENT_PLUGIN_INSPECT: &str = "agentPlugins.inspect";
+const METHOD_AGENT_PLUGIN_PLAN: &str = "agentPlugins.plan";
+const METHOD_AGENT_PLUGIN_APPROVE: &str = "agentPlugins.approve";
+const METHOD_AGENT_PLUGIN_APPLY: &str = "agentPlugins.apply";
+const METHOD_AGENT_PLUGIN_DISCARD: &str = "agentPlugins.discard";
 const METHOD_GROUP_DEFINITION_PLAN: &str = "group.definition.plan";
 const METHOD_GROUP_DEFINITION_APPLY: &str = "group.definition.apply";
 const METHOD_GROUP_DEFINITION_DISCARD: &str = "group.definition.discard";
@@ -59,6 +76,11 @@ const BRIDGE_CAPABILITIES: &[&str] = &[
     METHOD_GROUP_APPROVE,
     METHOD_GROUP_APPLY,
     METHOD_GROUP_DISCARD,
+    METHOD_AGENT_PLUGIN_INSPECT,
+    METHOD_AGENT_PLUGIN_PLAN,
+    METHOD_AGENT_PLUGIN_APPROVE,
+    METHOD_AGENT_PLUGIN_APPLY,
+    METHOD_AGENT_PLUGIN_DISCARD,
     METHOD_GROUP_DEFINITION_PLAN,
     METHOD_GROUP_DEFINITION_APPLY,
     METHOD_GROUP_DEFINITION_DISCARD,
@@ -102,13 +124,7 @@ fn run_with_io(
     mut input: impl BufRead,
     mut output: impl Write,
 ) -> Result<(), String> {
-    let mut state = DesktopBridgeState {
-        context,
-        reviewed_groups: Default::default(),
-        reviewed_restores: Default::default(),
-        reviewed_definitions: Default::default(),
-        next_definition_plan_id: 0,
-    };
+    let mut state = DesktopBridgeState::new(context);
     let mut seen_request_ids = RecentRequestIds::default();
     let mut frame = Vec::with_capacity(4096);
     while let Some(frame_status) =
@@ -147,13 +163,34 @@ struct Request {
 struct DesktopBridgeState {
     context: DesktopBridgeContext,
     reviewed_groups: BTreeMap<String, ReviewedGroupPlan>,
+    reviewed_agent_plugins: BTreeMap<String, ReviewedAgentPluginPlan>,
     reviewed_restores: BTreeMap<String, ReviewedRestorePlan>,
     reviewed_definitions: BTreeMap<String, ReviewedDefinitionChange>,
     next_definition_plan_id: u64,
 }
 
+impl DesktopBridgeState {
+    fn new(context: DesktopBridgeContext) -> Self {
+        Self {
+            context,
+            reviewed_groups: Default::default(),
+            reviewed_agent_plugins: Default::default(),
+            reviewed_restores: Default::default(),
+            reviewed_definitions: Default::default(),
+            next_definition_plan_id: 0,
+        }
+    }
+}
+
 struct ReviewedGroupPlan {
     plan: GroupTogglePlan,
+    authorization: Option<unpin_core::approval::ControlAuthorization>,
+    reviewed_at_unix: i64,
+}
+
+struct ReviewedAgentPluginPlan {
+    package: AgentPluginSummary,
+    plan: BulkTogglePlan,
     authorization: Option<unpin_core::approval::ControlAuthorization>,
     reviewed_at_unix: i64,
 }
@@ -335,6 +372,9 @@ fn prune_expired_reviewed_plans(state: &mut DesktopBridgeState) {
         .reviewed_groups
         .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
     state
+        .reviewed_agent_plugins
+        .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
+    state
         .reviewed_restores
         .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
     state
@@ -351,6 +391,11 @@ fn handle_request(state: &mut DesktopBridgeState, request: Request) -> Value {
         METHOD_GROUP_APPROVE => approve_group(state, &request.params),
         METHOD_GROUP_APPLY => apply_group(state, &request.params),
         METHOD_GROUP_DISCARD => discard_group(state, &request.params),
+        METHOD_AGENT_PLUGIN_INSPECT => inspect_agent_plugin(state, &request.params),
+        METHOD_AGENT_PLUGIN_PLAN => plan_agent_plugin(state, &request.params),
+        METHOD_AGENT_PLUGIN_APPROVE => approve_agent_plugin(state, &request.params),
+        METHOD_AGENT_PLUGIN_APPLY => apply_agent_plugin(state, &request.params),
+        METHOD_AGENT_PLUGIN_DISCARD => discard_agent_plugin(state, &request.params),
         METHOD_GROUP_DEFINITION_PLAN => plan_definition_change(state, &request.params),
         METHOD_GROUP_DEFINITION_APPLY => apply_definition_change(state, &request.params),
         METHOD_GROUP_DEFINITION_DISCARD => discard_definition_change(state, &request.params),
@@ -490,6 +535,252 @@ fn discard_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value
     }
     state.reviewed_groups.remove(operation_id);
     Ok(json!({"discarded": true}))
+}
+
+fn inspect_agent_plugin(state: &DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &["logicalId"])?;
+    let logical_id = required_string(params, "logicalId")?;
+    let discovery =
+        discover_all(&state.context.discovery_roots).map_err(|_| "discovery-unavailable")?;
+    let package = discovery
+        .agent_plugins()
+        .into_iter()
+        .find(|package| package.logical_id == logical_id)
+        .ok_or("agent-plugin-not-found")?;
+    Ok(json!({"package": redacted_agent_plugin_summary(&package)}))
+}
+
+fn plan_agent_plugin(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(
+        params,
+        &["logicalId", "target", "reach", "selectedProvider"],
+    )?;
+    let logical_id = required_string(params, "logicalId")?;
+    let target_enabled = match required_string(params, "target")? {
+        "on" | "enable" => true,
+        "off" | "disable" => false,
+        _ => return Err("invalid-agent-plugin-target"),
+    };
+    let discovery =
+        discover_all(&state.context.discovery_roots).map_err(|_| "discovery-unavailable")?;
+    let package = discovery
+        .agent_plugins()
+        .into_iter()
+        .find(|package| package.logical_id == logical_id)
+        .ok_or("agent-plugin-not-found")?;
+    let mut request =
+        BulkToggleRequest::for_agent_plugin_summary(&discovery, &package, target_enabled)
+            .map_err(agent_plugin_plan_error_code)?;
+    let selected_provider = params
+        .get("selectedProvider")
+        .map(|value| {
+            value
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 1_024)
+                .ok_or("invalid-params")
+                .and_then(|value| parse_provider_id(value).ok_or("invalid-selected-provider"))
+        })
+        .transpose()?;
+    let reach = match required_string(params, "reach")? {
+        "all" if selected_provider.is_none() => ProviderReachArg::All,
+        "all" => return Err("provider-conflicts-with-all-reach"),
+        "selected" => ProviderReachArg::Selected,
+        _ => return Err("invalid-agent-plugin-reach"),
+    };
+    let reach_input = reach
+        .input(selected_provider)
+        .map_err(|_| "selected-provider-required")?;
+    request = request.with_reach(ConnectionBoundary::All, reach_input);
+    if let Some(provider) = selected_provider {
+        request = request.with_authority(SelectedProviderAuthority::new(
+            provider,
+            SelectedProviderProvenance::ExplicitInput,
+        ));
+    }
+    BulkToggleController::validate_before_discovery(&request)
+        .map_err(agent_plugin_plan_error_code)?;
+    let plan = BulkToggleController::new(&state.context.config.app_state_root)
+        .plan_agent_plugin_from_discovery(discovery, request, &package)
+        .map_err(agent_plugin_plan_error_code)?;
+    if !has_reviewed_plan_capacity(&state.reviewed_agent_plugins, &plan.operation_id) {
+        return Err("agent-plugin-plan-limit-reached");
+    }
+    let response = redacted_agent_plugin_plan(&package, &plan);
+    state.reviewed_agent_plugins.insert(
+        plan.operation_id.clone(),
+        ReviewedAgentPluginPlan {
+            package,
+            plan,
+            authorization: None,
+            reviewed_at_unix: unix_now(),
+        },
+    );
+    Ok(json!({"plan": response}))
+}
+
+fn approve_agent_plugin(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let plan = {
+        let reviewed = state
+            .reviewed_agent_plugins
+            .get(operation_id)
+            .ok_or("agent-plugin-plan-unavailable")?;
+        if reviewed.plan.plan_fingerprint != plan_fingerprint {
+            return Err("plan-fingerprint-mismatch");
+        }
+        reviewed.plan.clone()
+    };
+    if !matches!(
+        plan.lifecycle,
+        ProviderReachLifecycle::Applied | ProviderReachLifecycle::Partial
+    ) || plan.write_count() == 0
+    {
+        return Err("agent-plugin-plan-not-actionable");
+    }
+    let (_, durable) = durable_context(
+        &state.context.config.app_state_root,
+        &state.context.discovery_roots,
+        &state.context.config,
+        &plan,
+        state.context.fixture_mode,
+    )
+    .map_err(|_| "agent-plugin-approval-unavailable")?;
+    let expectation = plan
+        .approval_expectation(&durable.approval_context, &durable.principal.session_id)
+        .map_err(|_| "agent-plugin-approval-unavailable")?;
+    let digest = unprefixed_plan_fingerprint(plan_fingerprint);
+    let authorization = credentials::authorize_desktop_control_decision(
+        state.context.fixture_mode,
+        &state.context.config.app_state_root,
+        &expectation,
+        digest,
+        Some(digest),
+        "unpin-desktop-agent-plugin-approval",
+        unix_now(),
+    )
+    .map_err(|_| "desktop-approval-blocked")?;
+    state
+        .reviewed_agent_plugins
+        .get_mut(operation_id)
+        .ok_or("agent-plugin-plan-unavailable")?
+        .authorization = Some(authorization);
+    Ok(json!({
+        "operationId": operation_id,
+        "planFingerprint": plan_fingerprint,
+        "approval": "current",
+    }))
+}
+
+fn apply_agent_plugin(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let (logical_id, package, plan) = {
+        let reviewed = state
+            .reviewed_agent_plugins
+            .get(operation_id)
+            .ok_or("agent-plugin-plan-unavailable")?;
+        if reviewed.plan.plan_fingerprint != plan_fingerprint {
+            return Err("plan-fingerprint-mismatch");
+        }
+        if reviewed.authorization.is_none() {
+            return Err("desktop-approval-required");
+        }
+        (
+            reviewed.package.logical_id.clone(),
+            reviewed.package.clone(),
+            reviewed.plan.clone(),
+        )
+    };
+    let fresh_discovery =
+        discover_all(&state.context.discovery_roots).map_err(|_| "discovery-unavailable")?;
+    let (controller, durable) = durable_context(
+        &state.context.config.app_state_root,
+        &state.context.discovery_roots,
+        &state.context.config,
+        &plan,
+        state.context.fixture_mode,
+    )
+    .map_err(|_| "agent-plugin-apply-blocked")?;
+    require_group_write_sandbox(&state.context)?;
+    let authorization = state
+        .reviewed_agent_plugins
+        .get_mut(operation_id)
+        .ok_or("agent-plugin-plan-unavailable")?
+        .authorization
+        .take()
+        .ok_or("desktop-approval-required")?;
+    let result = controller
+        .apply_with_reach_aware(&plan, authorization, durable, fresh_discovery)
+        .map_err(|_| "agent-plugin-recovery-required")?;
+    state.reviewed_agent_plugins.remove(operation_id);
+    let refreshed = discover_all(&state.context.discovery_roots)
+        .ok()
+        .and_then(|discovery| {
+            discovery
+                .agent_plugins()
+                .into_iter()
+                .find(|candidate| candidate.logical_id == logical_id)
+        });
+    Ok(json!({
+        "result": redacted_agent_plugin_apply(refreshed.as_ref().unwrap_or(&package), &result),
+        "refreshStatus": if refreshed.is_some() { "complete" } else { "unavailable" },
+    }))
+}
+
+fn discard_agent_plugin(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId", "planFingerprint"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let plan_fingerprint = required_string(params, "planFingerprint")?;
+    let reviewed = state
+        .reviewed_agent_plugins
+        .get(operation_id)
+        .ok_or("agent-plugin-plan-unavailable")?;
+    if reviewed.plan.plan_fingerprint != plan_fingerprint {
+        return Err("plan-fingerprint-mismatch");
+    }
+    state.reviewed_agent_plugins.remove(operation_id);
+    Ok(json!({"discarded": true}))
+}
+
+fn agent_plugin_plan_error_code(error: BulkTogglePlanError) -> &'static str {
+    match error {
+        BulkTogglePlanError::AgentPluginNotFound => "agent-plugin-not-found",
+        BulkTogglePlanError::AgentPluginHasNoActivationAnchors => {
+            "agent-plugin-no-activation-anchors"
+        }
+        BulkTogglePlanError::AgentPluginInventoryIncomplete => "agent-plugin-inventory-incomplete",
+        BulkTogglePlanError::AgentPluginHasDiagnosticsOnlyActivationAnchors => {
+            "agent-plugin-diagnostics-only-writable-activation"
+        }
+        BulkTogglePlanError::AgentPluginHasNoActionableActivationAnchors => {
+            "agent-plugin-no-actionable-activation"
+        }
+        BulkTogglePlanError::SelectionContextFingerprintMismatch => {
+            "agent-plugin-projection-changed"
+        }
+        BulkTogglePlanError::PlanFingerprintMismatch => "plan-fingerprint-mismatch",
+        BulkTogglePlanError::NoTargetsInProviderReach => "no-targets-in-provider-reach",
+        _ => "agent-plugin-plan-unavailable",
+    }
+}
+
+fn unprefixed_plan_fingerprint(fingerprint: &str) -> &str {
+    fingerprint.strip_prefix("sha256:").unwrap_or(fingerprint)
 }
 
 fn plan_definition_change(
@@ -1421,6 +1712,7 @@ fn redacted_restore_result(result: &RestoreResult) -> Value {
 
 fn snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &'static str> {
     let discovery = discover_all(&context.discovery_roots).map_err(|_| "discovery-unavailable")?;
+    let agent_plugins = discovery.agent_plugins();
     let resolver = group_resolver(context)?;
     let (groups, group_warnings) = resolver
         .list_views_with_warnings(&discovery)
@@ -1433,6 +1725,8 @@ fn snapshot_response(context: &DesktopBridgeContext) -> Result<Value, &'static s
             "layer": warning.layer,
             "code": warning.code,
         })).collect::<Vec<_>>(),
+        "agentPluginInventoryComplete": discovery.agent_plugin_inventory_complete(),
+        "agentPlugins": agent_plugins.iter().map(redacted_agent_plugin_summary).collect::<Vec<_>>(),
         "groups": groups,
         "groupWarnings": group_warnings.iter().map(|warning| json!({
             "scope": warning.scope,
@@ -1451,6 +1745,269 @@ fn redacted_item(item: &DiscoveryItem) -> Value {
         "displayName": item.display_name,
         "enabled": item.enabled,
         "mutability": item.mutability,
+    })
+}
+
+fn redacted_agent_plugin_summary(package: &AgentPluginSummary) -> Value {
+    let providers = package
+        .instances
+        .iter()
+        .map(|instance| instance.provider)
+        .collect::<BTreeSet<_>>();
+    let component_kinds = package
+        .instances
+        .iter()
+        .flat_map(|instance| instance.components.iter().map(|component| component.kind))
+        .collect::<BTreeSet<_>>();
+    json!({
+        "logicalId": package.logical_id,
+        "name": package.name,
+        "componentSignature": package.component_signature,
+        "projectionFingerprint": package.projection_fingerprint,
+        "state": package.state,
+        "access": package.access,
+        "providers": providers,
+        "componentKinds": component_kinds,
+        "blockerCount": package.instances.iter().map(|instance| instance.blockers.len()).sum::<usize>(),
+        "diagnosticCount": package.instances.iter().map(|instance| instance.diagnostics.len()).sum::<usize>(),
+        "instanceCount": package.instances.len(),
+        "instances": package.instances.iter().map(redacted_agent_plugin_instance).collect::<Vec<_>>(),
+    })
+}
+
+fn redacted_agent_plugin_instance(instance: &AgentPluginInstance) -> Value {
+    json!({
+        "instanceId": instance.instance_id,
+        "provider": instance.provider,
+        "layer": instance.layer,
+        "state": instance.state,
+        "access": instance.access,
+        "version": instance.manifest.version,
+        "components": instance.components.iter().map(|component| json!({
+            "kind": component.kind,
+            "name": component.name,
+            "disposition": component.disposition,
+            "reason": component.reason,
+        })).collect::<Vec<_>>(),
+        "activations": instance.activations.iter().map(|activation| json!({
+            "enabled": activation.enabled,
+            "mutability": activation.mutability,
+        })).collect::<Vec<_>>(),
+        "blockers": instance.blockers,
+        "diagnostics": instance.diagnostics,
+    })
+}
+
+fn redacted_agent_plugin_plan(package: &AgentPluginSummary, plan: &BulkTogglePlan) -> Value {
+    let mut value = redacted_agent_plugin_summary(package);
+    value["operationId"] = json!(plan.operation_id);
+    value["planFingerprint"] = json!(plan.plan_fingerprint);
+    value["target"] = json!(if plan.target_enabled { "on" } else { "off" });
+    value["providerReach"] = json!(plan.provider_reach);
+    value["coverage"] = redacted_provider_coverage(&plan.provider_coverage);
+    value["lifecycle"] = json!(plan.lifecycle);
+    value["counts"] = redacted_agent_plugin_plan_counts(package, plan);
+    value["review"] = redacted_agent_plugin_plan_review(package, plan);
+    value
+}
+
+fn redacted_agent_plugin_plan_counts(package: &AgentPluginSummary, plan: &BulkTogglePlan) -> Value {
+    let activations = package
+        .instances
+        .iter()
+        .map(|instance| instance.activations.len())
+        .sum::<usize>();
+    let components = package
+        .instances
+        .iter()
+        .map(|instance| instance.components.len())
+        .sum::<usize>();
+    let diagnostics = package
+        .instances
+        .iter()
+        .map(|instance| instance.blockers.len() + instance.diagnostics.len())
+        .sum::<usize>();
+    json!({
+        "instances": package.instances.len(),
+        "activations": activations,
+        "components": components,
+        "diagnostics": diagnostics,
+        "included": plan.included_count(),
+        "writes": plan.write_count(),
+        "noOp": plan.included_count().saturating_sub(plan.write_count()),
+        "blocked": plan.blocked_count(),
+        "reachExcluded": plan.provider_coverage.reach_excluded_count(),
+    })
+}
+
+fn redacted_agent_plugin_plan_review(package: &AgentPluginSummary, plan: &BulkTogglePlan) -> Value {
+    let included = plan
+        .included
+        .iter()
+        .map(|item| {
+            json!({
+                "provider": item.item.provider,
+                "layer": item.item.layer,
+                "outcome": item.outcome,
+            })
+        })
+        .collect::<Vec<_>>();
+    let no_op = plan
+        .included
+        .iter()
+        .filter(|item| item.outcome == IncludedTargetOutcome::NoOp)
+        .map(|item| {
+            json!({
+                "provider": item.item.provider,
+                "layer": item.item.layer,
+            })
+        })
+        .collect::<Vec<_>>();
+    let blocked = plan
+        .blocked
+        .iter()
+        .map(|item| {
+            json!({
+                "provider": item.item.provider,
+                "layer": item.item.layer,
+                "reasonCode": item.reason_code,
+            })
+        })
+        .collect::<Vec<_>>();
+    let reach_excluded = package
+        .instances
+        .iter()
+        .filter(|instance| !plan.provider_reach.allows(instance.provider))
+        .map(|instance| {
+            json!({
+                "provider": instance.provider,
+                "layer": instance.layer,
+                "activationCount": instance.activations.len(),
+                "reasonCode": "outside-selected-provider-reach",
+            })
+        })
+        .collect::<Vec<_>>();
+    let component_diagnostics = package
+        .instances
+        .iter()
+        .flat_map(|instance| {
+            let mut rows = instance
+                .components
+                .iter()
+                .filter(|component| {
+                    component.disposition != AgentPluginComponentDisposition::Available
+                })
+                .map(|component| {
+                    json!({
+                        "provider": instance.provider,
+                        "layer": instance.layer,
+                        "kind": component.kind,
+                        "name": component.name,
+                        "disposition": component.disposition,
+                        "reason": component.reason,
+                    })
+                })
+                .collect::<Vec<_>>();
+            rows.extend(instance.blockers.iter().map(|reason| {
+                json!({
+                    "provider": instance.provider,
+                    "layer": instance.layer,
+                    "disposition": "blocked",
+                    "reason": reason,
+                })
+            }));
+            rows.extend(instance.diagnostics.iter().map(|reason| {
+                json!({
+                    "provider": instance.provider,
+                    "layer": instance.layer,
+                    "disposition": "diagnostic",
+                    "reason": reason,
+                })
+            }));
+            rows
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "included": included,
+        "noOp": no_op,
+        "blocked": blocked,
+        "reachExcluded": reach_excluded,
+        "componentDiagnostics": component_diagnostics,
+    })
+}
+
+fn redacted_provider_coverage(
+    coverage: &unpin_core::provider_reach::ProviderReachCoverage,
+) -> Value {
+    let mut summaries = BTreeMap::<ProviderId, (usize, usize, BTreeSet<String>)>::new();
+    for entry in &coverage.entries {
+        let summary = summaries.entry(entry.provider).or_default();
+        if entry.included {
+            summary.0 += 1;
+        } else {
+            summary.1 += 1;
+        }
+        if let Some(reason) = &entry.reason
+            && let Ok(Value::String(reason)) = serde_json::to_value(reason)
+        {
+            summary.2.insert(reason);
+        }
+    }
+    Value::Array(
+        summaries
+            .into_iter()
+            .map(|(provider, (included, excluded, reason_codes))| {
+                json!({
+                    "provider": provider,
+                    "included": included,
+                    "excluded": excluded,
+                    "reasonCodes": reason_codes,
+                })
+            })
+            .collect(),
+    )
+}
+
+fn redacted_agent_plugin_apply(
+    package: &AgentPluginSummary,
+    result: &BulkToggleApplyResult,
+) -> Value {
+    let mut applied = 0;
+    let mut no_op = 0;
+    let mut blocked = 0;
+    let mut recovery_required = 0;
+    let mut backup_count = 0;
+    let mut reason_codes = BTreeSet::new();
+    for item in &result.items {
+        match item.status {
+            ToggleStatus::Applied => applied += 1,
+            ToggleStatus::DryRun => no_op += 1,
+            ToggleStatus::Blocked => blocked += 1,
+            ToggleStatus::RecoveryRequired => recovery_required += 1,
+        }
+        backup_count += usize::from(item.backup_id.is_some());
+        if let Some(reason) = &item.reason {
+            reason_codes.insert(crate::commands::agent_plugins::safe_reason_code(reason));
+        }
+    }
+    json!({
+        "operationId": result.operation_id,
+        "planFingerprint": result.plan_fingerprint,
+        "lifecycle": result.lifecycle,
+        "providerReach": result.provider_reach,
+        "coverage": redacted_provider_coverage(&result.provider_coverage),
+        "logicalId": package.logical_id,
+        "name": package.name,
+        "state": package.state,
+        "access": package.access,
+        "counts": {
+            "applied": applied,
+            "noOp": no_op,
+            "blocked": blocked,
+            "recoveryRequired": recovery_required,
+            "backupCount": backup_count,
+            "reasonCodes": reason_codes,
+        },
     })
 }
 
@@ -1559,6 +2116,41 @@ mod tests {
             },
         };
         DesktopBridgeContext::new(config, DiscoveryRoots::fixture_root(root), true)
+    }
+
+    fn agent_plugin_fixture_context(root: &std::path::Path) -> DesktopBridgeContext {
+        let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("CLI crate has a workspace crates parent")
+            .join("unpin-core")
+            .join("tests")
+            .join("fixtures");
+        let app_state_root = root.join("state");
+        let project_root = root.join("project");
+        std::fs::create_dir_all(&app_state_root).expect("temporary bridge app state");
+        std::fs::create_dir_all(project_root.join(".git")).expect("temporary bridge project");
+        let config = UnpinConfig {
+            version: 1,
+            app_state_root,
+            cursor_root: root.join("cursor"),
+            project_root,
+            config_paths: unpin_core::config::UnpinConfigPaths {
+                user_config_path: root.join("user-config.json"),
+                project_config_path: root.join("project-config.json"),
+            },
+        };
+        DesktopBridgeContext::new(config, DiscoveryRoots::fixture_root(fixture_root), true)
+    }
+
+    fn bridge_state(context: DesktopBridgeContext) -> DesktopBridgeState {
+        DesktopBridgeState {
+            context,
+            reviewed_groups: Default::default(),
+            reviewed_agent_plugins: Default::default(),
+            reviewed_restores: Default::default(),
+            reviewed_definitions: Default::default(),
+            next_definition_plan_id: 0,
+        }
     }
 
     fn encoded_request(id: &str, method: &str, params: Option<Value>) -> Vec<u8> {
@@ -1917,6 +2509,155 @@ mod tests {
             100,
             101 + REVIEWED_PLAN_TTL_SECONDS
         ));
+    }
+
+    #[test]
+    fn agent_plugin_capabilities_and_snapshot_are_additive_and_path_free() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let context = agent_plugin_fixture_context(temporary.path());
+
+        let handshake = handshake_response();
+        for capability in [
+            METHOD_AGENT_PLUGIN_INSPECT,
+            METHOD_AGENT_PLUGIN_PLAN,
+            METHOD_AGENT_PLUGIN_APPROVE,
+            METHOD_AGENT_PLUGIN_APPLY,
+            METHOD_AGENT_PLUGIN_DISCARD,
+        ] {
+            assert!(
+                handshake["capabilities"]
+                    .as_array()
+                    .expect("bridge capabilities")
+                    .contains(&json!(capability)),
+                "missing capability {capability}",
+            );
+        }
+
+        let snapshot = snapshot_response(&context).expect("package snapshot");
+        assert_eq!(snapshot["agentPluginInventoryComplete"], true);
+        let packages = snapshot["agentPlugins"]
+            .as_array()
+            .expect("agent plugin package collection");
+        assert!(!packages.is_empty(), "checked-in fixtures project packages");
+        let encoded = serde_json::to_string(&packages).expect("package JSON");
+        for forbidden in [
+            "sourcePath",
+            "statePath",
+            "packageRoot",
+            "package_root",
+            "rawManifest",
+            "sourceFingerprint",
+            "description",
+            "Review and context tools for agent workbenches.",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "snapshot leaked forbidden field {forbidden}: {encoded}",
+            );
+        }
+        assert!(!encoded.contains(&temporary.path().to_string_lossy().into_owned()));
+
+        let logical_id = packages[0]["logicalId"]
+            .as_str()
+            .expect("logical package id");
+        let state = DesktopBridgeState::new(context);
+        let inspected = inspect_agent_plugin(&state, &json!({"logicalId": logical_id}))
+            .expect("agent plugin inspection");
+        assert_eq!(inspected["package"]["logicalId"], logical_id);
+    }
+
+    #[test]
+    fn agent_plugin_plan_redacts_bulk_internals_and_discard_invalidates_review() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let context = agent_plugin_fixture_context(temporary.path());
+        let discovery = discover_all(&context.discovery_roots).expect("fresh discovery");
+        let package = discovery
+            .agent_plugins()
+            .into_iter()
+            .find(|package| package.name == "connector-kit")
+            .expect("fixture connector package");
+        let logical_id = package.logical_id.clone();
+        let mut state = bridge_state(context);
+
+        let planned = plan_agent_plugin(
+            &mut state,
+            &json!({
+                "logicalId": logical_id.clone(),
+                "target": "off",
+                "reach": "selected",
+                "selectedProvider": "codex",
+            }),
+        )
+        .expect("selected-provider package plan");
+        let plan = &planned["plan"];
+        assert_eq!(plan["logicalId"], package.logical_id);
+        assert_eq!(plan["name"], package.name);
+        assert_eq!(plan["target"], "off");
+        assert_eq!(plan["access"], "actionable");
+        assert_eq!(plan["providerReach"]["selected"]["provider"], "codex");
+        assert!(plan["review"]["included"].is_array());
+        assert!(plan["review"]["noOp"].is_array());
+        assert!(plan["review"]["blocked"].is_array());
+        assert!(plan["review"]["reachExcluded"].is_array());
+        assert!(plan["review"]["componentDiagnostics"].is_array());
+        assert!(plan["counts"]["reachExcluded"].as_u64().unwrap_or_default() > 0);
+
+        let encoded = serde_json::to_string(plan).expect("plan JSON");
+        for forbidden in [
+            "matched",
+            "selector",
+            "sourcePath",
+            "statePath",
+            "packageRoot",
+            "sourceFingerprint",
+            "operationDigest",
+            "affectedResources",
+        ] {
+            assert!(
+                !encoded.contains(forbidden),
+                "plan leaked bulk/provider internals {forbidden}: {encoded}",
+            );
+        }
+
+        let operation_id = plan["operationId"].as_str().expect("operation id");
+        let fingerprint = plan["planFingerprint"].as_str().expect("plan fingerprint");
+        discard_agent_plugin(
+            &mut state,
+            &json!({
+                "operationId": operation_id,
+                "planFingerprint": fingerprint,
+            }),
+        )
+        .expect("discard reviewed package plan");
+        assert_eq!(
+            discard_agent_plugin(
+                &mut state,
+                &json!({
+                    "operationId": operation_id,
+                    "planFingerprint": fingerprint,
+                }),
+            ),
+            Err("agent-plugin-plan-unavailable"),
+        );
+
+        let all_planned = plan_agent_plugin(
+            &mut state,
+            &json!({
+                "logicalId": logical_id,
+                "target": "off",
+                "reach": "all",
+            }),
+        )
+        .expect("all-provider package plan");
+        let all_plan = &all_planned["plan"];
+        assert_eq!(all_plan["providerReach"], "all");
+        assert_eq!(all_plan["counts"]["reachExcluded"], 0);
+        assert!(
+            all_plan["review"]["reachExcluded"]
+                .as_array()
+                .expect("all-provider reach exclusions")
+                .is_empty()
+        );
     }
 
     #[test]

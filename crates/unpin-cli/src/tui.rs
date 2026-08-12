@@ -53,6 +53,7 @@ use unpin_core::state::workspace::resolve_workspace_identity;
 
 use crate::{credentials, unix_now};
 
+mod agent_plugins;
 mod gateway;
 mod groups;
 mod hooks;
@@ -94,6 +95,7 @@ impl WorkflowPhase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TuiView {
     Inventory,
+    Packages,
     Groups,
     Profiles,
     Gateways,
@@ -103,7 +105,7 @@ enum TuiView {
 }
 
 impl TuiView {
-    const ALL: [Self; 7] = [
+    const ALL: [Self; 8] = [
         Self::Inventory,
         Self::Groups,
         Self::Profiles,
@@ -111,11 +113,13 @@ impl TuiView {
         Self::Sessions,
         Self::Hooks,
         Self::RestoreOperations,
+        Self::Packages,
     ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Inventory => "inventory",
+            Self::Packages => "packages",
             Self::Groups => "groups",
             Self::Profiles => "profiles",
             Self::Gateways => "gateways",
@@ -128,6 +132,7 @@ impl TuiView {
     const fn title(self) -> &'static str {
         match self {
             Self::Inventory => "Inventory",
+            Self::Packages => "Packages",
             Self::Groups => "Groups",
             Self::Profiles => "Profiles",
             Self::Gateways => "Gateways",
@@ -157,8 +162,7 @@ enum CategoryFilter {
 }
 
 struct TuiState {
-    items: Vec<DiscoveryItem>,
-    warnings: Vec<DiscoveryWarning>,
+    discovery: DiscoveryOutput,
     backups: Vec<BackupSummary>,
     app_state_root: PathBuf,
     project_root: PathBuf,
@@ -174,6 +178,7 @@ struct TuiState {
     control_scroll: u16,
     control_scroll_limit: u16,
     profile_workflow: profiles::ProfileWorkflow,
+    package_workflow: agent_plugins::AgentPluginWorkflow,
     group_workflow: groups::GroupWorkflow,
     gateway_workflow: gateway::GatewayWorkflow,
     session_workflow: sessions::SessionWorkflow,
@@ -646,9 +651,9 @@ impl TuiState {
             backup_authentication_key.as_ref(),
         );
         let restore_workflow = RestoreWorkflow::new(backups.clone(), operations);
+        let package_workflow = agent_plugins::AgentPluginWorkflow::new(&discovery);
         Self {
-            items: discovery.items,
-            warnings: discovery.warnings,
+            discovery,
             backups,
             app_state_root,
             project_root,
@@ -664,6 +669,7 @@ impl TuiState {
             control_scroll: 0,
             control_scroll_limit: u16::MAX,
             profile_workflow,
+            package_workflow,
             group_workflow: groups::GroupWorkflow::empty(),
             gateway_workflow,
             session_workflow,
@@ -729,7 +735,7 @@ impl TuiState {
         let visible_indices = self.visible_indices();
         visible_indices
             .get(self.selected)
-            .and_then(|index| self.items.get(*index))
+            .and_then(|index| self.discovery.items.get(*index))
     }
 
     fn cycle_view(&mut self) {
@@ -770,6 +776,7 @@ impl TuiState {
                     )
                 })
                 .collect(),
+            TuiView::Packages => self.package_workflow.rows(),
             TuiView::Profiles => self.profile_workflow.rows(),
             TuiView::Groups if self.group_workflow.uses_inventory_rows() => {
                 self.group_workflow.rows(&self.visible_items())
@@ -792,6 +799,7 @@ impl TuiState {
                     details
                 },
             ),
+            TuiView::Packages => self.package_workflow.details(),
             TuiView::Profiles => self.profile_workflow.details(),
             TuiView::Groups => {
                 let mut details = self.group_workflow.details();
@@ -821,6 +829,9 @@ impl TuiState {
         if self.view == TuiView::Inventory {
             return self.stage_selected_toggle();
         }
+        if self.view == TuiView::Packages {
+            return self.plan_package_action();
+        }
         let Some(context) = self.approval_context.clone() else {
             self.last_action = Some(TuiActionStatus::Error(
                 self.approval_context_error
@@ -831,16 +842,12 @@ impl TuiState {
         };
         let operation = match self.view {
             TuiView::Inventory => unreachable!("inventory handled above"),
+            TuiView::Packages => unreachable!("packages handled above"),
             TuiView::Groups => self.group_workflow.plan(&context).cloned(),
-            TuiView::Profiles => {
-                let discovery = DiscoveryOutput {
-                    items: self.items.clone(),
-                    warnings: self.warnings.clone(),
-                };
-                self.profile_workflow
-                    .plan(&discovery, &self.app_state_root, &context)
-                    .cloned()
-            }
+            TuiView::Profiles => self
+                .profile_workflow
+                .plan(&self.discovery, &self.app_state_root, &context)
+                .cloned(),
             TuiView::Gateways => match (
                 self.session_authority_key.as_ref(),
                 self.backup_authentication_key.as_ref(),
@@ -865,15 +872,10 @@ impl TuiState {
                     Err("session authority key missing; run `unpin auth session init`".to_string())
                 }
             },
-            TuiView::Hooks => {
-                let discovery = DiscoveryOutput {
-                    items: self.items.clone(),
-                    warnings: self.warnings.clone(),
-                };
-                self.hook_workflow
-                    .plan(&discovery, &self.app_state_root)
-                    .cloned()
-            }
+            TuiView::Hooks => self
+                .hook_workflow
+                .plan(&self.discovery, &self.app_state_root)
+                .cloned(),
             TuiView::RestoreOperations => self
                 .restore_workflow
                 .plan(
@@ -902,6 +904,7 @@ impl TuiState {
                     TuiView::RestoreOperations => {
                         self.restore_workflow.record_error(error.clone());
                     }
+                    TuiView::Packages => unreachable!("packages handled above"),
                     TuiView::Inventory => {}
                 }
                 self.last_action = Some(TuiActionStatus::Error(error));
@@ -934,6 +937,7 @@ impl TuiState {
             return self.confirm_staged();
         }
         let confirmed = match self.view {
+            TuiView::Packages => self.package_workflow.confirm(),
             TuiView::Profiles => self.profile_workflow.confirm(),
             TuiView::Groups => self.group_workflow.confirm(),
             TuiView::Gateways => self.gateway_workflow.confirm(),
@@ -943,7 +947,9 @@ impl TuiState {
             TuiView::Inventory => unreachable!("inventory handled above"),
         };
         if confirmed {
-            let message = if self.view == TuiView::RestoreOperations
+            let message = if self.view == TuiView::Packages {
+                "aggregate package plan confirmed; press A to apply or U/Esc to cancel"
+            } else if self.view == TuiView::RestoreOperations
                 && self.restore_workflow.has_pending_deletion()
             {
                 "backup deletion confirmed; press A to apply"
@@ -958,6 +964,10 @@ impl TuiState {
     fn apply_active_action(&mut self) {
         if self.view == TuiView::Inventory {
             self.apply_confirmed_staged();
+            return;
+        }
+        if self.view == TuiView::Packages {
+            self.apply_package_action();
             return;
         }
         if self.view == TuiView::Groups {
@@ -1001,6 +1011,7 @@ impl TuiState {
             return;
         };
         let result = match self.view {
+            TuiView::Packages => unreachable!("packages handled above"),
             TuiView::Groups => unreachable!("groups handled above"),
             TuiView::Profiles => match (
                 self.session_authority_key.as_ref(),
@@ -1108,8 +1119,90 @@ impl TuiState {
                     TuiView::RestoreOperations => {
                         self.restore_workflow.record_error(error.clone());
                     }
+                    TuiView::Packages => unreachable!("packages handled above"),
                     TuiView::Inventory => {}
                 }
+                self.last_action = Some(TuiActionStatus::Error(error));
+            }
+        }
+    }
+
+    fn plan_package_action(&mut self) -> bool {
+        let result = self
+            .package_workflow
+            .plan(&self.discovery, &self.app_state_root)
+            .map(|plan| {
+                (
+                    plan.operation_id.clone(),
+                    plan.included_count(),
+                    plan.write_count(),
+                    plan.blocked_count(),
+                )
+            });
+        match result {
+            Ok((operation_id, included, writes, blocked)) => {
+                self.last_action = Some(TuiActionStatus::Success(format!(
+                    "planned aggregate package operation {operation_id}: included={included} writes={writes} blocked={blocked}; Enter confirms"
+                )));
+                true
+            }
+            Err(error) => {
+                self.package_workflow.record_error(error.clone());
+                self.last_action = Some(TuiActionStatus::Error(error));
+                false
+            }
+        }
+    }
+
+    fn apply_package_action(&mut self) {
+        let Some(roots) = self.discovery_roots.clone() else {
+            let error =
+                "package apply requires retained discovery roots; refresh and replan".to_string();
+            self.package_workflow.record_error(error.clone());
+            self.last_action = Some(TuiActionStatus::Error(error));
+            return;
+        };
+        let fresh_roots = roots.clone().with_app_state_root(&self.app_state_root);
+        let fresh_discovery = match discover_all(&fresh_roots) {
+            Ok(discovery) => discovery,
+            Err(error) => {
+                let error = format!("package refresh failed before apply: {error}");
+                self.package_workflow.record_error(error.clone());
+                self.last_action = Some(TuiActionStatus::Error(error));
+                return;
+            }
+        };
+        let result = self
+            .package_workflow
+            .apply(
+                fresh_discovery,
+                &self.app_state_root,
+                &self.project_root,
+                &roots,
+                self.fixture_mode,
+            )
+            .map(|result| (result.operation_id.clone(), result.lifecycle));
+        match result {
+            Ok((operation_id, lifecycle)) => match self.rediscover_after_apply() {
+                Ok(discovery) => {
+                    let refresh = self.refresh_control_plane_from(&discovery);
+                    self.last_action = Some(match refresh {
+                        Ok(()) => TuiActionStatus::Success(format!(
+                            "aggregate package operation {operation_id} {lifecycle:?}; discovery refreshed; replan before another mutation"
+                        )),
+                        Err(error) => TuiActionStatus::Error(format!(
+                            "aggregate package operation {operation_id} {lifecycle:?}; discovery refreshed but control status failed: {error}"
+                        )),
+                    });
+                }
+                Err(error) => {
+                    self.last_action = Some(TuiActionStatus::Error(format!(
+                        "aggregate package operation {operation_id} {lifecycle:?}; refresh failed: {error}; inspect durable status and Restore Operations"
+                    )));
+                }
+            },
+            Err(error) => {
+                self.package_workflow.record_error(error.clone());
                 self.last_action = Some(TuiActionStatus::Error(error));
             }
         }
@@ -1166,10 +1259,7 @@ impl TuiState {
                 if created {
                     self.clear_staged();
                 }
-                let discovery = DiscoveryOutput {
-                    items: self.items.clone(),
-                    warnings: self.warnings.clone(),
-                };
+                let discovery = self.discovery.clone();
                 self.last_action = Some(match self.refresh_group_workflow(&discovery) {
                     Ok(()) => TuiActionStatus::Success(format!(
                         "inventory group definition {message}; authenticated history recorded"
@@ -1198,6 +1288,7 @@ impl TuiState {
 
     fn cycle_active_action(&mut self) {
         match self.view {
+            TuiView::Packages => self.package_workflow.cycle_target(),
             TuiView::Groups => self.group_workflow.cycle_target(),
             TuiView::Profiles => self.profile_workflow.cycle_backend(),
             TuiView::Gateways => self.gateway_workflow.cycle_action(),
@@ -1219,9 +1310,11 @@ impl TuiState {
         }
     }
 
-    fn cycle_group_provider_reach(&mut self) {
-        if self.view == TuiView::Groups {
-            self.group_workflow.cycle_provider_reach();
+    fn cycle_active_provider_reach(&mut self) {
+        match self.view {
+            TuiView::Packages => self.package_workflow.cycle_reach(),
+            TuiView::Groups => self.group_workflow.cycle_provider_reach(),
+            _ => {}
         }
     }
 
@@ -1452,6 +1545,17 @@ impl TuiState {
         false
     }
 
+    fn cancel_package_interaction(&mut self) -> bool {
+        if self.view == TuiView::Packages && self.package_workflow.cancel() {
+            self.last_action = Some(TuiActionStatus::Success(
+                "package review cancelled without provider writes; choose reach and replan when ready"
+                    .to_string(),
+            ));
+            return true;
+        }
+        false
+    }
+
     fn record_group_definition_result(&mut self, result: Result<(), String>, success: &str) {
         match result {
             Ok(()) => {
@@ -1465,10 +1569,7 @@ impl TuiState {
     }
 
     fn refresh_control_plane(&mut self) -> Result<(), String> {
-        let discovery = DiscoveryOutput {
-            items: self.items.clone(),
-            warnings: self.warnings.clone(),
-        };
+        let discovery = self.discovery.clone();
         self.refresh_control_plane_from(&discovery)
     }
 
@@ -1557,7 +1658,7 @@ impl TuiState {
         };
         let (plan, blocked_reason, target_enabled) = match self
             .native_toggle_controller()
-            .plan_with_inventory(item.clone(), &self.items, context)
+            .plan_with_inventory(item.clone(), &self.discovery.items, context)
         {
             Ok(plan) => {
                 let target_enabled = plan.preview.target_enabled;
@@ -1596,6 +1697,7 @@ impl TuiState {
             let result = self.apply_staged_toggle(staged);
             if result.status == ToggleStatus::Applied
                 && let Some(item) = self
+                    .discovery
                     .items
                     .iter_mut()
                     .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
@@ -1653,6 +1755,7 @@ impl TuiState {
         self.clear_staged();
         for mut staged in failed_staged {
             if let Some(current_item) = self
+                .discovery
                 .items
                 .iter()
                 .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
@@ -1666,7 +1769,7 @@ impl TuiState {
                 staged.item = current_item.clone();
                 match self.native_toggle_controller().plan_with_inventory(
                     current_item.clone(),
-                    &self.items,
+                    &self.discovery.items,
                     context,
                 ) {
                     Ok(plan) => {
@@ -1884,8 +1987,8 @@ impl TuiState {
     }
 
     fn refresh_discovery(&mut self, discovery: &DiscoveryOutput) {
-        self.items.clone_from(&discovery.items);
-        self.warnings.clone_from(&discovery.warnings);
+        self.discovery.clone_from(discovery);
+        self.package_workflow.refresh(discovery);
         self.backups = load_backup_summaries_authenticated(
             &self.app_state_root,
             self.backup_authentication_key.as_ref(),
@@ -1909,6 +2012,7 @@ impl TuiState {
 
     fn move_next(&mut self) {
         match self.view {
+            TuiView::Packages => return self.package_workflow.select_next(),
             TuiView::Groups => {
                 let visible_count = self.visible_count();
                 return self.group_workflow.select_next(visible_count);
@@ -1930,6 +2034,7 @@ impl TuiState {
 
     fn move_previous(&mut self) {
         match self.view {
+            TuiView::Packages => return self.package_workflow.select_previous(),
             TuiView::Groups => {
                 let visible_count = self.visible_count();
                 return self.group_workflow.select_previous(visible_count);
@@ -1997,12 +2102,13 @@ impl TuiState {
     fn visible_items(&self) -> Vec<&DiscoveryItem> {
         self.visible_indices()
             .into_iter()
-            .filter_map(|index| self.items.get(index))
+            .filter_map(|index| self.discovery.items.get(index))
             .collect()
     }
 
     fn visible_count(&self) -> usize {
-        self.items
+        self.discovery
+            .items
             .iter()
             .filter(|item| self.matches_filters(item))
             .count()
@@ -2027,7 +2133,8 @@ impl TuiState {
     }
 
     fn visible_indices(&self) -> Vec<usize> {
-        self.items
+        self.discovery
+            .items
             .iter()
             .enumerate()
             .filter_map(|(index, item)| self.matches_filters(item).then_some(index))
@@ -2075,7 +2182,12 @@ impl TuiState {
     fn provider_choices(&self) -> Vec<ProviderFilter> {
         let mut choices = vec![ProviderFilter::All];
         for provider in ProviderId::ALL {
-            if self.items.iter().any(|item| item.provider == provider) {
+            if self
+                .discovery
+                .items
+                .iter()
+                .any(|item| item.provider == provider)
+            {
                 choices.push(ProviderFilter::Provider(provider));
             }
         }
@@ -2085,7 +2197,7 @@ impl TuiState {
     fn layer_choices(&self) -> Vec<LayerFilter> {
         let mut choices = vec![LayerFilter::All];
         for layer in [DiscoveryLayer::Global, DiscoveryLayer::Project] {
-            if self.items.iter().any(|item| item.layer == layer) {
+            if self.discovery.items.iter().any(|item| item.layer == layer) {
                 choices.push(LayerFilter::Layer(layer));
             }
         }
@@ -2104,7 +2216,12 @@ impl TuiState {
             DiscoveryCategory::PluginConfig,
             DiscoveryCategory::PluginManifest,
         ] {
-            if self.items.iter().any(|item| item.category == category) {
+            if self
+                .discovery
+                .items
+                .iter()
+                .any(|item| item.category == category)
+            {
                 choices.push(CategoryFilter::Category(category));
             }
         }
@@ -2200,9 +2317,10 @@ pub fn render_headless_with_paths(
 fn render_headless_state(state: &TuiState) -> String {
     let mut lines = vec![
         "Unpin".to_string(),
-        format!("Items: {}", state.items.len()),
+        format!("Items: {}", state.discovery.items.len()),
+        format!("Packages: {}", state.package_workflow.len()),
         format!("Showing: {}", state.visible_count()),
-        format!("Warnings: {}", state.warnings.len()),
+        format!("Warnings: {}", state.discovery.warnings.len()),
         format!("Backups: {}", state.backups.len()),
         format!(
             "Backup authentication: {}",
@@ -2212,7 +2330,7 @@ fn render_headless_state(state: &TuiState) -> String {
         format!("Last action: {}", last_action_label(state)),
         format!("Last control: {}", last_control_label(state)),
         format!("View: {}", state.view.label()),
-        provider_summary(&state.items),
+        provider_summary(&state.discovery.items),
         format!("Filters: {}", state.filter_summary()),
         format!("Search: {}", search_summary(state)),
         String::new(),
@@ -2266,10 +2384,10 @@ fn render_headless_state(state: &TuiState) -> String {
         lines.extend(state.active_details());
     }
 
-    if !state.warnings.is_empty() {
+    if !state.discovery.warnings.is_empty() {
         lines.push(String::new());
         lines.push("Warning details:".to_string());
-        lines.extend(state.warnings.iter().map(warning_label));
+        lines.extend(state.discovery.warnings.iter().map(warning_label));
     }
 
     if !state.backups.is_empty() {
@@ -2628,7 +2746,7 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
         Event::Key(key) => match key.code {
             KeyCode::Char('q' | 'Q') => return TuiEventOutcome::Quit,
             KeyCode::Esc => {
-                if !state.cancel_group_interaction() {
+                if !state.cancel_package_interaction() && !state.cancel_group_interaction() {
                     return TuiEventOutcome::Quit;
                 }
                 true
@@ -2710,7 +2828,7 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 true
             }
             KeyCode::Char('P') => {
-                state.cycle_group_provider_reach();
+                state.cycle_active_provider_reach();
                 true
             }
             KeyCode::Char('l' | 'L') if state.inventory_filters_available() => {
@@ -2748,7 +2866,9 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 true
             }
             KeyCode::Char('u' | 'U') => {
-                state.clear_staged();
+                if !state.cancel_package_interaction() {
+                    state.clear_staged();
+                }
                 true
             }
             _ => false,
@@ -2777,7 +2897,7 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
     let mnemonic_style = Style::default().add_modifier(Modifier::UNDERLINED);
     let supports_active_action = matches!(
         view,
-        TuiView::Groups | TuiView::Profiles | TuiView::Gateways
+        TuiView::Packages | TuiView::Groups | TuiView::Profiles | TuiView::Gateways
     );
     let mut primary_controls = vec![
         Span::styled("V", mnemonic_style),
@@ -2825,6 +2945,13 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
     let mut lines = vec![Line::from(primary_controls), Line::from(secondary_controls)];
 
     match view {
+        TuiView::Packages => lines.push(Line::from(vec![
+            Span::raw("Packages: "),
+            Span::styled("P", mnemonic_style),
+            Span::raw(" reach | "),
+            Span::styled("M", mnemonic_style),
+            Span::raw(" target | U/Esc cancel review"),
+        ])),
         TuiView::Profiles => lines.push(Line::from(vec![
             Span::raw("Profiles: "),
             Span::styled("s", mnemonic_style),
@@ -2977,9 +3104,10 @@ fn inventory_header_lines(state: &TuiState, content_height: u16) -> Vec<Line<'st
             "Unpin",
             Style::default().add_modifier(Modifier::BOLD),
         )]),
-        Line::from(format!("Items: {}", state.items.len())),
+        Line::from(format!("Items: {}", state.discovery.items.len())),
+        Line::from(format!("Packages: {}", state.package_workflow.len())),
         Line::from(format!("Showing: {}", state.visible_count())),
-        Line::from(format!("Warnings: {}", state.warnings.len())),
+        Line::from(format!("Warnings: {}", state.discovery.warnings.len())),
         Line::from(format!(
             "Backups: {} | Backup authentication: {}",
             state.backups.len(),
@@ -2989,7 +3117,7 @@ fn inventory_header_lines(state: &TuiState, content_height: u16) -> Vec<Line<'st
         Line::from(format!("Last action: {}", last_action_label(state))),
         Line::from(format!("Last control: {}", last_control_label(state))),
         Line::from(format!("View: {}", state.view.title())),
-        Line::from(provider_summary(&state.items)),
+        Line::from(provider_summary(&state.discovery.items)),
         Line::from(format!("Filters: {}", state.filter_summary())),
         Line::from(format!("Search: {}", search_summary(state))),
     ];
@@ -3003,10 +3131,11 @@ fn inventory_header_lines(state: &TuiState, content_height: u16) -> Vec<Line<'st
             Span::raw(format!(" | View: {}", state.view.title())),
         ]),
         Line::from(format!(
-            "Items: {} | Showing: {} | Warnings: {} | Staged: {}",
-            state.items.len(),
+            "Items: {} | Packages: {} | Showing: {} | Warnings: {} | Staged: {}",
+            state.discovery.items.len(),
+            state.package_workflow.len(),
             state.visible_count(),
-            state.warnings.len(),
+            state.discovery.warnings.len(),
             state.staged_count(),
         )),
         Line::from(format!(
@@ -3021,7 +3150,7 @@ fn inventory_header_lines(state: &TuiState, content_height: u16) -> Vec<Line<'st
             state.backups.len(),
             backup_authentication_readiness_label(state)
         )),
-        Line::from(provider_summary(&state.items)),
+        Line::from(provider_summary(&state.discovery.items)),
     ]
     .into_iter()
     .take(usize::from(content_height))
@@ -3212,10 +3341,11 @@ fn wrapped_control_line_count(details: &[String], width: usize) -> usize {
 }
 
 fn warning_detail(state: &TuiState) -> Paragraph<'static> {
-    let lines = if state.warnings.is_empty() {
+    let lines = if state.discovery.warnings.is_empty() {
         vec![Line::from("No discovery warnings.")]
     } else {
         state
+            .discovery
             .warnings
             .iter()
             .map(|warning| Line::from(warning_label(warning)))
@@ -4063,6 +4193,7 @@ mod tests {
         DiscoveryOutput {
             items,
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         }
     }
 
@@ -4070,7 +4201,11 @@ mod tests {
         items: Vec<DiscoveryItem>,
         warnings: Vec<DiscoveryWarning>,
     ) -> DiscoveryOutput {
-        DiscoveryOutput { items, warnings }
+        DiscoveryOutput {
+            items,
+            warnings,
+            ..DiscoveryOutput::default()
+        }
     }
 
     #[test]
@@ -5197,6 +5332,7 @@ mod tests {
         assert!(!state.pending_confirmation());
         assert!(
             !state
+                .discovery
                 .items
                 .iter()
                 .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
@@ -5488,6 +5624,7 @@ mod tests {
         );
         assert!(!state.backups[0].target_enabled);
         let selected_after = state
+            .discovery
             .items
             .iter()
             .find(|item| item.id == "pi:project:skill:example-pi-project-skill")
@@ -5543,6 +5680,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         state.view = TuiView::Groups;
 
@@ -5576,6 +5714,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         state.view = TuiView::Groups;
         assert_eq!(
@@ -5595,6 +5734,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         state.view = TuiView::Groups;
         state.control_scroll = u16::MAX;
@@ -5734,6 +5874,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         assert_eq!(
             handle_tui_event(&mut state, key_event(KeyCode::Char('/'))),
@@ -5758,6 +5899,7 @@ mod tests {
             let mut state = TuiState::new(DiscoveryOutput {
                 items: Vec::new(),
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             });
             state.view = view;
             state
@@ -5932,6 +6074,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         state.view = TuiView::Groups;
 
@@ -5994,6 +6137,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         let backend = ratatui::backend::TestBackend::new(20, 16);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -6017,6 +6161,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         state.view = TuiView::Groups;
         let backend = ratatui::backend::TestBackend::new(40, 20);
@@ -6041,6 +6186,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         let backend = ratatui::backend::TestBackend::new(40, 7);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
@@ -6087,6 +6233,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         let backups = (0..30).map(restore_backup_summary).collect::<Vec<_>>();
         state.backups.clone_from(&backups);
@@ -6131,6 +6278,7 @@ mod tests {
             DiscoveryOutput {
                 items: Vec::new(),
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             app_state.path().to_path_buf(),
         );
@@ -6212,6 +6360,7 @@ mod tests {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         });
         state.restore_workflow = RestoreWorkflow::new(
             vec![restore_backup_summary(0), restore_backup_summary(1)],
@@ -6227,5 +6376,226 @@ mod tests {
             TuiEventOutcome::Redraw
         );
         assert!(state.active_rows()[1].starts_with('>'));
+    }
+
+    fn agent_plugin_fixture_state() -> (TempDir, TempDir, TuiState) {
+        let fixture = TempDir::new().expect("temporary Agent Plugin TUI fixture");
+        copy_dir_all(&fixtures_root(), fixture.path());
+        let app_state = TempDir::new().expect("temporary Agent Plugin TUI state");
+        let git = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(fixture.path())
+            .output()
+            .expect("initialize Agent Plugin TUI fixture repository");
+        assert!(git.status.success());
+        let project_root = fs::canonicalize(fixture.path()).expect("canonical fixture root");
+        let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+        let roots =
+            DiscoveryRoots::fixture_root(&project_root).with_app_state_root(&app_state_root);
+        let discovery = discover_all(&roots).expect("discover Agent Plugin TUI fixture");
+        let mut state =
+            TuiState::new_with_paths_and_roots(discovery, app_state_root, project_root, roots);
+        state.view = TuiView::Packages;
+        (fixture, app_state, state)
+    }
+
+    #[test]
+    fn agent_plugin_tui_empty_guidance_distinguishes_packages_from_groups() {
+        let mut state = TuiState::new(DiscoveryOutput::default());
+        state.view = TuiView::Packages;
+
+        assert!(state.active_rows().is_empty());
+        let details = state.active_details().join("\n");
+        assert!(details.contains("No Agent Plugin packages"));
+        assert!(details.contains("Packages are derived"));
+        assert!(details.contains("Groups are editable"));
+    }
+
+    #[test]
+    fn agent_plugin_tui_navigation_and_state_labels_are_explicit() {
+        use unpin_core::agent_plugins::AgentPluginState;
+
+        for (state, expected) in [
+            (AgentPluginState::On, "on"),
+            (AgentPluginState::Off, "off"),
+            (AgentPluginState::Mixed, "mixed"),
+            (AgentPluginState::Unknown, "unknown"),
+        ] {
+            assert_eq!(agent_plugins::state_label(state), expected);
+        }
+
+        let (_fixture, _app_state, mut state) = agent_plugin_fixture_state();
+        let rows = state.active_rows();
+        assert!(!rows.is_empty());
+        assert!(rows[0].starts_with("> [on]"));
+        assert!(
+            state
+                .active_details()
+                .join("\n")
+                .contains("Packages vs Groups")
+        );
+        let backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(backend).expect("package TUI test terminal");
+        terminal
+            .draw(|frame| draw(frame, &mut state))
+            .expect("draw package view");
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("Packages"));
+        assert!(rendered.contains("[on]"));
+        state.move_next();
+        assert!(state.active_rows()[state.package_workflow.selected()].starts_with('>'));
+    }
+
+    #[test]
+    fn agent_plugin_tui_requires_explicit_reach_and_builds_one_aggregate_plan() {
+        let (_fixture, _app_state, mut state) = agent_plugin_fixture_state();
+        state.cycle_active_action();
+        assert!(!state.plan_active_action());
+        assert!(matches!(
+            state.last_action,
+            Some(TuiActionStatus::Error(ref message))
+                if message.contains("choose explicit package reach")
+        ));
+
+        state.provider_filter = ProviderFilter::Provider(ProviderId::Codex);
+        state.set_search_query("no inventory row matches this");
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('P'))),
+            TuiEventOutcome::Redraw
+        );
+        assert!(state.plan_active_action());
+        let reviewed = state
+            .package_workflow
+            .reviewed_plan()
+            .expect("aggregate package plan");
+        assert_eq!(reviewed.included_count(), 2);
+        assert_eq!(reviewed.write_count(), 2);
+        assert_eq!(reviewed.selector.exact_identities.len(), 2);
+        assert_eq!(state.package_workflow.reach_label(), "all");
+        assert_eq!(
+            state.staged_count(),
+            0,
+            "package planning is never per-item staging"
+        );
+    }
+
+    #[test]
+    fn agent_plugin_tui_confirm_cancel_and_apply_use_reviewed_bulk_lifecycle() {
+        let (_fixture, app_state, mut state) = agent_plugin_fixture_state();
+        let before = state.discovery.clone();
+        state.cycle_active_action();
+        state.cycle_active_provider_reach();
+        assert!(state.plan_active_action());
+        assert!(state.confirm_active_action());
+        assert_eq!(state.package_workflow.phase(), WorkflowPhase::Confirmed);
+        assert!(state.cancel_package_interaction());
+        assert!(state.package_workflow.reviewed_plan().is_none());
+        assert_eq!(state.discovery, before, "cancel must not mutate providers");
+        assert!(
+            !app_state.path().join("transitions").exists(),
+            "cancelled package preview must not persist a durable handoff"
+        );
+
+        assert!(
+            state.plan_active_action(),
+            "replan after cancel failed: {:?}",
+            state.last_action
+        );
+        assert!(state.confirm_active_action());
+        state.apply_active_action();
+        assert_eq!(state.package_workflow.phase(), WorkflowPhase::Applied);
+        assert!(state.package_workflow.reviewed_plan().is_none());
+        assert!(!state.confirm_active_action());
+        let packages = state.discovery.agent_plugins();
+        assert_eq!(packages.len(), 1);
+        assert_eq!(
+            agent_plugins::state_label(packages[0].state),
+            "off",
+            "one aggregate apply refreshes both native activations"
+        );
+        let details = state.package_workflow.details().join("\n");
+        assert!(details.contains("last apply:"));
+        assert!(!details.contains("requires replanning"));
+    }
+
+    #[test]
+    fn agent_plugin_tui_redacts_internal_plan_error_details() {
+        let message =
+            agent_plugins::safe_plan_error(unpin_core::mutation::BulkTogglePlanError::ReachAware(
+                "private provider path and journal detail".to_string(),
+            ));
+
+        assert_eq!(
+            message,
+            "package plan blocked; refresh inventory and review package diagnostics"
+        );
+        assert!(!message.contains("private provider path"));
+    }
+
+    #[test]
+    fn agent_plugin_tui_diagnostics_only_plan_never_creates_writes() {
+        let fixture = TempDir::new().expect("temporary diagnostics-only package fixture");
+        let app_state = TempDir::new().expect("temporary diagnostics-only app state");
+        let package_root = fixture
+            .path()
+            .join("codex/global/plugins/cache/acme/connector-kit/1.0.0");
+        fs::create_dir_all(package_root.join("skills/review")).expect("create package fixture");
+        fs::write(
+            fixture.path().join("codex/global/config.toml"),
+            "[plugins.\"connector-kit@acme\"]\nenabled = true\n",
+        )
+        .expect("write native activation");
+        fs::write(
+            package_root.join("plugin.json"),
+            r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"connector-kit","version":"1.0.0"}"#,
+        )
+        .expect("write plugin manifest");
+        fs::write(
+            package_root.join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: Review changes.\n---\n",
+        )
+        .expect("write package skill");
+        fs::write(package_root.join("mcp.json"), "{").expect("write invalid MCP component");
+        let activation_path = fixture.path().join("codex/global/config.toml");
+        let activation_before =
+            fs::read(&activation_path).expect("read native activation before plan");
+        let git = StdCommand::new("git")
+            .args(["init", "-q"])
+            .current_dir(fixture.path())
+            .output()
+            .expect("initialize diagnostics-only fixture repository");
+        assert!(git.status.success());
+        let project_root = fs::canonicalize(fixture.path()).expect("canonical fixture root");
+        let app_state_root = fs::canonicalize(app_state.path()).expect("canonical app state root");
+        let roots =
+            DiscoveryRoots::fixture_root(&project_root).with_app_state_root(&app_state_root);
+        let discovery = discover_all(&roots).expect("discover diagnostics-only package");
+        let mut state = TuiState::new_with_paths_and_roots(
+            discovery,
+            app_state_root.clone(),
+            project_root,
+            roots,
+        );
+        state.view = TuiView::Packages;
+        state.cycle_active_action();
+        state.cycle_active_provider_reach();
+
+        assert!(!state.plan_active_action());
+        assert!(matches!(
+            state.last_action,
+            Some(TuiActionStatus::Error(ref message))
+                if message.contains("diagnostics-only")
+        ));
+        assert!(!app_state_root.join("operations").exists());
+        assert_eq!(
+            fs::read(activation_path).expect("read native activation after blocked plan"),
+            activation_before
+        );
     }
 }

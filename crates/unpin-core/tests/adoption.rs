@@ -113,6 +113,7 @@ fn fixture(temp: &TempDir, operation_id: &str) -> PlannedAdoption {
     let mut record = Catalog::from_discovery(&DiscoveryOutput {
         items: vec![item.clone()],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     })
     .expect("catalog")
     .records

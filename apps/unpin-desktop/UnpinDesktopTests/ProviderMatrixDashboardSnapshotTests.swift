@@ -1,6 +1,8 @@
 import AppKit
+import SwiftUI
 import WebKit
 import XCTest
+@testable import UnpinDesktop
 
 private struct ProviderMatrixSection: Codable, Equatable {
     let id: String
@@ -80,6 +82,8 @@ final class ProviderMatrixDashboardSnapshotTests: XCTestCase {
         ProviderMatrixSection(id: "provider-opencode", filename: "opencode-states.png"),
         ProviderMatrixSection(id: "provider-zed", filename: "zed-states.png"),
         ProviderMatrixSection(id: "mcp-states", filename: "mcp-states.png"),
+        ProviderMatrixSection(id: "desktop-packages-light", filename: "desktop-packages-light.png"),
+        ProviderMatrixSection(id: "desktop-packages-dark", filename: "desktop-packages-dark.png"),
     ]
 
     func testCaptureProviderMatrixDashboard() throws {
@@ -145,6 +149,12 @@ final class ProviderMatrixDashboardSnapshotTests: XCTestCase {
         RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
 
         for section in requestedSections {
+            if let colorScheme = packageColorScheme(for: section.id) {
+                let png = try packageWorkbenchPNG(colorScheme: colorScheme)
+                let destination = outputRoot.appendingPathComponent(section.filename)
+                try png.write(to: destination, options: .atomic)
+                continue
+            }
             var height = try prepare(section: section, in: webView)
             resize(webView: webView, window: window, height: height)
             RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
@@ -164,6 +174,143 @@ final class ProviderMatrixDashboardSnapshotTests: XCTestCase {
             let destination = outputRoot.appendingPathComponent(section.filename)
             try png.write(to: destination, options: .atomic)
         }
+    }
+
+    func testPackageWorkbenchCaptureUsesCanonicalPixelDimensions() throws {
+        for colorScheme in [WorkbenchColorScheme.light, .dark] {
+            let png = try packageWorkbenchPNG(colorScheme: colorScheme)
+            let bitmap = try XCTUnwrap(NSBitmapImageRep(data: png))
+
+            XCTAssertEqual(bitmap.pixelsWide, Self.dashboardWidth)
+            XCTAssertEqual(bitmap.pixelsHigh, 900)
+        }
+    }
+
+    private func packageColorScheme(for sectionID: String) -> WorkbenchColorScheme? {
+        switch sectionID {
+        case "desktop-packages-light": .light
+        case "desktop-packages-dark": .dark
+        default: nil
+        }
+    }
+
+    private func packageWorkbenchPNG(colorScheme: WorkbenchColorScheme) throws -> Data {
+        let fixture = WorkbenchViewFixture(
+            workArea: .discover,
+            colorScheme: colorScheme,
+            guidanceExpanded: true,
+            presentation: .fixture(
+                state: .ready,
+                hasWorkspace: true,
+                isBusy: false,
+                workspaceName: "agent-plugins-matrix"
+            ),
+            inventory: [],
+            agentPlugins: try packageFixtures(),
+            discoverMode: .packages,
+            discoverFilters: nil,
+            groups: nil,
+            recovery: nil
+        )
+        let size = CGSize(width: Self.dashboardWidth, height: 900)
+        let host = NSHostingView(
+            rootView: WorkbenchView(fixture: fixture)
+                .environmentObject(WorkspaceStore())
+                .frame(width: size.width, height: size.height)
+        )
+        host.frame = NSRect(origin: .zero, size: size)
+        host.appearance = NSAppearance(
+            named: colorScheme == .dark ? .darkAqua : .aqua
+        )
+        let window = NSWindow(
+            contentRect: host.bounds,
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        window.isReleasedWhenClosed = false
+        window.contentView = host
+        window.setFrameOrigin(NSPoint(x: -10_000, y: -10_000))
+        window.orderFrontRegardless()
+        defer {
+            window.orderOut(nil)
+            window.close()
+        }
+        host.layoutSubtreeIfNeeded()
+        host.displayIfNeeded()
+        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+        guard let bitmap = NSBitmapImageRep(
+            bitmapDataPlanes: nil,
+            pixelsWide: Int(size.width),
+            pixelsHigh: Int(size.height),
+            bitsPerSample: 8,
+            samplesPerPixel: 4,
+            hasAlpha: true,
+            isPlanar: false,
+            colorSpaceName: .deviceRGB,
+            bytesPerRow: 0,
+            bitsPerPixel: 0
+        ) else {
+            throw ProviderMatrixSnapshotError.bitmapCreationFailed
+        }
+        bitmap.size = size
+        host.cacheDisplay(in: host.bounds, to: bitmap)
+        guard let png = bitmap.representation(using: .png, properties: [:]) else {
+            throw ProviderMatrixSnapshotError.pngEncodingFailed
+        }
+        return png
+    }
+
+    private func packageFixtures() throws -> [AgentPluginSummary] {
+        try JSONDecoder().decode(
+            [AgentPluginSummary].self,
+            from: Data(
+                """
+                [{
+                  "logicalId": "agent-plugin:connector-kit",
+                  "name": "Connector Kit",
+                  "componentSignature": "mcp+skill",
+                  "projectionFingerprint": "sha256:matrix-projection",
+                  "state": "mixed",
+                  "access": "actionable",
+                  "providers": ["claude", "codex"],
+                  "componentKinds": ["mcp", "skill"],
+                  "instanceCount": 2,
+                  "instances": [{
+                    "instanceId": "instance-connector-kit-claude-global",
+                    "provider": "claude",
+                    "layer": "global",
+                    "state": "on",
+                    "access": "actionable",
+                    "version": "1.0.0",
+                    "description": "Review and context tools for agent workbenches.",
+                    "components": [
+                      {"kind": "mcp", "name": "context", "disposition": "available"},
+                      {"kind": "skill", "name": "review", "disposition": "available"}
+                    ],
+                    "activations": [{"enabled": true, "mutability": "read-write"}],
+                    "blockers": [],
+                    "diagnostics": []
+                  }, {
+                    "instanceId": "instance-connector-kit-codex-global",
+                    "provider": "codex",
+                    "layer": "global",
+                    "state": "off",
+                    "access": "actionable",
+                    "version": "1.0.0",
+                    "description": "Review and context tools for agent workbenches.",
+                    "components": [
+                      {"kind": "mcp", "name": "context", "disposition": "available"},
+                      {"kind": "skill", "name": "review", "disposition": "available"}
+                    ],
+                    "activations": [{"enabled": false, "mutability": "read-write"}],
+                    "blockers": [],
+                    "diagnostics": []
+                  }]
+                }]
+                """.utf8
+            )
+        )
     }
 
     private func nonEmptyEnvironmentValue(_ value: String?) -> String? {

@@ -5,10 +5,10 @@ use unpin_core::{
     },
     provider_reach::{
         ConnectionBoundary, DerivedTargetKind, IncludedTargetOutcome, LifecycleEvidence,
-        ProviderCoverageEntry, ProviderReach, ProviderReachError, ProviderReachInput,
-        ProviderReachOperationProjection, ProviderReachRequest, ProviderReachTarget,
-        SelectedProviderProvenance, classify_lifecycle, filter_derived_targets,
-        provider_reach_fingerprint,
+        ProviderCoverageEntry, ProviderReach, ProviderReachCoverage, ProviderReachError,
+        ProviderReachInput, ProviderReachOperationProjection, ProviderReachReason,
+        ProviderReachRequest, ProviderReachTarget, SelectedProviderProvenance, classify_lifecycle,
+        filter_derived_targets, provider_reach_fingerprint,
     },
     providers::ProviderId,
     transitions::EffectActivation,
@@ -16,6 +16,22 @@ use unpin_core::{
 
 fn target(provider: ProviderId, id: &str) -> ProviderReachTarget {
     ProviderReachTarget::new(provider, id)
+}
+
+#[test]
+fn reach_excluded_count_ignores_non_reach_blockers() {
+    let coverage = ProviderReachCoverage::new(vec![
+        ProviderCoverageEntry::excluded(ProviderId::Claude, "outside-reach"),
+        ProviderCoverageEntry {
+            provider: ProviderId::Codex,
+            target_id: "read-only".to_string(),
+            included: false,
+            reason: Some(ProviderReachReason::ReadOnly),
+        },
+    ]);
+
+    assert_eq!(coverage.excluded().count(), 2);
+    assert_eq!(coverage.reach_excluded_count(), 1);
 }
 
 #[test]

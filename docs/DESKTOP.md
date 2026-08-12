@@ -70,9 +70,26 @@ restore. Govern handoffs are selectable and copyable; Change Safely and Recover
 and Audit continue to use the existing plan, approval, backup, recovery, and
 restore boundaries. Choose Light or Dark from the title bar appearance control.
 
+Discover and Organize includes a Packages mode for Agent Plugins already
+present in supported provider state. Package rows are derived on refresh, not
+editable definitions: filters control visibility, the separate reach control
+chooses selected-provider or all-provider authority, and every change opens an
+exact review before apply. A false inventory-complete marker is shown as an
+access diagnostic, so incomplete cache traversal never looks like an empty
+package list. Package Details exposes component dispositions, blockers, and
+diagnostics without manifest descriptions or local paths. Use Groups for
+Unpin-owned reusable selections.
+
+The bundled bridge package contract is `agentPlugins.inspect`,
+`agentPlugins.plan`, `agentPlugins.approve`, `agentPlugins.apply`, and
+`agentPlugins.discard`. Desktop always creates a fresh local package plan for
+its current bridge connection; it does not adopt an MCP-sealed operation from a
+different connection. This preserves the desktop approval, generation, and
+fresh-observation boundaries.
+
 ## Regenerate the guidance matrix
 
-Maintainers can capture the 26 authoritative workbench scenarios in both Light
+Maintainers can capture the 27 authoritative workbench scenarios in both Light
 and Dark at the default 1180 by 760 window size:
 
 ```bash
@@ -81,7 +98,7 @@ python3 scripts/run_desktop_guidance_matrix.py
 ```
 
 The capture command creates a timestamped directory below repository `tmp/`
-with 52 native PNG files, `manifest.json`, `report.md`, and `SHA256SUMS`. The
+with 54 native PNG files, `manifest.json`, `report.md`, and `SHA256SUMS`. The
 ordinary Xcode test action skips file capture when the matrix environment is
 absent, while still exercising the compact 1040 by 720 render assertions.
 

@@ -293,6 +293,7 @@ fn resolver_derives_tri_state_from_full_identity() {
     let discovery = DiscoveryOutput {
         items: vec![item(&first, true), item(&second, false)],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     };
 
     let resolver = GroupResolver::new(context, personal, repository);
@@ -337,6 +338,7 @@ fn resolver_derives_uniform_state_from_blocked_members_observation() {
                 &DiscoveryOutput {
                     items: vec![blocked],
                     warnings: Vec::new(),
+                    ..DiscoveryOutput::default()
                 },
             )
             .expect("inspect");

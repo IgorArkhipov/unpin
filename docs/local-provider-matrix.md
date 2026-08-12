@@ -410,14 +410,21 @@ Each full run covers:
 - one personal inventory group per MCP scenario, including definition
   create/apply evidence plus read-only list, get, and non-authorizable preview
   assertions with unchanged provider and app state during group planning;
+- one derived Agent Plugin parity pass comparing the same logical package,
+  state, access, and provider coverage across CLI, TUI, desktop bridge, and
+  MCP, plus matching exact-plan counts and a no-provider-write MCP handoff;
 - cross-provider fan-out assertions for every skill source visible to multiple
   hosts, proving disable hides all views and enable restores all original views;
 - authenticated manifest v3 backup and audit-event checks;
 - headless TUI, provider doctor, formatter, Clippy, workspace tests, build, CLI
   help, diff, and Python syntax checks.
 
-For manual capture, open generated `dashboard.html` and capture these sections
-into `screenshots/`:
+On macOS, `--capture-screenshots` captures the generated dashboard sections
+and the native Packages workbench in both Light and Dark schemes. Elsewhere,
+open the generated `dashboard.html` and capture its sections manually; native
+desktop screenshots require macOS and Xcode.
+
+Store captures in `screenshots/`:
 
 | Section | Filename |
 | --- | --- |
@@ -432,6 +439,8 @@ into `screenshots/`:
 | OpenCode transitions | `opencode-states.png` |
 | Zed transitions | `zed-states.png` |
 | MCP control plane | `mcp-states.png` |
+| Native Packages workbench, Light | `desktop-packages-light.png` |
+| Native Packages workbench, Dark | `desktop-packages-dark.png` |
 
 Inspect every PNG before publishing. Set `screenshot-review.json` to `approved`,
 record reviewer and timezone-qualified UTC review time, add each PNG's

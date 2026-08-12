@@ -634,7 +634,7 @@ class ProviderMatrixScreenshotCaptureTests(unittest.TestCase):
     def _dashboard_html(*, omitted_section=None) -> str:
         sections = (
             f"<section class='panel' id='{section_id}'>ready</section>"
-            for section_id in matrix_screenshots.SCREENSHOT_SECTION_IDS
+            for section_id in matrix_screenshots.DASHBOARD_SECTION_IDS
             if section_id != omitted_section
         )
         return "<!doctype html>" + "".join(sections)
@@ -877,7 +877,7 @@ class ProviderMatrixScreenshotCaptureTests(unittest.TestCase):
             prefix="unpin-provider-screenshot-test-"
         ) as temporary_directory:
             artifact_root = Path(temporary_directory)
-            missing = matrix_screenshots.SCREENSHOT_SECTION_IDS[-1]
+            missing = matrix_screenshots.DASHBOARD_SECTION_IDS[-1]
             (artifact_root / "dashboard.html").write_text(
                 self._dashboard_html(omitted_section=missing),
                 encoding="utf-8",
@@ -1354,7 +1354,7 @@ class LiveInventoryFilterTests(unittest.TestCase):
             [target, sibling],
         )
 
-    def test_default_mcp_session_requires_read_only_inventory_group_tools(self) -> None:
+    def test_default_mcp_session_requires_agent_plugin_tools(self) -> None:
         session = matrix_cases.McpSession(
             Path("/test/unpin"),
             Path("/test/fixtures"),
@@ -1369,9 +1369,10 @@ class LiveInventoryFilterTests(unittest.TestCase):
                 {
                     "tools": [
                         {"name": "unpin_get_inventory_summary"},
-                        {"name": "unpin_list_inventory_groups"},
-                        {"name": "unpin_get_inventory_group"},
-                        {"name": "unpin_plan_toggle_item"},
+                    {"name": "unpin_list_inventory_groups"},
+                    {"name": "unpin_get_inventory_group"},
+                    {"name": "unpin_plan_inventory_group"},
+                    {"name": "unpin_plan_toggle_item"},
                         {"name": "unpin_apply_toggle_item"},
                         {"name": "unpin_restore_backup"},
                     ]
@@ -1384,6 +1385,95 @@ class LiveInventoryFilterTests(unittest.TestCase):
             MatrixFailure, "omitted required matrix tools"
         ):
             session._initialize()
+
+    def test_agent_plugin_surface_contracts_normalize_provider_shapes(self) -> None:
+        base = {
+            "logicalId": "plugin:connector-kit",
+            "name": "connector-kit",
+            "componentSignature": "mcp+skill",
+            "projectionFingerprint": "projection-fingerprint",
+            "state": "mixed",
+            "access": "actionable",
+            "componentKinds": ["mcp", "skill"],
+            "instanceCount": 2,
+            "blockerCount": 1,
+            "diagnosticCount": 2,
+        }
+        expected = [
+            {
+                **base,
+                "providers": ["claude", "codex"],
+            }
+        ]
+
+        self.assertEqual(
+            matrix_cases.agent_plugin_surface_contracts(
+                [
+                    {
+                        **{
+                            key: value
+                            for key, value in base.items()
+                            if key
+                            not in {
+                                "componentKinds",
+                                "instanceCount",
+                                "blockerCount",
+                                "diagnosticCount",
+                            }
+                        },
+                        "instances": [
+                            {
+                                "provider": "codex",
+                                "components": [{"kind": "skill"}],
+                                "blockers": ["blocked"],
+                                "diagnostics": ["diagnostic"],
+                            },
+                            {
+                                "provider": "claude",
+                                "components": [{"kind": "mcp"}],
+                                "diagnostics": ["diagnostic"],
+                            },
+                        ],
+                    }
+                ]
+            ),
+            expected,
+        )
+        self.assertEqual(
+            matrix_cases.agent_plugin_surface_contracts(
+                [{**base, "providers": ["codex", "claude"]}]
+            ),
+            expected,
+        )
+        self.assertEqual(
+            matrix_cases.agent_plugin_surface_contracts(
+                [
+                    {
+                        **base,
+                        "componentKinds": None,
+                        "coverage": {
+                            "providers": ["codex", "claude"],
+                            "instanceCount": 2,
+                        },
+                        "components": [{"kind": "skill"}, {"kind": "mcp"}],
+                    }
+                ]
+            ),
+            expected,
+        )
+        with self.assertRaisesRegex(MatrixFailure, "incomplete identity contract"):
+            matrix_cases.agent_plugin_surface_contracts(
+                [{key: value for key, value in base.items() if key != "componentSignature"}]
+            )
+
+    def test_agent_plugin_surface_redaction_rejects_internal_capabilities(self) -> None:
+        matrix_cases.assert_agent_plugin_payload_redacted(
+            {"logicalId": "plugin:connector-kit"}, "test"
+        )
+        with self.assertRaisesRegex(MatrixFailure, "exactIdentities"):
+            matrix_cases.assert_agent_plugin_payload_redacted(
+                {"exactIdentities": []}, "test"
+            )
 
     def test_run_command_uses_devnull_without_explicit_input(self) -> None:
         observed: dict[str, object] = {}

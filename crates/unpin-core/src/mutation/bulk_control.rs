@@ -17,6 +17,7 @@ use sha2::{Digest, Sha256};
 
 use super::consolidate_bulk_backup_bundle;
 use crate::{
+    agent_plugins::AgentPluginSummary,
     approval::{
         ApprovalError, ApprovalExpectation, CONTROL_APPROVAL_ISSUER, ControlApprovalContext,
         ControlAuthorization,
@@ -27,7 +28,10 @@ use crate::{
         ReachAwareRecoveryEvidence, ReachAwareRootBinding,
     },
     discovery::{DiscoveryCategory, DiscoveryItem, DiscoveryKind, DiscoveryLayer, DiscoveryOutput},
-    groups::{GroupMemberIdentity, index_source_views, shared_source_has_unlisted_view},
+    groups::{
+        GroupMemberIdentity, MAX_GROUP_MEMBER_ID_BYTES, index_source_views,
+        shared_source_has_unlisted_view,
+    },
     mutation::{
         BackupAuthenticationKey, NativeToggleControlError, NativeToggleController,
         TogglePlanRequest, ToggleResult, ToggleStatus, is_control_plane_protected_disable,
@@ -54,6 +58,8 @@ use crate::{
 
 pub const BULK_TOGGLE_PLAN_SCHEMA_VERSION: u32 = 2;
 pub const BULK_TOGGLE_APPROVAL_AUDIENCE: &str = "unpin-core-bulk-toggle-apply-v2";
+pub const BULK_TOGGLE_PROVIDER_ROOT_PROVENANCE: &str = "unpin-bulk-toggle-provider-root";
+pub const BULK_TOGGLE_ROOT_PROVENANCE: &str = "unpin-bulk-toggle";
 
 #[derive(Debug, Clone)]
 pub struct BulkToggleReachAwareApplyContext {
@@ -71,6 +77,8 @@ pub struct BulkToggleReachAwareApplyContext {
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BulkToggleSelector {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exact_identities: Vec<BulkItemIdentity>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub providers: Vec<ProviderId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kinds: Vec<DiscoveryKind>,
@@ -87,6 +95,20 @@ pub struct BulkToggleSelector {
 impl BulkToggleSelector {
     /// Normalize ordering and reject duplicate values before discovery.
     pub fn normalize(mut self) -> Result<Self, BulkTogglePlanError> {
+        for identity in &self.exact_identities {
+            identity.validate()?;
+        }
+        self.exact_identities.sort();
+        if let Some(duplicate) = self
+            .exact_identities
+            .windows(2)
+            .find(|window| window[0] == window[1])
+        {
+            return Err(BulkTogglePlanError::DuplicateIdentity(duplicate[0].key()));
+        }
+        if !self.exact_identities.is_empty() && self.has_coarse_criterion() {
+            return Err(BulkTogglePlanError::ExactSelectorCannotMixCoarseCriteria);
+        }
         normalize_enum_values(&mut self.providers, "providers")?;
         normalize_enum_values(&mut self.kinds, "kinds")?;
         normalize_enum_values(&mut self.categories, "categories")?;
@@ -100,7 +122,8 @@ impl BulkToggleSelector {
 
     #[must_use]
     pub fn has_non_provider_criterion(&self) -> bool {
-        !self.kinds.is_empty()
+        !self.exact_identities.is_empty()
+            || !self.kinds.is_empty()
             || !self.categories.is_empty()
             || !self.layers.is_empty()
             || !self.ids.is_empty()
@@ -109,12 +132,30 @@ impl BulkToggleSelector {
 
     #[must_use]
     pub fn matches(&self, item: &DiscoveryItem) -> bool {
+        if !self.exact_identities.is_empty() {
+            return BulkItemIdentity::try_from(item)
+                .is_ok_and(|identity| self.exact_identities.binary_search(&identity).is_ok());
+        }
         (self.providers.is_empty() || self.providers.contains(&item.provider))
             && (self.kinds.is_empty() || self.kinds.contains(&item.kind))
             && (self.categories.is_empty() || self.categories.contains(&item.category))
             && (self.layers.is_empty() || self.layers.contains(&item.layer))
             && (self.ids.is_empty() || self.ids.iter().any(|id| id == &item.id))
             && self.enabled.is_none_or(|enabled| enabled == item.enabled)
+    }
+
+    #[must_use]
+    pub fn is_exact(&self) -> bool {
+        !self.exact_identities.is_empty()
+    }
+
+    fn has_coarse_criterion(&self) -> bool {
+        !self.providers.is_empty()
+            || !self.kinds.is_empty()
+            || !self.categories.is_empty()
+            || !self.layers.is_empty()
+            || !self.ids.is_empty()
+            || self.enabled.is_some()
     }
 }
 
@@ -149,10 +190,31 @@ fn normalize_strings(values: &mut [String], field: &str) -> Result<(), BulkToggl
     Ok(())
 }
 
+fn validate_selection_context_pair(
+    selector: &BulkToggleSelector,
+    fingerprint: Option<&str>,
+) -> Result<(), BulkTogglePlanError> {
+    match (selector.is_exact(), fingerprint) {
+        (true, None) => Err(BulkTogglePlanError::SelectionContextFingerprintRequired),
+        (false, Some(_)) => Err(BulkTogglePlanError::UnexpectedSelectionContextFingerprint),
+        (true, Some(fingerprint)) if !valid_sha256_fingerprint(fingerprint) => {
+            Err(BulkTogglePlanError::MalformedSelectionContextFingerprint)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn valid_sha256_fingerprint(value: &str) -> bool {
+    value
+        .strip_prefix("sha256:")
+        .is_some_and(crate::is_lower_hex_digest)
+}
+
 /// Inputs accepted by all bulk operation adapters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkToggleRequest {
     pub selector: BulkToggleSelector,
+    pub selection_context_fingerprint: Option<String>,
     pub target_enabled: bool,
     pub allow_empty_selection: bool,
     pub acknowledge_whole_inventory: bool,
@@ -166,6 +228,7 @@ impl BulkToggleRequest {
     pub fn new(selector: BulkToggleSelector, target_enabled: bool) -> Self {
         Self {
             selector,
+            selection_context_fingerprint: None,
             target_enabled,
             allow_empty_selection: false,
             acknowledge_whole_inventory: false,
@@ -173,6 +236,114 @@ impl BulkToggleRequest {
             reach: ProviderReachInput::Omitted,
             authority_candidates: Vec::new(),
         }
+    }
+
+    pub fn for_agent_plugin(
+        discovery: &DiscoveryOutput,
+        logical_id: &str,
+        target_enabled: bool,
+    ) -> Result<Self, BulkTogglePlanError> {
+        if !discovery.agent_plugin_inventory_complete() {
+            return Err(BulkTogglePlanError::AgentPluginInventoryIncomplete);
+        }
+
+        let package = discovery
+            .agent_plugins()
+            .into_iter()
+            .find(|package| package.logical_id == logical_id)
+            .ok_or(BulkTogglePlanError::AgentPluginNotFound)?;
+        if crate::agent_plugins::has_diagnostics_only_writable_activation_anchors(&package) {
+            return Err(BulkTogglePlanError::AgentPluginHasDiagnosticsOnlyActivationAnchors);
+        }
+
+        let has_activation_anchors = package
+            .instances
+            .iter()
+            .any(|instance| !instance.activations.is_empty());
+        let mut exact_identities = package
+            .instances
+            .iter()
+            .flat_map(crate::agent_plugins::AgentPluginInstance::control_activations)
+            .map(|activation| BulkItemIdentity::try_from(&activation.identity))
+            .collect::<Result<Vec<_>, _>>()?;
+        exact_identities.sort();
+        if let Some(duplicate) = exact_identities
+            .windows(2)
+            .find(|window| window[0] == window[1])
+        {
+            return Err(BulkTogglePlanError::DuplicateIdentity(duplicate[0].key()));
+        }
+        if exact_identities.is_empty() {
+            return Err(if has_activation_anchors {
+                BulkTogglePlanError::AgentPluginHasNoActionableActivationAnchors
+            } else {
+                BulkTogglePlanError::AgentPluginHasNoActivationAnchors
+            });
+        }
+        Ok(Self::new(
+            BulkToggleSelector {
+                exact_identities,
+                ..BulkToggleSelector::default()
+            },
+            target_enabled,
+        )
+        .acknowledge_whole_inventory(true)
+        .with_selection_context_fingerprint(package.projection_fingerprint))
+    }
+
+    pub fn for_agent_plugin_summary(
+        discovery: &DiscoveryOutput,
+        package: &AgentPluginSummary,
+        target_enabled: bool,
+    ) -> Result<Self, BulkTogglePlanError> {
+        if !discovery.agent_plugin_inventory_complete() {
+            return Err(BulkTogglePlanError::AgentPluginInventoryIncomplete);
+        }
+        if crate::agent_plugins::has_diagnostics_only_writable_activation_anchors(package) {
+            return Err(BulkTogglePlanError::AgentPluginHasDiagnosticsOnlyActivationAnchors);
+        }
+        let has_activation_anchors = package
+            .instances
+            .iter()
+            .any(|instance| !instance.activations.is_empty());
+        let mut exact_identities = package
+            .instances
+            .iter()
+            .flat_map(crate::agent_plugins::AgentPluginInstance::control_activations)
+            .map(|activation| BulkItemIdentity::try_from(&activation.identity))
+            .collect::<Result<Vec<_>, _>>()?;
+        exact_identities.sort();
+        if let Some(duplicate) = exact_identities
+            .windows(2)
+            .find(|window| window[0] == window[1])
+        {
+            return Err(BulkTogglePlanError::DuplicateIdentity(duplicate[0].key()));
+        }
+        if exact_identities.is_empty() {
+            return Err(if has_activation_anchors {
+                BulkTogglePlanError::AgentPluginHasNoActionableActivationAnchors
+            } else {
+                BulkTogglePlanError::AgentPluginHasNoActivationAnchors
+            });
+        }
+        Ok(Self::new(
+            BulkToggleSelector {
+                exact_identities,
+                ..BulkToggleSelector::default()
+            },
+            target_enabled,
+        )
+        .acknowledge_whole_inventory(true)
+        .with_selection_context_fingerprint(package.projection_fingerprint.clone()))
+    }
+
+    #[must_use]
+    pub fn with_selection_context_fingerprint(
+        mut self,
+        selection_context_fingerprint: impl Into<String>,
+    ) -> Self {
+        self.selection_context_fingerprint = Some(selection_context_fingerprint.into());
+        self
     }
 
     #[must_use]
@@ -225,7 +396,7 @@ pub struct BulkInventoryAcknowledgement {
     pub counts: Vec<BulkProviderCount>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct BulkItemIdentity {
     pub provider: ProviderId,
@@ -239,20 +410,45 @@ impl TryFrom<&DiscoveryItem> for BulkItemIdentity {
     type Error = BulkTogglePlanError;
 
     fn try_from(item: &DiscoveryItem) -> Result<Self, Self::Error> {
-        if item.id.is_empty() || item.id.chars().any(char::is_control) {
-            return Err(BulkTogglePlanError::MalformedIdentity(item.id.clone()));
-        }
-        Ok(Self {
+        let identity = Self {
             provider: item.provider,
             kind: item.kind,
             category: item.category,
             layer: item.layer,
             id: item.id.clone(),
-        })
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+}
+
+impl TryFrom<&GroupMemberIdentity> for BulkItemIdentity {
+    type Error = BulkTogglePlanError;
+
+    fn try_from(identity: &GroupMemberIdentity) -> Result<Self, Self::Error> {
+        let identity = Self {
+            provider: identity.provider,
+            kind: identity.kind,
+            category: identity.category,
+            layer: identity.layer,
+            id: identity.id.clone(),
+        };
+        identity.validate()?;
+        Ok(identity)
     }
 }
 
 impl BulkItemIdentity {
+    fn validate(&self) -> Result<(), BulkTogglePlanError> {
+        if self.id.is_empty()
+            || self.id.len() > MAX_GROUP_MEMBER_ID_BYTES
+            || self.id.chars().any(char::is_control)
+        {
+            return Err(BulkTogglePlanError::MalformedIdentity(self.id.clone()));
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn key(&self) -> String {
         format!(
@@ -298,6 +494,8 @@ pub struct BulkTogglePlan {
     pub operation_id: String,
     pub status: BulkTogglePlanStatus,
     pub selector: BulkToggleSelector,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_context_fingerprint: Option<String>,
     pub target_enabled: bool,
     pub allow_empty_selection: bool,
     pub provider_reach: ProviderReach,
@@ -331,6 +529,14 @@ impl BulkTogglePlan {
         if self.status != expected_status {
             return Err(BulkTogglePlanError::InvalidPlan);
         }
+        let normalized = self.selector.clone().normalize()?;
+        if normalized != self.selector {
+            return Err(BulkTogglePlanError::InvalidPlan);
+        }
+        validate_selection_context_pair(
+            &self.selector,
+            self.selection_context_fingerprint.as_deref(),
+        )?;
         let mut seen = BTreeSet::new();
         for item in &self.matched {
             let identity = BulkItemIdentity::try_from(item)?;
@@ -508,6 +714,17 @@ pub enum BulkTogglePlanError {
     State(String),
     TransitionPlan(String),
     SelectorRequiresNonProviderCriterion,
+    ExactSelectorCannotMixCoarseCriteria,
+    SelectionContextFingerprintRequired,
+    UnexpectedSelectionContextFingerprint,
+    MalformedSelectionContextFingerprint,
+    SelectionContextFingerprintMismatch,
+    AgentPluginNotFound,
+    AgentPluginHasNoActivationAnchors,
+    AgentPluginHasNoActionableActivationAnchors,
+    AgentPluginHasDiagnosticsOnlyActivationAnchors,
+    AgentPluginInventoryIncomplete,
+    ExactIdentityMissing(String),
     DuplicateSelectorValue(String),
     MalformedSelectorValue(String),
     MalformedIdentity(String),
@@ -536,6 +753,36 @@ impl fmt::Display for BulkTogglePlanError {
             | Self::TransitionPlan(error) => formatter.write_str(error),
             Self::SelectorRequiresNonProviderCriterion => formatter
                 .write_str("bulk selector must include at least one non-provider criterion"),
+            Self::ExactSelectorCannotMixCoarseCriteria => formatter
+                .write_str("exact identity selector cannot include coarse selector criteria"),
+            Self::SelectionContextFingerprintRequired => formatter
+                .write_str("exact identity selector requires a selection context fingerprint"),
+            Self::UnexpectedSelectionContextFingerprint => formatter
+                .write_str("coarse selector cannot include a selection context fingerprint"),
+            Self::MalformedSelectionContextFingerprint => {
+                formatter.write_str("selection context fingerprint is malformed")
+            }
+            Self::SelectionContextFingerprintMismatch => {
+                formatter.write_str("selection context fingerprint does not match fresh discovery")
+            }
+            Self::AgentPluginNotFound => formatter.write_str("agent plugin was not found"),
+            Self::AgentPluginHasNoActivationAnchors => {
+                formatter.write_str("agent plugin has no native activation anchors")
+            }
+            Self::AgentPluginInventoryIncomplete => {
+                formatter.write_str("agent plugin inventory is incomplete; refresh discovery before planning")
+            }
+            Self::AgentPluginHasDiagnosticsOnlyActivationAnchors => formatter.write_str(
+                "agent plugin has diagnostics-only writable activation anchors; fix diagnostics before planning",
+            ),
+            Self::AgentPluginHasNoActionableActivationAnchors => formatter
+                .write_str("agent plugin has no safely actionable native activation anchors"),
+            Self::ExactIdentityMissing(id) => {
+                write!(
+                    formatter,
+                    "exact identity is missing from fresh discovery: {id}"
+                )
+            }
             Self::DuplicateSelectorValue(field) => {
                 write!(formatter, "selector.{field} contains duplicate values")
             }
@@ -673,6 +920,10 @@ impl BulkToggleController {
         request: &BulkToggleRequest,
     ) -> Result<(BulkToggleSelector, ProviderReachResolution), BulkTogglePlanError> {
         let selector = request.selector.clone().normalize()?;
+        validate_selection_context_pair(
+            &selector,
+            request.selection_context_fingerprint.as_deref(),
+        )?;
         let resolution = ProviderReachRequest {
             boundary: request.boundary,
             reach: request.reach,
@@ -693,7 +944,17 @@ impl BulkToggleController {
         request: BulkToggleRequest,
     ) -> Result<BulkTogglePlan, BulkTogglePlanError> {
         let (selector, resolution) = Self::preflight(&request)?;
-        self.plan_normalized(discovery, selector, request, resolution)
+        self.plan_normalized(discovery, selector, request, resolution, None)
+    }
+
+    pub fn plan_agent_plugin_from_discovery(
+        &self,
+        discovery: DiscoveryOutput,
+        request: BulkToggleRequest,
+        package: &AgentPluginSummary,
+    ) -> Result<BulkTogglePlan, BulkTogglePlanError> {
+        let (selector, resolution) = Self::preflight(&request)?;
+        self.plan_normalized(discovery, selector, request, resolution, Some(package))
     }
 
     pub fn plan(
@@ -710,6 +971,7 @@ impl BulkToggleController {
         selector: BulkToggleSelector,
         request: BulkToggleRequest,
         resolution: ProviderReachResolution,
+        agent_plugin: Option<&AgentPluginSummary>,
     ) -> Result<BulkTogglePlan, BulkTogglePlanError> {
         let matched = discovery
             .items
@@ -718,6 +980,13 @@ impl BulkToggleController {
             .cloned()
             .collect::<Vec<_>>();
         reject_duplicate_identities(&matched)?;
+        validate_exact_selection_context(
+            &discovery,
+            &selector,
+            &matched,
+            request.selection_context_fingerprint.as_deref(),
+            agent_plugin,
+        )?;
         reject_path_aliases(&matched)?;
 
         let counts = inventory_counts(&discovery.items, &matched);
@@ -889,6 +1158,7 @@ impl BulkToggleController {
             operation_id: String::new(),
             status,
             selector,
+            selection_context_fingerprint: request.selection_context_fingerprint,
             target_enabled: request.target_enabled,
             allow_empty_selection: request.allow_empty_selection,
             provider_reach,
@@ -2029,6 +2299,7 @@ fn finalize_bulk_journal(
 fn request_from_reviewed(plan: &BulkTogglePlan, boundary: ConnectionBoundary) -> BulkToggleRequest {
     BulkToggleRequest {
         selector: plan.selector.clone(),
+        selection_context_fingerprint: plan.selection_context_fingerprint.clone(),
         target_enabled: plan.target_enabled,
         allow_empty_selection: plan.allow_empty_selection,
         acknowledge_whole_inventory: plan.acknowledgement.acknowledged,
@@ -2208,6 +2479,108 @@ fn bulk_result_matches_plan(result: &BulkToggleApplyResult, plan: &BulkTogglePla
         .all(|item| matched.contains(&item.item.key()) && seen.insert(item.item.key()))
 }
 
+fn validate_exact_selection_context(
+    discovery: &DiscoveryOutput,
+    selector: &BulkToggleSelector,
+    matched: &[DiscoveryItem],
+    fingerprint: Option<&str>,
+    agent_plugin: Option<&AgentPluginSummary>,
+) -> Result<(), BulkTogglePlanError> {
+    if !selector.is_exact() {
+        return Ok(());
+    }
+    let mut matched_identities = matched
+        .iter()
+        .map(BulkItemIdentity::try_from)
+        .collect::<Result<Vec<_>, _>>()?;
+    matched_identities.sort();
+    if matched_identities != selector.exact_identities {
+        let matched = matched_identities.into_iter().collect::<BTreeSet<_>>();
+        let missing = selector
+            .exact_identities
+            .iter()
+            .find(|identity| !matched.contains(*identity))
+            .map(BulkItemIdentity::key)
+            .unwrap_or_else(|| "unknown".to_string());
+        return Err(BulkTogglePlanError::ExactIdentityMissing(missing));
+    }
+    let fingerprint =
+        fingerprint.ok_or(BulkTogglePlanError::SelectionContextFingerprintRequired)?;
+    if !discovery.agent_plugin_inventory_complete() {
+        return Err(BulkTogglePlanError::AgentPluginInventoryIncomplete);
+    }
+    if let Some(package) = agent_plugin {
+        return validate_agent_plugin_selection_context(package, selector, fingerprint);
+    }
+    let agent_plugin_packages = discovery.agent_plugins();
+    for package in &agent_plugin_packages {
+        if !crate::agent_plugins::has_diagnostics_only_writable_activation_anchors(package) {
+            continue;
+        }
+        let diagnostics_only_identities = package
+            .instances
+            .iter()
+            .filter(|instance| {
+                instance.access == crate::agent_plugins::AgentPluginAccess::DiagnosticsOnly
+            })
+            .flat_map(|instance| instance.activations.iter())
+            .filter(|activation| {
+                activation.mutability == crate::discovery::DiscoveryMutability::ReadWrite
+            })
+            .map(|activation| BulkItemIdentity::try_from(&activation.identity))
+            .collect::<Result<Vec<_>, _>>()?;
+        if diagnostics_only_identities
+            .iter()
+            .any(|identity| selector.exact_identities.contains(identity))
+        {
+            return Err(BulkTogglePlanError::AgentPluginHasDiagnosticsOnlyActivationAnchors);
+        }
+    }
+    for package in agent_plugin_packages {
+        if package.projection_fingerprint != fingerprint {
+            continue;
+        }
+        if crate::agent_plugins::has_diagnostics_only_writable_activation_anchors(&package) {
+            return Err(BulkTogglePlanError::AgentPluginHasDiagnosticsOnlyActivationAnchors);
+        }
+        let mut identities = package
+            .instances
+            .iter()
+            .flat_map(crate::agent_plugins::AgentPluginInstance::control_activations)
+            .map(|activation| BulkItemIdentity::try_from(&activation.identity))
+            .collect::<Result<Vec<_>, _>>()?;
+        identities.sort();
+        if identities == selector.exact_identities {
+            return Ok(());
+        }
+    }
+    Err(BulkTogglePlanError::SelectionContextFingerprintMismatch)
+}
+
+fn validate_agent_plugin_selection_context(
+    package: &AgentPluginSummary,
+    selector: &BulkToggleSelector,
+    fingerprint: &str,
+) -> Result<(), BulkTogglePlanError> {
+    if package.projection_fingerprint != fingerprint {
+        return Err(BulkTogglePlanError::SelectionContextFingerprintMismatch);
+    }
+    if crate::agent_plugins::has_diagnostics_only_writable_activation_anchors(package) {
+        return Err(BulkTogglePlanError::AgentPluginHasDiagnosticsOnlyActivationAnchors);
+    }
+    let mut identities = package
+        .instances
+        .iter()
+        .flat_map(crate::agent_plugins::AgentPluginInstance::control_activations)
+        .map(|activation| BulkItemIdentity::try_from(&activation.identity))
+        .collect::<Result<Vec<_>, _>>()?;
+    identities.sort();
+    if selector.exact_identities != identities {
+        return Err(BulkTogglePlanError::SelectionContextFingerprintMismatch);
+    }
+    Ok(())
+}
+
 fn reject_duplicate_identities(items: &[DiscoveryItem]) -> Result<(), BulkTogglePlanError> {
     let mut identities = BTreeSet::new();
     for item in items {
@@ -2326,6 +2699,8 @@ fn bulk_plan_fingerprint(plan: &BulkTogglePlan) -> Result<String, BulkTogglePlan
     struct FingerprintBody<'a> {
         schema_version: u32,
         selector: &'a BulkToggleSelector,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        selection_context_fingerprint: Option<&'a str>,
         target_enabled: bool,
         allow_empty_selection: bool,
         provider_reach: ProviderReach,
@@ -2351,6 +2726,7 @@ fn bulk_plan_fingerprint(plan: &BulkTogglePlan) -> Result<String, BulkTogglePlan
     let body = FingerprintBody {
         schema_version: plan.schema_version,
         selector: &plan.selector,
+        selection_context_fingerprint: plan.selection_context_fingerprint.as_deref(),
         target_enabled: plan.target_enabled,
         allow_empty_selection: plan.allow_empty_selection,
         provider_reach: plan.provider_reach,

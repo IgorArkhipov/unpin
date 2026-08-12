@@ -22,6 +22,7 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
     private static let scenarioMetadata = [
         GuidanceMatrixScenarioMetadata(id: "discover-ready-expanded", area: "discover", primerState: "expanded", sourceFixture: "inventory-ready"),
         GuidanceMatrixScenarioMetadata(id: "discover-ready-collapsed", area: "discover", primerState: "collapsed", sourceFixture: "inventory-ready"),
+        GuidanceMatrixScenarioMetadata(id: "discover-packages-ready", area: "discover", primerState: "expanded", sourceFixture: "agent-plugins-ready"),
         GuidanceMatrixScenarioMetadata(id: "discover-no-workspace", area: "discover", primerState: "expanded", sourceFixture: "no-workspace"),
         GuidanceMatrixScenarioMetadata(id: "discover-loading", area: "discover", primerState: "expanded", sourceFixture: "workspace-loading"),
         GuidanceMatrixScenarioMetadata(id: "discover-blocked", area: "discover", primerState: "expanded", sourceFixture: "bridge-blocked"),
@@ -193,6 +194,15 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
                 presentation: ready,
                 inventory: inventory
             )
+        case "discover-packages-ready":
+            return workbench(
+                area: .discover,
+                theme: theme,
+                presentation: ready,
+                inventory: [],
+                agentPlugins: try agentPlugins,
+                discoverMode: .packages
+            )
         case "discover-no-workspace":
             return workbench(area: .discover, theme: theme, presentation: noWorkspace)
         case "discover-loading":
@@ -352,6 +362,8 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
         guidanceExpanded: Bool = true,
         presentation: WorkbenchPresentationInputs,
         inventory: [InventoryItem]? = nil,
+        agentPlugins: [AgentPluginSummary]? = nil,
+        discoverMode: DiscoverInventoryMode? = nil,
         discoverFilters: DiscoverFilterState? = nil,
         groups: [GroupSummary]? = nil,
         recovery: RecoverAuditFixture? = nil
@@ -362,6 +374,8 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
             guidanceExpanded: guidanceExpanded,
             presentation: presentation,
             inventory: inventory,
+            agentPlugins: agentPlugins,
+            discoverMode: discoverMode,
             discoverFilters: discoverFilters,
             groups: groups,
             recovery: recovery
@@ -483,6 +497,60 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
                       "members": [],
                       "state": "mixed",
                       "fresh": true
+                    }]
+                    """.utf8
+                )
+            )
+        }
+    }
+
+    private var agentPlugins: [AgentPluginSummary] {
+        get throws {
+            try JSONDecoder().decode(
+                [AgentPluginSummary].self,
+                from: Data(
+                    """
+                    [{
+                      "logicalId": "agent-plugin:connector-kit",
+                      "name": "Connector Kit",
+                      "componentSignature": "mcp+skill",
+                      "projectionFingerprint": "sha256:fixture-projection",
+                      "state": "mixed",
+                      "access": "actionable",
+                      "providers": ["claude", "codex"],
+                      "componentKinds": ["mcp", "skill"],
+                      "instanceCount": 2,
+                      "instances": [{
+                        "instanceId": "instance-connector-kit-claude-global",
+                        "provider": "claude",
+                        "layer": "global",
+                        "state": "on",
+                        "access": "actionable",
+                        "version": "1.0.0",
+                        "description": "Review and context tools for agent workbenches.",
+                        "components": [
+                          {"kind": "mcp", "name": "context", "disposition": "available"},
+                          {"kind": "skill", "name": "review", "disposition": "available"}
+                        ],
+                        "activations": [{"enabled": true, "mutability": "read-write"}],
+                        "blockers": [],
+                        "diagnostics": []
+                      }, {
+                        "instanceId": "instance-connector-kit-codex-global",
+                        "provider": "codex",
+                        "layer": "global",
+                        "state": "off",
+                        "access": "actionable",
+                        "version": "1.0.0",
+                        "description": "Review and context tools for agent workbenches.",
+                        "components": [
+                          {"kind": "mcp", "name": "context", "disposition": "available"},
+                          {"kind": "skill", "name": "review", "disposition": "available"}
+                        ],
+                        "activations": [{"enabled": false, "mutability": "read-write"}],
+                        "blockers": [],
+                        "diagnostics": []
+                      }]
                     }]
                     """.utf8
                 )

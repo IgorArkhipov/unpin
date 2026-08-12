@@ -9,6 +9,8 @@ pub(crate) fn discover_claude(
         shared_skill_views,
         items,
         warnings,
+        agent_plugin_metadata,
+        agent_plugin_item_keys,
     } = state;
     let global_skill_root = roots.claude_global.join("skills");
     let live_skill_ids = discover_direct_child_skill_dirs(
@@ -257,6 +259,16 @@ pub(crate) fn discover_claude(
         items.extend(claude_plugin_config_items(&source));
         items.extend(claude_hook_items(&source, warnings));
     }
+
+    let activations = crate::agent_plugins::activation_candidates(ProviderId::Claude, items);
+    crate::agent_plugins::discover_cached_agent_plugins(
+        ProviderId::Claude,
+        &roots.claude_global.join("plugins").join("cache"),
+        &activations,
+        agent_plugin_metadata,
+        agent_plugin_item_keys,
+        warnings,
+    )?;
 
     Ok(())
 }
