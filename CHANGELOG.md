@@ -7,6 +7,34 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-08-11
+
+### Added
+
+- Added discovery and control of portable Agent Plugin packages across the CLI,
+  terminal TUI, native desktop workbench, and MCP planning surface.
+- Added a sortable and filterable desktop Packages workbench with Light and
+  Dark appearances, first-run guidance, and exact CLI handoffs.
+- Added actionable Claude global/project and Codex global activation anchors;
+  unsupported provider and layer combinations remain visible as diagnostics.
+
+### Security
+
+- Package rows are derived from existing provider inventory instead of a
+  second package store, and incomplete or symlinked package caches fail closed.
+- Package changes retain Unpin's provider reach, fingerprint, drift, locking,
+  confirmation, backup, audit, restore, and recovery protections. MCP remains
+  no-write and prepares human-action handoffs instead of applying changes.
+
+### Compatibility
+
+- Existing skills, MCP servers, plugins, groups, CLI, TUI, desktop, and MCP
+  workflows remain supported. Agent Plugin activation is currently actionable
+  for Claude and Codex anchors; other detected combinations are diagnostic.
+- The stable macOS certificate and executable identifiers are unchanged, so a
+  verified update from `1.1.0` preserves Keychain designated requirements and
+  existing **Always Allow** grants.
+
 ## [1.1.0] - 2026-08-07
 
 ### Added
