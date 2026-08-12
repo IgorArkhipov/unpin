@@ -606,6 +606,14 @@ impl ProviderReachCoverage {
     pub fn excluded(&self) -> impl Iterator<Item = &ProviderCoverageEntry> {
         self.entries.iter().filter(|entry| entry.is_excluded())
     }
+
+    #[must_use]
+    pub fn reach_excluded_count(&self) -> usize {
+        self.entries
+            .iter()
+            .filter(|entry| entry.is_reach_exclusion())
+            .count()
+    }
 }
 
 impl From<Vec<ProviderCoverageEntry>> for ProviderReachCoverage {

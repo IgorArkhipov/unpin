@@ -399,6 +399,7 @@ fn validate_snapshot(snapshot: &DiscoverySnapshot) -> Result<(), String> {
     let expected_inventory = build_inventory_summary(&DiscoveryOutput {
         items: snapshot.items.clone(),
         warnings: snapshot.warnings.clone(),
+        ..DiscoveryOutput::default()
     });
     if snapshot.inventory != expected_inventory {
         return Err("snapshot inventory does not match items and warnings".to_string());

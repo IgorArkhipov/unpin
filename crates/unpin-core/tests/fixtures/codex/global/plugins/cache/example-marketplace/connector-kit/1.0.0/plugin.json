@@ -1,0 +1,6 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "connector-kit",
+  "version": "1.0.0",
+  "description": "Fixture Agent Plugin with a portable skill and MCP connector"
+}

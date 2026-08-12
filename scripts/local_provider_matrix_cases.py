@@ -151,6 +151,9 @@ class McpSession:
         tool_names = [tool["name"] for tool in tools.get("tools", [])]
         required_tools = {
             "unpin_get_inventory_summary",
+            "unpin_list_agent_plugins",
+            "unpin_inspect_agent_plugin",
+            "unpin_plan_agent_plugin_toggle",
             "unpin_list_inventory_groups",
             "unpin_get_inventory_group",
             "unpin_plan_inventory_group",
@@ -481,6 +484,289 @@ def run_cli_scenario(
             "asserted": shared_contract is not None,
             "providers": shared_contract["providers"] if shared_contract else [],
         },
+    }
+    write_json(case_root / "summary.json", result)
+    return result
+
+
+def agent_plugin_surface_contract(package: dict[str, Any]) -> dict[str, Any]:
+    coverage = package.get("coverage")
+    coverage = coverage if isinstance(coverage, dict) else {}
+    instances = package.get("instances")
+    instances = instances if isinstance(instances, list) else None
+
+    providers = package.get("providers")
+    if not isinstance(providers, list):
+        providers = coverage.get("providers")
+    if not isinstance(providers, list) and instances is not None:
+        providers = [instance.get("provider") for instance in instances if isinstance(instance, dict)]
+
+    component_kinds = package.get("componentKinds")
+    if not isinstance(component_kinds, list):
+        components = package.get("components")
+        if isinstance(components, list):
+            component_kinds = [component.get("kind") for component in components if isinstance(component, dict)]
+        elif instances is not None:
+            component_kinds = [
+                component.get("kind")
+                for instance in instances
+                if isinstance(instance, dict)
+                for component in instance.get("components", [])
+                if isinstance(component, dict)
+            ]
+
+    def count(field: str, instance_field: str | None = None) -> int | None:
+        value = package.get(field, coverage.get(field))
+        if value is not None:
+            return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+        if instances is None:
+            return None
+        if instance_field is None:
+            return len(instances)
+        return sum(
+            len(instance.get(instance_field, []))
+            for instance in instances
+            if isinstance(instance, dict) and isinstance(instance.get(instance_field, []), list)
+        )
+
+    def normalized_strings(values: Any) -> list[str] | None:
+        if not isinstance(values, list) or any(
+            not isinstance(value, str) or not value for value in values
+        ):
+            return None
+        return sorted(set(values))
+
+    contract = {
+        "logicalId": package.get("logicalId"),
+        "name": package.get("name"),
+        "state": package.get("state"),
+        "access": package.get("access"),
+        "componentSignature": package.get("componentSignature"),
+        "projectionFingerprint": package.get("projectionFingerprint"),
+        "providers": normalized_strings(providers),
+        "componentKinds": normalized_strings(component_kinds),
+        "instanceCount": count("instanceCount"),
+        "blockerCount": count("blockerCount", "blockers"),
+        "diagnosticCount": count("diagnosticCount", "diagnostics"),
+    }
+    required_strings = (
+        "logicalId",
+        "name",
+        "state",
+        "access",
+        "componentSignature",
+        "projectionFingerprint",
+    )
+    if any(not isinstance(contract[field], str) or not contract[field] for field in required_strings):
+        raise MatrixFailure("Agent Plugin surface returned an incomplete identity contract")
+    if (
+        not isinstance(contract["providers"], list)
+        or not contract["providers"]
+        or not isinstance(contract["componentKinds"], list)
+        or any(contract[field] is None for field in ("instanceCount", "blockerCount", "diagnosticCount"))
+    ):
+        raise MatrixFailure("Agent Plugin surface returned an incomplete coverage contract")
+    return contract
+
+
+def agent_plugin_surface_contracts(packages: Any) -> list[dict[str, Any]]:
+    if not isinstance(packages, list):
+        raise MatrixFailure("Agent Plugin surface did not return a package list")
+    contracts = [agent_plugin_surface_contract(package) for package in packages]
+    return sorted(contracts, key=lambda contract: contract["logicalId"])
+
+
+def assert_agent_plugin_payload_redacted(payload: Any, surface: str) -> None:
+    encoded = json.dumps(payload, sort_keys=True)
+    for forbidden in (
+        "sourcePath",
+        "statePath",
+        "packageRoot",
+        "rawManifest",
+        "exactIdentities",
+        "selectionContextFingerprint",
+    ):
+        if forbidden in encoded:
+            raise MatrixFailure(f"{surface} Agent Plugin payload leaked {forbidden}")
+
+
+def run_agent_plugin_surface_parity(
+    binary: Path,
+    artifact_root: Path,
+    fixture_workspace_root: Path,
+    canonical_fixture_digest: str,
+) -> dict[str, Any]:
+    case_root, fixture_root, app_state_root = matrix_case_roots(
+        artifact_root,
+        fixture_workspace_root,
+        "agent-plugin-parity",
+        "cross-surface",
+    )
+    copy_fixture_tree(fixture_root)
+    app_state_root.mkdir(parents=True)
+    project_root = app_state_root.parent / "project"
+    (project_root / ".git").mkdir(parents=True)
+    provider_state_before = digest_path(fixture_root)
+
+    cli_list = parse_json_output(
+        run_command(
+            [
+                binary,
+                "agent-plugins",
+                "list",
+                "--fixture-root",
+                fixture_root,
+                "--app-state-root",
+                app_state_root,
+                "--json",
+            ]
+        ).stdout
+    )
+    assert_agent_plugin_payload_redacted(cli_list, "CLI")
+    cli_contracts = agent_plugin_surface_contracts(cli_list.get("packages"))
+    if not cli_contracts:
+        raise MatrixFailure("Agent Plugin fixtures produced no CLI packages")
+    write_json(case_root / "cli-list.json", cli_list)
+
+    logical_id = next(
+        (
+            contract["logicalId"]
+            for contract in cli_contracts
+            if contract["name"] == "connector-kit"
+        ),
+        cli_contracts[0]["logicalId"],
+    )
+    cli_plan = parse_json_output(
+        run_command(
+            [
+                binary,
+                "agent-plugins",
+                "plan",
+                logical_id,
+                "--fixture-root",
+                fixture_root,
+                "--app-state-root",
+                app_state_root,
+                "--reach",
+                "all",
+                "--disable",
+                "--json",
+            ]
+        ).stdout
+    )
+    assert_agent_plugin_payload_redacted(cli_plan, "CLI plan")
+    write_json(case_root / "cli-plan.json", cli_plan)
+
+    tui_output = run_command(
+        [
+            binary,
+            "tui",
+            "--fixture-root",
+            fixture_root,
+            "--app-state-root",
+            app_state_root,
+            "--headless",
+        ]
+    ).stdout
+    tui_package_line = next(
+        (line for line in tui_output.splitlines() if line.startswith("Packages: ")),
+        None,
+    )
+    if tui_package_line is None:
+        raise MatrixFailure("headless TUI omitted Agent Plugin package count")
+    try:
+        tui_package_count = int(tui_package_line.removeprefix("Packages: "))
+    except ValueError as error:
+        raise MatrixFailure("headless TUI returned invalid Agent Plugin count") from error
+
+    bridge_requests = "\n".join(
+        json.dumps(request)
+        for request in (
+            {"version": 2, "id": "handshake", "method": "handshake"},
+            {"version": 2, "id": "snapshot", "method": "snapshot"},
+        )
+    ) + "\n"
+    bridge = run_command(
+        [
+            binary,
+            "desktop",
+            "bridge",
+            "--fixture-root",
+            fixture_root,
+            "--home-root",
+            fixture_root,
+            "--project-root",
+            project_root,
+            "--app-state-root",
+            app_state_root,
+        ],
+        input_text=bridge_requests,
+    )
+    bridge_responses = [json.loads(line) for line in bridge.stdout.splitlines()]
+    if len(bridge_responses) != 2 or bridge_responses[0].get("id") != "handshake":
+        raise MatrixFailure("desktop bridge Agent Plugin parity handshake failed")
+    desktop_snapshot = bridge_responses[1].get("result", {})
+    assert_agent_plugin_payload_redacted(desktop_snapshot, "desktop bridge")
+    desktop_contracts = agent_plugin_surface_contracts(
+        desktop_snapshot.get("agentPlugins")
+    )
+    write_json(case_root / "desktop-snapshot.json", desktop_snapshot)
+
+    with McpSession(binary, fixture_root, app_state_root) as session:
+        mcp_list = mcp_call(
+            session,
+            request_id="agent-plugin-list",
+            name="unpin_list_agent_plugins",
+            arguments={},
+        )
+        assert_agent_plugin_payload_redacted(mcp_list, "MCP")
+        mcp_contracts = agent_plugin_surface_contracts(mcp_list.get("packages"))
+        inspected = mcp_call(
+            session,
+            request_id="agent-plugin-inspect",
+            name="unpin_inspect_agent_plugin",
+            arguments={"logicalId": logical_id},
+        )
+        assert_agent_plugin_payload_redacted(inspected, "MCP inspect")
+        mcp_plan = mcp_call(
+            session,
+            request_id="agent-plugin-plan",
+            name="unpin_plan_agent_plugin_toggle",
+            arguments={
+                "logicalId": logical_id,
+                "targetEnabled": False,
+                "providerReach": "all",
+            },
+        )
+        assert_agent_plugin_payload_redacted(mcp_plan, "MCP plan")
+    write_json(case_root / "mcp-list.json", mcp_list)
+    write_json(case_root / "mcp-inspect.json", inspected)
+    write_json(case_root / "mcp-plan.json", mcp_plan)
+
+    if cli_contracts != desktop_contracts or cli_contracts != mcp_contracts:
+        raise MatrixFailure("CLI, desktop bridge, and MCP Agent Plugin DTOs diverged")
+    if tui_package_count != len(cli_contracts):
+        raise MatrixFailure("TUI Agent Plugin count diverged from shared package projection")
+    if mcp_plan.get("status") != "human-action-required":
+        raise MatrixFailure("MCP Agent Plugin plan did not preserve human handoff authority")
+    if cli_plan.get("counts", {}).get("included") != mcp_plan.get("counts", {}).get(
+        "included"
+    ):
+        raise MatrixFailure("CLI and MCP Agent Plugin plans selected different exact counts")
+    if digest_path(fixture_root) != provider_state_before:
+        raise MatrixFailure("Agent Plugin parity checks mutated fixture provider state")
+    if provider_state_before != canonical_fixture_digest:
+        raise MatrixFailure("Agent Plugin parity fixture copy did not match canonical fixtures")
+
+    result = {
+        "status": "passed",
+        "packageCount": len(cli_contracts),
+        "logicalIds": [contract["logicalId"] for contract in cli_contracts],
+        "surfaces": ["cli", "tui", "desktop-bridge", "mcp"],
+        "contractsEqual": True,
+        "planIncluded": cli_plan.get("counts", {}).get("included"),
+        "mcpHumanActionHandoff": True,
+        "providerStateUnchanged": True,
     }
     write_json(case_root / "summary.json", result)
     return result

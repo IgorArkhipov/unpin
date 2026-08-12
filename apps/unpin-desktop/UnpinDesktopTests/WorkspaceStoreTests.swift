@@ -234,6 +234,162 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertEqual(store.reviewedPlan?.target, "disable")
     }
 
+    func testAgentPluginPlanApprovalApplyRefreshesDerivedPackageState() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let package = try XCTUnwrap(
+            store.snapshot?.agentPlugins.first(where: { $0.name == "connector-kit" })
+        )
+
+        await store.planAgentPlugin(
+            package,
+            target: "off",
+            reach: "selected",
+            selectedProvider: "codex"
+        )
+        XCTAssertEqual(store.reviewedAgentPlugin?.logicalId, package.logicalId)
+        XCTAssertFalse(store.reviewedAgentPluginIsApproved)
+
+        await store.approveReviewedAgentPlugin()
+        XCTAssertTrue(store.reviewedAgentPluginIsApproved)
+
+        await store.applyApprovedAgentPlugin()
+        XCTAssertNil(store.reviewedAgentPlugin)
+        XCTAssertNil(store.approvedAgentPluginFingerprint)
+        XCTAssertEqual(store.lastAgentPluginApply?.counts.applied, 1)
+        let refreshed = try XCTUnwrap(
+            store.snapshot?.agentPlugins.first(where: { $0.logicalId == package.logicalId })
+        )
+        XCTAssertTrue(["off", "mixed"].contains(refreshed.state))
+    }
+
+    func testAgentPluginRefreshCannotPublishStaleSnapshotAfterReload() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let package = try XCTUnwrap(
+            store.snapshot?.agentPlugins.first(where: { $0.name == "connector-kit" })
+        )
+        await store.planAgentPlugin(
+            package,
+            target: "off",
+            reach: "selected",
+            selectedProvider: "codex"
+        )
+        XCTAssertNotNil(store.reviewedAgentPlugin)
+
+        let manifestURL = fixture.temporaryRoot
+            .appendingPathComponent("fixtures/codex/global/plugins/cache/example-marketplace/connector-kit/1.0.0/plugin.json")
+        var manifest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any]
+        )
+        manifest["description"] = "first refresh projection"
+        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+
+        let discardBarrier = ReadBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeAgentPluginDiscard: { await discardBarrier.pause() }
+        ))
+        let staleRefresh = Task { try? await store.refresh() }
+        await discardBarrier.waitUntilReached()
+
+        manifest["description"] = "replacement connection projection"
+        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+        await store.reloadWorkspace()
+        let replacementFingerprint = try XCTUnwrap(
+            store.snapshot?.agentPlugins.first(where: { $0.logicalId == package.logicalId })?
+                .projectionFingerprint
+        )
+
+        await discardBarrier.release()
+        await staleRefresh.value
+
+        XCTAssertEqual(
+            store.snapshot?.agentPlugins.first(where: { $0.logicalId == package.logicalId })?
+                .projectionFingerprint,
+            replacementFingerprint
+        )
+        XCTAssertNil(store.reviewedAgentPlugin)
+    }
+
+    func testConcurrentAgentPluginPlansKeepTheLatestReachAndTarget() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        let package = try XCTUnwrap(
+            store.snapshot?.agentPlugins.first(where: { $0.name == "connector-kit" })
+        )
+        let firstPlanBarrier = FirstInvocationBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeAgentPluginPlan: { await firstPlanBarrier.pauseFirstInvocation() }
+        ))
+        let first = Task {
+            await store.planAgentPlugin(
+                package,
+                target: "on",
+                reach: "all",
+                selectedProvider: nil
+            )
+        }
+        await firstPlanBarrier.waitUntilFirstInvocation()
+
+        let second = Task {
+            await store.planAgentPlugin(
+                package,
+                target: "off",
+                reach: "selected",
+                selectedProvider: "codex"
+            )
+        }
+        await second.value
+        XCTAssertEqual(store.reviewedAgentPlugin?.target, "off")
+        XCTAssertTrue(store.reviewedAgentPlugin?.providerReach.contains("selected") == true)
+
+        await firstPlanBarrier.release()
+        await first.value
+
+        XCTAssertEqual(store.reviewedAgentPlugin?.target, "off")
+        XCTAssertTrue(store.reviewedAgentPlugin?.providerReach.contains("selected") == true)
+        await store.discardReviewedAgentPlugin()
+    }
+
+    func testAgentPluginApplyUncertaintyRoutesToRecoveryAudit() async throws {
+        let fixture = try makeFixtureStore()
+        defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
+        let store = fixture.store
+        await store.selectWorkspace(fixture.workspaceRoot)
+        await store.refreshRecovery()
+        let package = try XCTUnwrap(
+            store.snapshot?.agentPlugins.first(where: { $0.name == "connector-kit" })
+        )
+        await store.planAgentPlugin(
+            package,
+            target: "off",
+            reach: "selected",
+            selectedProvider: "codex"
+        )
+        await store.approveReviewedAgentPlugin()
+
+        let applyBarrier = ReadBarrier()
+        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
+            beforeAgentPluginApply: { await applyBarrier.pause() }
+        ))
+        let applyTask = Task { await store.applyApprovedAgentPlugin() }
+        await applyBarrier.waitUntilReached()
+        applyTask.cancel()
+        await applyBarrier.release()
+        await applyTask.value
+
+        XCTAssertNil(store.reviewedAgentPlugin)
+        XCTAssertNil(store.approvedAgentPluginFingerprint)
+        XCTAssertNotNil(store.mutationUncertaintyBlocker)
+        XCTAssertTrue(store.actionsBlocked)
+    }
+
     func testGroupApplyUncertaintyRetainsBlockerUntilWorkspaceReload() async throws {
         let fixture = try makeFixtureStore()
         defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }

@@ -9,6 +9,8 @@ pub(crate) fn discover_codex(
         shared_skill_views,
         items,
         warnings,
+        agent_plugin_metadata,
+        agent_plugin_item_keys,
     } = state;
     let config_path = roots.codex_global.join("config.toml");
     let skill_config_states = if let Some(raw) = read_optional_string(&config_path)? {
@@ -237,6 +239,16 @@ pub(crate) fn discover_codex(
             allow_top_level_events: true,
         },
         items,
+        warnings,
+    )?;
+
+    let activations = crate::agent_plugins::activation_candidates(ProviderId::Codex, items);
+    crate::agent_plugins::discover_cached_agent_plugins(
+        ProviderId::Codex,
+        &roots.codex_global.join("plugins").join("cache"),
+        &activations,
+        agent_plugin_metadata,
+        agent_plugin_item_keys,
         warnings,
     )?;
 

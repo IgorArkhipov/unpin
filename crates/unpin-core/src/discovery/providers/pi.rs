@@ -9,6 +9,7 @@ pub(crate) fn discover_pi(
         shared_skill_views,
         items,
         warnings,
+        ..
     } = state;
     let native_global_root = roots.pi_global.join("skills");
     let shared_global_root = roots.shared_global.join(".agents").join("skills");

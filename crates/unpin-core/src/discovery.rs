@@ -16,9 +16,11 @@ use sha2::{Digest, Sha256};
 pub use crate::providers::ProviderId;
 
 use crate::{
+    agent_plugins::{AgentPluginMetadata, ComponentAssociationKey},
     config::normalize_path,
     encode_path_segment,
     fs_support::read_optional_string,
+    groups::GroupMemberIdentity,
     hooks::{HookInventoryMetadata, parse_hook_document},
     pi_packages::{pi_disabled_package_entry, pi_package_extension_state},
     providers::registry::provider_registry,
@@ -359,11 +361,36 @@ pub struct DiscoveryWarning {
 pub struct DiscoveryOutput {
     pub items: Vec<DiscoveryItem>,
     pub warnings: Vec<DiscoveryWarning>,
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub agent_plugin_metadata: Arc<Vec<AgentPluginMetadata>>,
+    #[doc(hidden)]
+    #[serde(default, skip_serializing, skip_deserializing)]
+    pub agent_plugin_item_keys: Arc<BTreeMap<GroupMemberIdentity, ComponentAssociationKey>>,
 }
 
 impl DiscoveryOutput {
     pub fn to_catalog(&self) -> Result<crate::catalog::Catalog, crate::catalog::CatalogModelError> {
         crate::catalog::Catalog::from_discovery(self)
+    }
+
+    #[must_use]
+    pub fn agent_plugins(&self) -> Vec<crate::agent_plugins::AgentPluginSummary> {
+        crate::agent_plugins::project_agent_plugins(
+            &self.items,
+            &self.agent_plugin_metadata,
+            &self.agent_plugin_item_keys,
+        )
+    }
+
+    #[must_use]
+    pub fn agent_plugin_inventory_complete(&self) -> bool {
+        !self.warnings.iter().any(|warning| {
+            matches!(
+                warning.code.as_str(),
+                "agent-plugin-cache-unavailable" | "agent-plugin-cache-incomplete"
+            )
+        })
     }
 }
 
@@ -484,12 +511,19 @@ pub fn discover_all_with_progress(
         shared_skill_views,
         mut items,
         warnings,
+        agent_plugin_metadata,
+        agent_plugin_item_keys,
         ..
     } = state;
     project_disabled_shared_skill_views(&shared_skill_views, &mut items);
     sort_items(&mut items);
 
-    Ok(DiscoveryOutput { items, warnings })
+    Ok(DiscoveryOutput {
+        items,
+        warnings,
+        agent_plugin_metadata: Arc::new(agent_plugin_metadata),
+        agent_plugin_item_keys: Arc::new(agent_plugin_item_keys),
+    })
 }
 
 pub(crate) type ProviderDiscoverer =
@@ -670,6 +704,8 @@ pub(crate) struct DiscoveryState {
     shared_skill_views: Vec<SkillView>,
     items: Vec<DiscoveryItem>,
     warnings: Vec<DiscoveryWarning>,
+    agent_plugin_metadata: Vec<AgentPluginMetadata>,
+    agent_plugin_item_keys: BTreeMap<GroupMemberIdentity, ComponentAssociationKey>,
 }
 
 impl ProjectScopeCache {

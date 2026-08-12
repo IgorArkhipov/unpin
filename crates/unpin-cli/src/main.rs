@@ -234,6 +234,12 @@ enum Commands {
         #[command(subcommand)]
         command: commands::toggle::BulkCommands,
     },
+    /// Inspect and control derived Agent Plugin packages.
+    #[command(name = "agent-plugins", alias = "agent-plugin")]
+    AgentPlugins {
+        #[command(subcommand)]
+        command: commands::agent_plugins::AgentPluginCommands,
+    },
     /// Restore one previously saved backup.
     Restore {
         /// Backup identifier to restore.
@@ -1129,6 +1135,7 @@ fn main() -> ExitCode {
         }
         Some(Commands::Session { command }) => commands::session::run(command),
         Some(Commands::Bulk { command }) => commands::toggle::run(command),
+        Some(Commands::AgentPlugins { command }) => commands::agent_plugins::run(command),
         Some(Commands::Catalog { command }) => commands::catalog::run(command),
         Some(Commands::Profile { command }) => commands::profile::run(command),
         Some(Commands::Group { command }) => commands::group::run(command),

@@ -198,10 +198,25 @@ pub struct ReachAwareRootBinding {
     pub provenance: String,
 }
 
+/// Which trusted discovery-root slot an authenticated provider root restores.
+///
+/// Most reach-aware operations have one primary root per provider. Agent
+/// Plugins can also mutate Claude project activation state, so their sealed
+/// handoffs bind that independent project root explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReachAwareRootScope {
+    #[default]
+    Primary,
+    Project,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ReachAwareProviderRoot {
     pub provider: ProviderId,
+    #[serde(default)]
+    pub scope: ReachAwareRootScope,
     pub root: String,
     pub provenance: String,
 }
@@ -212,27 +227,50 @@ impl ReachAwareRootBinding {
         provider_roots: Vec<(ProviderId, PathBuf, String)>,
         provenance: impl Into<String>,
     ) -> Result<Self, ReachAwareEnvelopeError> {
+        Self::from_scoped_provider_paths(
+            app_state_root,
+            provider_roots
+                .into_iter()
+                .map(|(provider, root, provider_provenance)| {
+                    (
+                        provider,
+                        ReachAwareRootScope::Primary,
+                        root,
+                        provider_provenance,
+                    )
+                })
+                .collect(),
+            provenance,
+        )
+    }
+
+    pub fn from_scoped_provider_paths(
+        app_state_root: impl AsRef<Path>,
+        provider_roots: Vec<(ProviderId, ReachAwareRootScope, PathBuf, String)>,
+        provenance: impl Into<String>,
+    ) -> Result<Self, ReachAwareEnvelopeError> {
         let app_state_root = canonical_root(app_state_root.as_ref())?;
         let provenance = provenance.into();
         validate_safe_text(&provenance, "root provenance")?;
         let mut normalized = provider_roots
             .into_iter()
-            .map(|(provider, root, provider_provenance)| {
+            .map(|(provider, scope, root, provider_provenance)| {
                 let provider_provenance = {
                     validate_safe_text(&provider_provenance, "provider root provenance")?;
                     provider_provenance
                 };
                 Ok(ReachAwareProviderRoot {
                     provider,
+                    scope,
                     root: canonical_root(&root)?,
                     provenance: provider_provenance,
                 })
             })
             .collect::<Result<Vec<_>, ReachAwareEnvelopeError>>()?;
-        normalized.sort_by_key(|entry| entry.provider);
+        normalized.sort_by_key(|entry| (entry.provider, entry.scope));
         if normalized
             .windows(2)
-            .any(|pair| pair[0].provider == pair[1].provider)
+            .any(|pair| pair[0].provider == pair[1].provider && pair[0].scope == pair[1].scope)
         {
             return Err(ReachAwareEnvelopeError::InvalidOperation);
         }
@@ -252,6 +290,7 @@ impl ReachAwareRootBinding {
                 .iter()
                 .map(|entry| ReachAwareProviderRoot {
                     provider: entry.provider,
+                    scope: entry.scope,
                     root: redact_path(&entry.root),
                     provenance: entry.provenance.clone(),
                 })
@@ -268,7 +307,7 @@ impl ReachAwareRootBinding {
             || self
                 .provider_roots
                 .windows(2)
-                .any(|pair| pair[0].provider >= pair[1].provider)
+                .any(|pair| (pair[0].provider, pair[0].scope) >= (pair[1].provider, pair[1].scope))
             || self.provider_roots.iter().any(|entry| {
                 entry.root.is_empty()
                     || !Path::new(&entry.root).is_absolute()
@@ -1089,8 +1128,15 @@ impl ReachAwareControlOperationEnvelope {
         }
         if self.family != ReachAwareOperationFamily::Profile
             && let Some(selected_provider) = self.provider_reach.provider()
-            && (self.roots.provider_roots.len() != 1
-                || self.roots.provider_roots[0].provider != selected_provider
+            && (self.roots.provider_roots.is_empty()
+                || !self.roots.provider_roots.iter().any(|root| {
+                    root.provider == selected_provider && root.scope == ReachAwareRootScope::Primary
+                })
+                || self
+                    .roots
+                    .provider_roots
+                    .iter()
+                    .any(|root| root.provider != selected_provider)
                 || self
                     .provider_coverage
                     .included()

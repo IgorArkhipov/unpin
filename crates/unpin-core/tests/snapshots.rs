@@ -150,6 +150,7 @@ fn deterministic_order_discovery() -> DiscoveryOutput {
                 "claude global warning",
             ),
         ],
+        ..DiscoveryOutput::default()
     }
 }
 
@@ -405,6 +406,7 @@ fn snapshot_inventory_summarizes_kind_category_and_layer_buckets() {
             code: "json-parse-error".to_string(),
             message: "bad settings".to_string(),
         }],
+        ..DiscoveryOutput::default()
     };
 
     let written = write_discovery_snapshot(SnapshotWriteOptions {

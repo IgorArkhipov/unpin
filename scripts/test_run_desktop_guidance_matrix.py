@@ -75,10 +75,10 @@ class DesktopGuidanceMatrixTests(unittest.TestCase):
     def setUp(self) -> None:
         self.module = load_module()
 
-    def test_authoritative_inventory_has_26_unique_scenarios(self) -> None:
+    def test_authoritative_inventory_has_27_unique_scenarios(self) -> None:
         scenario_ids = [scenario.id for scenario in self.module.SCENARIOS]
-        self.assertEqual(len(scenario_ids), 26)
-        self.assertEqual(len(set(scenario_ids)), 26)
+        self.assertEqual(len(scenario_ids), 27)
+        self.assertEqual(len(set(scenario_ids)), 27)
         self.assertEqual(self.module.validate_scenario_ids(scenario_ids), scenario_ids)
         with self.assertRaises(self.module.MatrixError):
             self.module.validate_scenario_ids(scenario_ids[:-1])
@@ -215,7 +215,7 @@ class DesktopGuidanceMatrixTests(unittest.TestCase):
 
             images = self.module.validate_capture(root)
             manifest = self.module.write_evidence(root, images)
-            self.assertEqual(manifest["image_count"], 52)
+            self.assertEqual(manifest["image_count"], 54)
             self.assertEqual(manifest["screenshot_review"]["status"], "pending")
             self.module.verify_checksums(root)
 

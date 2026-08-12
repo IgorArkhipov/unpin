@@ -1501,6 +1501,7 @@ mod tests {
             .with_discovery_override(DiscoveryOutput {
                 items: vec![ambiguous_item.clone(), ambiguous_item],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             })
             .plan(
                 &GroupRef::qualified(GroupScope::Personal, "ambiguous").expect("reference"),
@@ -1524,6 +1525,7 @@ mod tests {
             .with_discovery_override(DiscoveryOutput {
                 items: vec![item(&protected, "unpin")],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             })
             .plan(
                 &GroupRef::qualified(GroupScope::Personal, "protected").expect("reference"),
@@ -1639,6 +1641,7 @@ mod tests {
             .with_discovery_override(DiscoveryOutput {
                 items: vec![codex_item, zed_item],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             });
 
         let plan = planner

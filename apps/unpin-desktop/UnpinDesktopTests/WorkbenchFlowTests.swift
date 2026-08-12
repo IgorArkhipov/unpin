@@ -93,6 +93,94 @@ final class WorkbenchFlowTests: XCTestCase {
         )
     }
 
+    func testAgentPluginSortingAndFilteringCoverAllPackageColumns() throws {
+        let packages = [
+            try agentPlugin(
+                name: "Zulu",
+                provider: "claude",
+                componentKinds: ["skill"],
+                state: "off",
+                access: "diagnostics-only"
+            ),
+            try agentPlugin(
+                name: "Alpha",
+                provider: "codex",
+                componentKinds: ["mcp", "skill"],
+                state: "on",
+                access: "actionable"
+            ),
+        ]
+
+        XCTAssertEqual(AgentPluginSortState().sorted(packages).map(\.name), ["Alpha", "Zulu"])
+        var sort = AgentPluginSortState()
+        sort.add(.provider)
+        sort.remove(.name)
+        sort.setDirection(.descending, for: .provider)
+        XCTAssertEqual(sort.sorted(packages).map(\.providerDisplay), ["codex", "claude"])
+
+        let filters = [
+            AgentPluginFilterState(provider: "codex"),
+            AgentPluginFilterState(type: "mcp"),
+            AgentPluginFilterState(state: "on"),
+            AgentPluginFilterState(access: "actionable"),
+            AgentPluginFilterState(search: "alpha"),
+        ]
+        for filter in filters {
+            XCTAssertEqual(packages.filter(filter.matches).map(\.name), ["Alpha"])
+        }
+    }
+
+    func testAgentPluginPackageInventoryRendersInLightAndDarkThemes() throws {
+        let package = try agentPlugin(
+            name: "Connector Kit",
+            provider: "codex",
+            componentKinds: ["mcp", "skill"],
+            state: "mixed",
+            access: "actionable"
+        )
+        let presentation = WorkbenchPresentationInputs.fixture(
+            state: .ready,
+            hasWorkspace: true,
+            isBusy: false,
+            workspaceName: "fixture"
+        )
+
+        var renderings = [Data]()
+        for scheme in [ColorScheme.light, .dark] {
+            let host = NSHostingView(
+                rootView: DiscoverOrganizeView(
+                    inventoryOverride: [],
+                    packagesOverride: [package],
+                    modeOverride: .packages
+                )
+                .environmentObject(WorkspaceStore())
+                .environment(\.workbenchPresentation, presentation)
+                .preferredColorScheme(scheme)
+            )
+            host.frame = NSRect(x: 0, y: 0, width: 1_180, height: 760)
+            let window = NSWindow(
+                contentRect: host.bounds,
+                styleMask: [.titled],
+                backing: .buffered,
+                defer: false
+            )
+            window.isReleasedWhenClosed = false
+            window.contentView = host
+            window.makeKeyAndOrderFront(nil)
+            defer { window.close() }
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
+            XCTAssertGreaterThan(host.fittingSize.width, 0)
+            let bitmap = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: bitmap)
+            let png = try XCTUnwrap(bitmap.representation(using: .png, properties: [:]))
+            XCTAssertFalse(png.isEmpty)
+            renderings.append(png)
+        }
+        XCTAssertNotEqual(renderings[0], renderings[1])
+    }
+
     func testDiscoverClassifierPrioritizesWorkspaceAndConnectionState() {
         let inventory = [inventoryItem(name: "Alpha", provider: "codex", id: "alpha")]
         let filters = DiscoverFilterState(search: "missing")
@@ -874,6 +962,36 @@ final class WorkbenchFlowTests: XCTestCase {
             displayName: name,
             enabled: enabled,
             mutability: mutability
+        )
+    }
+
+    private func agentPlugin(
+        name: String,
+        provider: String,
+        componentKinds: [String],
+        state: String,
+        access: String
+    ) throws -> AgentPluginSummary {
+        let kinds = try String(
+            data: JSONEncoder().encode(componentKinds),
+            encoding: .utf8
+        ).map { $0 } ?? "[]"
+        return try JSONDecoder().decode(
+            AgentPluginSummary.self,
+            from: Data(#"""
+            {
+              "logicalId":"agent-plugin:\#(name):\#(provider)",
+              "name":"\#(name)",
+              "componentSignature":"\#(componentKinds.joined(separator: "+"))",
+              "projectionFingerprint":"sha256:projection-\#(provider)",
+              "state":"\#(state)",
+              "access":"\#(access)",
+              "providers":["\#(provider)"],
+              "componentKinds":\#(kinds),
+              "instanceCount":0,
+              "instances":[]
+            }
+            """#.utf8)
         )
     }
 }

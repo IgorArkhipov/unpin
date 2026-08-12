@@ -10,7 +10,7 @@ use clap::{Args, Subcommand};
 use serde_json::{Value, json};
 use unpin_core::{
     approval::ControlApprovalContext,
-    control_operation::{ReachAwarePrincipal, ReachAwareRootBinding},
+    control_operation::{ReachAwarePrincipal, ReachAwareRootBinding, ReachAwareRootScope},
     discovery::{DiscoveryCategory, DiscoveryKind, DiscoveryLayer, DiscoveryRoots, discover_all},
     mutation::{
         BULK_TOGGLE_APPROVAL_AUDIENCE, BulkToggleApplyResult, BulkToggleController, BulkTogglePlan,
@@ -350,6 +350,7 @@ fn status(args: BulkStatusArgs) -> ExitCode {
 
 fn selector_from_args(args: &BulkPlanArgs) -> Result<BulkToggleSelector, String> {
     Ok(BulkToggleSelector {
+        exact_identities: Vec::new(),
         providers: args
             .providers
             .iter()
@@ -414,7 +415,7 @@ fn parse_layer(value: &str) -> Result<DiscoveryLayer, String> {
         .ok_or_else(|| format!("invalid layer: {value}"))
 }
 
-fn durable_context(
+pub(crate) fn durable_context(
     app_state_root: &Path,
     roots: &DiscoveryRoots,
     config: &unpin_core::config::UnpinConfig,
@@ -479,18 +480,36 @@ fn root_binding(
     for entry in plan.provider_coverage.included() {
         providers.insert(entry.provider);
     }
-    let provider_roots = providers
+    let mut provider_roots = providers
         .into_iter()
         .map(|provider| {
             (
                 provider,
+                ReachAwareRootScope::Primary,
                 provider_root(roots, provider),
-                "cli-discovery-root".to_string(),
+                unpin_core::mutation::BULK_TOGGLE_PROVIDER_ROOT_PROVENANCE.to_string(),
             )
         })
-        .collect();
-    ReachAwareRootBinding::from_provider_paths(app_state_root, provider_roots, "cli-bulk-toggle")
-        .map_err(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if plan.included.iter().any(|target| {
+        target.item.provider == ProviderId::Claude && target.item.layer == DiscoveryLayer::Project
+    }) && provider_roots
+        .iter()
+        .any(|(provider, _, _, _)| *provider == ProviderId::Claude)
+    {
+        provider_roots.push((
+            ProviderId::Claude,
+            ReachAwareRootScope::Project,
+            roots.claude_project.clone(),
+            unpin_core::mutation::BULK_TOGGLE_PROVIDER_ROOT_PROVENANCE.to_string(),
+        ));
+    }
+    ReachAwareRootBinding::from_scoped_provider_paths(
+        app_state_root,
+        provider_roots,
+        unpin_core::mutation::BULK_TOGGLE_ROOT_PROVENANCE,
+    )
+    .map_err(|error| error.to_string())
 }
 
 fn provider_root(roots: &DiscoveryRoots, provider: ProviderId) -> PathBuf {
@@ -566,7 +585,7 @@ fn print_value(value: Value, json_output: bool, title: &str) {
     }
 }
 
-fn lifecycle_name(lifecycle: ProviderReachLifecycle) -> &'static str {
+pub(crate) const fn lifecycle_name(lifecycle: ProviderReachLifecycle) -> &'static str {
     match lifecycle {
         ProviderReachLifecycle::Applied => "applied",
         ProviderReachLifecycle::Partial => "partial",
@@ -577,7 +596,7 @@ fn lifecycle_name(lifecycle: ProviderReachLifecycle) -> &'static str {
     }
 }
 
-fn lifecycle_exit(lifecycle: ProviderReachLifecycle) -> ExitCode {
+pub(crate) fn lifecycle_exit(lifecycle: ProviderReachLifecycle) -> ExitCode {
     ExitCode::from(match lifecycle {
         ProviderReachLifecycle::Applied | ProviderReachLifecycle::NoOp => 0,
         ProviderReachLifecycle::Partial => 2,

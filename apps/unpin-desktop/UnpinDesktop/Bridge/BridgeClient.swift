@@ -8,6 +8,7 @@ enum BridgeClientError: LocalizedError {
     case bundleIntegrityMismatch
     case incompatibleProtocol
     case incompatibleBinary
+    case incompatibleCapabilities
     case malformedResponse
     case requestFailed(String)
     case requestTimedOut
@@ -21,6 +22,7 @@ enum BridgeClientError: LocalizedError {
         case .bundleIntegrityMismatch: "The bundled Unpin executable did not match its manifest. Rebuild the app."
         case .incompatibleProtocol: "The bundled Unpin executable does not support this workbench."
         case .incompatibleBinary: "The bundled Unpin executable does not match this workbench release."
+        case .incompatibleCapabilities: "The bundled Unpin executable does not support Agent Plugin workbench controls."
         case .malformedResponse: "The Unpin bridge returned an invalid response."
         case .requestFailed(let code): "The Unpin bridge blocked this request: \(code)."
         case .requestTimedOut: "The bundled Unpin bridge did not respond. Select Reload workspace to restart it."
@@ -129,6 +131,13 @@ struct BridgeTerminationPolicy: Sendable {
 
 actor BridgeClient {
     static let protocolVersion = BundledBridgeVerifier.protocolVersion
+    static let requiredAgentPluginCapabilities: Set<String> = [
+        "agentPlugins.inspect",
+        "agentPlugins.plan",
+        "agentPlugins.approve",
+        "agentPlugins.apply",
+        "agentPlugins.discard",
+    ]
     private static let maximumFrameBytes = 1_048_576
     private static let readOnlyRequestTimeoutMilliseconds = 15_000
     private static let defaultControlRequestTimeoutMilliseconds = 180_000
@@ -203,6 +212,10 @@ actor BridgeClient {
             await stop()
             throw BridgeClientError.incompatibleBinary
         }
+        guard Set(handshake.capabilities).isSuperset(of: Self.requiredAgentPluginCapabilities) else {
+            await stop()
+            throw BridgeClientError.incompatibleCapabilities
+        }
         return handshake
     }
 
@@ -238,6 +251,71 @@ actor BridgeClient {
         let _: DiscardedReview = try await request(
             method: "group.discard",
             parameters: GroupApprovalParameters(operationId: operationID, planFingerprint: fingerprint),
+            kind: .readOnly
+        )
+    }
+
+    func planAgentPlugin(
+        logicalID: String,
+        target: String,
+        reach: String,
+        selectedProvider: String?
+    ) async throws -> AgentPluginPlanEnvelope {
+        try await request(
+            method: "agentPlugins.plan",
+            parameters: AgentPluginPlanParameters(
+                logicalId: logicalID,
+                target: target,
+                reach: reach,
+                selectedProvider: selectedProvider
+            ),
+            kind: .readOnly
+        )
+    }
+
+    func inspectAgentPlugin(logicalID: String) async throws -> AgentPluginInspectEnvelope {
+        try await request(
+            method: "agentPlugins.inspect",
+            parameters: AgentPluginInspectParameters(logicalId: logicalID),
+            kind: .readOnly
+        )
+    }
+
+    func approveAgentPlugin(
+        operationID: String,
+        fingerprint: String
+    ) async throws -> GroupApprovalEnvelope {
+        try await request(
+            method: "agentPlugins.approve",
+            parameters: GroupApprovalParameters(
+                operationId: operationID,
+                planFingerprint: fingerprint
+            ),
+            kind: .localControl
+        )
+    }
+
+    func applyAgentPlugin(
+        operationID: String,
+        fingerprint: String
+    ) async throws -> AgentPluginApplyEnvelope {
+        try await request(
+            method: "agentPlugins.apply",
+            parameters: GroupApprovalParameters(
+                operationId: operationID,
+                planFingerprint: fingerprint
+            ),
+            kind: .mutation
+        )
+    }
+
+    func discardAgentPlugin(operationID: String, fingerprint: String) async throws {
+        let _: DiscardedReview = try await request(
+            method: "agentPlugins.discard",
+            parameters: GroupApprovalParameters(
+                operationId: operationID,
+                planFingerprint: fingerprint
+            ),
             kind: .readOnly
         )
     }
@@ -488,6 +566,13 @@ private struct BridgeErrorPayload: Decodable { let code: String }
 private struct DiscardedReview: Decodable { let discarded: Bool }
 private struct EmptyParameters: Codable {}
 private struct GroupPlanParameters: Codable { let qualifiedName: String; let target: String }
+private struct AgentPluginInspectParameters: Codable { let logicalId: String }
+private struct AgentPluginPlanParameters: Codable {
+    let logicalId: String
+    let target: String
+    let reach: String
+    let selectedProvider: String?
+}
 private struct GroupApprovalParameters: Codable { let operationId: String; let planFingerprint: String }
 private struct RestorePlanParameters: Codable { let backupId: String }
 private struct GroupDefinitionHistoryParameters: Codable { let scope: String }
@@ -524,8 +609,28 @@ struct BridgeSnapshot: Decodable {
     let capturedAtUnix: Int
     let inventory: [InventoryItem]
     let warnings: [BridgeWarning]
+    let agentPluginInventoryComplete: Bool
+    let agentPlugins: [AgentPluginSummary]
     let groups: [GroupSummary]
     let groupWarnings: [GroupWarning]
+
+    private enum CodingKeys: String, CodingKey {
+        case capturedAtUnix, inventory, warnings, agentPluginInventoryComplete, agentPlugins, groups, groupWarnings
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        capturedAtUnix = try container.decode(Int.self, forKey: .capturedAtUnix)
+        inventory = try container.decode([InventoryItem].self, forKey: .inventory)
+        warnings = try container.decode([BridgeWarning].self, forKey: .warnings)
+        agentPluginInventoryComplete = try container.decode(
+            Bool.self,
+            forKey: .agentPluginInventoryComplete
+        )
+        agentPlugins = try container.decode([AgentPluginSummary].self, forKey: .agentPlugins)
+        groups = try container.decode([GroupSummary].self, forKey: .groups)
+        groupWarnings = try container.decode([GroupWarning].self, forKey: .groupWarnings)
+    }
 }
 struct InventoryItem: Decodable, Identifiable { let provider: String; let kind: String; let category: String; let layer: String; let id: String; let displayName: String; let enabled: Bool; let mutability: String }
 struct BridgeWarning: Decodable, Identifiable { let provider: String; let layer: String?; let code: String; var id: String { "\(provider)-\(code)" } }
@@ -534,6 +639,151 @@ struct GroupWarning: Decodable, Identifiable {
     let code: String
 
     var id: String { "\(scope)-\(code)" }
+}
+
+struct AgentPluginSummary: Decodable, Identifiable {
+    let logicalId: String
+    let name: String
+    let componentSignature: String
+    let projectionFingerprint: String
+    let state: String
+    let access: String
+    let providers: [String]
+    let componentKinds: [String]
+    let instanceCount: Int
+    let instances: [AgentPluginInstance]
+
+    var id: String { logicalId }
+    var providerDisplay: String { providers.joined(separator: ", ") }
+    var typeDisplay: String { componentKinds.joined(separator: " + ") }
+}
+
+struct AgentPluginInstance: Decodable, Identifiable {
+    let instanceId: String
+    let provider: String
+    let layer: String
+    let state: String
+    let access: String
+    let version: String?
+    let components: [AgentPluginComponent]
+    let activations: [AgentPluginActivation]
+    let blockers: [String]
+    let diagnostics: [String]
+
+    var id: String { instanceId }
+}
+
+struct AgentPluginComponent: Decodable, Identifiable {
+    let kind: String
+    let name: String
+    let disposition: String
+    let reason: String?
+
+    var id: String { "\(kind):\(name):\(disposition)" }
+}
+
+struct AgentPluginActivation: Decodable {
+    let enabled: Bool
+    let mutability: String
+}
+
+struct AgentPluginInspectEnvelope: Decodable { let package: AgentPluginSummary }
+struct AgentPluginPlanEnvelope: Decodable { let plan: AgentPluginPlan }
+struct AgentPluginPlan: Decodable, Identifiable {
+    let logicalId: String
+    let name: String
+    let componentSignature: String
+    let projectionFingerprint: String
+    let state: String
+    let access: String
+    let providers: [String]
+    let componentKinds: [String]
+    let instanceCount: Int
+    let instances: [AgentPluginInstance]
+    let operationId: String
+    let planFingerprint: String
+    let target: String
+    @ProviderReachField var providerReach: String
+    let coverage: [AgentPluginCoverage]
+    let lifecycle: String
+    let counts: AgentPluginPlanCounts
+    let review: AgentPluginPlanReview
+
+    var id: String { operationId }
+}
+
+struct AgentPluginCoverage: Decodable, Identifiable {
+    let provider: String
+    let included: Int
+    let excluded: Int
+    let reasonCodes: [String]
+
+    var id: String { provider }
+}
+
+struct AgentPluginPlanCounts: Decodable {
+    let instances: Int
+    let activations: Int
+    let components: Int
+    let diagnostics: Int
+    let included: Int
+    let writes: Int
+    let noOp: Int
+    let blocked: Int
+    let reachExcluded: Int
+}
+
+struct AgentPluginPlanReview: Decodable {
+    let included: [AgentPluginDisposition]
+    let noOp: [AgentPluginDisposition]
+    let blocked: [AgentPluginDisposition]
+    let reachExcluded: [AgentPluginDisposition]
+    let componentDiagnostics: [AgentPluginDisposition]
+}
+
+struct AgentPluginDisposition: Decodable, Identifiable {
+    let provider: String
+    let layer: String
+    let outcome: String?
+    let reasonCode: String?
+    let activationCount: Int?
+    let kind: String?
+    let name: String?
+    let disposition: String?
+    let reason: String?
+
+    var id: String {
+        [provider, layer, kind, name, outcome, disposition, reasonCode, reason]
+            .compactMap { $0 }
+            .joined(separator: ":")
+    }
+}
+
+struct AgentPluginApplyEnvelope: Decodable {
+    let result: AgentPluginApplyResult
+    let refreshStatus: String
+}
+
+struct AgentPluginApplyResult: Decodable {
+    let operationId: String
+    let planFingerprint: String
+    let lifecycle: String
+    @ProviderReachField var providerReach: String
+    let coverage: [AgentPluginCoverage]
+    let logicalId: String
+    let name: String
+    let state: String
+    let access: String
+    let counts: AgentPluginApplyCounts
+}
+
+struct AgentPluginApplyCounts: Decodable {
+    let applied: Int
+    let noOp: Int
+    let blocked: Int
+    let recoveryRequired: Int
+    let backupCount: Int
+    let reasonCodes: [String]
 }
 
 enum ProviderReachValue: Decodable, Equatable {

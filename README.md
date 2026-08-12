@@ -1,8 +1,8 @@
 # Unpin
 
 Unpin is a Rust CLI with a terminal TUI and a macOS desktop workbench for local
-AI-agent configuration discovery, safe mutation, reusable inventory groups,
-snapshots, restore, and MCP-backed agent workflows.
+AI-agent configuration discovery, derived Agent Plugin packages, safe mutation,
+reusable inventory groups, snapshots, restore, and MCP-backed agent workflows.
 
 ## Distribution status and quick start
 
@@ -90,9 +90,10 @@ precedence, guided code tour, and fixture-backed first mutation.
 The native desktop workbench is the preferred first-phase human surface on
 macOS. It organizes high-volume configuration
 work around **Discover and Organize**, **Change Safely**, and **Recover and
-Audit** instead of mirroring every terminal view. It can inspect a cross-provider
-inventory, maintain explicit groups, review and apply a locally approved group
-change, and inspect backup and operation evidence before a reviewed restore.
+Audit** instead of mirroring every terminal view. It can inspect cross-provider
+inventory and derived Agent Plugin packages, maintain explicit groups, review
+and apply a locally approved aggregate change, and inspect backup and operation
+evidence before a reviewed restore.
 
 The app bundles and supervises a matching `unpin` executable over a local stdio
 bridge. SwiftUI only renders redacted bridge state and starts one bundled child;
@@ -262,12 +263,13 @@ operation remains handoff-only.
 - `unpin snapshot` writes a discovery snapshot into Unpin app state.
 - `unpin list` lists discovered provider items.
 - `unpin toggle` plans a supported item toggle, then applies only the exact confirmed fingerprint.
+- `unpin agent-plugins list|show|plan|handoff|apply|status` inspects and controls derived Agent Plugin packages through explicit provider reach and the existing reviewed bulk-operation lifecycle.
 - `unpin restore` plans a backup restore, then applies only the exact confirmed fingerprint.
 - `unpin group` maintains explicit mixed-type inventory groups, their revisions, history, previews, MCP approvals, and operation evidence.
 - `unpin catalog`, `profile`, `gateway`, `session`, and `hook` manage normalized capabilities, reusable policy, optional routing, isolated leases, and reviewed hook trust.
 - `unpin mcp` runs a newline-delimited stdio MCP control plane. Default item, bulk, restore, profile, policy, gateway, session, and hook writes return human-action handoffs; approved group apply is an explicit persistent-mode exception.
 - `unpin update check|apply` checks and installs a confirmed stable CLI or macOS desktop release through the verified updater.
-- `unpin tui` opens the terminal compatibility UI, including item and Groups views. Use it for Profiles, Gateways, Sessions, and Hooks until their desktop workspaces arrive; `unpin dashboard` is an alias for the same command.
+- `unpin tui` opens the terminal compatibility UI, including item, Packages, and Groups views. Use it for Profiles, Gateways, Sessions, and Hooks until their desktop workspaces arrive; `unpin dashboard` is an alias for the same command.
 
 ## Provider Coverage
 
@@ -293,6 +295,25 @@ Skill discovery follows current provider layouts. Claude scans `.claude/skills`;
 Zed `context_servers` and OpenCode `mcp.<id>.enabled` mutation are JSONC-aware: comments, trailing commas, and surrounding formatting survive toggles and backup restore.
 
 OpenCode is the supported harness in this provider family. OpenRouter is a model/API router with per-request plugins, not a standard local global/project agent-configuration host, so it has no Unpin provider adapter.
+
+## Agent Plugins packages
+
+Unpin recognizes the [Agent Plugins 1.0.0](https://agent-plugins.org/specification) package layout already installed by a supported host. A root `plugin.json` provides safe package metadata, immediate `skills/*/SKILL.md` entries and root `mcp.json` describe component coverage, and the host's native activation setting remains the only writable authority. Unpin does not install, update, import, delete, or persist desired state for packages, and it never creates missing Skill or MCP inventory rows.
+
+Packages are a derived workbench projection. Each scan groups matching existing inventory under one logical package, reports `on`, `off`, `mixed`, or `unknown` state, and distinguishes actionable, diagnostics-only, and unsupported instances. A toggle expands to the exact existing native activation identities, requires explicit selected-provider or all-provider reach, and reuses Unpin's review, fingerprint, drift, backup, audit, recovery, and restore boundaries. Visibility filters never grant mutation reach.
+
+Current package-root support is explicit:
+
+| Provider | Global/user | Project/repository |
+| --- | --- | --- |
+| Claude Code | Actionable through native `enabledPlugins` | Actionable through project/local `enabledPlugins` |
+| Codex | Actionable through native `plugins.<id>.enabled` | Unsupported; current plugin activation is user-scoped |
+| Cursor | Unsupported; current adapter recognizes provider-specific manifests | Unsupported; no fixture-backed standard package root |
+| Pi | Unsupported; package references do not expose standard package roots | Unsupported |
+| OpenCode | Unsupported; no fixture-backed installed standard package root | Unsupported |
+| Zed | Unsupported; Zed uses standard Agent Skills | Unsupported |
+
+Use `unpin agent-plugins list --json` to obtain a safe logical package ID. Its `inventoryComplete` marker is `false` whenever an installed package cache could not be fully read; inspect diagnostics and correct access before planning. `show` exposes coverage and blockers, while `plan` previews exact dispositions. `handoff` seals a durable CLI operation, and `apply` requires the same operation ID, fingerprint, explicit reach, and human confirmation. The TUI and desktop workbench expose the same Packages projection. MCP offers list, inspect, and plan/handoff tools only; it cannot apply a package toggle.
 
 ## Inventory groups
 

@@ -16,8 +16,8 @@ use unpin_core::{
         DiscoveryOutput, DiscoveryRoots, ProviderId, discover_all,
     },
     mutation::{
-        BULK_TOGGLE_APPROVAL_AUDIENCE, BackupAuthenticationKey, BulkToggleController,
-        BulkTogglePlan, BulkTogglePlanError, BulkTogglePlanStatus,
+        BULK_TOGGLE_APPROVAL_AUDIENCE, BackupAuthenticationKey, BulkItemIdentity,
+        BulkToggleController, BulkTogglePlan, BulkTogglePlanError, BulkTogglePlanStatus,
         BulkToggleReachAwareApplyContext, BulkToggleRequest, BulkToggleSelector,
         RestoreBackupInput, RestoreController, RestoreStatus, load_backup_summary_authenticated,
         plan_backup_deletion, restore_backup,
@@ -463,6 +463,7 @@ fn agent_reenable_restore_rejects_a_recreated_vault_payload() {
     let disabled_discovery = DiscoveryOutput {
         items: vec![disabled_agent],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     };
     let reenable_plan = fixture
         .controller
@@ -667,6 +668,7 @@ fn whole_inventory_acknowledgement_is_required_before_reach_filtering() {
             item(ProviderId::Zed, "zed-a", true),
         ],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     };
     let error = BulkToggleController::new(std::env::temp_dir())
         .plan_from_discovery(
@@ -695,6 +697,7 @@ fn allow_empty_selection_does_not_bypass_all_excluded_reach() {
     let discovery = DiscoveryOutput {
         items: vec![item(ProviderId::Zed, "zed-only", true)],
         warnings: Vec::new(),
+        ..DiscoveryOutput::default()
     };
     let plan = BulkToggleController::new(std::env::temp_dir())
         .plan_from_discovery(
@@ -722,6 +725,7 @@ fn allow_empty_selection_does_not_bypass_all_excluded_reach() {
             DiscoveryOutput {
                 items: vec![item(ProviderId::Zed, "zed-only", true)],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             request(
                 BulkToggleSelector {
@@ -744,6 +748,7 @@ fn duplicate_identities_and_unknown_selector_fields_are_rejected() {
             DiscoveryOutput {
                 items: vec![duplicate.clone(), duplicate],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             request(
                 BulkToggleSelector {
@@ -763,6 +768,98 @@ fn duplicate_identities_and_unknown_selector_fields_are_rejected() {
 }
 
 #[test]
+fn exact_selector_requires_an_exclusive_valid_selection_context() {
+    let first = BulkItemIdentity::try_from(&item(ProviderId::Codex, "first", true)).unwrap();
+    let second = BulkItemIdentity::try_from(&item(ProviderId::Claude, "second", false)).unwrap();
+    let fingerprint = format!("sha256:{}", "0".repeat(64));
+
+    let normalized = BulkToggleSelector {
+        exact_identities: vec![first.clone(), second.clone()],
+        ..BulkToggleSelector::default()
+    }
+    .normalize()
+    .expect("exact selector normalizes");
+    assert_eq!(
+        normalized.exact_identities,
+        vec![second.clone(), first.clone()]
+    );
+    let serialized = serde_json::to_value(&normalized).expect("serialize exact selector");
+    assert!(serialized.get("exactIdentities").is_some());
+    assert!(serialized.get("exact_identities").is_none());
+
+    let duplicate = BulkToggleRequest::new(
+        BulkToggleSelector {
+            exact_identities: vec![first.clone(), first.clone()],
+            ..BulkToggleSelector::default()
+        },
+        true,
+    )
+    .with_selection_context_fingerprint(fingerprint.clone());
+    assert!(matches!(
+        BulkToggleController::validate_before_discovery(&duplicate),
+        Err(BulkTogglePlanError::DuplicateIdentity(_))
+    ));
+
+    let mixed = BulkToggleRequest::new(
+        BulkToggleSelector {
+            kinds: vec![DiscoveryKind::Plugin],
+            exact_identities: vec![first.clone()],
+            ..BulkToggleSelector::default()
+        },
+        true,
+    )
+    .with_selection_context_fingerprint(fingerprint.clone());
+    assert_eq!(
+        BulkToggleController::validate_before_discovery(&mixed),
+        Err(BulkTogglePlanError::ExactSelectorCannotMixCoarseCriteria)
+    );
+
+    let missing_context = BulkToggleRequest::new(
+        BulkToggleSelector {
+            exact_identities: vec![first],
+            ..BulkToggleSelector::default()
+        },
+        true,
+    );
+    assert_eq!(
+        BulkToggleController::validate_before_discovery(&missing_context),
+        Err(BulkTogglePlanError::SelectionContextFingerprintRequired)
+    );
+
+    let malformed_context = BulkToggleRequest::new(
+        BulkToggleSelector {
+            exact_identities: vec![second],
+            ..BulkToggleSelector::default()
+        },
+        true,
+    )
+    .with_selection_context_fingerprint("sha256:not-a-digest");
+    assert_eq!(
+        BulkToggleController::validate_before_discovery(&malformed_context),
+        Err(BulkTogglePlanError::MalformedSelectionContextFingerprint)
+    );
+
+    let unexpected_context = BulkToggleRequest::new(
+        BulkToggleSelector {
+            ids: vec!["first".to_string()],
+            ..BulkToggleSelector::default()
+        },
+        true,
+    )
+    .with_selection_context_fingerprint(fingerprint);
+    assert_eq!(
+        BulkToggleController::validate_before_discovery(&unexpected_context),
+        Err(BulkTogglePlanError::UnexpectedSelectionContextFingerprint)
+    );
+
+    let empty_exact = BulkToggleRequest::new(BulkToggleSelector::default(), true);
+    assert_eq!(
+        BulkToggleController::validate_before_discovery(&empty_exact),
+        Err(BulkTogglePlanError::SelectorRequiresNonProviderCriterion)
+    );
+}
+
+#[test]
 fn equivalent_path_aliases_are_rejected_without_exposing_the_path() {
     let mut first = item(ProviderId::Codex, "first", true);
     first.source_path = "/tmp/shared/skill/SKILL.md".to_string();
@@ -773,6 +870,7 @@ fn equivalent_path_aliases_are_rejected_without_exposing_the_path() {
             DiscoveryOutput {
                 items: vec![first, aliased],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             request(
                 BulkToggleSelector {
@@ -838,6 +936,7 @@ fn fingerprint_binds_reach_coverage_acknowledgement_and_item_digest() {
             DiscoveryOutput {
                 items: vec![item(ProviderId::Codex, "codex-noop", false)],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             request(
                 BulkToggleSelector {
@@ -879,6 +978,7 @@ fn no_op_included_item_plus_reach_exclusion_is_partial() {
                     item(ProviderId::Zed, "zed-excluded", true),
                 ],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             request(
                 BulkToggleSelector {
@@ -904,6 +1004,7 @@ fn in_reach_blocker_blocks_the_whole_plan_even_with_an_included_no_op() {
             DiscoveryOutput {
                 items: vec![no_op.clone(), protected.clone()],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             request(
                 BulkToggleSelector {
@@ -932,6 +1033,7 @@ fn operation_id_is_bound_to_the_reviewed_bulk_fingerprint() {
             DiscoveryOutput {
                 items: vec![item(ProviderId::Codex, "codex-noop", false)],
                 warnings: Vec::new(),
+                ..DiscoveryOutput::default()
             },
             request(
                 BulkToggleSelector {

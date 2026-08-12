@@ -142,6 +142,8 @@ struct WorkbenchViewFixture {
     let guidanceExpanded: Bool
     let presentation: WorkbenchPresentationInputs
     let inventory: [InventoryItem]?
+    let agentPlugins: [AgentPluginSummary]?
+    let discoverMode: DiscoverInventoryMode?
     let discoverFilters: DiscoverFilterState?
     let groups: [GroupSummary]?
     let recovery: RecoverAuditFixture?
@@ -309,7 +311,9 @@ struct WorkbenchView: View {
         case .discover:
             DiscoverOrganizeView(
                 inventoryOverride: fixture?.inventory,
-                filtersOverride: fixture?.discoverFilters
+                filtersOverride: fixture?.discoverFilters,
+                packagesOverride: fixture?.agentPlugins,
+                modeOverride: fixture?.discoverMode
             )
         case .govern:
             GovernAutomateView()

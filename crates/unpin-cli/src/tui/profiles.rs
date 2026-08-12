@@ -788,6 +788,7 @@ mod tests {
                 &DiscoveryOutput {
                     items: Vec::new(),
                     warnings: Vec::new(),
+                    ..DiscoveryOutput::default()
                 },
                 &root,
                 &context,
@@ -834,6 +835,7 @@ mod tests {
                 &DiscoveryOutput {
                     items: Vec::new(),
                     warnings: Vec::new(),
+                    ..DiscoveryOutput::default()
                 },
                 &root,
                 &context,
@@ -885,6 +887,7 @@ mod tests {
         let discovery = DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         };
         let mut workflow = workflow();
         workflow.plan(&discovery, &root, &context).unwrap();
@@ -914,6 +917,7 @@ mod tests {
         let discovery = DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
+            ..DiscoveryOutput::default()
         };
         let mut workflow = workflow_with_source(ProfileSourceScope::Global);
         workflow.cycle_scope();
