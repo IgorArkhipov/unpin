@@ -43,13 +43,14 @@ impl GatewaySessionRuntime {
             GatewayRuntimeTimeouts::default(),
         );
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
+        let listener_gateway = Arc::clone(&gateway);
         let thread = thread::Builder::new()
             .name("unpin-session-gateway".to_string())
             .spawn(move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(run_listener(listener, server, receiver))
+                runtime.block_on(run_listener(listener, listener_gateway, server, receiver))
             })?;
         Ok(Self {
             gateway,
@@ -149,6 +150,7 @@ impl Drop for GatewaySessionRuntime {
 #[cfg(unix)]
 async fn run_listener(
     listener: StdUnixListener,
+    gateway: Arc<GatewayService>,
     server: GatewayMcpServer,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), GatewaySessionError> {
@@ -172,11 +174,26 @@ async fn run_listener(
                     drop(stream);
                     continue;
                 };
+                let claim = match gateway.accept_connection() {
+                    Ok(claim) => claim,
+                    Err(_) => {
+                        drop(stream);
+                        continue;
+                    }
+                };
                 let (read, write) = stream.into_split();
-                let server = server.clone();
+                let server = server.clone().with_connection_claim(claim.clone());
+                let connection_gateway = Arc::clone(&gateway);
                 connections.spawn(async move {
                     let _permit = permit;
-                    serve_gateway_io(server, read, write).await
+                    let result = serve_gateway_io(server, read, write).await;
+                    // Fence this transport claim without reconciling the
+                    // durable lease: the launched child may still be alive
+                    // after its MCP proxy closes. GatewaySessionRuntime::stop
+                    // performs the durable runtime reconciliation once the
+                    // child lifecycle has actually ended.
+                    let _ = connection_gateway.connection_registry().disconnect(&claim);
+                    result
                 });
             }
         }

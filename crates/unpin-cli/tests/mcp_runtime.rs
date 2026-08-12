@@ -1043,6 +1043,79 @@ async fn gateway_server_exposes_compact_control_surface_and_lazy_skill_body() {
 }
 
 #[tokio::test]
+async fn claimed_auxiliary_connection_exposes_only_workflow_controls() {
+    let temp = TempDir::new().expect("temporary directory");
+    let gateway = skill_gateway(&temp);
+    let _primary = gateway
+        .issue_connection_claim()
+        .expect("primary connection claim");
+    let auxiliary = gateway
+        .issue_connection_claim()
+        .expect("auxiliary connection claim");
+    let server = GatewayMcpServer::new(
+        gateway.clone(),
+        Arc::new(NoGatewayCredentials),
+        GatewayRuntimeTimeouts::default(),
+    )
+    .with_connection_claim(auxiliary.clone());
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+    let server_start = tokio::spawn(async move { server.serve(server_io).await });
+    let mut client = ().serve(client_io).await.expect("connect gateway client");
+    let mut server = server_start
+        .await
+        .expect("gateway server task")
+        .expect("serve gateway");
+
+    let tools = client.list_all_tools().await.expect("list auxiliary tools");
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "unpin_workflow_cancel_transition",
+            "unpin_workflow_enter_mode",
+            "unpin_workflow_modes",
+            "unpin_workflow_status",
+        ])
+    );
+
+    let forbidden = client
+        .call_tool(CallToolRequestParams::new("unpin_search_skills"))
+        .await;
+    assert!(
+        forbidden.is_err(),
+        "auxiliary connection must not search skills"
+    );
+
+    let status = client
+        .call_tool(CallToolRequestParams::new("unpin_workflow_status"))
+        .await
+        .expect("workflow status");
+    assert_eq!(
+        status.structured_content.as_ref().unwrap()["connection"]["role"],
+        "auxiliary"
+    );
+
+    client
+        .close_with_timeout(Duration::from_secs(2))
+        .await
+        .expect("close client");
+    server
+        .close_with_timeout(Duration::from_secs(2))
+        .await
+        .expect("close server");
+    gateway
+        .disconnect_connection(&auxiliary, now_unix())
+        .expect("disconnect auxiliary claim");
+    gateway
+        .connection_registry()
+        .disconnect(&_primary)
+        .expect("disconnect primary claim");
+}
+
+#[tokio::test]
 async fn gateway_projects_and_dispatches_upstream_tool_end_to_end() {
     let temp = TempDir::new().expect("temporary directory");
     let identity = fixture_upstream_identity(&temp);

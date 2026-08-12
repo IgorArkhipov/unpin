@@ -7,10 +7,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     catalog::{CapabilityId, CapabilityKind, Catalog},
-    hooks::{HookHandler, HookPolicy, HookPolicyLimits, HookRouteOwner},
+    hooks::{
+        HookActionOutcome, HookAfterResult, HookBeforeResult, HookHandler, HookPolicy,
+        HookPolicyLimits, HookRewriteAuthorization, HookRouteOwner,
+    },
     profiles::{COMPILED_PROFILE_SCHEMA_VERSION, CapabilityLockState, CompiledProfileRevision},
     providers::ProviderId,
-    sessions::{LiveExposureStatus, PinnedExposure, PinnedProfile},
+    sessions::{
+        LiveExposureStatus, PinnedExposure, PinnedProfile, WorkflowTransitionRequest,
+        WorkflowTransitionResult,
+    },
 };
 
 use super::{
@@ -828,6 +834,63 @@ impl GatewayService {
         self.connections.status(claim)
     }
 
+    /// Route a typed workflow transition through the authenticated primary
+    /// connection. Auxiliary connections are deliberately control-only and
+    /// cannot mutate the active workflow envelope.
+    pub fn enter_workflow_mode_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        request: WorkflowTransitionRequest,
+    ) -> Result<WorkflowTransitionResult, GatewayError> {
+        self.connections.require_primary(claim)?;
+        self.control.enter_workflow_mode(request)
+    }
+
+    pub fn complete_before_hooks_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        permit: &mut super::GatewayCallPermit,
+        outcomes: BTreeMap<String, HookActionOutcome>,
+        rewrite_authorizations: &[HookRewriteAuthorization],
+        validate_arguments: impl Fn(&serde_json::Value) -> bool,
+    ) -> Result<HookBeforeResult, GatewayError> {
+        self.connections.require_primary(claim)?;
+        if GatewayDataPlane::permit_connection_epoch(permit) != claim.connection_epoch() {
+            return Err(GatewayError::ConnectionEpochStale);
+        }
+        self.data_plane.complete_before_hooks(
+            permit,
+            outcomes,
+            rewrite_authorizations,
+            validate_arguments,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn finish_tool_with_authorized_hooks_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        permit: &mut super::GatewayCallPermit,
+        succeeded: bool,
+        response: &serde_json::Value,
+        outcomes: BTreeMap<String, HookActionOutcome>,
+        rewrite_authorizations: &[HookRewriteAuthorization],
+        now_unix: i64,
+    ) -> Result<HookAfterResult, GatewayError> {
+        self.connections.require_primary(claim)?;
+        if GatewayDataPlane::permit_connection_epoch(permit) != claim.connection_epoch() {
+            return Err(GatewayError::ConnectionEpochStale);
+        }
+        self.data_plane.finish_tool_with_authorized_hooks(
+            permit,
+            succeeded,
+            response,
+            outcomes,
+            rewrite_authorizations,
+            now_unix,
+        )
+    }
+
     /// Cancel a directly staged refresh when no U2 workflow operation exists.
     /// Workflow transitions should use `cancel_transition_for_connection` so
     /// the authenticated journal can restore the source mode as well.
@@ -858,6 +921,27 @@ impl GatewayService {
             None if snapshot.lease.observed_exposure == snapshot.lease.desired_exposure => Ok(()),
             _ => Err(GatewayError::InvalidExposure(
                 "pending exposure is no longer desired",
+            )),
+        }
+    }
+
+    pub fn validate_notified_exposure_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+    ) -> Result<(), GatewayError> {
+        self.connections.require_primary(claim)?;
+        let pending = self.connections.pending(claim)?;
+        let snapshot = self.control.snapshot()?;
+        match pending {
+            Some(exposure)
+                if exposure.pinned() == &snapshot.lease.desired_exposure
+                    && snapshot.lease.live_status != LiveExposureStatus::ReloadRequired =>
+            {
+                Ok(())
+            }
+            None if snapshot.lease.observed_exposure == snapshot.lease.desired_exposure => Ok(()),
+            _ => Err(GatewayError::InvalidExposure(
+                "pending connection exposure is no longer desired",
             )),
         }
     }

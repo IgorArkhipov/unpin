@@ -6,7 +6,7 @@ use crate::{
     providers::ProviderId,
     sessions::{
         CallAdmission, LeaseLifecycle, LeaseSnapshot, LiveExposureStatus, PinnedExposure,
-        SessionHandle, SessionManager,
+        SessionHandle, SessionManager, WorkflowTransitionRequest, WorkflowTransitionResult,
     },
 };
 
@@ -183,6 +183,19 @@ impl GatewayControlPlane {
             .map_err(|error| GatewayError::Workflow(error.to_string()))?;
         *snapshot = updated.clone();
         Ok(updated)
+    }
+
+    pub(crate) fn enter_workflow_mode(
+        &self,
+        request: WorkflowTransitionRequest,
+    ) -> Result<WorkflowTransitionResult, GatewayError> {
+        let mut snapshot = self.lock_snapshot()?;
+        let router = crate::sessions::WorkflowRouter::new(self.manager.clone());
+        let result = router
+            .enter_mode(&self.handle, &snapshot.revision, request)
+            .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        *snapshot = self.manager.load_for_handle(&self.handle)?;
+        Ok(result)
     }
 
     pub(crate) fn restore_observed_exposure(
