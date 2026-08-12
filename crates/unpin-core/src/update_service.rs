@@ -1419,6 +1419,12 @@ impl UpdateLock {
     }
 }
 
+impl Drop for UpdateLock {
+    fn drop(&mut self) {
+        let _ = self._file.unlock();
+    }
+}
+
 fn sync_file(path: &Path) -> Result<(), String> {
     File::open(path)
         .and_then(|file| file.sync_all())
@@ -1952,11 +1958,13 @@ mod tests {
                 0o600
             );
         }
+        let inherited_file = first._file.try_clone().expect("duplicate lock descriptor");
         assert!(UpdateLock::acquire(&install_path).is_err());
         drop(first);
         assert!(lock_path.is_file(), "lock file persists after release");
         let second = UpdateLock::acquire(&install_path).expect("released lock can be reacquired");
         drop(second);
+        drop(inherited_file);
         assert!(lock_path.is_file(), "lock file remains durable");
     }
 

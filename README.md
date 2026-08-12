@@ -37,7 +37,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v1.1.0-TARGET.tar.gz \
+gh attestation verify unpin-v1.2.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -45,7 +45,7 @@ Extract the archive, install the included binary on your user `PATH`, and start
 with read-only inspection:
 
 ```bash
-cd unpin-v1.1.0-TARGET
+cd unpin-v1.2.0-TARGET
 mkdir -p "$HOME/.local/bin"
 install -m 0755 unpin "$HOME/.local/bin/unpin"
 export PATH="$HOME/.local/bin:$PATH"
@@ -119,9 +119,9 @@ archive against `SHA256SUMS` and its GitHub attestation before extracting it:
 
 ```bash
 gh attestation verify \
-  unpin-desktop-v1.1.0-TARGET.tar.gz \
+  unpin-desktop-v1.2.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
-tar -xzf unpin-desktop-v1.1.0-TARGET.tar.gz
+tar -xzf unpin-desktop-v1.2.0-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
