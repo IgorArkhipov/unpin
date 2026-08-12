@@ -24,6 +24,7 @@ pub mod state;
 pub mod transitions;
 pub mod update;
 pub mod update_service;
+pub mod workflows;
 
 mod pi_packages;
 mod toml_syntax;
