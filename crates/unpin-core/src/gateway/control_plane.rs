@@ -168,6 +168,43 @@ impl GatewayControlPlane {
         Ok(updated)
     }
 
+    /// Cancel a durable U2 workflow transition using its authenticated
+    /// operation journal. The router owns source-mode recovery and reopens
+    /// admission only after restoring the prior observed exposure.
+    pub(crate) fn cancel_workflow_transition(
+        &self,
+        operation_id: &str,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, GatewayError> {
+        let mut snapshot = self.lock_snapshot()?;
+        let router = crate::sessions::WorkflowRouter::new(self.manager.clone());
+        let updated = router
+            .cancel_transition(&self.handle, &snapshot.revision, operation_id, now_unix)
+            .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        *snapshot = updated.clone();
+        Ok(updated)
+    }
+
+    pub(crate) fn restore_observed_exposure(
+        &self,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, GatewayError> {
+        let mut snapshot = self.lock_snapshot()?;
+        if snapshot.lease.workflow.is_some()
+            && snapshot.lease.desired_exposure != snapshot.lease.observed_exposure
+            && !snapshot.lease.admission_open
+        {
+            return Err(GatewayError::Workflow(
+                "workflow transition cancellation requires its operation id".to_string(),
+            ));
+        }
+        let updated =
+            self.manager
+                .restore_observed_exposure(&self.handle, &snapshot.revision, now_unix)?;
+        *snapshot = updated.clone();
+        Ok(updated)
+    }
+
     fn lock_snapshot(&self) -> Result<MutexGuard<'_, LeaseSnapshot>, GatewayError> {
         let mut snapshot = match self.snapshot.lock() {
             Ok(snapshot) => snapshot,

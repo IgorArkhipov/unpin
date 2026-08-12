@@ -4,6 +4,7 @@
 //! descriptors and calls to MCP, but lease ownership and exposure checks remain
 //! in core.
 
+mod connection_registry;
 mod control_plane;
 mod data_plane;
 mod service;
@@ -15,6 +16,10 @@ use std::fmt;
 
 use crate::sessions::LeaseError;
 
+pub use connection_registry::{
+    GatewayConnectionClaim, GatewayConnectionRegistry, GatewayConnectionRole,
+    GatewayConnectionStatus,
+};
 pub use control_plane::{GatewayControlPlane, GatewaySessionStatus};
 pub use data_plane::{GatewayCallPermit, GatewayDataPlane, GatewayHookCallContext};
 pub use service::{
@@ -42,6 +47,11 @@ pub enum GatewayError {
     CapabilityUnavailable,
     HookDispatchIncomplete,
     HookPolicyDenied,
+    ConnectionClaimInvalid,
+    ConnectionEpochStale,
+    ConnectionControlOnly,
+    RefreshNotObserved,
+    Workflow(String),
     SkillContentChanged,
     SkillContentInvalid,
     StatePoisoned,
@@ -85,6 +95,17 @@ impl fmt::Display for GatewayError {
                 formatter.write_str("gateway hook dispatch is incomplete")
             }
             Self::HookPolicyDenied => formatter.write_str("gateway hook policy denied tool call"),
+            Self::ConnectionClaimInvalid => {
+                formatter.write_str("gateway connection claim is invalid")
+            }
+            Self::ConnectionEpochStale => formatter.write_str("gateway connection epoch is stale"),
+            Self::ConnectionControlOnly => {
+                formatter.write_str("auxiliary gateway connection is control-only")
+            }
+            Self::RefreshNotObserved => {
+                formatter.write_str("gateway refresh requires a re-list on the same connection")
+            }
+            Self::Workflow(message) => write!(formatter, "gateway workflow error: {message}"),
             Self::SkillContentChanged => {
                 formatter.write_str("selected skill content changed after exposure was pinned")
             }

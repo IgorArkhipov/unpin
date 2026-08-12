@@ -528,6 +528,24 @@ impl SessionManager {
         })
     }
 
+    /// Restore the currently observed exposure after cancelling a direct
+    /// gateway refresh. Unlike `request_exposure`, this closes the durable
+    /// transition by reopening admission and recording an observed state.
+    pub(crate) fn restore_observed_exposure(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            lease.desired_exposure = lease.observed_exposure.clone();
+            lease.live_status = LiveExposureStatus::ObservedRefresh;
+            lease.admission_open = true;
+            Ok(())
+        })
+    }
+
     pub fn observe_exposure(
         &self,
         handle: &SessionHandle,
@@ -549,6 +567,7 @@ impl SessionManager {
             require_active(lease)?;
             if status == LiveExposureStatus::ObservedRefresh {
                 lease.observed_exposure = lease.desired_exposure.clone();
+                lease.admission_open = true;
             }
             lease.live_status = status;
             Ok(())

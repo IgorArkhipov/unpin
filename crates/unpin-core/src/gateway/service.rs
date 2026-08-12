@@ -14,8 +14,9 @@ use crate::{
 };
 
 use super::{
-    GatewayControlPlane, GatewayDataPlane, GatewayError, LoadedSkill, ProjectedTool, SkillMetadata,
-    SkillRegistry, ToolRegistry, UpstreamToolRegistration,
+    GatewayConnectionClaim, GatewayConnectionRegistry, GatewayConnectionRole,
+    GatewayConnectionStatus, GatewayControlPlane, GatewayDataPlane, GatewayError, LoadedSkill,
+    ProjectedTool, SkillMetadata, SkillRegistry, ToolRegistry, UpstreamToolRegistration,
 };
 
 const ABSOLUTE_MAX_TOOLS: usize = 2_048;
@@ -442,19 +443,28 @@ fn validate_profile_pin(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListChangeSupport {
     Negotiated,
+    /// The host can receive a notification but has no observed re-list yet.
+    NotificationOnly,
     Unsupported,
+    /// The host cannot refresh this session safely; expose the proposal for a
+    /// new session and keep the currently observed set callable.
+    NextSessionOnly,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GatewayRefreshOutcome {
     NotificationRequired,
+    NotificationSent,
+    RefreshUnconfirmed,
     ReloadRequired,
+    NextSessionOnly,
 }
 
 #[derive(Debug)]
 pub struct GatewayService {
     control: Arc<GatewayControlPlane>,
     data_plane: GatewayDataPlane,
+    connections: GatewayConnectionRegistry,
     pending: Mutex<Option<Arc<GatewayExposure>>>,
     limits: GatewayLimits,
 }
@@ -475,11 +485,14 @@ impl GatewayService {
             ));
         }
         let control = Arc::new(control);
-        let data_plane =
-            GatewayDataPlane::new(Arc::clone(&control), Arc::new(initial_exposure), limits);
+        let initial_exposure = Arc::new(initial_exposure);
+        let connections =
+            GatewayConnectionRegistry::new(Arc::clone(&control), Arc::clone(&initial_exposure));
+        let data_plane = GatewayDataPlane::new(Arc::clone(&control), initial_exposure, limits);
         Ok(Self {
             control,
             data_plane,
+            connections,
             pending: Mutex::new(None),
             limits,
         })
@@ -521,6 +534,312 @@ impl GatewayService {
         } else {
             Ok(GatewayRefreshOutcome::NotificationRequired)
         }
+    }
+
+    /// Issue the server-authenticated claim for an accepted gateway
+    /// connection. Transport adapters must retain and pass this opaque value
+    /// to every claim-aware gateway operation.
+    pub fn issue_connection_claim(&self) -> Result<GatewayConnectionClaim, GatewayError> {
+        self.connections.issue_claim()
+    }
+
+    /// Alias used by transport adapters at connection-accept time.
+    pub fn accept_connection(&self) -> Result<GatewayConnectionClaim, GatewayError> {
+        self.issue_connection_claim()
+    }
+
+    /// Return status for a claim without exposing authored capability names.
+    pub fn connection_status(
+        &self,
+        claim: &GatewayConnectionClaim,
+    ) -> Result<GatewayConnectionStatus, GatewayError> {
+        self.connections.status(claim)
+    }
+
+    #[must_use]
+    pub fn connection_registry(&self) -> &GatewayConnectionRegistry {
+        &self.connections
+    }
+
+    /// Disconnect and permanently fence a connection epoch. A primary
+    /// disconnect reconciles the durable gateway runtime; auxiliary
+    /// connections are status-only and do not affect session admission.
+    pub fn disconnect_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        now_unix: i64,
+    ) -> Result<(), GatewayError> {
+        let status = self.connections.status(claim)?;
+        self.connections.disconnect(claim)?;
+        if status.role == GatewayConnectionRole::Primary {
+            self.control.reconcile_stopped_runtime(now_unix)?;
+        }
+        Ok(())
+    }
+
+    /// Stage a replacement exposure in the primary connection's private
+    /// registry. Auxiliary claims are intentionally unable to stage or observe
+    /// a replacement. The old observed exposure remains the only one usable
+    /// for calls until this exact primary connection re-lists.
+    pub fn stage_refresh_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        exposure: GatewayExposure,
+        support: ListChangeSupport,
+        now_unix: i64,
+    ) -> Result<GatewayRefreshOutcome, GatewayError> {
+        self.connections.require_primary(claim)?;
+        let snapshot = self.control.snapshot()?;
+        if snapshot.lease.provider != exposure.provider
+            || snapshot.lease.desired_exposure != exposure.pinned
+        {
+            return Err(GatewayError::InvalidExposure(
+                "refresh exposure does not match desired lease state",
+            ));
+        }
+        let exposure = Arc::new(exposure);
+        match support {
+            ListChangeSupport::NextSessionOnly => {
+                // Known next-session-only coverage does not stage a pending
+                // set. Keep the old observed registry intact and surface the
+                // limitation to the host. A workflow operation can later use
+                // cancel_transition_for_connection to restore admission.
+                self.connections.clear_pending(claim)?;
+                self.control
+                    .observe_exposure(LiveExposureStatus::NextSessionOnly, now_unix)?;
+                Ok(GatewayRefreshOutcome::NextSessionOnly)
+            }
+            ListChangeSupport::Unsupported => {
+                self.connections.stage_pending(claim, exposure)?;
+                if let Err(error) = self
+                    .control
+                    .observe_exposure(LiveExposureStatus::ReloadRequired, now_unix)
+                {
+                    let _ = self.connections.clear_pending(claim);
+                    return Err(error);
+                }
+                Ok(GatewayRefreshOutcome::ReloadRequired)
+            }
+            ListChangeSupport::NotificationOnly => {
+                self.connections.stage_pending(claim, exposure)?;
+                self.control
+                    .observe_exposure(LiveExposureStatus::NotificationSent, now_unix)?;
+                Ok(GatewayRefreshOutcome::RefreshUnconfirmed)
+            }
+            ListChangeSupport::Negotiated => {
+                self.connections.stage_pending(claim, exposure)?;
+                Ok(GatewayRefreshOutcome::NotificationRequired)
+            }
+        }
+    }
+
+    /// Record that the host received a list-change notification. Notification
+    /// alone never promotes a pending exposure; a same-claim re-list is still
+    /// required.
+    pub fn notify_tools_changed_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        now_unix: i64,
+    ) -> Result<GatewayRefreshOutcome, GatewayError> {
+        self.connections.require_primary(claim)?;
+        let pending = self
+            .connections
+            .pending(claim)?
+            .ok_or(GatewayError::RefreshNotObserved)?;
+        let snapshot = self.control.snapshot()?;
+        if pending.pinned() != &snapshot.lease.desired_exposure {
+            return Err(GatewayError::InvalidExposure(
+                "pending exposure is no longer desired",
+            ));
+        }
+        self.control
+            .observe_exposure(LiveExposureStatus::NotificationSent, now_unix)?;
+        Ok(GatewayRefreshOutcome::NotificationSent)
+    }
+
+    /// Re-list and observe a replacement on the exact primary connection.
+    /// This is the only operation that promotes a pending connection-local
+    /// exposure. It is idempotent once the desired revision is observed.
+    pub fn list_tools_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        now_unix: i64,
+    ) -> Result<Vec<ProjectedTool>, GatewayError> {
+        self.connections.require_primary(claim)?;
+        let snapshot = self.control.snapshot()?;
+        let pending = self
+            .connections
+            .take_pending(claim, &snapshot.lease.desired_exposure.revision)?;
+        if let Some(exposure) = pending {
+            if snapshot.lease.live_status != LiveExposureStatus::NotificationSent {
+                self.connections.restore_pending(claim, exposure)?;
+            } else {
+                if let Err(error) = self.control.observe_exposure_if_desired(
+                    exposure.pinned(),
+                    LiveExposureStatus::ObservedRefresh,
+                    now_unix,
+                ) {
+                    self.connections.restore_pending(claim, exposure)?;
+                    return Err(error);
+                }
+                self.connections.mark_observed(claim, exposure)?;
+            }
+        }
+        let exposure = self.connections.observed(claim)?;
+        self.data_plane.list_tools_for_exposure(&exposure)
+    }
+
+    pub fn search_skills_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        query: &str,
+        limit: usize,
+        now_unix: i64,
+    ) -> Result<Vec<SkillMetadata>, GatewayError> {
+        let exposure = self.connections.observed(claim)?;
+        self.data_plane
+            .search_skills_for_exposure(exposure, query, limit, now_unix)
+    }
+
+    pub fn load_skill_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        reference: &str,
+        now_unix: i64,
+    ) -> Result<LoadedSkill, GatewayError> {
+        let exposure = self.connections.observed(claim)?;
+        self.data_plane
+            .load_skill_for_exposure(exposure, reference, now_unix)
+    }
+
+    pub fn admit_tool_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        public_name: &str,
+        arguments: &serde_json::Value,
+        now_unix: i64,
+    ) -> Result<super::GatewayCallPermit, GatewayError> {
+        let exposure = self.connections.observed(claim)?;
+        self.data_plane.admit_tool_for_exposure(
+            exposure,
+            public_name,
+            arguments,
+            now_unix,
+            crate::hooks::HookInvocationChain::default(),
+            claim.connection_epoch(),
+        )
+    }
+
+    pub fn admit_tool_for_connection_with_chain(
+        &self,
+        claim: &GatewayConnectionClaim,
+        public_name: &str,
+        arguments: &serde_json::Value,
+        now_unix: i64,
+        hook_chain: crate::hooks::HookInvocationChain,
+    ) -> Result<super::GatewayCallPermit, GatewayError> {
+        let exposure = self.connections.observed(claim)?;
+        self.data_plane.admit_tool_for_exposure(
+            exposure,
+            public_name,
+            arguments,
+            now_unix,
+            hook_chain,
+            claim.connection_epoch(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_hook_tool_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        context: &super::GatewayHookCallContext,
+        server_id: &str,
+        tool_name: &str,
+        arguments: &serde_json::Value,
+        now_unix: i64,
+        hook_chain: crate::hooks::HookInvocationChain,
+    ) -> Result<super::GatewayCallPermit, GatewayError> {
+        let exposure = self.connections.observed(claim)?;
+        self.data_plane.admit_hook_tool_for_exposure(
+            exposure,
+            context,
+            server_id,
+            tool_name,
+            arguments,
+            now_unix,
+            hook_chain,
+            claim.connection_epoch(),
+        )
+    }
+
+    pub fn finish_tool_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        permit: &mut super::GatewayCallPermit,
+        response: &serde_json::Value,
+        now_unix: i64,
+    ) -> Result<(), GatewayError> {
+        self.connections.require_primary(claim)?;
+        if GatewayDataPlane::permit_connection_epoch(permit) != claim.connection_epoch() {
+            return Err(GatewayError::ConnectionEpochStale);
+        }
+        self.data_plane.finish_tool(permit, response, now_unix)
+    }
+
+    pub fn cancel_tool_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        permit: &mut super::GatewayCallPermit,
+        now_unix: i64,
+    ) -> Result<(), GatewayError> {
+        self.connections.require_primary(claim)?;
+        if GatewayDataPlane::permit_connection_epoch(permit) != claim.connection_epoch() {
+            return Err(GatewayError::ConnectionEpochStale);
+        }
+        self.data_plane.cancel_tool(permit, now_unix)
+    }
+
+    pub fn observe_refresh_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        expected_revision: &str,
+        now_unix: i64,
+    ) -> Result<GatewayConnectionStatus, GatewayError> {
+        let _ = now_unix;
+        self.connections.require_primary(claim)?;
+        let status = self.connections.status(claim)?;
+        if status.observed_exposure_revision != expected_revision {
+            return Err(GatewayError::RefreshNotObserved);
+        }
+        Ok(status)
+    }
+
+    pub fn cancel_transition_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        operation_id: &str,
+        now_unix: i64,
+    ) -> Result<GatewayConnectionStatus, GatewayError> {
+        self.connections.require_primary(claim)?;
+        self.control
+            .cancel_workflow_transition(operation_id, now_unix)?;
+        self.connections.clear_pending(claim)?;
+        self.connections.status(claim)
+    }
+
+    /// Cancel a directly staged refresh when no U2 workflow operation exists.
+    /// Workflow transitions should use `cancel_transition_for_connection` so
+    /// the authenticated journal can restore the source mode as well.
+    pub fn cancel_refresh_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        now_unix: i64,
+    ) -> Result<GatewayConnectionStatus, GatewayError> {
+        self.connections.require_primary(claim)?;
+        self.control.restore_observed_exposure(now_unix)?;
+        self.connections.clear_pending(claim)?;
+        self.connections.status(claim)
     }
 
     pub fn validate_notified_exposure_is_current(&self) -> Result<(), GatewayError> {
