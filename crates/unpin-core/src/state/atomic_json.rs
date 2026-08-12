@@ -94,6 +94,22 @@ impl AtomicJsonStore {
         read_snapshot(&physical_path, self.schema_version)
     }
 
+    /// Loads state whose outer document schema is either the store's current
+    /// schema or one of the explicitly named compatible schemas. Callers must
+    /// still decode an exact value type for the returned schema.
+    pub fn load_compatible<T>(
+        &self,
+        compatible_schemas: &[u32],
+    ) -> StateResult<Option<StateSnapshot<T>>>
+    where
+        T: DeserializeOwned,
+    {
+        self.validate_schema_version()?;
+        validate_compatible_schemas(self.schema_version, compatible_schemas)?;
+        let physical_path = resolve_physical_path(&self.requested_path, false)?;
+        read_snapshot_compatible(&physical_path, self.schema_version, compatible_schemas)
+    }
+
     /// Atomically replaces state when `expected` still names current physical document.
     /// `None` is create-only: it succeeds only while document is absent.
     pub fn compare_and_swap<T>(
@@ -160,6 +176,53 @@ impl AtomicJsonStore {
         Ok(candidate)
     }
 
+    /// Atomically replaces a document using the store's current schema after
+    /// proving the existing document has the explicitly expected old schema.
+    pub fn compare_and_swap_migrating_schema<T>(
+        &self,
+        expected: &StateRevision,
+        expected_schema: u32,
+        owner: OwnerGeneration,
+        value: &T,
+    ) -> StateResult<StateRevision>
+    where
+        T: Serialize,
+    {
+        self.validate_schema_version()?;
+        validate_compatible_schemas(self.schema_version, &[expected_schema])?;
+        validate_owner_generation(&owner)?;
+        ensure_private_writes_supported(&self.requested_path)?;
+
+        let physical_path = resolve_physical_path(&self.requested_path, true)?;
+        let _lock = ResourceLock::acquire(&physical_path)?;
+        let locked_path = resolve_physical_path(&self.requested_path, true)?;
+        if physical_resource_id(&locked_path) != physical_resource_id(&physical_path) {
+            return Err(StateError::PhysicalResourceChanged {
+                before: physical_path,
+                after: locked_path,
+            });
+        }
+
+        let current = read_snapshot::<serde_json::Value>(&locked_path, expected_schema)?
+            .ok_or_else(|| StateError::StaleRevision {
+                expected: Some(expected.clone()),
+                actual: None,
+            })?;
+        if current.revision != *expected {
+            return Err(StateError::StaleRevision {
+                expected: Some(expected.clone()),
+                actual: Some(current.revision),
+            });
+        }
+        validate_owner_transition(&current.owner, &owner)?;
+        let sequence = current
+            .revision
+            .sequence
+            .checked_add(1)
+            .ok_or(StateError::RevisionOverflow)?;
+        write_document(&locked_path, self.schema_version, sequence, &owner, value)
+    }
+
     /// Removes current state only when its revision still matches `expected`.
     pub fn remove_if_revision(&self, expected: &StateRevision) -> StateResult<()> {
         self.validate_schema_version()?;
@@ -175,6 +238,43 @@ impl AtomicJsonStore {
             });
         }
         let current = read_snapshot::<serde_json::Value>(&locked_path, self.schema_version)?;
+        let actual = current.map(|snapshot| snapshot.revision);
+        if actual.as_ref() != Some(expected) {
+            return Err(StateError::StaleRevision {
+                expected: Some(expected.clone()),
+                actual,
+            });
+        }
+        fs::remove_file(&locked_path).map_err(|error| io_error(&locked_path, error))?;
+        sync_parent_directory(locked_path.parent().expect("state file has parent"))
+    }
+
+    /// Removes current state when its schema is either the store's current
+    /// schema or one explicitly named compatible schema.
+    pub fn remove_if_revision_compatible(
+        &self,
+        expected: &StateRevision,
+        compatible_schemas: &[u32],
+    ) -> StateResult<()> {
+        self.validate_schema_version()?;
+        validate_compatible_schemas(self.schema_version, compatible_schemas)?;
+        ensure_private_writes_supported(&self.requested_path)?;
+
+        let physical_path = resolve_physical_path(&self.requested_path, false)?;
+        let _lock = ResourceLock::acquire(&physical_path)?;
+        let locked_path = resolve_physical_path(&self.requested_path, false)?;
+        if physical_resource_id(&locked_path) != physical_resource_id(&physical_path) {
+            return Err(StateError::PhysicalResourceChanged {
+                before: physical_path,
+                after: locked_path,
+            });
+        }
+
+        let current = read_snapshot_compatible::<serde_json::Value>(
+            &locked_path,
+            self.schema_version,
+            compatible_schemas,
+        )?;
         let actual = current.map(|snapshot| snapshot.revision);
         if actual.as_ref() != Some(expected) {
             return Err(StateError::StaleRevision {
@@ -217,6 +317,17 @@ fn read_snapshot<T>(path: &Path, expected_schema: u32) -> StateResult<Option<Sta
 where
     T: DeserializeOwned,
 {
+    read_snapshot_compatible(path, expected_schema, &[])
+}
+
+fn read_snapshot_compatible<T>(
+    path: &Path,
+    expected_schema: u32,
+    compatible_schemas: &[u32],
+) -> StateResult<Option<StateSnapshot<T>>>
+where
+    T: DeserializeOwned,
+{
     reject_state_file_symlink(path)?;
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -239,7 +350,9 @@ where
             path: path.to_path_buf(),
             message: error.to_string(),
         })?;
-    if document.schema_version != expected_schema {
+    if document.schema_version != expected_schema
+        && !compatible_schemas.contains(&document.schema_version)
+    {
         return Err(StateError::SchemaVersionMismatch {
             expected: expected_schema,
             actual: document.schema_version,
@@ -261,6 +374,47 @@ where
         owner: document.owner,
         value: document.value,
     }))
+}
+
+fn validate_compatible_schemas(current: u32, compatible: &[u32]) -> StateResult<()> {
+    if compatible
+        .iter()
+        .any(|schema| *schema == 0 || *schema == current)
+    {
+        Err(StateError::InvalidSchemaVersion)
+    } else {
+        Ok(())
+    }
+}
+
+fn write_document<T>(
+    path: &Path,
+    schema_version: u32,
+    sequence: u64,
+    owner: &OwnerGeneration,
+    value: &T,
+) -> StateResult<StateRevision>
+where
+    T: Serialize,
+{
+    let document = StoredDocumentRef {
+        schema_version,
+        revision: sequence,
+        owner,
+        value,
+    };
+    let mut serialized =
+        serde_json::to_vec_pretty(&document).map_err(|error| StateError::Serialization {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    serialized.push(b'\n');
+    let candidate = StateRevision {
+        sequence,
+        fingerprint: fingerprint(&serialized),
+    };
+    write_atomically(path, &serialized, &candidate)?;
+    Ok(candidate)
 }
 
 fn validate_owner_generation(owner: &OwnerGeneration) -> StateResult<()> {

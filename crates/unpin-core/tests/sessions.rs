@@ -9,6 +9,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use hmac::{Hmac, KeyInit, Mac};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir as RawTempDir;
@@ -23,7 +24,7 @@ use unpin_core::{
         IsolationLevel, LeaseError, LeaseLifecycle, LiveExposureStatus, PinnedExposure,
         PinnedProfile, ProcessEvidence, ProcessInspector, SESSION_OVERLAY_MARKER,
         SessionAuthorityKey, SessionEndControlError, SessionEndController, SessionEndStatus,
-        SessionHandle, SessionManager, capture_process_evidence,
+        SessionHandle, SessionLease, SessionManager, capture_process_evidence,
     },
     state::atomic_json::StateError,
     transitions::{
@@ -76,6 +77,96 @@ fn authenticated_manager(path: &Path) -> SessionManager {
 
 fn hex_digest(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn authenticate_v2_lease(lease: &serde_json::Value) -> String {
+    let lease_json = lease;
+    let lease: SessionLease =
+        serde_json::from_value(lease_json.clone()).expect("typed v2 session lease");
+    let empty_call_ids = BTreeSet::new();
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct AuthenticationBody<'a> {
+        session_id: &'a str,
+        provider: ProviderId,
+        repository_key: &'a str,
+        workspace_key: &'a str,
+        workspace_start_revision: &'a Option<String>,
+        last_workspace_revision: &'a Option<String>,
+        workspace_drifted: bool,
+        desired_exposure: &'a PinnedExposure,
+        observed_exposure: &'a PinnedExposure,
+        live_status: LiveExposureStatus,
+        process: &'a ProcessEvidence,
+        isolation: IsolationLevel,
+        coverage: &'a CoverageLevel,
+        protected_resources: &'a BTreeSet<String>,
+        lifecycle: LeaseLifecycle,
+        admission_open: bool,
+        in_flight_calls: u32,
+        in_flight_call_ids: &'a BTreeSet<String>,
+        heartbeat_at_unix: i64,
+        lease_expires_at_unix: i64,
+        connection_owner_id: &'a str,
+        closed_reason: &'a Option<String>,
+        connection_scope_digest: &'a str,
+        owner_secret_digest: &'a str,
+        authentication_algorithm: &'a str,
+        authority_key_id: &'a str,
+    }
+    let body = serde_json::to_vec(&AuthenticationBody {
+        session_id: &lease.session_id,
+        provider: lease.provider,
+        repository_key: &lease.repository_key,
+        workspace_key: &lease.workspace_key,
+        workspace_start_revision: &lease.workspace_start_revision,
+        last_workspace_revision: &lease.last_workspace_revision,
+        workspace_drifted: lease.workspace_drifted,
+        desired_exposure: &lease.desired_exposure,
+        observed_exposure: &lease.observed_exposure,
+        live_status: lease.live_status,
+        process: &lease.process,
+        isolation: lease.isolation,
+        coverage: &lease.coverage,
+        protected_resources: &lease.protected_resources,
+        lifecycle: lease.lifecycle,
+        admission_open: lease.admission_open,
+        in_flight_calls: lease.in_flight_calls,
+        in_flight_call_ids: &empty_call_ids,
+        heartbeat_at_unix: lease.heartbeat_at_unix,
+        lease_expires_at_unix: lease.lease_expires_at_unix,
+        connection_owner_id: &lease.connection_owner_id,
+        closed_reason: &lease.closed_reason,
+        connection_scope_digest: lease_json["connectionScopeDigest"]
+            .as_str()
+            .expect("connection scope digest"),
+        owner_secret_digest: lease_json["ownerSecretDigest"]
+            .as_str()
+            .expect("owner secret digest"),
+        authentication_algorithm: lease_json["authenticationAlgorithm"]
+            .as_str()
+            .expect("authentication algorithm"),
+        authority_key_id: lease_json["authorityKeyId"]
+            .as_str()
+            .expect("authority key id"),
+    })
+    .expect("v2 lease authentication body");
+    let mut mac = Hmac::<Sha256>::new_from_slice(&[0x53; 32]).expect("HMAC key");
+    mac.update(b"unpin-session-lease-v2\0");
+    mac.update(&body);
+    hex_digest(&mac.finalize().into_bytes())
+}
+
+fn rewrite_outer_schema(path: &Path, schema_version: u32) -> serde_json::Value {
+    let mut document: serde_json::Value =
+        serde_json::from_slice(&fs::read(path).expect("session document")).expect("session JSON");
+    document["schemaVersion"] = serde_json::json!(schema_version);
+    fs::write(
+        path,
+        serde_json::to_vec_pretty(&document).expect("rewritten session JSON"),
+    )
+    .expect("rewrite session schema");
+    document
 }
 
 fn legacy_pending_integrity(claim: &serde_json::Value) -> String {
@@ -533,6 +624,100 @@ fn cancelled_bootstrap_removes_claim_and_cannot_establish_lease() {
         manager.claim_bootstrap(&authority, &claim, 1_001),
         Err(LeaseError::SessionNotFound)
     ));
+}
+
+#[test]
+fn genuine_v2_established_lease_loads_and_owner_update_migrates_to_v3() {
+    let temp = TempDir::new();
+    let manager = authenticated_manager(temp.path());
+    let session = establish(
+        &manager,
+        request("workspace-a", "connection-a", profile('a')),
+        1_000,
+        "owner-a",
+    );
+    let path = get_session_lease_path(temp.path(), session.handle.session_id());
+    let mut v2 = rewrite_outer_schema(&path, 2);
+    v2["value"]["lease"]
+        .as_object_mut()
+        .expect("lease object")
+        .remove("workflow");
+    let v2_tag = authenticate_v2_lease(&v2["value"]["lease"]);
+    v2["value"]["lease"]["authenticationTag"] = serde_json::json!(v2_tag);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&v2).expect("v2 lease JSON"),
+    )
+    .expect("write genuine v2 lease");
+
+    let loaded = manager
+        .load_for_handle(&session.handle)
+        .expect("load genuine v2 lease");
+    let migrated = manager
+        .heartbeat(&session.handle, &loaded.revision, 1_002)
+        .expect("migrate v2 lease on owner update");
+    assert_eq!(migrated.lease.heartbeat_at_unix, 1_002);
+    let migrated_document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&path).expect("migrated lease"))
+            .expect("migrated lease JSON");
+    assert_eq!(migrated_document["schemaVersion"], 3);
+
+    let mut relabeled = migrated_document;
+    relabeled["schemaVersion"] = serde_json::json!(2);
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&relabeled).expect("relabeled lease JSON"),
+    )
+    .expect("relabel v3 lease as v2");
+    assert!(matches!(
+        manager.load_for_handle(&session.handle),
+        Err(LeaseError::IntegrityMismatch)
+    ));
+}
+
+#[test]
+fn v2_pending_records_support_claim_cancel_and_stale_cleanup() {
+    let temp = TempDir::new();
+    let manager = authenticated_manager(temp.path());
+
+    let claim_request = request("workspace-claim", "connection-claim", profile('a'));
+    let claim = claim_for(&claim_request, "owner-claim");
+    let claim_authority = manager
+        .prepare_bootstrap(claim_request, 1_000)
+        .expect("prepare claim bootstrap");
+    let claim_path = get_session_lease_path(temp.path(), claim_authority.session_id());
+    rewrite_outer_schema(&claim_path, 2);
+    let claimed = manager
+        .claim_bootstrap(&claim_authority, &claim, 1_001)
+        .expect("claim v2 pending bootstrap");
+    let claimed_document: serde_json::Value =
+        serde_json::from_slice(&fs::read(&claim_path).expect("claimed lease"))
+            .expect("claimed lease JSON");
+    assert_eq!(claimed_document["schemaVersion"], 3);
+
+    let cancel_request = request("workspace-cancel", "connection-cancel", profile('b'));
+    let cancel_authority = manager
+        .prepare_bootstrap(cancel_request, 1_010)
+        .expect("prepare cancel bootstrap");
+    let cancel_path = get_session_lease_path(temp.path(), cancel_authority.session_id());
+    rewrite_outer_schema(&cancel_path, 2);
+    manager
+        .cancel_bootstrap(&cancel_authority)
+        .expect("cancel v2 pending bootstrap");
+    assert!(!cancel_path.exists());
+
+    let stale_request = request("workspace-stale", "connection-stale", profile('c'));
+    let stale_authority = manager
+        .prepare_bootstrap(stale_request, 1_020)
+        .expect("prepare stale bootstrap");
+    let stale_path = get_session_lease_path(temp.path(), stale_authority.session_id());
+    rewrite_outer_schema(&stale_path, 2);
+    manager
+        .expire_stale(1_321, 100, &NeverMatches)
+        .expect("clean stale v2 pending bootstrap");
+    assert!(!stale_path.exists());
+
+    assert_eq!(claimed.lease.lease.provider, ProviderId::Codex);
 }
 
 #[test]
