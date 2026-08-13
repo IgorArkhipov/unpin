@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1514,6 +1515,83 @@ class LiveInventoryFilterTests(unittest.TestCase):
             MatrixFailure, "omitted required matrix tools"
         ):
             session._initialize()
+
+    def test_desktop_snapshot_request_uses_handshake_binding(self) -> None:
+        binding = {
+            "parentPid": 101,
+            "parentStartMarker": "parent-start",
+            "childPid": 202,
+            "childStartMarker": "child-start",
+            "projectRoot": "/test/project",
+            "appStateRoot": "/test/state",
+            "processGeneration": "generation",
+        }
+        session_secret = "11" * 32
+        request = matrix_cases.authenticated_desktop_bridge_request(
+            {
+                "version": 2,
+                "id": "snapshot",
+                "method": "snapshot",
+                "params": {},
+            },
+            binding,
+            session_secret,
+            1,
+        )
+
+        fingerprint = hashlib.sha256(b"{}").hexdigest()
+        material = (
+            "unpin.desktop.bridge.request.v1\0"
+            f"{session_secret}\0{1}\0snapshot\0snapshot\0snapshot\0{fingerprint}"
+        )
+        self.assertEqual(
+            request["auth"],
+            {
+                **binding,
+                "sequence": 1,
+                "operationId": "snapshot",
+                "fingerprint": fingerprint,
+                "authTag": hashlib.sha256(material.encode("utf-8")).hexdigest(),
+            },
+        )
+
+    def test_desktop_bridge_snapshot_authenticates_after_handshake(self) -> None:
+        process = mock.Mock(pid=202)
+        process.stdin.closed = False
+        process.wait.return_value = 0
+        binding = {
+            "parentPid": os.getpid(),
+            "parentStartMarker": "parent-start",
+            "childPid": process.pid,
+            "childStartMarker": "child-start",
+            "projectRoot": "/test/project",
+            "appStateRoot": "/test/state",
+            "processGeneration": "generation",
+        }
+        snapshot = {"agentPlugins": []}
+        with (
+            mock.patch.object(matrix_cases.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                matrix_cases,
+                "_exchange_desktop_bridge_frame",
+                side_effect=[{"binding": binding}, snapshot],
+            ) as exchange,
+        ):
+            result = matrix_cases.desktop_bridge_snapshot(
+                Path("/test/unpin"),
+                Path("/test/fixtures"),
+                Path("/test/project"),
+                Path("/test/state"),
+            )
+
+        self.assertEqual(result, snapshot)
+        handshake_request = exchange.call_args_list[0].args[1]
+        snapshot_request = exchange.call_args_list[1].args[1]
+        self.assertEqual(handshake_request["params"]["childPid"], process.pid)
+        self.assertEqual(snapshot_request["auth"]["sequence"], 1)
+        for field, value in binding.items():
+            self.assertEqual(snapshot_request["auth"][field], value)
+        self.assertEqual(process.stdin.close.call_count, 1)
 
     def test_agent_plugin_surface_contracts_normalize_provider_shapes(self) -> None:
         base = {
