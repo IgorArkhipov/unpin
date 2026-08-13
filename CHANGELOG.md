@@ -7,6 +7,37 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-08-13
+
+### Added
+
+- Added revision-pinned workflow modes that expose a narrow, task-appropriate
+  set of tools, skills, hooks, and MCP capabilities for planning,
+  implementation, review, and custom workflows.
+- Added workflow and session controls across the CLI, terminal TUI, native
+  desktop workbench, MCP runtime, and authenticated gateway connections.
+- Added safe workflow transitions with explicit desired and observed state,
+  cancellation, bounded recovery, immutable revision history, and canonical
+  mode-routing evidence in the provider matrix.
+
+### Security
+
+- Workflow authority is scoped to the authenticated connection and pinned
+  workflow revision; reconnects cannot silently inherit another connection's
+  exposure or a later definition revision.
+- Workflow definition changes and transitions retain Unpin's validation,
+  drift, locking, approval, journaling, and recovery boundaries. Invalid or
+  stale transitions fail closed.
+
+### Compatibility
+
+- Existing provider discovery, plugins, groups, CLI, TUI, desktop, and MCP
+  workflows remain supported. The built-in workflow presets add routing
+  without changing provider configuration formats.
+- The stable macOS certificate and executable identifiers are unchanged, so a
+  verified update from `1.2.0` preserves Keychain designated requirements and
+  existing **Always Allow** grants.
+
 ## [1.2.0] - 2026-08-11
 
 ### Added
