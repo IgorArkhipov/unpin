@@ -23,6 +23,50 @@ additional mutation permission is introduced by the newer protocol edition.
 
 ## Safety boundary
 
+### Routed workflow sessions
+
+A confirmed workflow session receives one immutable maximum envelope and one
+active mode. `tools/list`, `unpin_search_skills`, `unpin_load_skill`, projected
+upstream calls, and gateway hooks all resolve against the same observed exposure
+revision. Out-of-mode schemas and skill bodies are absent rather than merely
+denied after entering model context.
+
+The fixed session control allowlist is:
+
+- `unpin_workflow_status`
+- `unpin_workflow_modes`
+- `unpin_workflow_enter_mode`
+- `unpin_workflow_cancel_transition`
+
+These controls can inspect state or request/cancel an in-envelope transition.
+They cannot edit workflow definitions, approve launch, expand the confirmed
+envelope, end a session, change gateway lifecycle, or dispatch arbitrary Unpin
+commands. Agent Plugin packages may contribute normalized skills, projected MCP
+tools, and hooks to referenced profiles, but a workflow transition never toggles
+the installed package or provider-native registration.
+
+On a host with negotiated list-change support, entering a mode stages the new
+revision and closes new-call admission. Notification changes status only. The
+same authenticated primary connection must perform a matching `tools/list`
+before Unpin promotes that revision and reopens admission; auxiliary, stale,
+disconnected, or other-session connections cannot observe it. Calls admitted
+under the previous pinned revision may finish.
+
+Fallbacks are explicit:
+
+- `refresh-unconfirmed`: notification sent without a matching re-list; cancel
+  restores the last observed exposure.
+- `reload-required`: reconnect is required; cancel restores the last observed
+  exposure.
+- `next-session-only`: nothing is staged into the current connection and its
+  observed exposure remains callable; start a new confirmed session or cancel
+  the proposal.
+
+The confirmed maximum envelope is the privilege boundary. An out-of-envelope
+request returns a local-human approval handoff and cannot be approved through
+the session MCP server. Native host capabilities outside Unpin's gateway remain
+`native-unmanaged` and are not hidden, toggled, or claimed as strict isolation.
+
 An MCP-connected agent can:
 
 - inspect providers, skills, configured MCP servers, plugins, derived Agent Plugin packages, and backups;

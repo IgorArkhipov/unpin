@@ -59,6 +59,31 @@ bundle.
 
 ## Use the workbench guidance
 
+### Govern & Automate workflows
+
+Desktop is the primary human surface for workflow mode routing. In Govern &
+Automate, use workflow composition to inspect the baseline profile, every named
+mode profile, separately injected Unpin controls, the maximum confirmed
+envelope, provider reach, strict-isolation coverage, and expected host refresh
+limitation before launch. Launch approval remains a local signed-app action; an
+agent MCP session cannot manufacture it.
+
+The active-session inspector distinguishes desired and observed exposure
+revisions, current mode, maximum-envelope authority, `native-unmanaged`
+coverage, connection role, transition history, and one safe next action.
+`notification-sent` is not live activation. `reload-required` and
+`refresh-unconfirmed` offer cancellation back to the last observed exposure.
+`next-session-only` explains that the current exposure remains callable and
+offers a new-session action rather than claiming the requested mode is live.
+
+Workflow definition edits, proposal review, launch confirmation, in-envelope
+transition, cancellation, recovery, and status are backed by the same Rust
+contracts as CLI and MCP. Every state-mutating bridge request is bound to the
+verified bundled binary, parent/child process identity, trusted roots,
+handshake-issued secret, process generation, monotonic sequence, operation ID,
+and fingerprint. Repository-owned configuration cannot redirect these roots or
+approval/session state.
+
 Each work area starts with a collapsible primer that explains its task and the
 result to expect. Primer disclosure is stored independently for Discover and
 Organize, Govern and Automate, Change Safely, and Recover and Audit. The app
