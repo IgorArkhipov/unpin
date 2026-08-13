@@ -51,96 +51,11 @@ if [[ -z "$python3_binary" || ! -x "$python3_binary" ]]; then
   echo "python3 is required for bounded desktop bridge verification" >&2
   exit 1
 fi
-timeout_helper="$smoke_root/run_bridge_with_timeout.py"
-cat > "$timeout_helper" <<'PY'
-from __future__ import annotations
-
-import os
-import pathlib
-import signal
-import subprocess
-import sys
-
-
-def terminate_process_group(process: subprocess.Popen[bytes]) -> bool:
-    try:
-        os.killpg(process.pid, signal.SIGTERM)
-    except ProcessLookupError:
-        return process.poll() is not None
-
-    try:
-        process.wait(timeout=1.0)
-        return True
-    except subprocess.TimeoutExpired:
-        pass
-
-    try:
-        os.killpg(process.pid, signal.SIGKILL)
-    except ProcessLookupError:
-        return process.poll() is not None
-
-    try:
-        process.wait(timeout=1.0)
-        return True
-    except subprocess.TimeoutExpired:
-        return False
-
-
-try:
-    timeout_seconds = float(sys.argv[1])
-except (IndexError, ValueError):
-    raise SystemExit("desktop archive bridge timeout is invalid")
-if timeout_seconds <= 0:
-    raise SystemExit("desktop archive bridge timeout must be greater than zero")
-
-stdin_path = pathlib.Path(sys.argv[2])
-stdout_path = pathlib.Path(sys.argv[3])
-stderr_path = pathlib.Path(sys.argv[4])
-command = sys.argv[5:]
-if not command:
-    raise SystemExit("desktop archive bridge command is missing")
-
-stdin_handle = None if str(stdin_path) == "-" else stdin_path.open("rb")
-stdout_handle = None if str(stdout_path) == "-" else stdout_path.open("wb")
-stderr_handle = None if str(stderr_path) == "-" else stderr_path.open("wb")
-try:
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL if stdin_handle is None else stdin_handle,
-        stdout=subprocess.PIPE if stdout_handle is None else stdout_handle,
-        stderr=stderr_handle,
-        start_new_session=True,
-    )
-    try:
-        stdout, _ = process.communicate(
-            timeout=timeout_seconds,
-        )
-    except subprocess.TimeoutExpired:
-        if not terminate_process_group(process):
-            print(
-                "desktop archive bridge did not terminate after SIGKILL",
-                file=sys.stderr,
-            )
-        print(
-            f"desktop archive bridge timed out after {timeout_seconds:g}s",
-            file=sys.stderr,
-        )
-        raise SystemExit(124)
-
-    if stdout_handle is None and stdout is not None:
-        sys.stdout.buffer.write(stdout)
-    if process.returncode:
-        raise SystemExit(process.returncode)
-finally:
-    if stdin_handle is not None:
-        stdin_handle.close()
-    if stdout_handle is not None:
-        stdout_handle.close()
-    if stderr_handle is not None:
-        stderr_handle.close()
-PY
-chmod 700 "$timeout_helper"
-
+smoke_driver="$repository_root/scripts/run_authenticated_desktop_bridge_smoke.py"
+if [[ ! -f "$smoke_driver" || -L "$smoke_driver" ]]; then
+  echo "authenticated desktop bridge smoke driver is missing or unsafe" >&2
+  exit 1
+fi
 tar -xzf "$archive" -C "$smoke_root"
 app="$smoke_root/$release_name/UnpinDesktop.app"
 desktop_binary="$app/Contents/MacOS/UnpinDesktop"
@@ -199,11 +114,10 @@ env -i \
   PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
   TMPDIR="$smoke_root" \
   LC_ALL=C \
-  "$python3_binary" "$timeout_helper" \
-    "$bridge_timeout_seconds" \
-    - \
-    "$version_output_file" \
-    - \
+  "$python3_binary" "$smoke_driver" \
+    --timeout-seconds "$bridge_timeout_seconds" \
+    --stdout-file "$version_output_file" \
+    -- \
     arch "-$expected_architecture" "$bridge_binary" --version
 bridge_status=$?
 set -e
@@ -223,8 +137,8 @@ home_root="$smoke_root/home"
 fixture_root="$smoke_root/fixtures"
 project_root="$smoke_root/workspace"
 app_state_root="$smoke_root/app-state"
-tmp_root="$smoke_root/tmp"
-mkdir -p "$home_root" "$project_root/.git" "$app_state_root" "$tmp_root"
+tmp_root="$smoke_root"
+mkdir -p "$home_root" "$project_root/.git" "$app_state_root"
 
 # Use the committed provider fixtures, but copy them into the smoke sandbox so
 # the bundled bridge cannot consult repository or user state. Ignore .env*
@@ -244,14 +158,8 @@ shutil.copytree(
 )
 PY
 
-request_file="$smoke_root/bridge-requests.jsonl"
 response_file="$smoke_root/bridge-responses.jsonl"
 stderr_file="$smoke_root/bridge.stderr"
-printf '%s\n' \
-  '{"version":2,"id":"archive-handshake","method":"handshake","params":{}}' \
-  '{"version":2,"id":"archive-snapshot","method":"snapshot","params":{}}' \
-  '{"version":2,"id":"archive-shutdown","method":"shutdown","params":{}}' \
-  > "$request_file"
 
 # An empty environment plus explicit roots makes accidental HOME/provider
 # lookups observable and keeps this smoke independent of the host account.
@@ -263,11 +171,13 @@ set +e
     PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
     TMPDIR="$tmp_root" \
     LC_ALL=C \
-    "$python3_binary" "$timeout_helper" \
-      "$bridge_timeout_seconds" \
-      "$request_file" \
-      "$response_file" \
-      "$stderr_file" \
+    "$python3_binary" "$smoke_driver" \
+      --timeout-seconds "$bridge_timeout_seconds" \
+      --response-file "$response_file" \
+      --stderr-file "$stderr_file" \
+      --project-root "$project_root" \
+      --app-state-root "$app_state_root" \
+      -- \
       arch "-$expected_architecture" "$bridge_binary" desktop bridge \
         --fixture-root "$fixture_root" \
         --home-root "$home_root" \
