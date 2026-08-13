@@ -631,7 +631,7 @@ fn current_parent_process_id() -> u32 {
         }
         // SAFETY: getppid is a side-effect-free libc query on supported Unix
         // hosts and has no pointers or ownership requirements.
-        return unsafe { getppid() }.try_into().unwrap_or_default();
+        unsafe { getppid() }.try_into().unwrap_or_default()
     }
     #[cfg(not(unix))]
     {

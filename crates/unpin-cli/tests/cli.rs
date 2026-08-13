@@ -1215,7 +1215,6 @@ stop="$1"
 
     fs::write(&stop, b"stop").expect("stop workflow host");
     thread::sleep(Duration::from_millis(250));
-    drop(request);
     drop(input);
     let bridge_status = child.wait().expect("wait for bridge");
     assert!(

@@ -820,7 +820,7 @@ fn build_gateway_service(
         // the same service before its listener is started.
         for (mode, profile) in &workflow.revision.effective_profiles {
             let pinned = resolved_mode_exposure(
-                &pinned_workflow,
+                pinned_workflow,
                 mode,
                 &profile.digest,
                 request.exposure.capability_locks.clone(),
@@ -971,23 +971,23 @@ where
     // for heartbeats and transitions.
     let pinned_workflow =
         workflow.map(|workflow| workflow.envelope(claimed.lease.revision.sequence));
-    if let Some(pinned_workflow) = &pinned_workflow {
-        if let Err(error) = manager.pin_workflow(
+    if let Some(pinned_workflow) = &pinned_workflow
+        && let Err(error) = manager.pin_workflow(
             &claimed.handle,
             &claimed.lease.revision,
             pinned_workflow.clone(),
             request.exposure.clone(),
             now_unix,
-        ) {
-            return Err(startup_failure_after_claim(
-                manager,
-                &claimed,
-                authority.session_id(),
-                None,
-                None,
-                SessionProcessError::WorkflowLaunch(error.to_string()),
-            ));
-        }
+        )
+    {
+        return Err(startup_failure_after_claim(
+            manager,
+            &claimed,
+            authority.session_id(),
+            None,
+            None,
+            SessionProcessError::WorkflowLaunch(error.to_string()),
+        ));
     }
 
     let gateway = if requires_verified_provider_overlay(&request.exposure.profile) {

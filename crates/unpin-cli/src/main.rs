@@ -275,7 +275,7 @@ enum Commands {
     /// Launch or inspect isolated Unpin sessions.
     Session {
         #[command(subcommand)]
-        command: commands::session::SessionCommands,
+        command: Box<commands::session::SessionCommands>,
     },
     /// Inspect and safely adopt normalized capability catalog entries.
     Catalog {
@@ -1138,7 +1138,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some(Commands::Session { command }) => commands::session::run(command),
+        Some(Commands::Session { command }) => commands::session::run(*command),
         Some(Commands::Bulk { command }) => commands::toggle::run(command),
         Some(Commands::AgentPlugins { command }) => commands::agent_plugins::run(command),
         Some(Commands::Catalog { command }) => commands::catalog::run(command),

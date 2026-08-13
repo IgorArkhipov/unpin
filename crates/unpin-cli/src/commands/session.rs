@@ -24,7 +24,7 @@ pub(crate) enum SessionCommands {
     /// Launch one child harness with a connection-scoped lease and private overlay.
     Launch {
         #[command(flatten)]
-        roots: DiscoveryRootArgs,
+        roots: Box<DiscoveryRootArgs>,
         /// Unpin-owned runtime state root.
         #[arg(long)]
         app_state_root: Option<PathBuf>,
@@ -194,6 +194,14 @@ pub(crate) enum SessionCommands {
     },
 }
 
+struct EnterModeRequestArgs {
+    id: String,
+    target_mode: String,
+    operation_id: String,
+    operation_fingerprint: String,
+    source_state_sequence: Option<u64>,
+}
+
 pub(crate) fn run(command: SessionCommands) -> ExitCode {
     match command {
         SessionCommands::Launch {
@@ -219,7 +227,7 @@ pub(crate) fn run(command: SessionCommands) -> ExitCode {
             json,
             command,
         } => launch(
-            roots,
+            *roots,
             app_state_root,
             &provider,
             exposure_revision,
@@ -264,11 +272,13 @@ pub(crate) fn run(command: SessionCommands) -> ExitCode {
         } => enter_mode(
             roots,
             app_state_root,
-            &id,
-            &target_mode,
-            &operation_id,
-            &operation_fingerprint,
-            source_state_sequence,
+            EnterModeRequestArgs {
+                id,
+                target_mode,
+                operation_id,
+                operation_fingerprint,
+                source_state_sequence,
+            },
             json,
         ),
         SessionCommands::CancelTransition {
@@ -833,28 +843,26 @@ fn session_status(
 fn enter_mode(
     roots: DiscoveryRootArgs,
     app_state_root: Option<PathBuf>,
-    id: &str,
-    target_mode: &str,
-    operation_id: &str,
-    operation_fingerprint: &str,
-    source_state_sequence: Option<u64>,
+    request: EnterModeRequestArgs,
     json: bool,
 ) -> ExitCode {
-    let (config, snapshot) = match authenticated_session(&roots, app_state_root, id) {
+    let (config, snapshot) = match authenticated_session(&roots, app_state_root, &request.id) {
         Ok(value) => value,
         Err((status, error)) => return command_error_exit(json, status, &error),
     };
-    let source_state_sequence = source_state_sequence.unwrap_or(snapshot.revision.sequence);
+    let source_state_sequence = request
+        .source_state_sequence
+        .unwrap_or(snapshot.revision.sequence);
     let requested_at_unix = unix_now();
     let result = session_process::call_gateway_control(
         &config.app_state_root,
-        id,
+        &request.id,
         "unpin_workflow_enter_mode",
         serde_json::json!(WorkflowTransitionRequest {
-            operation_id: operation_id.to_string(),
-            operation_fingerprint: operation_fingerprint.to_string(),
+            operation_id: request.operation_id,
+            operation_fingerprint: request.operation_fingerprint,
             source_state_sequence,
-            target_mode: target_mode.to_string(),
+            target_mode: request.target_mode,
             requested_at_unix,
         }),
     );
@@ -870,7 +878,7 @@ fn enter_mode(
                     .expect("workflow transition JSON")
                 );
             } else {
-                println!("session {id} workflow transition requested");
+                println!("session {} workflow transition requested", request.id);
             }
             ExitCode::SUCCESS
         }
