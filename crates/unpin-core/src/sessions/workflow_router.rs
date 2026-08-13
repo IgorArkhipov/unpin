@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    profiles::ProfileSourceScope,
     providers::ProviderId,
     state::atomic_json::{
         AtomicJsonStore, OwnerGeneration, StateError, StateRevision, StateSnapshot,
@@ -14,7 +15,7 @@ use super::lease::{
     SessionAuthorityKey, constant_time_equal, validate_digest, validate_identifier,
 };
 use super::{
-    LeaseSnapshot, PinnedExposure, SessionHandle, SessionManager, WorkflowJournal,
+    LeaseSnapshot, PinnedExposure, PinnedProfile, SessionHandle, SessionManager, WorkflowJournal,
     WorkflowOperationLifecycle, WorkflowOperationRecord,
 };
 
@@ -29,7 +30,6 @@ pub struct WorkflowTransitionRequest {
     pub operation_fingerprint: String,
     pub source_state_sequence: u64,
     pub target_mode: String,
-    pub target_exposure: PinnedExposure,
     pub requested_at_unix: i64,
 }
 
@@ -71,7 +71,6 @@ impl WorkflowRouter {
             "workflow operation fingerprint",
             &request.operation_fingerprint,
         )?;
-        request.target_exposure.validate()?;
         let current = self.sessions.load_for_handle(handle)?;
         if current.revision != *expected || request.source_state_sequence != expected.sequence {
             return Err(WorkflowRouterError::StaleOperation);
@@ -112,10 +111,12 @@ impl WorkflowRouter {
             self.record_denial(handle, &current, &request)?;
             return Err(WorkflowRouterError::ExpansionRequiresOperatorReview);
         };
-        if target_profile_digest != &request.target_exposure.revision {
-            self.record_denial(handle, &current, &request)?;
-            return Err(WorkflowRouterError::ExpansionRequiresOperatorReview);
-        }
+        let target_exposure = resolved_mode_exposure(
+            workflow,
+            &request.target_mode,
+            target_profile_digest,
+            current.lease.desired_exposure.capability_locks.clone(),
+        );
         if previous_mode == request.target_mode {
             return Ok(WorkflowTransitionResult {
                 operation_id: request.operation_id,
@@ -155,7 +156,7 @@ impl WorkflowRouter {
             handle,
             expected,
             &request.target_mode,
-            request.target_exposure.clone(),
+            target_exposure.clone(),
             request.requested_at_unix,
         )?;
         record.lifecycle = WorkflowOperationLifecycle::Staged;
@@ -173,7 +174,7 @@ impl WorkflowRouter {
             previous_mode,
             desired_mode: request.target_mode,
             previous_exposure_revision,
-            desired_exposure_revision: request.target_exposure.revision,
+            desired_exposure_revision: target_exposure.revision,
             lease_state_sequence: updated.revision.sequence,
             next_action: "observe-or-cancel-transition".to_string(),
         })
@@ -278,7 +279,7 @@ impl WorkflowRouter {
             return Ok(current);
         }
         if workflow.active_mode != target_mode
-            || operation.value.target_state_sequence != current.revision.sequence
+            || !transition_binding_matches_current_lease(&operation.value, &current)
             || current.lease.admission_open
         {
             return Err(WorkflowRouterError::OperationBindingMismatch);
@@ -301,6 +302,41 @@ impl WorkflowRouter {
             OwnerGeneration::new(handle.owner_id(), restored.revision.sequence)?,
         )?;
         Ok(restored)
+    }
+}
+
+fn transition_binding_matches_current_lease(
+    operation: &WorkflowOperationRecord,
+    current: &LeaseSnapshot,
+) -> bool {
+    let sequence_advance = current
+        .revision
+        .sequence
+        .checked_sub(operation.target_state_sequence);
+    match current.lease.live_status {
+        super::LiveExposureStatus::Configured => sequence_advance == Some(0),
+        super::LiveExposureStatus::NotificationSent
+        | super::LiveExposureStatus::ReloadRequired
+        | super::LiveExposureStatus::NextSessionOnly => sequence_advance == Some(1),
+        super::LiveExposureStatus::ObservedRefresh | super::LiveExposureStatus::Unknown => false,
+    }
+}
+
+pub fn resolved_mode_exposure(
+    workflow: &super::PinnedWorkflowEnvelope,
+    target_mode: &str,
+    target_profile_digest: &str,
+    capability_locks: Option<Box<crate::profiles::CapabilityLockSnapshot>>,
+) -> PinnedExposure {
+    PinnedExposure {
+        revision: target_profile_digest.to_string(),
+        profile: PinnedProfile::Profile {
+            profile_id: format!("{}.{}", workflow.workflow_id, target_mode),
+            profile_digest: target_profile_digest.to_string(),
+            origin_scope: ProfileSourceScope::Session,
+            definition_digest: workflow.workflow_revision.clone(),
+        },
+        capability_locks,
     }
 }
 

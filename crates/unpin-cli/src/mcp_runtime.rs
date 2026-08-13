@@ -18,7 +18,8 @@ use rmcp::{
         ServerInfo, Tool, ToolAnnotations,
     },
     service::{
-        RequestContext, RoleServer, RunningService, RxJsonRpcMessage, ServiceRole, TxJsonRpcMessage,
+        Peer, RequestContext, RoleServer, RunningService, RxJsonRpcMessage, ServiceRole,
+        TxJsonRpcMessage,
     },
     transport::{
         StreamableHttpClientTransport, Transport,
@@ -32,7 +33,8 @@ use tokio::{
 };
 use unpin_core::gateway::{
     GatewayCallPermit, GatewayConnectionClaim, GatewayError, GatewayHookCallContext,
-    GatewayService, PreparedStdioExecution, ProjectedTool, UpstreamIdentity, UpstreamTransportKind,
+    GatewayRefreshOutcome, GatewayService, ListChangeSupport, PreparedStdioExecution,
+    ProjectedTool, UpstreamIdentity, UpstreamTransportKind,
 };
 use unpin_core::hooks::{
     HookAction, HookActionOutcome, HookAfterResult, HookBeforeDecision, HookBeforeResult,
@@ -57,6 +59,81 @@ const MCP_ENVELOPE_BYTES: usize = 64 * 1024;
 const MAX_MALFORMED_STDIO_FRAMES: u8 = 3;
 const HTTP_POOL_MAX_IDLE_PER_HOST: usize = 1;
 const HTTP_POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Clone, Default)]
+pub struct GatewayPrimaryNotifier {
+    peer: Arc<StdMutex<Option<PrimaryPeer>>>,
+}
+
+#[derive(Clone)]
+struct PrimaryPeer {
+    connection_epoch: u64,
+    peer: Peer<RoleServer>,
+    list_change_gate: Arc<RwLock<()>>,
+}
+
+impl GatewayPrimaryNotifier {
+    fn install(
+        &self,
+        claim: &GatewayConnectionClaim,
+        peer: Peer<RoleServer>,
+        list_change_gate: Arc<RwLock<()>>,
+    ) {
+        if !claim.is_primary() {
+            return;
+        }
+        *self
+            .peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(PrimaryPeer {
+            connection_epoch: claim.connection_epoch(),
+            peer,
+            list_change_gate,
+        });
+    }
+
+    pub fn clear(&self, claim: &GatewayConnectionClaim) {
+        let mut peer = self
+            .peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if peer
+            .as_ref()
+            .is_some_and(|current| current.connection_epoch == claim.connection_epoch())
+        {
+            *peer = None;
+        }
+    }
+
+    fn is_ready(&self) -> bool {
+        self.peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some()
+    }
+
+    fn gate_for(&self, claim: &GatewayConnectionClaim) -> Option<Arc<RwLock<()>>> {
+        self.peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .filter(|current| current.connection_epoch == claim.connection_epoch())
+            .map(|current| Arc::clone(&current.list_change_gate))
+    }
+
+    async fn notify_tools_changed(&self) -> Result<(), GatewayRuntimeError> {
+        let peer = self
+            .peer
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .ok_or(GatewayRuntimeError::ServerFailed)?;
+        peer.peer
+            .notify_tool_list_changed()
+            .await
+            .map_err(|_| GatewayRuntimeError::ServerFailed)
+    }
+}
 
 fn build_hardened_http_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
@@ -682,6 +759,7 @@ pub struct GatewayMcpServer {
     hook_http_client: Option<reqwest::Client>,
     timeouts: GatewayRuntimeTimeouts,
     list_change_gate: Arc<RwLock<()>>,
+    primary_notifier: Option<GatewayPrimaryNotifier>,
 }
 
 impl std::fmt::Debug for GatewayMcpServer {
@@ -714,6 +792,7 @@ impl GatewayMcpServer {
             hook_http_client: build_hardened_http_client().ok(),
             timeouts,
             list_change_gate: Arc::new(RwLock::new(())),
+            primary_notifier: None,
         }
     }
 
@@ -722,6 +801,13 @@ impl GatewayMcpServer {
     #[must_use]
     pub fn with_connection_claim(mut self, claim: GatewayConnectionClaim) -> Self {
         self.claim = Some(claim);
+        self.list_change_gate = Arc::new(RwLock::new(()));
+        self
+    }
+
+    #[must_use]
+    pub fn with_primary_notifier(mut self, notifier: GatewayPrimaryNotifier) -> Self {
+        self.primary_notifier = Some(notifier);
         self
     }
 
@@ -834,14 +920,42 @@ impl GatewayMcpServer {
             WorkflowControl::UnpinWorkflowEnterMode => {
                 let request: WorkflowTransitionRequest = serde_json::from_value(arguments.clone())
                     .map_err(|_| McpError::invalid_params("invalid workflow transition", None))?;
-                let result = tokio::task::spawn_blocking(move || {
-                    gateway.enter_workflow_mode_for_connection(&claim, request)
+                let support = if self
+                    .primary_notifier
+                    .as_ref()
+                    .is_some_and(GatewayPrimaryNotifier::is_ready)
+                {
+                    ListChangeSupport::Negotiated
+                } else {
+                    ListChangeSupport::Unsupported
+                };
+                let transition_claim = claim.clone();
+                let (result, outcome) = tokio::task::spawn_blocking(move || {
+                    gateway.enter_workflow_mode_for_connection(&claim, request, support, now_unix)
                 })
                 .await
                 .map_err(|_| internal_error())?
                 .map_err(gateway_request_error)?;
-                let result = serde_json::to_value(result).map_err(|_| internal_error())?;
-                Ok(CallToolResult::structured(result))
+                if outcome == GatewayRefreshOutcome::NotificationRequired {
+                    let primary = match self.gateway.primary_connection_claim() {
+                        Ok(Some(primary)) => primary,
+                        Ok(None) | Err(_) => {
+                            self.cancel_transition_after_notification_failure(
+                                &transition_claim,
+                                &result.operation_id,
+                                now_unix,
+                            )
+                            .await?;
+                            return Err(internal_error());
+                        }
+                    };
+                    self.notify_primary_for_transition(&primary, &result.operation_id, now_unix)
+                        .await?;
+                }
+                Ok(CallToolResult::structured(json!({
+                    "transition": result,
+                    "refreshOutcome": outcome,
+                })))
             }
             WorkflowControl::UnpinWorkflowCancelTransition => {
                 let object = compact_arguments(arguments, &["operationId"])?;
@@ -861,6 +975,95 @@ impl GatewayMcpServer {
                 Ok(CallToolResult::structured(status))
             }
         }
+    }
+
+    async fn notify_primary_for_transition(
+        &self,
+        primary: &GatewayConnectionClaim,
+        operation_id: &str,
+        now_unix: i64,
+    ) -> Result<(), McpError> {
+        let Some(notifier) = self.primary_notifier.as_ref() else {
+            return self
+                .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
+                .await;
+        };
+        let Some(gate) = notifier.gate_for(primary) else {
+            return self
+                .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
+                .await;
+        };
+        let _list_change = gate.write().await;
+        let gateway = Arc::clone(&self.gateway);
+        let validation_claim = primary.clone();
+        let validation = match tokio::task::spawn_blocking(move || {
+            gateway.validate_notified_exposure_for_connection(&validation_claim)
+        })
+        .await
+        {
+            Ok(validation) => validation,
+            Err(_) => {
+                return self
+                    .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
+                    .await;
+            }
+        };
+        if validation.is_err() {
+            return self
+                .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
+                .await;
+        }
+        if notifier.notify_tools_changed().await.is_err() {
+            return self
+                .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
+                .await;
+        }
+        let gateway = Arc::clone(&self.gateway);
+        let durable_claim = primary.clone();
+        let durable = tokio::task::spawn_blocking(move || {
+            gateway.notify_tools_changed_for_connection(&durable_claim, now_unix)
+        })
+        .await;
+        let durable = match durable {
+            Ok(durable) => durable,
+            Err(_) => {
+                return self
+                    .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
+                    .await;
+            }
+        };
+        if durable.is_err() {
+            return self
+                .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
+                .await;
+        }
+        Ok(())
+    }
+
+    async fn cancel_transition_after_notification_failure(
+        &self,
+        claim: &GatewayConnectionClaim,
+        operation_id: &str,
+        now_unix: i64,
+    ) -> Result<(), McpError> {
+        let gateway = Arc::clone(&self.gateway);
+        let claim = claim.clone();
+        let operation_id = operation_id.to_string();
+        let compensation = tokio::task::spawn_blocking(move || {
+            gateway.cancel_transition_for_connection(&claim, &operation_id, now_unix)
+        })
+        .await
+        .map_err(|_| internal_error())?;
+        if compensation.is_err() {
+            return Err(McpError::internal_error(
+                "workflow transition notification and compensation failed",
+                None,
+            ));
+        }
+        Err(McpError::internal_error(
+            "workflow transition notification failed; transition cancelled",
+            None,
+        ))
     }
 
     async fn search_skills(
@@ -1824,11 +2027,18 @@ fn value_matches_type(value: &Value, kind: &str) -> bool {
 
 impl ServerHandler for GatewayMcpServer {
     fn get_info(&self) -> ServerInfo {
+        let mut capabilities = ServerCapabilities::builder().enable_tools();
+        if self.claim.is_none()
+            || (self
+                .claim
+                .as_ref()
+                .is_some_and(GatewayConnectionClaim::is_primary)
+                && self.primary_notifier.is_some())
+        {
+            capabilities = capabilities.enable_tool_list_changed();
+        }
         ServerInfo::new(
-            ServerCapabilities::builder()
-                .enable_tools()
-                .enable_tool_list_changed()
-                .build(),
+            capabilities.build(),
         )
         .with_server_info(Implementation::new("unpin-gateway", env!("CARGO_PKG_VERSION")))
         .with_instructions(
@@ -2126,6 +2336,19 @@ where
         ))
         .await
         .map_err(|_| GatewayRuntimeError::ServerFailed)?;
+    if let Some(claim) = running
+        .service()
+        .claim
+        .as_ref()
+        .filter(|claim| claim.is_primary())
+        && let Some(notifier) = &running.service().primary_notifier
+    {
+        notifier.install(
+            claim,
+            running.peer().clone(),
+            Arc::clone(&running.service().list_change_gate),
+        );
+    }
     running
         .waiting()
         .await
@@ -2147,20 +2370,58 @@ pub async fn notify_list_changed(
     running: &RunningService<RoleServer, GatewayMcpServer>,
 ) -> Result<(), GatewayRuntimeError> {
     let _list_change = running.service().list_change_gate.write().await;
-    running
-        .peer()
-        .notify_tool_list_changed()
-        .await
-        .map_err(|_| GatewayRuntimeError::ServerFailed)?;
+    let now_unix = unix_now()?;
     let gateway = Arc::clone(&running.service().gateway);
     let claim = running.service().claim.clone();
-    tokio::task::spawn_blocking(move || match claim {
-        Some(claim) => gateway.validate_notified_exposure_for_connection(&claim),
-        None => gateway.validate_notified_exposure_is_current(),
+    let preflight_claim = claim.clone();
+    let preflight_gateway = Arc::clone(&gateway);
+    tokio::task::spawn_blocking(move || match preflight_claim {
+        Some(claim) => preflight_gateway.validate_notified_exposure_for_connection(&claim),
+        None => preflight_gateway.validate_notified_exposure_is_current(),
     })
     .await
     .map_err(|_| GatewayRuntimeError::ServerFailed)?
-    .map_err(GatewayRuntimeError::Gateway)
+    .map_err(GatewayRuntimeError::Gateway)?;
+    let notification = running.peer().notify_tool_list_changed().await;
+    if let Err(_error) = notification {
+        if let Some(claim) = claim.as_ref() {
+            let compensation_gateway = Arc::clone(&gateway);
+            let compensation_claim = claim.clone();
+            let compensation = tokio::task::spawn_blocking(move || {
+                compensation_gateway.cancel_refresh_for_connection(&compensation_claim, now_unix)
+            })
+            .await
+            .map_err(|_| GatewayRuntimeError::ServerFailed)?;
+            if let Err(compensation) = compensation {
+                return Err(GatewayRuntimeError::Gateway(compensation));
+            }
+        }
+        return Err(GatewayRuntimeError::ServerFailed);
+    }
+    let post_notification = tokio::task::spawn_blocking(move || match claim {
+        Some(claim) => gateway.notify_tools_changed_for_connection(&claim, now_unix),
+        None => gateway
+            .validate_notified_exposure_is_current()
+            .map(|()| GatewayRefreshOutcome::NotificationSent),
+    })
+    .await
+    .map_err(|_| GatewayRuntimeError::ServerFailed)?;
+    if let Err(error) = post_notification {
+        if let Some(claim) = running.service().claim.as_ref() {
+            let compensation_gateway = Arc::clone(&running.service().gateway);
+            let compensation_claim = claim.clone();
+            let compensation = tokio::task::spawn_blocking(move || {
+                compensation_gateway.cancel_refresh_for_connection(&compensation_claim, now_unix)
+            })
+            .await
+            .map_err(|_| GatewayRuntimeError::ServerFailed)?;
+            if let Err(compensation) = compensation {
+                return Err(GatewayRuntimeError::Gateway(compensation));
+            }
+        }
+        return Err(GatewayRuntimeError::Gateway(error));
+    }
+    Ok(())
 }
 
 fn control_tools() -> Result<Vec<Tool>, McpError> {
@@ -2218,14 +2479,21 @@ fn workflow_control_tools() -> Result<Vec<Tool>, McpError> {
                     "inputSchema": {"type": "object", "additionalProperties": false},
                     "annotations": {"readOnlyHint": true, "openWorldHint": false}
                 }),
-                WorkflowControl::UnpinWorkflowEnterMode => json!({
-                    "name": control.name(),
-                    "description": "Enter a previously pinned workflow mode.",
-                    "inputSchema": {
-                        "type": "object",
-                        "required": ["operationId", "operationFingerprint", "sourceStateSequence", "targetMode", "targetExposure", "requestedAtUnix"],
-                        "additionalProperties": false
+            WorkflowControl::UnpinWorkflowEnterMode => json!({
+                "name": control.name(),
+                "description": "Enter a previously pinned workflow mode.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["operationId", "operationFingerprint", "sourceStateSequence", "targetMode", "requestedAtUnix"],
+                    "properties": {
+                        "operationId": {"type": "string"},
+                        "operationFingerprint": {"type": "string"},
+                        "sourceStateSequence": {"type": "integer", "minimum": 0},
+                        "targetMode": {"type": "string"},
+                        "requestedAtUnix": {"type": "integer"}
                     },
+                    "additionalProperties": false
+                },
                     "annotations": {"readOnlyHint": false, "openWorldHint": false}
                 }),
                 WorkflowControl::UnpinWorkflowCancelTransition => json!({

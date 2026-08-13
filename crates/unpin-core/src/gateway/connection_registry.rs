@@ -129,18 +129,13 @@ struct RegistryState {
 #[derive(Debug)]
 pub struct GatewayConnectionRegistry {
     control: Arc<GatewayControlPlane>,
-    initial_exposure: Arc<GatewayExposure>,
     state: Mutex<RegistryState>,
 }
 
 impl GatewayConnectionRegistry {
-    pub(crate) fn new(
-        control: Arc<GatewayControlPlane>,
-        initial_exposure: Arc<GatewayExposure>,
-    ) -> Self {
+    pub(crate) fn new(control: Arc<GatewayControlPlane>) -> Self {
         Self {
             control,
-            initial_exposure,
             state: Mutex::new(RegistryState {
                 next_epoch: 1,
                 ..RegistryState::default()
@@ -154,7 +149,10 @@ impl GatewayConnectionRegistry {
     /// the caller. They are derived from the authenticated lease and registry
     /// state; the first live connection is primary and all later connections
     /// are auxiliary until the primary disconnects.
-    pub fn issue_claim(&self) -> Result<GatewayConnectionClaim, GatewayError> {
+    pub(crate) fn issue_claim_with_exposure(
+        &self,
+        observed: Arc<GatewayExposure>,
+    ) -> Result<GatewayConnectionClaim, GatewayError> {
         let snapshot = self.control.snapshot()?;
         if snapshot.lease.lifecycle != LeaseLifecycle::Active {
             return Err(GatewayError::ConnectionClaimInvalid);
@@ -188,7 +186,7 @@ impl GatewayConnectionRegistry {
             epoch,
             ConnectionState {
                 claim: claim.clone(),
-                observed: Arc::clone(&self.initial_exposure),
+                observed,
                 pending: None,
                 observation_sequence: 0,
             },
@@ -197,11 +195,6 @@ impl GatewayConnectionRegistry {
             state.primary_epoch = Some(epoch);
         }
         Ok(claim)
-    }
-
-    /// Alias used by transport adapters when accepting a new connection.
-    pub fn accept_connection(&self) -> Result<GatewayConnectionClaim, GatewayError> {
-        self.issue_claim()
     }
 
     pub(crate) fn primary_claim(&self) -> Result<Option<GatewayConnectionClaim>, GatewayError> {

@@ -11,7 +11,10 @@ use crate::{
         HookActionOutcome, HookAfterResult, HookBeforeResult, HookHandler, HookPolicy,
         HookPolicyLimits, HookRewriteAuthorization, HookRouteOwner,
     },
-    profiles::{COMPILED_PROFILE_SCHEMA_VERSION, CapabilityLockState, CompiledProfileRevision},
+    profiles::{
+        COMPILED_PROFILE_SCHEMA_VERSION, CapabilityLockState, CompiledProfileMember,
+        CompiledProfileRevision,
+    },
     providers::ProviderId,
     sessions::{
         LiveExposureStatus, PinnedExposure, PinnedProfile, WorkflowTransitionRequest,
@@ -126,6 +129,61 @@ pub struct GatewayHookRegistration {
 }
 
 impl GatewayExposure {
+    pub fn compile_workflow_profile(
+        pinned: PinnedExposure,
+        provider: ProviderId,
+        catalog: &Catalog,
+        profile: &crate::workflows::CompiledWorkflowProfileRevision,
+        registrations: Vec<UpstreamToolRegistration>,
+        limits: GatewayLimits,
+    ) -> Result<Self, GatewayError> {
+        Self::compile_workflow_profile_with_hooks(
+            pinned,
+            provider,
+            catalog,
+            profile,
+            registrations,
+            Vec::new(),
+            limits,
+        )
+    }
+
+    pub fn compile_workflow_profile_with_hooks(
+        pinned: PinnedExposure,
+        provider: ProviderId,
+        catalog: &Catalog,
+        profile: &crate::workflows::CompiledWorkflowProfileRevision,
+        registrations: Vec<UpstreamToolRegistration>,
+        hook_registrations: Vec<GatewayHookRegistration>,
+        limits: GatewayLimits,
+    ) -> Result<Self, GatewayError> {
+        limits.validate()?;
+        pinned
+            .validate()
+            .map_err(|_| GatewayError::InvalidExposure("pinned exposure is invalid"))?;
+        profile
+            .verify_digest()
+            .map_err(|_| GatewayError::InvalidExposure("compiled workflow profile is invalid"))?;
+        if pinned.revision != profile.digest
+            || pinned.profile.digest() != Some(profile.digest.as_str())
+        {
+            return Err(GatewayError::InvalidExposure(
+                "compiled workflow profile does not match pinned exposure",
+            ));
+        }
+        validate_workflow_profile_pin(&pinned.profile, profile)?;
+        Self::compile_members(
+            pinned,
+            provider,
+            catalog,
+            Some(profile.digest.as_str()),
+            Some(&profile.members),
+            registrations,
+            hook_registrations,
+            limits,
+        )
+    }
+
     pub fn compile(
         pinned: PinnedExposure,
         provider: ProviderId,
@@ -160,11 +218,39 @@ impl GatewayExposure {
             .map_err(|_| GatewayError::InvalidExposure("pinned exposure is invalid"))?;
 
         let profile = profile_for_pin(&pinned.profile, profile)?;
-        let mut member_ids = BTreeSet::new();
-        let mut profile_members = BTreeMap::new();
         if let Some(profile) = profile {
             validate_profile_pin(&pinned.profile, profile)?;
-            for member in profile.members_for_provider(provider) {
+        }
+        Self::compile_members(
+            pinned,
+            provider,
+            catalog,
+            profile.map(|profile| profile.digest.as_str()),
+            profile.map(|profile| profile.members.as_slice()),
+            registrations,
+            hook_registrations,
+            limits,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compile_members(
+        pinned: PinnedExposure,
+        provider: ProviderId,
+        catalog: &Catalog,
+        profile_digest: Option<&str>,
+        members: Option<&[CompiledProfileMember]>,
+        registrations: Vec<UpstreamToolRegistration>,
+        hook_registrations: Vec<GatewayHookRegistration>,
+        limits: GatewayLimits,
+    ) -> Result<Self, GatewayError> {
+        let mut member_ids = BTreeSet::new();
+        let mut profile_members = BTreeMap::new();
+        if let Some(members) = members {
+            for member in members
+                .iter()
+                .filter(|member| member.providers.contains(&provider))
+            {
                 if !member_ids.insert(member.capability_id.clone()) {
                     return Err(GatewayError::InvalidExposure(
                         "compiled profile contains duplicate members",
@@ -204,7 +290,7 @@ impl GatewayExposure {
             }
         }
 
-        if profile.is_none() && member_ids.is_empty() {
+        if profile_digest.is_none() && member_ids.is_empty() {
             if !registrations.is_empty() || !hook_registrations.is_empty() {
                 return Err(GatewayError::InvalidExposure(
                     "native or empty exposure cannot project gateway capabilities",
@@ -337,8 +423,8 @@ impl GatewayExposure {
         )?;
         let hooks = HookPolicy::compile(
             provider,
-            profile
-                .map(|profile| profile.digest.clone())
+            profile_digest
+                .map(ToOwned::to_owned)
                 .or_else(|| {
                     pinned
                         .capability_locks
@@ -358,7 +444,7 @@ impl GatewayExposure {
         Ok(Self {
             pinned,
             provider,
-            profile_digest: profile.map(|profile| profile.digest.clone()),
+            profile_digest: profile_digest.map(ToOwned::to_owned),
             skills,
             tools,
             hooks: Arc::new(hooks),
@@ -446,6 +532,33 @@ fn validate_profile_pin(
     }
 }
 
+fn validate_workflow_profile_pin(
+    pin: &PinnedProfile,
+    profile: &crate::workflows::CompiledWorkflowProfileRevision,
+) -> Result<(), GatewayError> {
+    let PinnedProfile::Profile {
+        profile_id,
+        profile_digest,
+        origin_scope,
+        definition_digest,
+    } = pin
+    else {
+        return Err(GatewayError::InvalidExposure(
+            "workflow exposure requires a pinned profile",
+        ));
+    };
+    if profile_id != &profile.profile_id
+        || profile_digest != &profile.digest
+        || *origin_scope != crate::profiles::ProfileSourceScope::Session
+        || definition_digest.is_empty()
+    {
+        return Err(GatewayError::InvalidExposure(
+            "compiled workflow profile does not match pinned revision",
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ListChangeSupport {
     Negotiated,
@@ -457,8 +570,10 @@ pub enum ListChangeSupport {
     NextSessionOnly,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum GatewayRefreshOutcome {
+    Unchanged,
     NotificationRequired,
     NotificationSent,
     RefreshUnconfirmed,
@@ -470,6 +585,7 @@ pub enum GatewayRefreshOutcome {
 pub struct GatewayService {
     control: Arc<GatewayControlPlane>,
     data_plane: GatewayDataPlane,
+    exposures: Mutex<BTreeMap<String, Arc<GatewayExposure>>>,
     connections: GatewayConnectionRegistry,
     pending: Mutex<Option<Arc<GatewayExposure>>>,
     limits: GatewayLimits,
@@ -492,12 +608,16 @@ impl GatewayService {
         }
         let control = Arc::new(control);
         let initial_exposure = Arc::new(initial_exposure);
-        let connections =
-            GatewayConnectionRegistry::new(Arc::clone(&control), Arc::clone(&initial_exposure));
+        let exposures = BTreeMap::from([(
+            initial_exposure.pinned().revision.clone(),
+            Arc::clone(&initial_exposure),
+        )]);
+        let connections = GatewayConnectionRegistry::new(Arc::clone(&control));
         let data_plane = GatewayDataPlane::new(Arc::clone(&control), initial_exposure, limits);
         Ok(Self {
             control,
             data_plane,
+            exposures: Mutex::new(exposures),
             connections,
             pending: Mutex::new(None),
             limits,
@@ -546,7 +666,17 @@ impl GatewayService {
     /// connection. Transport adapters must retain and pass this opaque value
     /// to every claim-aware gateway operation.
     pub fn issue_connection_claim(&self) -> Result<GatewayConnectionClaim, GatewayError> {
-        self.connections.issue_claim()
+        let snapshot = self.control.snapshot()?;
+        let exposure = self
+            .exposures
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?
+            .get(&snapshot.lease.observed_exposure.revision)
+            .cloned()
+            .ok_or(GatewayError::InvalidExposure(
+                "observed workflow exposure is unavailable",
+            ))?;
+        self.connections.issue_claim_with_exposure(exposure)
     }
 
     /// Alias used by transport adapters at connection-accept time.
@@ -560,6 +690,75 @@ impl GatewayService {
         claim: &GatewayConnectionClaim,
     ) -> Result<GatewayConnectionStatus, GatewayError> {
         self.connections.status(claim)
+    }
+
+    pub fn primary_connection_claim(&self) -> Result<Option<GatewayConnectionClaim>, GatewayError> {
+        self.connections.primary_claim()
+    }
+
+    /// Register one immutable workflow-mode exposure before accepting live
+    /// transition requests. Re-registering identical bytes is idempotent;
+    /// revision collisions fail closed.
+    pub fn register_workflow_exposure(
+        &self,
+        exposure: GatewayExposure,
+    ) -> Result<(), GatewayError> {
+        let snapshot = self.control.snapshot()?;
+        if snapshot.lease.provider != exposure.provider {
+            return Err(GatewayError::InvalidExposure(
+                "workflow exposure provider does not match session",
+            ));
+        }
+        let workflow = snapshot
+            .lease
+            .workflow
+            .as_deref()
+            .ok_or(GatewayError::InvalidExposure(
+                "workflow exposure requires a pinned workflow",
+            ))?;
+        let revision = exposure.pinned().revision.clone();
+        let mode = workflow
+            .profile_revisions
+            .iter()
+            .find_map(|(mode, profile_revision)| (profile_revision == &revision).then_some(mode));
+        let PinnedProfile::Profile {
+            profile_id,
+            profile_digest,
+            origin_scope,
+            definition_digest,
+        } = &exposure.pinned().profile
+        else {
+            return Err(GatewayError::InvalidExposure(
+                "workflow exposure requires a pinned profile",
+            ));
+        };
+        if mode.is_none_or(|mode| profile_id != &format!("{}.{mode}", workflow.workflow_id))
+            || profile_digest != &revision
+            || *origin_scope != crate::profiles::ProfileSourceScope::Session
+            || definition_digest != &workflow.workflow_revision
+        {
+            return Err(GatewayError::InvalidExposure(
+                "workflow exposure is outside the pinned envelope",
+            ));
+        }
+        let exposure = Arc::new(exposure);
+        let mut exposures = self
+            .exposures
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?;
+        if let Some(existing) = exposures.get(&revision) {
+            if existing.pinned() == exposure.pinned()
+                && existing.provider() == exposure.provider()
+                && existing.profile_digest() == exposure.profile_digest()
+            {
+                return Ok(());
+            }
+            return Err(GatewayError::InvalidExposure(
+                "workflow exposure revision collision",
+            ));
+        }
+        exposures.insert(revision, exposure);
+        Ok(())
     }
 
     #[must_use]
@@ -827,11 +1026,15 @@ impl GatewayService {
         operation_id: &str,
         now_unix: i64,
     ) -> Result<GatewayConnectionStatus, GatewayError> {
-        self.connections.require_primary(claim)?;
+        self.connections.status(claim)?;
+        let primary = self
+            .connections
+            .primary_claim()?
+            .ok_or(GatewayError::ConnectionClaimInvalid)?;
         self.control
             .cancel_workflow_transition(operation_id, now_unix)?;
-        self.connections.clear_pending(claim)?;
-        self.connections.status(claim)
+        self.connections.clear_pending(&primary)?;
+        self.connections.status(&primary)
     }
 
     /// Route a typed workflow transition through the authenticated primary
@@ -841,9 +1044,101 @@ impl GatewayService {
         &self,
         claim: &GatewayConnectionClaim,
         request: WorkflowTransitionRequest,
-    ) -> Result<WorkflowTransitionResult, GatewayError> {
+        support: ListChangeSupport,
+        now_unix: i64,
+    ) -> Result<(WorkflowTransitionResult, GatewayRefreshOutcome), GatewayError> {
+        self.connections.status(claim)?;
+        let primary = self
+            .connections
+            .primary_claim()?
+            .ok_or(GatewayError::ConnectionClaimInvalid)?;
+        let snapshot = self.control.snapshot()?;
+        let workflow = snapshot
+            .lease
+            .workflow
+            .as_deref()
+            .ok_or_else(|| GatewayError::Workflow("workflow is not pinned".to_string()))?;
+        let revision = workflow
+            .profile_revisions
+            .get(&request.target_mode)
+            .ok_or_else(|| {
+                GatewayError::Workflow(
+                    "workflow envelope expansion requires operator review".to_string(),
+                )
+            })?;
+        let exposure = self
+            .exposures
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?
+            .get(revision)
+            .cloned()
+            .ok_or(GatewayError::InvalidExposure(
+                "workflow mode exposure is unavailable",
+            ))?;
+        let result = self.control.enter_workflow_mode(request)?;
+        if result.lifecycle == crate::sessions::WorkflowOperationLifecycle::Observed {
+            return Ok((result, GatewayRefreshOutcome::Unchanged));
+        }
+        let outcome =
+            self.stage_registered_refresh_for_connection(&primary, exposure, support, now_unix);
+        match outcome {
+            Ok(outcome) => Ok((result, outcome)),
+            Err(error) => {
+                match self.cancel_transition_for_connection(claim, &result.operation_id, now_unix) {
+                    Ok(_) => Err(error),
+                    Err(cancel_error) => Err(GatewayError::Workflow(format!(
+                        "workflow refresh staging failed: {error}; compensation failed: {cancel_error}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    fn stage_registered_refresh_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+        exposure: Arc<GatewayExposure>,
+        support: ListChangeSupport,
+        now_unix: i64,
+    ) -> Result<GatewayRefreshOutcome, GatewayError> {
         self.connections.require_primary(claim)?;
-        self.control.enter_workflow_mode(request)
+        let snapshot = self.control.snapshot()?;
+        if snapshot.lease.provider != exposure.provider
+            || snapshot.lease.desired_exposure != exposure.pinned
+        {
+            return Err(GatewayError::InvalidExposure(
+                "refresh exposure does not match desired lease state",
+            ));
+        }
+        match support {
+            ListChangeSupport::NextSessionOnly => {
+                self.connections.clear_pending(claim)?;
+                self.control
+                    .observe_exposure(LiveExposureStatus::NextSessionOnly, now_unix)?;
+                Ok(GatewayRefreshOutcome::NextSessionOnly)
+            }
+            ListChangeSupport::Unsupported => {
+                self.connections.stage_pending(claim, exposure)?;
+                if let Err(error) = self
+                    .control
+                    .observe_exposure(LiveExposureStatus::ReloadRequired, now_unix)
+                {
+                    let _ = self.connections.clear_pending(claim);
+                    return Err(error);
+                }
+                Ok(GatewayRefreshOutcome::ReloadRequired)
+            }
+            ListChangeSupport::NotificationOnly => {
+                self.connections.stage_pending(claim, exposure)?;
+                self.control
+                    .observe_exposure(LiveExposureStatus::NotificationSent, now_unix)?;
+                Ok(GatewayRefreshOutcome::RefreshUnconfirmed)
+            }
+            ListChangeSupport::Negotiated => {
+                self.connections.stage_pending(claim, exposure)?;
+                Ok(GatewayRefreshOutcome::NotificationRequired)
+            }
+        }
     }
 
     pub fn complete_before_hooks_for_connection(

@@ -11,6 +11,9 @@ use std::{
 };
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
+use rmcp::{ServiceExt, model::CallToolRequestParams};
+
 use unpin_core::{
     approval::ControlApprovalContext,
     catalog::{Catalog, adoption::authenticated_adopted_skill_catalog_for_capabilities},
@@ -26,10 +29,12 @@ use unpin_core::{
     sessions::{
         BootstrapRequest, ClaimedSession, CoverageLevel, GatewayModeTarget,
         GatewayNativeViewController, IsolationLevel, LeaseError, LeaseLifecycle, PinnedExposure,
-        PinnedProfile, SESSION_OVERLAY_MARKER, SessionAuthorityKey, SessionHandle, SessionManager,
-        capture_process_evidence, gateway_mode_resource_id,
+        PinnedProfile, PinnedWorkflowEnvelope, SESSION_OVERLAY_MARKER, SessionAuthorityKey,
+        SessionHandle, SessionManager, WORKFLOW_PROPOSAL_SCHEMA_VERSION, WorkflowReloadLimitation,
+        capture_process_evidence, gateway_mode_resource_id, resolved_mode_exposure,
     },
     state::atomic_json::{AtomicJsonStore, OwnerGeneration},
+    workflows::WorkflowStore,
 };
 
 use crate::gateway_session::GatewaySessionRuntime;
@@ -50,11 +55,75 @@ pub struct SessionLaunchRequest {
     pub workspace_revision: Option<String>,
     pub provider: ProviderId,
     pub exposure: PinnedExposure,
+    /// Explicitly reviewed workflow launch handoff. Workflow proposals are
+    /// metadata-only; this field is the confirmation boundary that permits
+    /// pinning one to the established session.
+    pub workflow: Option<WorkflowLaunchRequest>,
     pub bridge_socket: Option<PathBuf>,
     pub command: Vec<OsString>,
     pub authority_key: SessionAuthorityKey,
     pub backup_authentication_key: BackupAuthenticationKey,
     pub fixture_mode: bool,
+}
+
+/// Authenticated session metadata made available once the lease, private
+/// overlay, and optional gateway are ready, but before the child command is
+/// released. Desktop callers can use this handoff to publish the established
+/// session while the launch worker continues waiting for the child to exit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SessionEstablished {
+    pub session_id: String,
+    pub provider: ProviderId,
+    pub repository_key: String,
+    pub workspace_key: String,
+    pub overlay_root: PathBuf,
+    pub gateway_socket: Option<PathBuf>,
+    pub workflow: Option<PinnedWorkflowEnvelope>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkflowLaunchRequest {
+    pub workflow_id: String,
+    pub workflow_revision: String,
+    pub entry_mode: String,
+    pub catalog_revision: String,
+    pub proposal_id: String,
+    pub proposal_fingerprint: String,
+    pub prompt_digest: String,
+    pub capability_count: usize,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedWorkflowLaunch {
+    revision: unpin_core::workflows::CompiledWorkflowRevision,
+    request: WorkflowLaunchRequest,
+}
+
+impl PreparedWorkflowLaunch {
+    fn envelope(&self, state_sequence: u64) -> PinnedWorkflowEnvelope {
+        let entry = &self.revision.effective_profiles[&self.request.entry_mode];
+        PinnedWorkflowEnvelope {
+            workflow_id: self.request.workflow_id.clone(),
+            workflow_revision: self.revision.digest.clone(),
+            baseline_profile_id: self.revision.baseline_profile_id.clone(),
+            baseline_profile_digest: self.revision.baseline_profile_digest.clone(),
+            profile_revisions: self
+                .revision
+                .effective_profiles
+                .iter()
+                .map(|(mode, profile)| (mode.clone(), profile.digest.clone()))
+                .collect(),
+            active_mode: self.request.entry_mode.clone(),
+            active_effective_profile_digest: entry.digest.clone(),
+            maximum_envelope_digest: self.revision.maximum_envelope.digest.clone(),
+            capability_lock_digest: self.revision.capability_lock_digest.clone(),
+            catalog_revision: self.request.catalog_revision.clone(),
+            proposal_id: self.request.proposal_id.clone(),
+            proposal_fingerprint: self.request.proposal_fingerprint.clone(),
+            state_sequence,
+            sealed_generation: 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -241,15 +310,29 @@ impl SessionLaunchResult {
     }
 }
 
-pub fn launch(
+pub fn launch(request: SessionLaunchRequest) -> Result<SessionLaunchResult, SessionProcessError> {
+    launch_with_established_callback(request, |_| {})
+}
+
+/// Launch a session and invoke `on_established` after authenticated bootstrap
+/// succeeds, before the child command is released. The callback receives
+/// owned metadata so a desktop caller can hand it to another worker without
+/// borrowing the launch stack. It is a notification only; returning from it
+/// hands control back to the same blocking launch lifecycle used by [`launch`].
+pub(crate) fn launch_with_established_callback<F>(
     mut request: SessionLaunchRequest,
-) -> Result<SessionLaunchResult, SessionProcessError> {
+    on_established: F,
+) -> Result<SessionLaunchResult, SessionProcessError>
+where
+    F: FnOnce(SessionEstablished),
+{
     if request.command.is_empty() {
         return Err(SessionProcessError::MissingCommand);
     }
     if requires_verified_provider_overlay(&request.exposure.profile) && !request.fixture_mode {
         return Err(SessionProcessError::ProviderOverlayUnavailable);
     }
+    let workflow = prepare_workflow_launch(&mut request)?;
     request.bridge_socket = request
         .bridge_socket
         .as_deref()
@@ -265,7 +348,15 @@ pub fn launch(
         &request.command,
         request.fixture_mode,
     )?;
-    let result = establish_and_wait(&manager, &request, &control_path, &mut child, now_unix);
+    let result = establish_and_wait(
+        &manager,
+        &request,
+        workflow.as_ref(),
+        on_established,
+        &control_path,
+        &mut child,
+        now_unix,
+    );
     if result.is_err() {
         let _ = child.kill();
         let _ = child.wait();
@@ -274,8 +365,327 @@ pub fn launch(
     result
 }
 
+fn prepare_workflow_launch(
+    request: &mut SessionLaunchRequest,
+) -> Result<Option<PreparedWorkflowLaunch>, SessionProcessError> {
+    let Some(workflow_request) = request.workflow.clone() else {
+        return Ok(None);
+    };
+    let revision = WorkflowStore::new(&request.app_state_root)
+        .load_revision(&workflow_request.workflow_revision)
+        .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?
+        .ok_or_else(|| {
+            SessionProcessError::WorkflowLaunch("workflow-revision-unavailable".to_string())
+        })?;
+    if revision.workflow_id != workflow_request.workflow_id {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-id-mismatch".to_string(),
+        ));
+    }
+    if revision.entry_mode != workflow_request.entry_mode {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-entry-mode-mismatch".to_string(),
+        ));
+    }
+    if revision.provider != request.provider {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-provider-mismatch".to_string(),
+        ));
+    }
+    let discovery = discover_all(&request.discovery_roots)
+        .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?;
+    let catalog = Catalog::from_discovery(&discovery)
+        .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?;
+    let catalog_revision = unpin_core::sha256_digest(
+        &serde_json::to_vec(&catalog)
+            .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?,
+    );
+    if catalog_revision != workflow_request.catalog_revision {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-catalog-revision-stale".to_string(),
+        ));
+    }
+    for (capability_id, fingerprint) in &revision.catalog_fingerprints {
+        let Some(record) = catalog.get(capability_id) else {
+            return Err(SessionProcessError::WorkflowLaunch(
+                "workflow-catalog-capability-missing".to_string(),
+            ));
+        };
+        if record.fingerprint != *fingerprint || !record.supports_provider(request.provider) {
+            return Err(SessionProcessError::WorkflowLaunch(
+                "workflow-catalog-capability-stale".to_string(),
+            ));
+        }
+    }
+    let locks = request.exposure.capability_locks.as_ref().ok_or_else(|| {
+        SessionProcessError::WorkflowLaunch("workflow-capability-locks-missing".to_string())
+    })?;
+    locks
+        .verify()
+        .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?;
+    if locks.provider != request.provider {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-capability-lock-provider-mismatch".to_string(),
+        ));
+    }
+    if locks.digest != revision.capability_lock_digest {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-capability-lock-revision-stale".to_string(),
+        ));
+    }
+    verify_workflow_proposal(request, &workflow_request, &revision)?;
+    let entry = revision
+        .effective_profiles
+        .get(&workflow_request.entry_mode)
+        .ok_or_else(|| {
+            SessionProcessError::WorkflowLaunch("workflow-entry-profile-missing".to_string())
+        })?;
+    let expected_profile = PinnedProfile::Profile {
+        profile_id: entry.profile_id.clone(),
+        profile_digest: entry.digest.clone(),
+        origin_scope: unpin_core::profiles::ProfileSourceScope::Session,
+        definition_digest: revision.digest.clone(),
+    };
+    if !matches!(&request.exposure.profile, PinnedProfile::None)
+        && request.exposure.profile != expected_profile
+    {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-entry-profile-mismatch".to_string(),
+        ));
+    }
+    if request.exposure.revision != entry.digest {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-entry-exposure-mismatch".to_string(),
+        ));
+    }
+    request.exposure = PinnedExposure {
+        revision: entry.digest.clone(),
+        profile: expected_profile,
+        capability_locks: request.exposure.capability_locks.clone(),
+    };
+    Ok(Some(PreparedWorkflowLaunch {
+        revision,
+        request: workflow_request,
+    }))
+}
+
+fn verify_workflow_proposal(
+    request: &SessionLaunchRequest,
+    proposal: &WorkflowLaunchRequest,
+    revision: &unpin_core::workflows::CompiledWorkflowRevision,
+) -> Result<(), SessionProcessError> {
+    if proposal.catalog_revision.is_empty()
+        || proposal.prompt_digest.len() != 64
+        || !proposal
+            .prompt_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-proposal-invalid".to_string(),
+        ));
+    }
+    if proposal.capability_count != revision.maximum_envelope.authored_member_count {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-proposal-capability-count-mismatch".to_string(),
+        ));
+    }
+    let proposal_id_material = serde_json::to_vec(&(
+        &proposal.workflow_id,
+        &proposal.entry_mode,
+        request.provider,
+        &request.repository_key,
+        &request.workspace_key,
+        &proposal.catalog_revision,
+        &proposal.workflow_revision,
+        &proposal.prompt_digest,
+    ))
+    .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?;
+    let expected_proposal_id = format!(
+        "workflow-proposal-{}",
+        &workflow_domain_digest(b"unpin.workflow.proposal-id.v1", &proposal_id_material)[..24]
+    );
+    if proposal.proposal_id != expected_proposal_id {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-proposal-id-mismatch".to_string(),
+        ));
+    }
+    let fingerprint_material = serde_json::to_vec(&(
+        WORKFLOW_PROPOSAL_SCHEMA_VERSION,
+        &proposal.proposal_id,
+        &proposal.workflow_id,
+        &proposal.entry_mode,
+        request.provider,
+        &request.repository_key,
+        &request.workspace_key,
+        &proposal.catalog_revision,
+        &proposal.workflow_revision,
+        &proposal.prompt_digest,
+        proposal.capability_count,
+        true,
+        WorkflowReloadLimitation::LiveRefreshExpected,
+    ))
+    .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?;
+    let expected_fingerprint =
+        workflow_domain_digest(b"unpin.workflow.proposal.v1", &fingerprint_material);
+    if proposal.proposal_fingerprint != expected_fingerprint {
+        return Err(SessionProcessError::WorkflowLaunch(
+            "workflow-proposal-fingerprint-mismatch".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+fn workflow_domain_digest(domain: &[u8], bytes: &[u8]) -> String {
+    let mut material = Vec::with_capacity(16 + domain.len() + bytes.len());
+    material.extend((domain.len() as u64).to_be_bytes());
+    material.extend(domain);
+    material.extend((bytes.len() as u64).to_be_bytes());
+    material.extend(bytes);
+    unpin_core::sha256_digest(&material)
+}
+
 pub(crate) fn preflight_bridge_socket(path: Option<&Path>) -> Result<(), SessionProcessError> {
     path.map(verified_bridge_socket).transpose().map(|_| ())
+}
+
+/// Resolve the private gateway socket published for an established session.
+///
+/// The overlay is created by the authenticated session launcher and is kept
+/// private to the app-state root. The returned socket is still authenticated
+/// by the gateway when a client connects: the transport receives a
+/// server-issued connection claim and auxiliary clients are limited to the
+/// typed workflow control surface.
+pub(crate) fn gateway_socket_for_session(
+    app_state_root: &Path,
+    session_id: &str,
+) -> Result<PathBuf, SessionProcessError> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let overlay_root = get_session_overlay_root(app_state_root, session_id);
+    let overlay_metadata = fs::symlink_metadata(&overlay_root)
+        .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+    if overlay_metadata.file_type().is_symlink() || !overlay_metadata.is_dir() {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let marker_path = overlay_root.join(SESSION_OVERLAY_MARKER);
+    let marker_metadata = fs::symlink_metadata(&marker_path)
+        .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+    if marker_metadata.file_type().is_symlink() || !marker_metadata.is_file() {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let marker: serde_json::Value = serde_json::from_slice(
+        &fs::read(&marker_path).map_err(|_| SessionProcessError::GatewayControlUnavailable)?,
+    )
+    .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+    if marker.get("version").and_then(serde_json::Value::as_u64) != Some(1)
+        || marker.get("sessionId").and_then(serde_json::Value::as_str) != Some(session_id)
+    {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let gateway_path = overlay_root.join("gateway-session.json");
+    let gateway_metadata = fs::symlink_metadata(&gateway_path)
+        .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+    if gateway_metadata.file_type().is_symlink() || !gateway_metadata.is_file() {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let gateway: serde_json::Value = serde_json::from_slice(
+        &fs::read(&gateway_path).map_err(|_| SessionProcessError::GatewayControlUnavailable)?,
+    )
+    .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+    if gateway.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let socket = gateway
+        .get("socket")
+        .and_then(serde_json::Value::as_str)
+        .filter(|socket| !socket.is_empty())
+        .map(PathBuf::from)
+        .ok_or(SessionProcessError::GatewayControlUnavailable)?;
+    verified_gateway_socket(&socket)
+}
+
+#[cfg(unix)]
+fn verified_gateway_socket(path: &Path) -> Result<PathBuf, SessionProcessError> {
+    use std::os::unix::fs::FileTypeExt;
+
+    if !path.is_absolute() {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    fs::canonicalize(path).map_err(|_| SessionProcessError::GatewayControlUnavailable)
+}
+
+#[cfg(not(unix))]
+fn verified_gateway_socket(_path: &Path) -> Result<PathBuf, SessionProcessError> {
+    Err(SessionProcessError::GatewayControlUnavailable)
+}
+
+/// Call one of the core-declared workflow controls over an authenticated
+/// auxiliary gateway connection. No caller-provided session secret is
+/// accepted: the gateway issues and validates the connection claim.
+#[cfg(unix)]
+pub(crate) fn call_gateway_control(
+    app_state_root: &Path,
+    session_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+) -> Result<serde_json::Value, SessionProcessError> {
+    let socket = gateway_socket_for_session(app_state_root, session_id)?;
+    let object = arguments
+        .as_object()
+        .cloned()
+        .ok_or(SessionProcessError::GatewayControlUnavailable)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+    runtime.block_on(async move {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+        let mut client = ()
+            .serve(stream)
+            .await
+            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+        let response = client
+            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(object))
+            .await
+            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+        let value = serde_json::to_value(response)
+            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+        let _ = client
+            .close_with_timeout(std::time::Duration::from_secs(2))
+            .await;
+        if value
+            .get("isError")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            return Err(SessionProcessError::GatewayControlRejected);
+        }
+        Ok(value.get("structuredContent").cloned().unwrap_or(value))
+    })
+}
+
+#[cfg(not(unix))]
+pub(crate) fn call_gateway_control(
+    _app_state_root: &Path,
+    _session_id: &str,
+    _tool_name: &str,
+    _arguments: serde_json::Value,
+) -> Result<serde_json::Value, SessionProcessError> {
+    Err(SessionProcessError::GatewayControlUnavailable)
 }
 
 fn requires_verified_provider_overlay(profile: &PinnedProfile) -> bool {
@@ -286,25 +696,41 @@ fn build_gateway_service(
     manager: &SessionManager,
     request: &SessionLaunchRequest,
     handle: &SessionHandle,
+    workflow: Option<&PreparedWorkflowLaunch>,
+    pinned_workflow: Option<&PinnedWorkflowEnvelope>,
 ) -> Result<Arc<GatewayService>, SessionProcessError> {
-    let profile = match &request.exposure.profile {
-        PinnedProfile::Profile { profile_digest, .. } => Some(
-            ProfileStore::new(&request.app_state_root)
-                .load_revision(profile_digest)
-                .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?
-                .ok_or_else(|| {
-                    SessionProcessError::GatewayPreparation(
-                        "compiled profile revision is unavailable".to_string(),
-                    )
-                })?,
-        ),
-        PinnedProfile::Native | PinnedProfile::None => None,
+    let profile = if workflow.is_some() {
+        None
+    } else {
+        match &request.exposure.profile {
+            PinnedProfile::Profile { profile_digest, .. } => Some(
+                ProfileStore::new(&request.app_state_root)
+                    .load_revision(profile_digest)
+                    .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?
+                    .ok_or_else(|| {
+                        SessionProcessError::GatewayPreparation(
+                            "compiled profile revision is unavailable".to_string(),
+                        )
+                    })?,
+            ),
+            PinnedProfile::Native | PinnedProfile::None => None,
+        }
     };
-    let mut capability_ids = profile
-        .iter()
-        .flat_map(|profile| profile.members_for_provider(request.provider))
-        .map(|member| member.capability_id.clone())
-        .collect::<BTreeSet<_>>();
+    let mut capability_ids = if let Some(workflow) = workflow {
+        workflow
+            .revision
+            .maximum_envelope
+            .members
+            .iter()
+            .map(|member| member.capability_id.clone())
+            .collect::<BTreeSet<_>>()
+    } else {
+        profile
+            .iter()
+            .flat_map(|profile| profile.members_for_provider(request.provider))
+            .map(|member| member.capability_id.clone())
+            .collect::<BTreeSet<_>>()
+    };
     if let Some(locks) = &request.exposure.capability_locks {
         for (capability_id, state) in &locks.entries {
             match state {
@@ -317,7 +743,25 @@ fn build_gateway_service(
             }
         }
     }
-    let catalog = if capability_ids.is_empty() {
+    let catalog = if workflow.is_some() && request.fixture_mode {
+        let discovery = discover_all(&request.discovery_roots)
+            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+        let catalog = Catalog::from_discovery(&discovery)
+            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+        Catalog::from_records(
+            capability_ids
+                .iter()
+                .map(|capability_id| {
+                    catalog.get(capability_id).cloned().ok_or_else(|| {
+                        SessionProcessError::GatewayPreparation(format!(
+                            "workflow capability is unavailable: {capability_id}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?
+    } else if capability_ids.is_empty() {
         Catalog::default()
     } else {
         authenticated_adopted_skill_catalog_for_capabilities(
@@ -337,18 +781,67 @@ fn build_gateway_service(
         limits.maximum_concurrent_calls,
     )
     .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
-    let exposure = GatewayExposure::compile(
-        request.exposure.clone(),
-        request.provider,
-        &catalog,
-        profile.as_ref(),
-        Vec::new(),
-        limits,
-    )
+    let exposure = if let Some(workflow) = workflow {
+        let profile = workflow
+            .revision
+            .effective_profiles
+            .get(&workflow.request.entry_mode)
+            .ok_or_else(|| {
+                SessionProcessError::GatewayPreparation(
+                    "compiled workflow entry profile is unavailable".to_string(),
+                )
+            })?;
+        GatewayExposure::compile_workflow_profile(
+            request.exposure.clone(),
+            request.provider,
+            &catalog,
+            profile,
+            Vec::new(),
+            limits,
+        )
+    } else {
+        GatewayExposure::compile(
+            request.exposure.clone(),
+            request.provider,
+            &catalog,
+            profile.as_ref(),
+            Vec::new(),
+            limits,
+        )
+    }
     .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
-    GatewayService::new(control, exposure, limits)
-        .map(Arc::new)
-        .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))
+    let gateway = Arc::new(
+        GatewayService::new(control, exposure, limits)
+            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?,
+    );
+    if let (Some(workflow), Some(pinned_workflow)) = (workflow, pinned_workflow) {
+        // The entry exposure is already installed as the primary gateway
+        // projection. Register the remaining immutable mode projections on
+        // the same service before its listener is started.
+        for (mode, profile) in &workflow.revision.effective_profiles {
+            let pinned = resolved_mode_exposure(
+                &pinned_workflow,
+                mode,
+                &profile.digest,
+                request.exposure.capability_locks.clone(),
+            );
+            let exposure = GatewayExposure::compile_workflow_profile(
+                pinned,
+                request.provider,
+                &catalog,
+                profile,
+                Vec::new(),
+                limits,
+            )
+            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+            if exposure.pinned() != &request.exposure {
+                gateway
+                    .register_workflow_exposure(exposure)
+                    .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+            }
+        }
+    }
+    Ok(gateway)
 }
 
 fn duplicate_session_handle(handle: &SessionHandle) -> Result<SessionHandle, SessionProcessError> {
@@ -395,13 +888,18 @@ fn write_gateway_overlay(
     Ok(())
 }
 
-fn establish_and_wait(
+fn establish_and_wait<F>(
     manager: &SessionManager,
     request: &SessionLaunchRequest,
+    workflow: Option<&PreparedWorkflowLaunch>,
+    on_established: F,
     control_path: &Path,
     child: &mut Child,
     now_unix: i64,
-) -> Result<SessionLaunchResult, SessionProcessError> {
+) -> Result<SessionLaunchResult, SessionProcessError>
+where
+    F: FnOnce(SessionEstablished),
+{
     let process = capture_process_evidence(child.id())?;
     let protected_resources = launch_protected_resources(request)?;
     let connection_scope_id = format!(
@@ -468,8 +966,38 @@ fn establish_and_wait(
         }
     };
 
+    // Bind the workflow high-water to the authenticated lease state consumed
+    // by this claim. Lease CAS revisions continue to advance independently
+    // for heartbeats and transitions.
+    let pinned_workflow =
+        workflow.map(|workflow| workflow.envelope(claimed.lease.revision.sequence));
+    if let Some(pinned_workflow) = &pinned_workflow {
+        if let Err(error) = manager.pin_workflow(
+            &claimed.handle,
+            &claimed.lease.revision,
+            pinned_workflow.clone(),
+            request.exposure.clone(),
+            now_unix,
+        ) {
+            return Err(startup_failure_after_claim(
+                manager,
+                &claimed,
+                authority.session_id(),
+                None,
+                None,
+                SessionProcessError::WorkflowLaunch(error.to_string()),
+            ));
+        }
+    }
+
     let gateway = if requires_verified_provider_overlay(&request.exposure.profile) {
-        match build_gateway_service(manager, request, &claimed.handle) {
+        match build_gateway_service(
+            manager,
+            request,
+            &claimed.handle,
+            workflow,
+            pinned_workflow.as_ref(),
+        ) {
             Ok(gateway) => Some(gateway),
             Err(error) => {
                 return Err(startup_failure_after_claim(
@@ -516,6 +1044,15 @@ fn establish_and_wait(
             error,
         ));
     }
+    on_established(SessionEstablished {
+        session_id: authority.session_id().to_string(),
+        provider: request.provider,
+        repository_key: request.repository_key.clone(),
+        workspace_key: request.workspace_key.clone(),
+        overlay_root: overlay_root.clone(),
+        gateway_socket: gateway_socket.clone(),
+        workflow: pinned_workflow.clone(),
+    });
     let run_result = (|| -> Result<ExitStatus, SessionProcessError> {
         write_control(
             control_path,
@@ -1022,6 +1559,9 @@ pub enum SessionProcessError {
     InvalidControl(&'static str),
     ControlAuthentication(String),
     BridgeControlUnavailable,
+    GatewayControlUnavailable,
+    GatewayControlRejected,
+    WorkflowLaunch(String),
     ProviderOverlayUnavailable,
     GatewayPreparation(String),
     CleanupRecoveryRequired {
@@ -1081,6 +1621,15 @@ impl std::fmt::Display for SessionProcessError {
             }
             Self::BridgeControlUnavailable => {
                 formatter.write_str("session bridge control socket is unavailable")
+            }
+            Self::GatewayControlUnavailable => {
+                formatter.write_str("session gateway control socket is unavailable")
+            }
+            Self::GatewayControlRejected => {
+                formatter.write_str("session gateway control request was rejected")
+            }
+            Self::WorkflowLaunch(reason) => {
+                write!(formatter, "workflow launch blocked: {reason}")
             }
             Self::ProviderOverlayUnavailable => formatter.write_str(
                 "verified provider overlay is unavailable; refusing profile-scoped launch that could expose native capabilities",

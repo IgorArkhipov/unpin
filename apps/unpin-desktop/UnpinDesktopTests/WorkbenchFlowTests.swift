@@ -943,6 +943,68 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertEqual(copiedValues, expectedValues)
     }
 
+    func testWorkflowSurfaceGuidanceCoversRouterStates() {
+        let ready = WorkbenchPresentationState.ready
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(presentation: .needsWorkspace)),
+            .empty
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(presentation: .loading)),
+            .loading
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(presentation: .blocked("denied"))),
+            .denied
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
+                reloadLimitation: "reload-required"
+            )),
+            .reloadRequired
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
+                reloadLimitation: "refresh-unconfirmed"
+            )),
+            .refreshUnconfirmed
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasProposal: true,
+                reloadLimitation: "next-session-only"
+            )),
+            .nextSessionOnly
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
+                recoveryRequired: true
+            )),
+            .recoveryRequired
+        )
+    }
+
+    func testWorkflowHostCommandEntryProducesDirectArgvWithoutShellExpansion() {
+        XCTAssertEqual(
+            parseWorkflowHostCommand("codex --profile 'delivery mode' --flag=\"safe\""),
+            ["codex", "--profile", "delivery mode", "--flag=safe"]
+        )
+        XCTAssertEqual(
+            parseWorkflowHostCommand("codex --prompt hello\\ world"),
+            ["codex", "--prompt", "hello world"]
+        )
+        XCTAssertTrue(parseWorkflowHostCommand("   ").isEmpty)
+        XCTAssertTrue(parseWorkflowHostCommand("codex 'unterminated").isEmpty)
+        XCTAssertTrue(parseWorkflowHostCommand(#"codex \"#).isEmpty)
+    }
+
     private func inventoryItem(
         name: String,
         provider: String,

@@ -1,13 +1,17 @@
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    ffi::OsString,
     io::{self, BufRead, Write},
-    time::{SystemTime, UNIX_EPOCH},
+    sync::mpsc,
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use serde_json::{Value, json};
 use unpin_core::{
     agent_plugins::{AgentPluginComponentDisposition, AgentPluginInstance, AgentPluginSummary},
     approval::ControlApprovalContext,
+    catalog::Catalog,
     config::UnpinConfig,
     control::build_control_status,
     control_operation::ReachAwareOperationFamily,
@@ -26,30 +30,52 @@ use unpin_core::{
         RestoreControlPlan, RestoreController, RestoreResult, ToggleStatus,
         load_backup_index_authenticated,
     },
+    profiles::{
+        CapabilityLockSnapshot, PolicyStore, PolicyTarget, ProfileSourceScope, ProfileStore,
+        compile_profile,
+    },
     provider_reach::{
         ConnectionBoundary, IncludedTargetOutcome, ProviderReach, ProviderReachLifecycle,
         SelectedProviderAuthority, SelectedProviderProvenance,
     },
     providers::ProviderId,
-    sessions::SessionAuthorityKey,
+    sessions::{
+        LeaseSnapshot, PinnedExposure, PinnedProfile, SessionAuthorityKey, SessionManager,
+        WorkflowProposalV1, WorkflowReloadLimitation, WorkflowTransitionRequest,
+    },
     state::atomic_json::OwnerGeneration,
+    workflows::{
+        WORKFLOW_DEFINITION_VERSION, WorkflowDefinition, WorkflowModeDefinition, WorkflowStore,
+        compile_workflow,
+    },
 };
 
 use crate::{
     commands::{ProviderReachArg, toggle::durable_context},
     credentials,
     group_store::ScopedGroupStore,
-    parse_provider_id,
+    parse_provider_id, session_process,
 };
 
 pub(crate) const PROTOCOL_VERSION: u64 = 2;
 const MAX_FRAME_BYTES: usize = 1_048_576;
 const MAX_REQUEST_ID_BYTES: usize = 128;
 const MAX_SEEN_REQUEST_IDS: usize = 4_096;
+const MAX_BRIDGE_IDENTIFIER_BYTES: usize = 256;
 const MAX_REVIEWED_CONTROL_PLANS: usize = 32;
 const MAX_REVIEWED_DEFINITION_PLANS: usize = 32;
 const REVIEWED_PLAN_TTL_SECONDS: i64 = 15 * 60;
 const METHOD_HANDSHAKE: &str = "handshake";
+const METHOD_WORKFLOW_COMPOSE: &str = "workflow.compose";
+const METHOD_WORKFLOW_VALIDATE: &str = "workflow.validate";
+const METHOD_WORKFLOW_PROPOSE: &str = "workflow.propose";
+const METHOD_WORKFLOW_LAUNCH: &str = "workflow.launch";
+const METHOD_WORKFLOW_TRANSITION: &str = "workflow.transition";
+const METHOD_WORKFLOW_OBSERVE: &str = "workflow.observe";
+const METHOD_WORKFLOW_CANCEL: &str = "workflow.cancel-transition";
+const METHOD_WORKFLOW_STATUS: &str = "workflow.status";
+const METHOD_WORKFLOW_RECOVERY: &str = "workflow.recovery";
+const METHOD_WORKFLOW_RECOVER: &str = "workflow.recover";
 const METHOD_SNAPSHOT: &str = "snapshot";
 const METHOD_GROUP_PLAN: &str = "group.plan";
 const METHOD_GROUP_APPROVE: &str = "group.approve";
@@ -90,6 +116,16 @@ const BRIDGE_CAPABILITIES: &[&str] = &[
     METHOD_RESTORE_APPROVE,
     METHOD_RESTORE_APPLY,
     METHOD_RESTORE_DISCARD,
+    METHOD_WORKFLOW_COMPOSE,
+    METHOD_WORKFLOW_VALIDATE,
+    METHOD_WORKFLOW_PROPOSE,
+    METHOD_WORKFLOW_LAUNCH,
+    METHOD_WORKFLOW_TRANSITION,
+    METHOD_WORKFLOW_OBSERVE,
+    METHOD_WORKFLOW_CANCEL,
+    METHOD_WORKFLOW_STATUS,
+    METHOD_WORKFLOW_RECOVERY,
+    METHOD_WORKFLOW_RECOVER,
 ];
 
 pub(crate) struct DesktopBridgeContext {
@@ -158,14 +194,121 @@ struct Request {
     id: String,
     method: String,
     params: Value,
+    auth: Option<BridgeRequestAuth>,
+}
+
+#[derive(Clone, Debug)]
+struct BridgeRequestAuth {
+    parent_pid: u32,
+    parent_start_marker: String,
+    child_pid: u32,
+    child_start_marker: String,
+    project_root: String,
+    app_state_root: String,
+    process_generation: String,
+    sequence: u64,
+    operation_id: String,
+    fingerprint: String,
+    auth_tag: String,
+}
+
+impl BridgeRequestAuth {
+    fn from_value(value: &Value) -> Result<Self, ()> {
+        let object = value.as_object().ok_or(())?;
+        if object.len() != 11
+            || object.keys().any(|key| {
+                !matches!(
+                    key.as_str(),
+                    "parentPid"
+                        | "parentStartMarker"
+                        | "childPid"
+                        | "childStartMarker"
+                        | "projectRoot"
+                        | "appStateRoot"
+                        | "processGeneration"
+                        | "sequence"
+                        | "operationId"
+                        | "fingerprint"
+                        | "authTag"
+                )
+            })
+        {
+            return Err(());
+        }
+        let string = |key: &str| {
+            object
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or(())
+        };
+        Ok(Self {
+            parent_pid: u32::try_from(object.get("parentPid").and_then(Value::as_u64).ok_or(())?)
+                .map_err(|_| ())?,
+            parent_start_marker: string("parentStartMarker")?,
+            child_pid: u32::try_from(object.get("childPid").and_then(Value::as_u64).ok_or(())?)
+                .map_err(|_| ())?,
+            child_start_marker: string("childStartMarker")?,
+            project_root: string("projectRoot")?,
+            app_state_root: string("appStateRoot")?,
+            process_generation: string("processGeneration")?,
+            sequence: object.get("sequence").and_then(Value::as_u64).ok_or(())?,
+            operation_id: string("operationId")?,
+            fingerprint: string("fingerprint")?,
+            auth_tag: string("authTag")?,
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+struct BridgeBinding {
+    session_secret: String,
+    parent_pid: u32,
+    parent_start_marker: String,
+    child_pid: u32,
+    child_start_marker: String,
+    project_root: String,
+    app_state_root: String,
+    process_generation: String,
+}
+
+#[derive(Clone, Debug)]
+struct WorkflowModeDraft {
+    name: String,
+    profile_id: String,
+}
+
+#[derive(Clone, Debug)]
+struct WorkflowDraft {
+    workflow_id: String,
+    display_name: String,
+    description: Option<String>,
+    provider: String,
+    baseline_profile_id: String,
+    entry_mode: String,
+    modes: Vec<WorkflowModeDraft>,
+    workflow_revision: String,
+}
+
+#[derive(Clone, Debug)]
+struct ReviewedWorkflowLaunch {
+    proposal: WorkflowProposalV1,
+    workflow_id: String,
+    proposal_fingerprint: String,
+    reviewed_at_unix: i64,
 }
 
 struct DesktopBridgeState {
     context: DesktopBridgeContext,
+    binding: Option<BridgeBinding>,
+    next_authenticated_sequence: u64,
     reviewed_groups: BTreeMap<String, ReviewedGroupPlan>,
     reviewed_agent_plugins: BTreeMap<String, ReviewedAgentPluginPlan>,
     reviewed_restores: BTreeMap<String, ReviewedRestorePlan>,
     reviewed_definitions: BTreeMap<String, ReviewedDefinitionChange>,
+    workflows: BTreeMap<String, WorkflowDraft>,
+    reviewed_workflow_launches: BTreeMap<String, ReviewedWorkflowLaunch>,
+    workflow_session_id: Option<String>,
     next_definition_plan_id: u64,
 }
 
@@ -173,10 +316,15 @@ impl DesktopBridgeState {
     fn new(context: DesktopBridgeContext) -> Self {
         Self {
             context,
+            binding: None,
+            next_authenticated_sequence: 0,
             reviewed_groups: Default::default(),
             reviewed_agent_plugins: Default::default(),
             reviewed_restores: Default::default(),
             reviewed_definitions: Default::default(),
+            workflows: Default::default(),
+            reviewed_workflow_launches: Default::default(),
+            workflow_session_id: None,
             next_definition_plan_id: 0,
         }
     }
@@ -280,10 +428,12 @@ fn parse_request(frame: &[u8]) -> Result<Request, RequestError> {
         id: None,
         code: "malformed-request",
     })?;
-    if object
-        .keys()
-        .any(|key| !matches!(key.as_str(), "version" | "id" | "method" | "params"))
-    {
+    if object.keys().any(|key| {
+        !matches!(
+            key.as_str(),
+            "version" | "id" | "method" | "params" | "auth"
+        )
+    }) {
         return Err(RequestError {
             id: object
                 .get("id")
@@ -334,6 +484,17 @@ fn parse_request(frame: &[u8]) -> Result<Request, RequestError> {
         id,
         method,
         params: object.get("params").cloned().unwrap_or_else(|| json!({})),
+        auth: object
+            .get("auth")
+            .map(BridgeRequestAuth::from_value)
+            .transpose()
+            .map_err(|_| RequestError {
+                id: object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
+                code: "invalid-bridge-auth",
+            })?,
     })
 }
 
@@ -380,33 +541,214 @@ fn prune_expired_reviewed_plans(state: &mut DesktopBridgeState) {
     state
         .reviewed_definitions
         .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
+    state
+        .reviewed_workflow_launches
+        .retain(|_, review| !reviewed_plan_is_expired(review.reviewed_at_unix, now_unix));
+}
+
+fn handle_handshake(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(
+        params,
+        &[
+            "sessionSecret",
+            "parentPid",
+            "parentStartMarker",
+            "childPid",
+            "processGeneration",
+            "projectRoot",
+            "appStateRoot",
+        ],
+    )?;
+    if state.binding.is_some() {
+        return Err("bridge-handshake-already-complete");
+    }
+    let session_secret = required_string(params, "sessionSecret")?;
+    if session_secret.len() != 64 || !session_secret.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("invalid-bridge-session-secret");
+    }
+    let parent_pid = params
+        .get("parentPid")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .ok_or("invalid-bridge-parent")?;
+    let child_pid = params
+        .get("childPid")
+        .and_then(Value::as_u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .filter(|value| *value != 0)
+        .ok_or("invalid-bridge-child")?;
+    let parent_start_marker = bounded_bridge_string(params, "parentStartMarker")?;
+    let process_generation = bounded_bridge_string(params, "processGeneration")?;
+    let project_root = bounded_bridge_string(params, "projectRoot")?;
+    let app_state_root = bounded_bridge_string(params, "appStateRoot")?;
+    let expected_project_root = state.context.config.project_root.to_string_lossy();
+    let expected_app_state_root = state.context.config.app_state_root.to_string_lossy();
+    if project_root != expected_project_root || app_state_root != expected_app_state_root {
+        return Err("bridge-root-mismatch");
+    }
+    if child_pid != std::process::id() || parent_pid != current_parent_process_id() {
+        return Err("bridge-process-mismatch");
+    }
+    let child_start_marker = unpin_core::sha256_digest(
+        format!(
+            "unpin.desktop.bridge.child.v1\0{session_secret}\0{child_pid}\0{}",
+            unix_now()
+        )
+        .as_bytes(),
+    );
+    let binding = BridgeBinding {
+        session_secret: session_secret.to_ascii_lowercase(),
+        parent_pid,
+        parent_start_marker: parent_start_marker.to_string(),
+        child_pid,
+        child_start_marker: child_start_marker.clone(),
+        project_root: project_root.to_string(),
+        app_state_root: app_state_root.to_string(),
+        process_generation: process_generation.to_string(),
+    };
+    state.binding = Some(binding.clone());
+    state.next_authenticated_sequence = 0;
+    Ok(handshake_response_for_binding(&binding))
+}
+
+fn bounded_bridge_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, &'static str> {
+    let value = required_string(params, key)?;
+    if value.is_empty()
+        || value.len() > MAX_BRIDGE_IDENTIFIER_BYTES
+        || value.chars().any(char::is_control)
+    {
+        return Err("invalid-bridge-binding");
+    }
+    Ok(value)
+}
+
+fn current_parent_process_id() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe extern "C" {
+            fn getppid() -> i32;
+        }
+        // SAFETY: getppid is a side-effect-free libc query on supported Unix
+        // hosts and has no pointers or ownership requirements.
+        return unsafe { getppid() }.try_into().unwrap_or_default();
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+fn authenticate_request(
+    state: &mut DesktopBridgeState,
+    request: &Request,
+) -> Result<(), &'static str> {
+    let Some(binding) = state.binding.as_ref() else {
+        return Err("bridge-handshake-required");
+    };
+    let Some(auth) = request.auth.as_ref() else {
+        return Err("bridge-auth-required");
+    };
+    if auth.parent_pid != binding.parent_pid
+        || auth.parent_start_marker != binding.parent_start_marker
+        || auth.child_pid != binding.child_pid
+        || auth.child_start_marker != binding.child_start_marker
+        || auth.project_root != binding.project_root
+        || auth.app_state_root != binding.app_state_root
+        || auth.process_generation != binding.process_generation
+    {
+        return Err("bridge-binding-mismatch");
+    }
+    let expected_sequence = state
+        .next_authenticated_sequence
+        .checked_add(1)
+        .ok_or("bridge-sequence-overflow")?;
+    if auth.sequence != expected_sequence {
+        return Err("bridge-sequence-mismatch");
+    }
+    if auth.operation_id.is_empty()
+        || auth.operation_id.len() > MAX_BRIDGE_IDENTIFIER_BYTES
+        || auth.fingerprint.len() != 64
+        || !auth
+            .fingerprint
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+        || auth.auth_tag.len() != 64
+        || !auth.auth_tag.bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err("invalid-bridge-request-auth");
+    }
+    let expected_tag = bridge_request_tag(&binding.session_secret, request, auth);
+    if !constant_time_text_equal(&expected_tag, &auth.auth_tag) {
+        return Err("bridge-authentication-failed");
+    }
+    state.next_authenticated_sequence = expected_sequence;
+    Ok(())
+}
+
+fn bridge_request_tag(secret: &str, request: &Request, auth: &BridgeRequestAuth) -> String {
+    let operation_id = &auth.operation_id;
+    let fingerprint = &auth.fingerprint;
+    let material = format!(
+        "unpin.desktop.bridge.request.v1\0{secret}\0{}\0{}\0{}\0{operation_id}\0{fingerprint}",
+        auth.sequence, request.id, request.method,
+    );
+    unpin_core::sha256_digest(material.as_bytes())
+}
+
+fn constant_time_text_equal(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.as_bytes()
+        .iter()
+        .zip(right.as_bytes())
+        .fold(0_u8, |difference, (left, right)| {
+            difference | (left ^ right)
+        })
+        == 0
 }
 
 fn handle_request(state: &mut DesktopBridgeState, request: Request) -> Value {
     prune_expired_reviewed_plans(state);
-    let result = match request.method.as_str() {
-        METHOD_HANDSHAKE => Ok(handshake_response()),
-        METHOD_SNAPSHOT => snapshot_response(&state.context),
-        METHOD_GROUP_PLAN => plan_group(state, &request.params),
-        METHOD_GROUP_APPROVE => approve_group(state, &request.params),
-        METHOD_GROUP_APPLY => apply_group(state, &request.params),
-        METHOD_GROUP_DISCARD => discard_group(state, &request.params),
-        METHOD_AGENT_PLUGIN_INSPECT => inspect_agent_plugin(state, &request.params),
-        METHOD_AGENT_PLUGIN_PLAN => plan_agent_plugin(state, &request.params),
-        METHOD_AGENT_PLUGIN_APPROVE => approve_agent_plugin(state, &request.params),
-        METHOD_AGENT_PLUGIN_APPLY => apply_agent_plugin(state, &request.params),
-        METHOD_AGENT_PLUGIN_DISCARD => discard_agent_plugin(state, &request.params),
-        METHOD_GROUP_DEFINITION_PLAN => plan_definition_change(state, &request.params),
-        METHOD_GROUP_DEFINITION_APPLY => apply_definition_change(state, &request.params),
-        METHOD_GROUP_DEFINITION_DISCARD => discard_definition_change(state, &request.params),
-        METHOD_GROUP_DEFINITION_HISTORY => definition_history(&state.context, &request.params),
-        METHOD_RECOVERY_SNAPSHOT => recovery_snapshot_response(&state.context),
-        METHOD_RESTORE_PLAN => plan_restore(state, &request.params),
-        METHOD_RESTORE_APPROVE => approve_restore(state, &request.params),
-        METHOD_RESTORE_APPLY => apply_restore(state, &request.params),
-        METHOD_RESTORE_DISCARD => discard_restore(state, &request.params),
-        METHOD_SHUTDOWN => Ok(json!({"shutdown": true})),
-        _ => Err("unknown-method"),
+    let result = if request.method == METHOD_HANDSHAKE {
+        handle_handshake(state, &request.params)
+    } else if let Err(code) = authenticate_request(state, &request) {
+        Err(code)
+    } else {
+        match request.method.as_str() {
+            METHOD_SNAPSHOT => snapshot_response(&state.context),
+            METHOD_GROUP_PLAN => plan_group(state, &request.params),
+            METHOD_GROUP_APPROVE => approve_group(state, &request.params),
+            METHOD_GROUP_APPLY => apply_group(state, &request.params),
+            METHOD_GROUP_DISCARD => discard_group(state, &request.params),
+            METHOD_AGENT_PLUGIN_INSPECT => inspect_agent_plugin(state, &request.params),
+            METHOD_AGENT_PLUGIN_PLAN => plan_agent_plugin(state, &request.params),
+            METHOD_AGENT_PLUGIN_APPROVE => approve_agent_plugin(state, &request.params),
+            METHOD_AGENT_PLUGIN_APPLY => apply_agent_plugin(state, &request.params),
+            METHOD_AGENT_PLUGIN_DISCARD => discard_agent_plugin(state, &request.params),
+            METHOD_GROUP_DEFINITION_PLAN => plan_definition_change(state, &request.params),
+            METHOD_GROUP_DEFINITION_APPLY => apply_definition_change(state, &request.params),
+            METHOD_GROUP_DEFINITION_DISCARD => discard_definition_change(state, &request.params),
+            METHOD_GROUP_DEFINITION_HISTORY => definition_history(&state.context, &request.params),
+            METHOD_RECOVERY_SNAPSHOT => recovery_snapshot_response(&state.context),
+            METHOD_RESTORE_PLAN => plan_restore(state, &request.params),
+            METHOD_RESTORE_APPROVE => approve_restore(state, &request.params),
+            METHOD_RESTORE_APPLY => apply_restore(state, &request.params),
+            METHOD_RESTORE_DISCARD => discard_restore(state, &request.params),
+            METHOD_WORKFLOW_COMPOSE => compose_workflow(state, &request.params),
+            METHOD_WORKFLOW_VALIDATE => validate_workflow(state, &request.params),
+            METHOD_WORKFLOW_PROPOSE => propose_workflow(state, &request.params),
+            METHOD_WORKFLOW_LAUNCH => launch_workflow(state, &request.params),
+            METHOD_WORKFLOW_TRANSITION => transition_workflow(state, &request.params),
+            METHOD_WORKFLOW_OBSERVE => observe_workflow(state, &request.params),
+            METHOD_WORKFLOW_CANCEL => cancel_workflow_transition(state, &request.params),
+            METHOD_WORKFLOW_STATUS => workflow_status(state),
+            METHOD_WORKFLOW_RECOVERY => workflow_recovery(state, false),
+            METHOD_WORKFLOW_RECOVER => workflow_recovery(state, true),
+            METHOD_SHUTDOWN => Ok(json!({"shutdown": true})),
+            _ => Err("unknown-method"),
+        }
     };
     match result {
         Ok(result) => json!({
@@ -418,12 +760,679 @@ fn handle_request(state: &mut DesktopBridgeState, request: Request) -> Value {
     }
 }
 
+fn compose_workflow(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(
+        params,
+        &[
+            "workflowId",
+            "displayName",
+            "description",
+            "provider",
+            "baselineProfileId",
+            "entryMode",
+            "modes",
+        ],
+    )?;
+    let provider = required_string(params, "provider")?;
+    parse_provider_id(provider).ok_or("invalid-workflow-provider")?;
+    let modes = params
+        .get("modes")
+        .and_then(Value::as_array)
+        .ok_or("invalid-workflow-modes")?
+        .iter()
+        .map(|mode| {
+            require_only_params(mode, &["name", "profileId"])?;
+            Ok::<WorkflowModeDraft, &'static str>(WorkflowModeDraft {
+                name: required_string(mode, "name")?.to_string(),
+                profile_id: required_string(mode, "profileId")?.to_string(),
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let definition = WorkflowDefinition {
+        version: WORKFLOW_DEFINITION_VERSION,
+        id: required_string(params, "workflowId")?.to_string(),
+        display_name: required_string(params, "displayName")?.to_string(),
+        description: optional_bounded_string(params, "description")?.map(str::to_string),
+        baseline_profile_id: required_string(params, "baselineProfileId")?.to_string(),
+        entry_mode: required_string(params, "entryMode")?.to_string(),
+        modes: modes
+            .iter()
+            .map(|mode| WorkflowModeDefinition::new(&mode.name, &mode.profile_id))
+            .collect(),
+    };
+    definition
+        .validate()
+        .map_err(|_| "invalid-workflow-definition")?;
+    let workflow_revision = definition
+        .definition_digest()
+        .map_err(|_| "invalid-workflow-definition")?;
+    let draft = WorkflowDraft {
+        workflow_id: definition.id,
+        display_name: definition.display_name,
+        description: definition.description,
+        provider: provider.to_string(),
+        baseline_profile_id: definition.baseline_profile_id,
+        entry_mode: definition.entry_mode,
+        modes,
+        workflow_revision,
+    };
+    state
+        .workflows
+        .insert(draft.workflow_id.clone(), draft.clone());
+    Ok(json!({
+        "status": "composed",
+        "workflowRevision": draft.workflow_revision,
+        "workflow": workflow_draft_value(&draft),
+        "errors": [],
+    }))
+}
+
+fn validate_workflow(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["workflowId", "provider", "workflowRevision"])?;
+    let workflow_id = required_string(params, "workflowId")?;
+    let provider = parse_provider_id(required_string(params, "provider")?)
+        .ok_or("invalid-workflow-provider")?;
+    let draft = state
+        .workflows
+        .get(workflow_id)
+        .cloned()
+        .ok_or("workflow-draft-unavailable")?;
+    if optional_bounded_string(params, "workflowRevision")?
+        .is_some_and(|revision| revision != draft.workflow_revision)
+    {
+        return Err("workflow-revision-mismatch");
+    }
+    let (definition, revision) = compile_workflow_draft(&state.context, &draft, provider)?;
+    Ok(json!({
+        "status": "valid",
+        "valid": true,
+        "workflow": workflow_draft_value(&draft),
+        "workflowRevision": revision.digest,
+        "provider": provider,
+        "capabilityCount": revision.maximum_envelope.authored_member_count,
+        "reloadLimitation": WorkflowReloadLimitation::LiveRefreshExpected,
+        "errors": [],
+        "definitionDigest": definition.definition_digest().map_err(|_| "workflow-validation-failed")?,
+    }))
+}
+
+fn propose_workflow(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &["prompt", "workflowId", "provider"])?;
+    let prompt = required_string(params, "prompt")?;
+    let workflow_id = optional_bounded_string(params, "workflowId")?;
+    let provider = optional_bounded_string(params, "provider")?
+        .and_then(parse_provider_id)
+        .ok_or("workflow-provider-required")?;
+    let draft = match workflow_id {
+        Some(workflow_id) => state
+            .workflows
+            .get(workflow_id)
+            .cloned()
+            .ok_or("workflow-draft-unavailable")?,
+        None => state
+            .workflows
+            .values()
+            .find(|draft| draft.provider == provider.as_str())
+            .cloned()
+            .ok_or("workflow-selection-required")?,
+    };
+    let (_, revision) = compile_workflow_draft(&state.context, &draft, provider)?;
+    let identity = state
+        .context
+        .config
+        .workspace_identity()
+        .map_err(|_| "workspace-identity-unavailable")?;
+    let discovery =
+        discover_all(&state.context.discovery_roots).map_err(|_| "discovery-unavailable")?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|_| "catalog-unavailable")?;
+    let catalog_revision = desktop_catalog_digest(&catalog);
+    let proposal = WorkflowProposalV1::new(
+        draft.workflow_id.clone(),
+        draft.entry_mode.clone(),
+        provider,
+        identity.repository_key,
+        identity.workspace_key,
+        catalog_revision,
+        revision.digest,
+        prompt,
+        revision.maximum_envelope.authored_member_count,
+        true,
+        WorkflowReloadLimitation::LiveRefreshExpected,
+    )
+    .map_err(|_| "workflow-proposal-invalid")?;
+    state.reviewed_workflow_launches.insert(
+        proposal.proposal_id.clone(),
+        ReviewedWorkflowLaunch {
+            workflow_id: draft.workflow_id.clone(),
+            proposal_fingerprint: proposal.proposal_fingerprint.clone(),
+            proposal: proposal.clone(),
+            reviewed_at_unix: unix_now(),
+        },
+    );
+    Ok(json!({
+        "status": "proposed",
+        "proposal": proposal,
+        "candidates": [{
+            "workflowId": draft.workflow_id,
+            "displayName": draft.display_name,
+            "scope": "desktop-draft",
+            "score": 1,
+            "entryMode": draft.entry_mode,
+        }],
+        "confirmationRequired": true,
+        "nextAction": "confirm-workflow-session",
+    }))
+}
+
+fn launch_workflow(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(
+        params,
+        &["proposalId", "proposalFingerprint", "hostCommand"],
+    )?;
+    let proposal_id = required_string(params, "proposalId")?;
+    let proposal_fingerprint = required_string(params, "proposalFingerprint")?;
+    let reviewed = state
+        .reviewed_workflow_launches
+        .get(proposal_id)
+        .cloned()
+        .ok_or("workflow-proposal-unavailable")?;
+    if reviewed.proposal_fingerprint != proposal_fingerprint {
+        return Err("workflow-proposal-fingerprint-mismatch");
+    }
+    if state.workflow_session_id.is_some() {
+        return Err("workflow-session-already-active");
+    }
+    let host_command = workflow_host_command(params)?;
+    let draft = state
+        .workflows
+        .get(&reviewed.workflow_id)
+        .cloned()
+        .ok_or("workflow-draft-unavailable")?;
+    let (definition, revision) =
+        compile_workflow_draft(&state.context, &draft, reviewed.proposal.provider)?;
+    validate_reviewed_workflow(&reviewed.proposal, &definition, &revision, &state.context)?;
+    WorkflowStore::new(&state.context.config.app_state_root)
+        .materialize_revision(
+            &revision,
+            OwnerGeneration::new(
+                format!("desktop-workflow-{}", reviewed.proposal.proposal_id),
+                1,
+            )
+            .map_err(|_| "workflow-revision-unavailable")?,
+        )
+        .map_err(|_| "workflow-revision-unavailable")?;
+    let policy = PolicyStore::new(&state.context.config.app_state_root)
+        .load(&PolicyTarget::Global)
+        .map_err(|_| "workflow-policy-unavailable")?;
+    let locks = CapabilityLockSnapshot::compile(
+        reviewed.proposal.provider,
+        policy
+            .as_ref()
+            .and_then(|snapshot| snapshot.policy.providers.get(&reviewed.proposal.provider))
+            .map(|provider| provider.capability_locks.clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|_| "workflow-policy-invalid")?;
+    let entry = revision
+        .effective_profiles
+        .get(&revision.entry_mode)
+        .ok_or("workflow-entry-profile-missing")?;
+    let authority_key = credentials::resolve_session_authority_key(
+        state.context.fixture_mode,
+        &state.context.config.app_state_root,
+    )
+    .map_err(|_| "workflow-session-authority-unavailable")?
+    .ok_or("workflow-session-authority-unavailable")?;
+    let backup_authentication_key = credentials::resolve_backup_authentication_key(
+        state.context.fixture_mode,
+        &state.context.config.app_state_root,
+    )
+    .map_err(|_| "workflow-backup-authority-unavailable")?
+    .ok_or("workflow-backup-authority-unavailable")?;
+    let identity = state
+        .context
+        .config
+        .workspace_identity()
+        .map_err(|_| "workspace-identity-unavailable")?;
+    let request = session_process::SessionLaunchRequest {
+        app_state_root: state.context.config.app_state_root.clone(),
+        discovery_roots: state.context.discovery_roots.clone(),
+        repository_key: identity.repository_key,
+        workspace_key: identity.workspace_key,
+        workspace_revision: identity.diagnostics.head,
+        provider: reviewed.proposal.provider,
+        exposure: PinnedExposure {
+            revision: entry.digest.clone(),
+            profile: PinnedProfile::Profile {
+                profile_id: entry.profile_id.clone(),
+                profile_digest: entry.digest.clone(),
+                origin_scope: ProfileSourceScope::Session,
+                definition_digest: revision.digest.clone(),
+            },
+            capability_locks: Some(Box::new(locks)),
+        },
+        workflow: Some(session_process::WorkflowLaunchRequest {
+            workflow_id: reviewed.proposal.workflow_id.clone(),
+            workflow_revision: reviewed.proposal.workflow_revision.clone(),
+            entry_mode: reviewed.proposal.entry_mode.clone(),
+            catalog_revision: reviewed.proposal.catalog_revision.clone(),
+            proposal_id: reviewed.proposal.proposal_id.clone(),
+            proposal_fingerprint: reviewed.proposal.proposal_fingerprint.clone(),
+            prompt_digest: reviewed.proposal.prompt_digest.clone(),
+            capability_count: reviewed.proposal.capability_count,
+        }),
+        bridge_socket: None,
+        command: host_command,
+        authority_key,
+        backup_authentication_key,
+        fixture_mode: state.context.fixture_mode,
+    };
+    let (established_sender, established_receiver) = mpsc::sync_channel(1);
+    thread::Builder::new()
+        .name("unpin-desktop-workflow-session".to_string())
+        .spawn(move || {
+            match session_process::launch_with_established_callback(request, |established| {
+                let _ = established_sender.send(Ok(established));
+            }) {
+                Ok(_) => {}
+                Err(error) => {
+                    let _ = established_sender.send(Err(error.to_string()));
+                }
+            }
+        })
+        .map_err(|_| "workflow-launch-failed")?;
+    let established = established_receiver
+        .recv_timeout(Duration::from_secs(15))
+        .map_err(|_| "workflow-launch-unconfirmed")?
+        .map_err(|_| "workflow-launch-failed")?;
+    state.workflow_session_id = Some(established.session_id.clone());
+    state.reviewed_workflow_launches.remove(proposal_id);
+    let session = current_workflow_session(state)?;
+    Ok(json!({
+        "status": "launched",
+        "sessionId": established.session_id,
+        "session": workflow_session_value(&session),
+        "nextAction": "inspect-workflow-status",
+    }))
+}
+
+fn transition_workflow(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(
+        params,
+        &[
+            "operationId",
+            "operationFingerprint",
+            "sourceStateSequence",
+            "targetMode",
+            "requestedAtUnix",
+        ],
+    )?;
+    let session_id = workflow_session_id(state)?;
+    let target_mode = required_string(params, "targetMode")?;
+    let session = current_workflow_session(state)?;
+    let workflow = session
+        .lease
+        .workflow
+        .as_deref()
+        .ok_or("workflow-session-unavailable")?;
+    if !workflow.profile_revisions.contains_key(target_mode) {
+        return Err("workflow-expansion-requires-review");
+    }
+    let source_state_sequence = params
+        .get("sourceStateSequence")
+        .and_then(Value::as_u64)
+        .ok_or("invalid-workflow-transition")?;
+    let requested_at_unix = params
+        .get("requestedAtUnix")
+        .and_then(Value::as_i64)
+        .ok_or("invalid-workflow-transition")?;
+    let result = session_process::call_gateway_control(
+        &state.context.config.app_state_root,
+        &session_id,
+        "unpin_workflow_enter_mode",
+        json!(WorkflowTransitionRequest {
+            operation_id: required_string(params, "operationId")?.to_string(),
+            operation_fingerprint: required_string(params, "operationFingerprint")?.to_string(),
+            source_state_sequence,
+            target_mode: target_mode.to_string(),
+            requested_at_unix,
+        }),
+    )
+    .map_err(|_| "workflow-transition-blocked")?;
+    let session = current_workflow_session(state)?;
+    Ok(json!({
+        "result": result.get("result").cloned().unwrap_or(result),
+        "session": workflow_session_value(&session),
+        "status": workflow_status_value(Some(&session)),
+    }))
+}
+
+fn observe_workflow(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
+    require_only_params(params, &[])?;
+    let session = current_workflow_session(state)?;
+    Ok(json!({
+        "session": workflow_session_value(&session),
+        "status": workflow_status_value(Some(&session)),
+    }))
+}
+
+fn cancel_workflow_transition(
+    state: &mut DesktopBridgeState,
+    params: &Value,
+) -> Result<Value, &'static str> {
+    require_only_params(params, &["operationId"])?;
+    let operation_id = required_string(params, "operationId")?;
+    let session_id = workflow_session_id(state)?;
+    let _ = session_process::call_gateway_control(
+        &state.context.config.app_state_root,
+        &session_id,
+        "unpin_workflow_cancel_transition",
+        json!({"operationId": operation_id}),
+    )
+    .map_err(|_| "workflow-cancel-blocked")?;
+    let session = current_workflow_session(state)?;
+    Ok(json!({
+        "status": "cancelled",
+        "operationId": operation_id,
+        "session": workflow_session_value(&session),
+    }))
+}
+
+fn workflow_status(state: &mut DesktopBridgeState) -> Result<Value, &'static str> {
+    let session = state
+        .workflow_session_id
+        .as_deref()
+        .map(|_| current_workflow_session(state))
+        .transpose()?;
+    Ok(json!({
+        "status": workflow_status_value(session.as_ref()),
+        "session": session.as_ref().map(workflow_session_value),
+        "operations": [],
+        "recoveryRequired": session.as_ref().is_some_and(workflow_recovery_required),
+    }))
+}
+
+fn workflow_recovery(state: &mut DesktopBridgeState, recover: bool) -> Result<Value, &'static str> {
+    let session = state
+        .workflow_session_id
+        .as_deref()
+        .map(|_| current_workflow_session(state))
+        .transpose()?;
+    let recovery_required = session.as_ref().is_some_and(workflow_recovery_required);
+    if recover && recovery_required {
+        return Err("workflow-owner-recovery-required");
+    }
+    Ok(json!({
+        "status": if recovery_required { "recovery-required" } else { "ready" },
+        "recoveryRequired": recovery_required,
+        "operations": [],
+        "session": session.as_ref().map(workflow_session_value),
+        "message": if recovery_required { "End and relaunch the routed child session after inspecting status." } else { "No workflow recovery is required." },
+    }))
+}
+
+fn workflow_host_command(params: &Value) -> Result<Vec<OsString>, &'static str> {
+    let command = params
+        .get("hostCommand")
+        .and_then(Value::as_array)
+        .ok_or("workflow-host-command-required")?;
+    if command.is_empty() || command.len() > 128 {
+        return Err("workflow-host-command-required");
+    }
+    command
+        .iter()
+        .map(|part| {
+            part.as_str()
+                .filter(|part| !part.is_empty() && part.len() <= 16 * 1024)
+                .map(OsString::from)
+                .ok_or("invalid-workflow-host-command")
+        })
+        .collect()
+}
+
+fn validate_reviewed_workflow(
+    proposal: &WorkflowProposalV1,
+    definition: &WorkflowDefinition,
+    revision: &unpin_core::workflows::CompiledWorkflowRevision,
+    context: &DesktopBridgeContext,
+) -> Result<(), &'static str> {
+    let identity = context
+        .config
+        .workspace_identity()
+        .map_err(|_| "workspace-identity-unavailable")?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|_| "discovery-unavailable")?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|_| "catalog-unavailable")?;
+    if definition.id != proposal.workflow_id
+        || definition.entry_mode != proposal.entry_mode
+        || revision.provider != proposal.provider
+        || identity.repository_key != proposal.repository_key
+        || identity.workspace_key != proposal.workspace_key
+        || desktop_catalog_digest(&catalog) != proposal.catalog_revision
+        || revision.digest != proposal.workflow_revision
+        || revision.maximum_envelope.authored_member_count != proposal.capability_count
+        || !proposal.gateway_required
+    {
+        return Err("workflow-proposal-stale");
+    }
+    Ok(())
+}
+
+fn workflow_session_id(state: &DesktopBridgeState) -> Result<String, &'static str> {
+    state
+        .workflow_session_id
+        .clone()
+        .ok_or("workflow-session-unavailable")
+}
+
+fn current_workflow_session(state: &DesktopBridgeState) -> Result<LeaseSnapshot, &'static str> {
+    let session_id = workflow_session_id(state)?;
+    let authority_key = credentials::resolve_session_authority_key(
+        state.context.fixture_mode,
+        &state.context.config.app_state_root,
+    )
+    .map_err(|_| "workflow-session-authority-unavailable")?
+    .ok_or("workflow-session-authority-unavailable")?;
+    SessionManager::with_authority_key(&state.context.config.app_state_root, authority_key)
+        .list()
+        .map_err(|_| "workflow-session-unavailable")?
+        .into_iter()
+        .find(|snapshot| snapshot.lease.session_id == session_id)
+        .ok_or("workflow-session-unavailable")
+}
+
+fn workflow_recovery_required(session: &LeaseSnapshot) -> bool {
+    session.lease.desired_exposure != session.lease.observed_exposure
+        && matches!(
+            session.lease.live_status,
+            unpin_core::sessions::LiveExposureStatus::ReloadRequired
+                | unpin_core::sessions::LiveExposureStatus::NextSessionOnly
+                | unpin_core::sessions::LiveExposureStatus::Unknown
+        )
+}
+
+fn compile_workflow_draft(
+    context: &DesktopBridgeContext,
+    draft: &WorkflowDraft,
+    provider: ProviderId,
+) -> Result<
+    (
+        WorkflowDefinition,
+        unpin_core::workflows::CompiledWorkflowRevision,
+    ),
+    &'static str,
+> {
+    let definition = WorkflowDefinition {
+        version: WORKFLOW_DEFINITION_VERSION,
+        id: draft.workflow_id.clone(),
+        display_name: draft.display_name.clone(),
+        description: draft.description.clone(),
+        baseline_profile_id: draft.baseline_profile_id.clone(),
+        entry_mode: draft.entry_mode.clone(),
+        modes: draft
+            .modes
+            .iter()
+            .map(|mode| WorkflowModeDefinition::new(&mode.name, &mode.profile_id))
+            .collect(),
+    };
+    definition
+        .validate()
+        .map_err(|_| "workflow-validation-failed")?;
+    let discovery = discover_all(&context.discovery_roots).map_err(|_| "discovery-unavailable")?;
+    let catalog = Catalog::from_discovery(&discovery).map_err(|_| "catalog-unavailable")?;
+    let profile_store = ProfileStore::new(&context.config.app_state_root);
+    let profile_ids = std::iter::once(definition.baseline_profile_id.clone())
+        .chain(definition.modes.iter().map(|mode| mode.profile_id.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut profiles = BTreeMap::new();
+    for profile_id in profile_ids {
+        let entry =
+            ProfileStore::load_workspace_definition(&context.config.project_root, &profile_id)
+                .map_err(|_| "workflow-profile-unavailable")?
+                .or_else(|| {
+                    profile_store
+                        .load_global_definition(&profile_id)
+                        .ok()
+                        .flatten()
+                        .map(|snapshot| unpin_core::profiles::ProfileDefinitionEntry {
+                            scope: ProfileSourceScope::Global,
+                            definition: snapshot.value,
+                            revision: Some(snapshot.revision),
+                        })
+                })
+                .ok_or("workflow-profile-unavailable")?;
+        profiles.insert(
+            profile_id,
+            compile_profile(&entry.definition, &catalog, entry.scope)
+                .map_err(|_| "workflow-profile-invalid")?,
+        );
+    }
+    let policy = PolicyStore::new(&context.config.app_state_root)
+        .load(&PolicyTarget::Global)
+        .map_err(|_| "workflow-policy-unavailable")?;
+    let locks = CapabilityLockSnapshot::compile(
+        provider,
+        policy
+            .as_ref()
+            .and_then(|snapshot| snapshot.policy.providers.get(&provider))
+            .map(|policy| policy.capability_locks.clone())
+            .unwrap_or_default(),
+    )
+    .map_err(|_| "workflow-policy-invalid")?;
+    let revision = compile_workflow(
+        &definition,
+        &profiles,
+        &catalog,
+        &locks,
+        provider,
+        ProfileSourceScope::Workspace,
+    )
+    .map_err(|_| "workflow-validation-failed")?;
+    Ok((definition, revision))
+}
+
+fn desktop_catalog_digest(catalog: &Catalog) -> String {
+    unpin_core::sha256_digest(&serde_json::to_vec(catalog).expect("catalog serialization"))
+}
+
+fn workflow_draft_value(draft: &WorkflowDraft) -> Value {
+    json!({
+        "workflowId": draft.workflow_id,
+        "displayName": draft.display_name,
+        "description": draft.description,
+        "provider": draft.provider,
+        "baselineProfileId": draft.baseline_profile_id,
+        "entryMode": draft.entry_mode,
+        "modes": draft.modes.iter().map(|mode| json!({
+            "name": mode.name,
+            "profileId": mode.profile_id,
+        })).collect::<Vec<_>>(),
+        "workflowRevision": draft.workflow_revision,
+    })
+}
+
+fn workflow_session_value(session: &LeaseSnapshot) -> Value {
+    let workflow = session.lease.workflow.as_deref();
+    json!({
+        "sessionId": session.lease.session_id,
+        "workflowId": workflow.map(|workflow| workflow.workflow_id.as_str()),
+        "proposalId": workflow.map(|workflow| workflow.proposal_id.as_str()),
+        "activeMode": workflow.map(|workflow| workflow.active_mode.as_str()),
+        "observedMode": observed_workflow_mode(session),
+        "desiredExposureRevision": session.lease.desired_exposure.revision,
+        "observedExposureRevision": session.lease.observed_exposure.revision,
+        "stateSequence": session.revision.sequence,
+        "liveStatus": session.lease.live_status,
+        "admissionOpen": session.lease.admission_open,
+        "operationHistory": [],
+    })
+}
+
+fn workflow_status_value(session: Option<&LeaseSnapshot>) -> Value {
+    session.map_or_else(
+        || {
+            json!({
+                "activeMode": null,
+                "desiredMode": null,
+                "observedMode": null,
+                "stateSequence": null,
+                "liveStatus": "no-session",
+                "admissionOpen": false,
+                "recoveryRequired": false,
+            })
+        },
+        |session| {
+            let workflow = session.lease.workflow.as_deref();
+            json!({
+                "sessionId": session.lease.session_id,
+                "workflowId": workflow.map(|workflow| workflow.workflow_id.as_str()),
+                "activeMode": workflow.map(|workflow| workflow.active_mode.as_str()),
+                "desiredMode": workflow.map(|workflow| workflow.active_mode.as_str()),
+                "observedMode": observed_workflow_mode(session),
+                "stateSequence": session.revision.sequence,
+                "liveStatus": session.lease.live_status,
+                "admissionOpen": session.lease.admission_open,
+                "recoveryRequired": workflow_recovery_required(session),
+            })
+        },
+    )
+}
+
+fn observed_workflow_mode(session: &LeaseSnapshot) -> Option<&str> {
+    let workflow = session.lease.workflow.as_deref()?;
+    workflow
+        .profile_revisions
+        .iter()
+        .find_map(|(mode, revision)| {
+            (revision == &session.lease.observed_exposure.revision).then_some(mode.as_str())
+        })
+}
+
 fn handshake_response() -> Value {
     json!({
         "protocolVersion": PROTOCOL_VERSION,
         "binaryVersion": env!("CARGO_PKG_VERSION"),
         "capabilities": BRIDGE_CAPABILITIES,
     })
+}
+
+fn handshake_response_for_binding(binding: &BridgeBinding) -> Value {
+    let mut response = handshake_response();
+    response["binding"] = json!({
+        "parentPid": binding.parent_pid,
+        "parentStartMarker": binding.parent_start_marker,
+        "childPid": binding.child_pid,
+        "childStartMarker": binding.child_start_marker,
+        "projectRoot": binding.project_root,
+        "appStateRoot": binding.app_state_root,
+        "processGeneration": binding.process_generation,
+    });
+    response
 }
 
 fn plan_group(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
@@ -1432,6 +2441,20 @@ fn required_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, &'static
         .ok_or("invalid-params")
 }
 
+fn optional_bounded_string<'a>(
+    params: &'a Value,
+    key: &str,
+) -> Result<Option<&'a str>, &'static str> {
+    match params.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_str()
+            .filter(|value| !value.is_empty() && value.len() <= 1_024)
+            .map(Some)
+            .ok_or("invalid-params"),
+    }
+}
+
 fn group_access_context(
     context: &DesktopBridgeContext,
 ) -> Result<GroupAccessContext, &'static str> {
@@ -2145,10 +3168,15 @@ mod tests {
     fn bridge_state(context: DesktopBridgeContext) -> DesktopBridgeState {
         DesktopBridgeState {
             context,
+            binding: None,
+            next_authenticated_sequence: 0,
             reviewed_groups: Default::default(),
             reviewed_agent_plugins: Default::default(),
             reviewed_restores: Default::default(),
             reviewed_definitions: Default::default(),
+            workflows: Default::default(),
+            reviewed_workflow_launches: Default::default(),
+            workflow_session_id: None,
             next_definition_plan_id: 0,
         }
     }
@@ -2162,6 +3190,230 @@ mod tests {
             request.insert("params".to_string(), params);
         }
         serde_json::to_vec(&Value::Object(request)).expect("encode bridge request")
+    }
+
+    fn test_handshake_request(id: &str, context: &DesktopBridgeContext) -> Vec<u8> {
+        encoded_request(
+            id,
+            METHOD_HANDSHAKE,
+            Some(json!({
+                "sessionSecret": "11".repeat(32),
+                "parentPid": current_parent_process_id(),
+                "parentStartMarker": "test-parent",
+                "childPid": std::process::id(),
+                "processGeneration": "test-generation",
+                "projectRoot": context.config.project_root,
+                "appStateRoot": context.config.app_state_root,
+            })),
+        )
+    }
+
+    fn parsed_request(id: &str, method: &str, params: Value) -> Request {
+        parse_request(&encoded_request(id, method, Some(params)))
+            .unwrap_or_else(|error| panic!("test bridge request failed: {}", error.code))
+    }
+
+    fn authenticate_test_request(state: &DesktopBridgeState, request: &mut Request, sequence: u64) {
+        let binding = state.binding.as_ref().expect("test bridge binding");
+        let operation_id = request
+            .params
+            .get("operationId")
+            .or_else(|| request.params.get("proposalId"))
+            .and_then(Value::as_str)
+            .unwrap_or(&request.id)
+            .to_string();
+        let fallback_fingerprint =
+            unpin_core::sha256_digest(&serde_json::to_vec(&request.params).expect("test params"));
+        let fingerprint = request
+            .params
+            .get("planFingerprint")
+            .or_else(|| request.params.get("proposalFingerprint"))
+            .or_else(|| request.params.get("operationFingerprint"))
+            .and_then(Value::as_str)
+            .unwrap_or(&fallback_fingerprint)
+            .to_string();
+        let mut auth = BridgeRequestAuth {
+            parent_pid: binding.parent_pid,
+            parent_start_marker: binding.parent_start_marker.clone(),
+            child_pid: binding.child_pid,
+            child_start_marker: binding.child_start_marker.clone(),
+            project_root: binding.project_root.clone(),
+            app_state_root: binding.app_state_root.clone(),
+            process_generation: binding.process_generation.clone(),
+            sequence,
+            operation_id,
+            fingerprint,
+            auth_tag: String::new(),
+        };
+        auth.auth_tag = bridge_request_tag(&binding.session_secret, request, &auth);
+        request.auth = Some(auth);
+    }
+
+    fn complete_test_handshake(state: &mut DesktopBridgeState) {
+        let encoded = test_handshake_request("handshake", &state.context);
+        let handshake = parse_request(&encoded)
+            .unwrap_or_else(|error| panic!("test handshake request failed: {}", error.code));
+        let response = handle_request(state, handshake);
+        assert_eq!(response["result"]["protocolVersion"], PROTOCOL_VERSION);
+    }
+
+    #[test]
+    fn authenticated_requests_require_binding_and_monotonic_sequence() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let context = agent_plugin_fixture_context(temporary.path());
+        let mut state = bridge_state(context);
+
+        let pre_handshake = parsed_request("snapshot-pre", METHOD_SNAPSHOT, json!({}));
+        assert_eq!(
+            handle_request(&mut state, pre_handshake)["error"]["code"],
+            "bridge-handshake-required"
+        );
+
+        complete_test_handshake(&mut state);
+        let unauthenticated = parsed_request("snapshot-no-auth", METHOD_SNAPSHOT, json!({}));
+        assert_eq!(
+            handle_request(&mut state, unauthenticated)["error"]["code"],
+            "bridge-auth-required"
+        );
+
+        let mut first = parsed_request("snapshot-1", METHOD_SNAPSHOT, json!({}));
+        authenticate_test_request(&state, &mut first, 1);
+        assert!(handle_request(&mut state, first).get("result").is_some());
+
+        let mut replay = parsed_request("snapshot-replay", METHOD_SNAPSHOT, json!({}));
+        authenticate_test_request(&state, &mut replay, 1);
+        assert_eq!(
+            handle_request(&mut state, replay)["error"]["code"],
+            "bridge-sequence-mismatch"
+        );
+
+        let mut skipped = parsed_request("snapshot-skipped", METHOD_SNAPSHOT, json!({}));
+        authenticate_test_request(&state, &mut skipped, 3);
+        assert_eq!(
+            handle_request(&mut state, skipped)["error"]["code"],
+            "bridge-sequence-mismatch"
+        );
+
+        let mut second = parsed_request("snapshot-2", METHOD_SNAPSHOT, json!({}));
+        authenticate_test_request(&state, &mut second, 2);
+        assert!(handle_request(&mut state, second).get("result").is_some());
+    }
+
+    #[test]
+    fn authenticated_requests_reject_each_process_binding_mismatch() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let context = agent_plugin_fixture_context(temporary.path());
+        let mut state = bridge_state(context);
+        complete_test_handshake(&mut state);
+
+        for field in [
+            "parentPid",
+            "parentStartMarker",
+            "childPid",
+            "childStartMarker",
+            "projectRoot",
+            "appStateRoot",
+            "processGeneration",
+        ] {
+            let mut request =
+                parsed_request(&format!("binding-{field}"), METHOD_SNAPSHOT, json!({}));
+            authenticate_test_request(&state, &mut request, 1);
+            let auth = request.auth.as_mut().expect("test auth");
+            match field {
+                "parentPid" => auth.parent_pid = auth.parent_pid.saturating_add(1),
+                "parentStartMarker" => auth.parent_start_marker.push_str("-other"),
+                "childPid" => auth.child_pid = auth.child_pid.saturating_add(1),
+                "childStartMarker" => auth.child_start_marker.push_str("-other"),
+                "projectRoot" => auth.project_root.push_str("-other"),
+                "appStateRoot" => auth.app_state_root.push_str("-other"),
+                "processGeneration" => auth.process_generation.push_str("-other"),
+                _ => unreachable!(),
+            }
+            assert_eq!(
+                handle_request(&mut state, request)["error"]["code"],
+                "bridge-binding-mismatch",
+                "binding field {field} must be authenticated"
+            );
+        }
+    }
+
+    #[test]
+    fn authenticated_workflow_requests_compose_validate_and_propose() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let root =
+            std::fs::canonicalize(temporary.path()).expect("canonical temporary bridge state");
+        let context = agent_plugin_fixture_context(&root);
+        unpin_core::profiles::ProfileStore::new(&context.config.app_state_root)
+            .save_global_definition(
+                &unpin_core::profiles::ProfileDefinition {
+                    version: unpin_core::profiles::PROFILE_DEFINITION_VERSION,
+                    id: "baseline".to_string(),
+                    display_name: "Baseline".to_string(),
+                    description: None,
+                    members: Vec::new(),
+                    provider_members: Default::default(),
+                    supported_providers: Default::default(),
+                },
+                None,
+                OwnerGeneration::new("desktop-workflow-test", 1).expect("profile owner"),
+            )
+            .expect("global baseline profile");
+        let mut state = bridge_state(context);
+        complete_test_handshake(&mut state);
+
+        let mut compose = parsed_request(
+            "workflow-compose",
+            METHOD_WORKFLOW_COMPOSE,
+            json!({
+                "workflowId": "delivery",
+                "displayName": "Delivery",
+                "description": "Plan and implement",
+                "provider": "codex",
+                "baselineProfileId": "baseline",
+                "entryMode": "planning",
+                "modes": [{"name": "planning", "profileId": "baseline"}],
+            }),
+        );
+        authenticate_test_request(&state, &mut compose, 1);
+        let composed = handle_request(&mut state, compose);
+        let workflow_revision = composed["result"]["workflowRevision"]
+            .as_str()
+            .expect("workflow revision")
+            .to_string();
+
+        let mut validate = parsed_request(
+            "workflow-validate",
+            METHOD_WORKFLOW_VALIDATE,
+            json!({
+                "workflowId": "delivery",
+                "provider": "codex",
+                "workflowRevision": workflow_revision,
+            }),
+        );
+        authenticate_test_request(&state, &mut validate, 2);
+        let validated = handle_request(&mut state, validate);
+        assert_eq!(
+            validated["result"]["status"], "valid",
+            "workflow validation response: {validated}"
+        );
+        assert_eq!(validated["result"]["provider"], "codex");
+
+        let private_prompt = "Implement the private customer task";
+        let mut propose = parsed_request(
+            "workflow-propose",
+            METHOD_WORKFLOW_PROPOSE,
+            json!({"prompt": private_prompt, "provider": "codex"}),
+        );
+        authenticate_test_request(&state, &mut propose, 3);
+        let proposed = handle_request(&mut state, propose);
+        assert_eq!(proposed["result"]["status"], "proposed");
+        assert_eq!(proposed["result"]["proposal"]["workflowId"], "delivery");
+        assert!(proposed["result"]["proposal"]["promptDigest"].is_string());
+        assert!(
+            !serde_json::to_string(&proposed)
+                .expect("proposal response")
+                .contains(private_prompt)
+        );
     }
 
     #[test]
@@ -2386,10 +3638,10 @@ mod tests {
                 0,
             ),
             (
-                "unknown-method",
+                "bridge-handshake-required",
                 vec![encoded_request("unknown-method", "unknown.method", None)],
                 Some("unknown-method"),
-                "unknown-method",
+                "bridge-handshake-required",
                 0,
             ),
             (
@@ -2426,17 +3678,14 @@ mod tests {
                 input.extend_from_slice(&frame);
                 input.push(b'\n');
             }
-            input.extend_from_slice(&encoded_request("recovery", METHOD_HANDSHAKE, None));
+            let context = bridge_test_context(temporary.path());
+            let recovery = test_handshake_request("recovery", &context);
+            input.extend_from_slice(&recovery);
             input.push(b'\n');
             input.extend_from_slice(&encoded_request("shutdown", METHOD_SHUTDOWN, None));
             input.push(b'\n');
             let mut output = Vec::new();
-            run_with_io(
-                bridge_test_context(temporary.path()),
-                input.as_slice(),
-                &mut output,
-            )
-            .expect(name);
+            run_with_io(context, input.as_slice(), &mut output).expect(name);
             let output = String::from_utf8(output).expect("bridge UTF-8 responses");
             let responses = output
                 .lines()

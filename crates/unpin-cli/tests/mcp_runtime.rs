@@ -18,8 +18,9 @@ use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Notify;
 use unpin_cli::mcp_runtime::{
-    BoundBearerToken, GatewayMcpServer, GatewayRuntimeError, GatewayRuntimeTimeouts,
-    McpUpstreamPool, NoGatewayCredentials, notify_list_changed,
+    BoundBearerToken, GatewayMcpServer, GatewayPrimaryNotifier, GatewayRuntimeError,
+    GatewayRuntimeTimeouts, McpUpstreamPool, NoGatewayCredentials, notify_list_changed,
+    serve_gateway_io,
 };
 use unpin_core::{
     catalog::{
@@ -39,9 +40,13 @@ use unpin_core::{
     providers::ProviderId,
     sessions::{
         BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
-        PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
+        PinnedProfile, PinnedWorkflowEnvelope, ProcessEvidence, SessionAuthorityKey,
+        SessionManager,
     },
     state::atomic_json::OwnerGeneration,
+    workflows::{
+        WORKFLOW_DEFINITION_VERSION, WorkflowDefinition, WorkflowModeDefinition, compile_workflow,
+    },
 };
 
 fn fixtures_root() -> String {
@@ -187,6 +192,161 @@ fn skill_gateway(temp: &TempDir) -> Arc<unpin_core::gateway::GatewayService> {
         unpin_core::gateway::GatewayService::new(control, exposure, limits)
             .expect("gateway service"),
     )
+}
+
+fn workflow_gateway(temp: &TempDir) -> Arc<unpin_core::gateway::GatewayService> {
+    let root = fs::canonicalize(temp.path()).expect("canonical temporary directory");
+    let catalog = Catalog::default();
+    let profile = |id: &str| {
+        compile_profile(
+            &ProfileDefinition {
+                version: PROFILE_DEFINITION_VERSION,
+                id: id.to_string(),
+                display_name: id.to_string(),
+                description: None,
+                members: Vec::new(),
+                provider_members: BTreeMap::new(),
+                supported_providers: BTreeSet::from([ProviderId::Codex]),
+            },
+            &catalog,
+            ProfileSourceScope::Session,
+        )
+        .expect("workflow profile")
+    };
+    let baseline = profile("baseline");
+    let planning = profile("planning");
+    let implementation = profile("implementation");
+    let profiles = BTreeMap::from([
+        (baseline.profile_id.clone(), baseline),
+        (planning.profile_id.clone(), planning),
+        (implementation.profile_id.clone(), implementation),
+    ]);
+    let compiled = compile_workflow(
+        &WorkflowDefinition {
+            version: WORKFLOW_DEFINITION_VERSION,
+            id: "delivery".to_string(),
+            display_name: "Delivery".to_string(),
+            description: None,
+            baseline_profile_id: "baseline".to_string(),
+            entry_mode: "planning".to_string(),
+            modes: vec![
+                WorkflowModeDefinition::new("implementation", "implementation"),
+                WorkflowModeDefinition::new("planning", "planning"),
+            ],
+        },
+        &profiles,
+        &catalog,
+        &unpin_core::profiles::CapabilityLockSnapshot::empty(ProviderId::Codex),
+        ProviderId::Codex,
+        ProfileSourceScope::Session,
+    )
+    .expect("compiled workflow");
+    let pinned = |mode: &str| {
+        let profile = &compiled.effective_profiles[mode];
+        PinnedExposure {
+            revision: profile.digest.clone(),
+            profile: PinnedProfile::Profile {
+                profile_id: profile.profile_id.clone(),
+                profile_digest: profile.digest.clone(),
+                origin_scope: ProfileSourceScope::Session,
+                definition_digest: compiled.digest.clone(),
+            },
+            capability_locks: None,
+        }
+    };
+    let planning_exposure_pin = pinned("planning");
+    let implementation_exposure_pin = pinned("implementation");
+    let now = now_unix();
+    let manager = SessionManager::with_authority_key(root, SessionAuthorityKey::new([0x53; 32]));
+    let request = BootstrapRequest {
+        provider: ProviderId::Codex,
+        repository_key: "workflow-runtime-repository".to_string(),
+        workspace_key: "workflow-runtime-workspace".to_string(),
+        workspace_revision: Some(digest('1')),
+        exposure: planning_exposure_pin.clone(),
+        process: ProcessEvidence {
+            pid: std::process::id(),
+            start_marker: "workflow-runtime".to_string(),
+        },
+        connection_scope_id: "workflow-runtime-connection".to_string(),
+        isolation: IsolationLevel::Strict,
+        coverage: CoverageLevel::VerifiedMasked,
+        protected_resources: BTreeSet::new(),
+        lease_expires_at_unix: now + 600,
+    };
+    let claim = ConnectionClaim {
+        connection_owner_id: "workflow-runtime-owner".to_string(),
+        provider: request.provider,
+        repository_key: request.repository_key.clone(),
+        workspace_key: request.workspace_key.clone(),
+        process: request.process.clone(),
+        connection_scope_id: request.connection_scope_id.clone(),
+    };
+    let authority = manager
+        .prepare_bootstrap(request.clone(), now)
+        .expect("prepare workflow bootstrap");
+    let claimed = manager
+        .claim_bootstrap(&authority, &claim, now + 1)
+        .expect("claim workflow bootstrap");
+    let workflow = PinnedWorkflowEnvelope {
+        workflow_id: "delivery".to_string(),
+        workflow_revision: compiled.digest.clone(),
+        baseline_profile_id: compiled.baseline_profile_id.clone(),
+        baseline_profile_digest: compiled.baseline_profile_digest.clone(),
+        profile_revisions: compiled
+            .effective_profiles
+            .iter()
+            .map(|(mode, profile)| (mode.clone(), profile.digest.clone()))
+            .collect(),
+        active_mode: "planning".to_string(),
+        active_effective_profile_digest: planning_exposure_pin.revision.clone(),
+        maximum_envelope_digest: compiled.maximum_envelope.digest.clone(),
+        capability_lock_digest: compiled.capability_lock_digest.clone(),
+        catalog_revision: digest('c'),
+        proposal_id: "workflow-runtime-proposal".to_string(),
+        proposal_fingerprint: digest('f'),
+        state_sequence: 1,
+        sealed_generation: 1,
+    };
+    manager
+        .pin_workflow(
+            &claimed.handle,
+            &claimed.lease.revision,
+            workflow,
+            planning_exposure_pin.clone(),
+            now + 2,
+        )
+        .expect("pin workflow");
+    let limits = GatewayLimits::default();
+    let planning_exposure = GatewayExposure::compile_workflow_profile(
+        planning_exposure_pin,
+        ProviderId::Codex,
+        &catalog,
+        &compiled.effective_profiles["planning"],
+        Vec::new(),
+        limits,
+    )
+    .expect("planning gateway exposure");
+    let implementation_exposure = GatewayExposure::compile_workflow_profile(
+        implementation_exposure_pin,
+        ProviderId::Codex,
+        &catalog,
+        &compiled.effective_profiles["implementation"],
+        Vec::new(),
+        limits,
+    )
+    .expect("implementation gateway exposure");
+    let control =
+        GatewayControlPlane::new(manager, claimed.handle, limits.maximum_concurrent_calls)
+            .expect("workflow control plane");
+    let gateway = Arc::new(
+        unpin_core::gateway::GatewayService::new(control, planning_exposure, limits)
+            .expect("workflow gateway"),
+    );
+    gateway
+        .register_workflow_exposure(implementation_exposure)
+        .expect("register implementation exposure");
+    gateway
 }
 
 fn fixture_upstream_identity(state: &TempDir) -> UpstreamIdentity {
@@ -1098,6 +1258,15 @@ async fn claimed_auxiliary_connection_exposes_only_workflow_controls() {
         "auxiliary"
     );
 
+    gateway
+        .connection_registry()
+        .disconnect(&auxiliary)
+        .expect("fence auxiliary claim");
+    let stale = client
+        .call_tool(CallToolRequestParams::new("unpin_workflow_status"))
+        .await;
+    assert!(stale.is_err(), "stale auxiliary claim must fail closed");
+
     client
         .close_with_timeout(Duration::from_secs(2))
         .await
@@ -1107,11 +1276,168 @@ async fn claimed_auxiliary_connection_exposes_only_workflow_controls() {
         .await
         .expect("close server");
     gateway
-        .disconnect_connection(&auxiliary, now_unix())
+        .connection_registry()
+        .disconnect(&_primary)
+        .expect("disconnect primary claim");
+}
+
+#[tokio::test]
+async fn auxiliary_enter_mode_notifies_only_primary_and_primary_relist_observes() {
+    let temp = TempDir::new().expect("temporary directory");
+    let gateway = workflow_gateway(&temp);
+    let primary_claim = gateway
+        .issue_connection_claim()
+        .expect("primary connection claim");
+    let auxiliary_claim = gateway
+        .issue_connection_claim()
+        .expect("auxiliary connection claim");
+    let notifier = GatewayPrimaryNotifier::default();
+    let primary_server = GatewayMcpServer::new(
+        Arc::clone(&gateway),
+        Arc::new(NoGatewayCredentials),
+        GatewayRuntimeTimeouts::default(),
+    )
+    .with_connection_claim(primary_claim.clone())
+    .with_primary_notifier(notifier.clone());
+    let auxiliary_server = GatewayMcpServer::new(
+        Arc::clone(&gateway),
+        Arc::new(NoGatewayCredentials),
+        GatewayRuntimeTimeouts::default(),
+    )
+    .with_connection_claim(auxiliary_claim.clone())
+    .with_primary_notifier(notifier);
+    let primary_observer = ListChangeClient::default();
+    let auxiliary_observer = ListChangeClient::default();
+    let (primary_client_io, primary_server_io) = tokio::io::duplex(1024 * 1024);
+    let (auxiliary_client_io, auxiliary_server_io) = tokio::io::duplex(1024 * 1024);
+    let primary_server_task = tokio::spawn(async move {
+        let (read, write) = tokio::io::split(primary_server_io);
+        serve_gateway_io(primary_server, read, write).await
+    });
+    let auxiliary_server_task = tokio::spawn(async move {
+        let (read, write) = tokio::io::split(auxiliary_server_io);
+        serve_gateway_io(auxiliary_server, read, write).await
+    });
+    let mut primary_client = primary_observer
+        .clone()
+        .serve(primary_client_io)
+        .await
+        .expect("connect primary client");
+    let mut auxiliary_client = auxiliary_observer
+        .clone()
+        .serve(auxiliary_client_io)
+        .await
+        .expect("connect auxiliary client");
+
+    let primary_tools = primary_client
+        .list_all_tools()
+        .await
+        .expect("primary tools");
+    assert!(
+        primary_tools
+            .iter()
+            .any(|tool| tool.name == "unpin_workflow_enter_mode")
+    );
+    let auxiliary_tools = auxiliary_client
+        .list_all_tools()
+        .await
+        .expect("auxiliary tools");
+    let auxiliary_names = auxiliary_tools
+        .iter()
+        .map(|tool| tool.name.as_ref())
+        .collect::<BTreeSet<_>>();
+    assert!(!auxiliary_names.contains("unpin_search_skills"));
+    assert!(!auxiliary_names.contains("unpin_load_skill"));
+
+    let _modes = auxiliary_client
+        .call_tool(CallToolRequestParams::new("unpin_workflow_modes"))
+        .await
+        .expect("workflow modes");
+    let snapshot = gateway
+        .control_plane()
+        .snapshot()
+        .expect("workflow snapshot");
+    let source_state_sequence = snapshot.revision.sequence;
+    let planning_revision = snapshot.lease.observed_exposure.revision.clone();
+    let implementation_revision = snapshot
+        .lease
+        .workflow
+        .expect("pinned workflow")
+        .profile_revisions["implementation"]
+        .clone();
+    let transition = auxiliary_client
+        .call_tool(
+            CallToolRequestParams::new("unpin_workflow_enter_mode").with_arguments(
+                serde_json::from_value(serde_json::json!({
+                    "operationId": "runtime-enter-implementation",
+                    "operationFingerprint": digest('8'),
+                    "sourceStateSequence": source_state_sequence,
+                    "targetMode": "implementation",
+                    "requestedAtUnix": now_unix(),
+                }))
+                .expect("transition arguments"),
+            ),
+        )
+        .await
+        .expect("auxiliary enter mode");
+    assert_eq!(
+        transition.structured_content.as_ref().unwrap()["refreshOutcome"],
+        "notification-required"
+    );
+    tokio::time::timeout(Duration::from_secs(2), primary_observer.notified.notified())
+        .await
+        .expect("primary list-change notification");
+    assert_eq!(primary_observer.count.load(Ordering::SeqCst), 1);
+    assert_eq!(auxiliary_observer.count.load(Ordering::SeqCst), 0);
+
+    let _refreshed_tools = primary_client
+        .list_all_tools()
+        .await
+        .expect("same-primary relist");
+    let status = primary_client
+        .call_tool(CallToolRequestParams::new("unpin_get_session_status"))
+        .await
+        .expect("primary status after relist");
+    assert_eq!(
+        status.structured_content.as_ref().unwrap()["connection"]["observedExposureRevision"],
+        implementation_revision
+    );
+    assert_eq!(
+        status.structured_content.as_ref().unwrap()["session"]["liveStatus"],
+        "observed-refresh"
+    );
+    let auxiliary_status = auxiliary_client
+        .call_tool(CallToolRequestParams::new("unpin_workflow_status"))
+        .await
+        .expect("auxiliary status");
+    assert_eq!(
+        auxiliary_status.structured_content.as_ref().unwrap()["connection"]["observedExposureRevision"],
+        planning_revision
+    );
+
+    primary_client
+        .close_with_timeout(Duration::from_secs(2))
+        .await
+        .expect("close primary client");
+    auxiliary_client
+        .close_with_timeout(Duration::from_secs(2))
+        .await
+        .expect("close auxiliary client");
+    primary_server_task
+        .await
+        .expect("primary server task")
+        .expect("primary server");
+    auxiliary_server_task
+        .await
+        .expect("auxiliary server task")
+        .expect("auxiliary server");
+    gateway
+        .connection_registry()
+        .disconnect(&auxiliary_claim)
         .expect("disconnect auxiliary claim");
     gateway
         .connection_registry()
-        .disconnect(&_primary)
+        .disconnect(&primary_claim)
         .expect("disconnect primary claim");
 }
 

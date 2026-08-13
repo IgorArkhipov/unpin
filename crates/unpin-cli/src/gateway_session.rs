@@ -13,7 +13,8 @@ use unpin_cli::mcp_runtime::GatewayRuntimeError;
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 #[cfg(unix)]
 use unpin_cli::mcp_runtime::{
-    GatewayMcpServer, GatewayRuntimeTimeouts, NoGatewayCredentials, serve_gateway_io,
+    GatewayMcpServer, GatewayPrimaryNotifier, GatewayRuntimeTimeouts, NoGatewayCredentials,
+    serve_gateway_io,
 };
 
 pub(crate) struct GatewaySessionRuntime {
@@ -42,6 +43,7 @@ impl GatewaySessionRuntime {
             Arc::new(NoGatewayCredentials),
             GatewayRuntimeTimeouts::default(),
         );
+        let notifier = GatewayPrimaryNotifier::default();
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
         let listener_gateway = Arc::clone(&gateway);
         let thread = thread::Builder::new()
@@ -50,7 +52,13 @@ impl GatewaySessionRuntime {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
-                runtime.block_on(run_listener(listener, listener_gateway, server, receiver))
+                runtime.block_on(run_listener(
+                    listener,
+                    listener_gateway,
+                    server,
+                    notifier,
+                    receiver,
+                ))
             })?;
         Ok(Self {
             gateway,
@@ -152,6 +160,7 @@ async fn run_listener(
     listener: StdUnixListener,
     gateway: Arc<GatewayService>,
     server: GatewayMcpServer,
+    notifier: GatewayPrimaryNotifier,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), GatewaySessionError> {
     const MAX_CONCURRENT_CONNECTIONS: usize = 32;
@@ -182,8 +191,12 @@ async fn run_listener(
                     }
                 };
                 let (read, write) = stream.into_split();
-                let server = server.clone().with_connection_claim(claim.clone());
+                let server = server
+                    .clone()
+                    .with_connection_claim(claim.clone())
+                    .with_primary_notifier(notifier.clone());
                 let connection_gateway = Arc::clone(&gateway);
+                let connection_notifier = notifier.clone();
                 connections.spawn(async move {
                     let _permit = permit;
                     let result = serve_gateway_io(server, read, write).await;
@@ -193,6 +206,9 @@ async fn run_listener(
                     // performs the durable runtime reconciliation once the
                     // child lifecycle has actually ended.
                     let _ = connection_gateway.connection_registry().disconnect(&claim);
+                    if claim.is_primary() {
+                        connection_notifier.clear(&claim);
+                    }
                     result
                 });
             }
@@ -412,7 +428,15 @@ mod tests {
             names
         });
 
-        assert!(names.contains("unpin_get_session_status"));
+        assert_eq!(
+            names,
+            BTreeSet::from([
+                "unpin_workflow_cancel_transition".to_string(),
+                "unpin_workflow_enter_mode".to_string(),
+                "unpin_workflow_modes".to_string(),
+                "unpin_workflow_status".to_string(),
+            ])
+        );
         runtime.shutdown().unwrap();
     }
 

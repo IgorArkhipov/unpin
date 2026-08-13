@@ -612,6 +612,10 @@ impl TuiState {
                 ),
                 Err(error) => (None, Some(error)),
             };
+        let workflow_snapshots = session_authority_key
+            .as_ref()
+            .map(|key| sessions::SessionWorkflow::load_workflows(&app_state_root, key))
+            .unwrap_or_default();
         let (mut profile_workflow, gateway_workflow, session_workflow, hook_workflow, operations) =
             match control_status.as_ref() {
                 Some(control) => (
@@ -627,7 +631,10 @@ impl TuiState {
                         &control.workspace_key,
                         control.gateways.clone(),
                     ),
-                    sessions::SessionWorkflow::new(control.sessions.clone()),
+                    sessions::SessionWorkflow::new_with_workflows(
+                        control.sessions.clone(),
+                        &workflow_snapshots,
+                    ),
                     hooks::HookWorkflow::new(
                         &control.repository_key,
                         &control.workspace_key,
@@ -1626,7 +1633,13 @@ impl TuiState {
             &control.workspace_key,
             control.gateways.clone(),
         );
-        self.session_workflow = sessions::SessionWorkflow::new(control.sessions.clone());
+        let workflows = self
+            .session_authority_key
+            .as_ref()
+            .map(|key| sessions::SessionWorkflow::load_workflows(&self.app_state_root, key))
+            .unwrap_or_default();
+        self.session_workflow =
+            sessions::SessionWorkflow::new_with_workflows(control.sessions.clone(), &workflows);
         self.hook_workflow = hooks::HookWorkflow::new(
             &control.repository_key,
             &control.workspace_key,
@@ -2358,11 +2371,15 @@ fn render_headless_state(state: &TuiState) -> String {
         lines.push(format!("Hooks: {}", state.hook_workflow.len()));
         lines.push(format!("Hook coverage rows: {}", control.hooks.len()));
         lines.push(format!("Operations: {}", control.operations.len()));
+        lines.push("Workflow session projection:".to_string());
+        lines.extend(state.session_workflow.projection_rows());
     } else {
         lines.push(format!(
             "Unavailable: {}",
             state.control_status_error.as_deref().unwrap_or("unknown")
         ));
+        lines.push("Workflow session projection:".to_string());
+        lines.extend(state.session_workflow.projection_rows());
     }
     lines.push(String::new());
 

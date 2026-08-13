@@ -9,6 +9,7 @@ enum BridgeClientError: LocalizedError {
     case incompatibleProtocol
     case incompatibleBinary
     case incompatibleCapabilities
+    case workflowUnavailable
     case malformedResponse
     case requestFailed(String)
     case requestTimedOut
@@ -23,6 +24,7 @@ enum BridgeClientError: LocalizedError {
         case .incompatibleProtocol: "The bundled Unpin executable does not support this workbench."
         case .incompatibleBinary: "The bundled Unpin executable does not match this workbench release."
         case .incompatibleCapabilities: "The bundled Unpin executable does not support Agent Plugin workbench controls."
+        case .workflowUnavailable: "The bundled Unpin executable does not support workflow mode routing."
         case .malformedResponse: "The Unpin bridge returned an invalid response."
         case .requestFailed(let code): "The Unpin bridge blocked this request: \(code)."
         case .requestTimedOut: "The bundled Unpin bridge did not respond. Select Reload workspace to restart it."
@@ -138,6 +140,18 @@ actor BridgeClient {
         "agentPlugins.apply",
         "agentPlugins.discard",
     ]
+    static let requiredWorkflowCapabilities: Set<String> = [
+        "workflow.compose",
+        "workflow.validate",
+        "workflow.propose",
+        "workflow.launch",
+        "workflow.transition",
+        "workflow.observe",
+        "workflow.cancel-transition",
+        "workflow.status",
+        "workflow.recovery",
+        "workflow.recover",
+    ]
     private static let maximumFrameBytes = 1_048_576
     private static let readOnlyRequestTimeoutMilliseconds = 15_000
     private static let defaultControlRequestTimeoutMilliseconds = 180_000
@@ -151,6 +165,12 @@ actor BridgeClient {
     private var output: FileHandle?
     private var outputBuffer = Data()
     private var requestSequence = 0
+    private var authenticatedRequestSequence: UInt64 = 0
+    private var sessionSecret = ""
+    private var parentStartMarker = ""
+    private var processGeneration = ""
+    private var childStartMarker = ""
+    private var binding: BridgeSessionBinding?
     private var controlRequestInFlight = false
     private let controlRequestTimeoutMilliseconds: Int
     private let terminationPolicy: BridgeTerminationPolicy
@@ -196,12 +216,28 @@ actor BridgeClient {
         process = child
         input = standardInput.fileHandleForWriting
         output = standardOutput.fileHandleForReading
+        sessionSecret = Self.randomHexSecret()
+        parentStartMarker = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        processGeneration = UUID().uuidString.replacingOccurrences(of: "-", with: "")
+        childStartMarker = ""
+        binding = nil
+        authenticatedRequestSequence = 0
     }
 
     func handshake() async throws -> BridgeHandshake {
+        guard let process else { throw BridgeClientError.childStopped }
+        let handshakeParameters = BridgeHandshakeParameters(
+            sessionSecret: sessionSecret,
+            parentPid: UInt32(ProcessInfo.processInfo.processIdentifier),
+            parentStartMarker: parentStartMarker,
+            childPid: UInt32(process.processIdentifier),
+            processGeneration: processGeneration,
+            projectRoot: projectRoot.standardizedFileURL.path,
+            appStateRoot: resolvedAppStateRoot.path
+        )
         let handshake: BridgeHandshake = try await request(
             method: "handshake",
-            parameters: EmptyParameters(),
+            parameters: handshakeParameters,
             kind: .readOnly
         )
         guard handshake.protocolVersion == Self.protocolVersion else {
@@ -215,6 +251,33 @@ actor BridgeClient {
         guard Set(handshake.capabilities).isSuperset(of: Self.requiredAgentPluginCapabilities) else {
             await stop()
             throw BridgeClientError.incompatibleCapabilities
+        }
+        guard Set(handshake.capabilities).isSuperset(of: Self.requiredWorkflowCapabilities) else {
+            await stop()
+            throw BridgeClientError.workflowUnavailable
+        }
+        if let responseBinding = handshake.binding {
+            guard responseBinding.childPid == UInt32(process.processIdentifier),
+                  responseBinding.parentPid == UInt32(ProcessInfo.processInfo.processIdentifier),
+                  responseBinding.projectRoot == projectRoot.standardizedFileURL.path,
+                  responseBinding.appStateRoot == resolvedAppStateRoot.path,
+                  responseBinding.processGeneration == processGeneration,
+                  responseBinding.parentStartMarker == parentStartMarker,
+                  responseBinding.childStartMarker.isEmpty == false
+            else {
+                await stop()
+                throw BridgeClientError.malformedResponse
+            }
+            childStartMarker = responseBinding.childStartMarker
+            binding = BridgeSessionBinding(
+                parentPid: responseBinding.parentPid,
+                parentStartMarker: responseBinding.parentStartMarker,
+                childPid: responseBinding.childPid,
+                childStartMarker: responseBinding.childStartMarker,
+                projectRoot: responseBinding.projectRoot,
+                appStateRoot: responseBinding.appStateRoot,
+                processGeneration: responseBinding.processGeneration
+            )
         }
         return handshake
     }
@@ -352,6 +415,50 @@ actor BridgeClient {
         try await request(method: "recovery.snapshot", parameters: EmptyParameters(), kind: .readOnly)
     }
 
+    func composeWorkflow(_ parameters: WorkflowComposeParameters) async throws -> WorkflowComposeEnvelope {
+        try await request(method: "workflow.compose", parameters: parameters, kind: .readOnly)
+    }
+
+    func validateWorkflow(_ parameters: WorkflowValidateParameters) async throws -> WorkflowValidationEnvelope {
+        try await request(method: "workflow.validate", parameters: parameters, kind: .readOnly)
+    }
+
+    func proposeWorkflow(_ parameters: WorkflowProposeParameters) async throws -> WorkflowProposalEnvelope {
+        try await request(method: "workflow.propose", parameters: parameters, kind: .readOnly)
+    }
+
+    func launchWorkflow(_ parameters: WorkflowLaunchParameters) async throws -> WorkflowLaunchEnvelope {
+        try await request(method: "workflow.launch", parameters: parameters, kind: .mutation)
+    }
+
+    func transitionWorkflow(_ parameters: WorkflowTransitionParameters) async throws -> WorkflowTransitionEnvelope {
+        try await request(method: "workflow.transition", parameters: parameters, kind: .mutation)
+    }
+
+    func observeWorkflow() async throws -> WorkflowObserveEnvelope {
+        try await request(method: "workflow.observe", parameters: EmptyParameters(), kind: .readOnly)
+    }
+
+    func cancelWorkflowTransition(operationID: String) async throws -> WorkflowCancelEnvelope {
+        try await request(
+            method: "workflow.cancel-transition",
+            parameters: WorkflowCancelParameters(operationId: operationID),
+            kind: .mutation
+        )
+    }
+
+    func workflowStatus() async throws -> WorkflowStatusEnvelope {
+        try await request(method: "workflow.status", parameters: EmptyParameters(), kind: .readOnly)
+    }
+
+    func workflowRecovery() async throws -> WorkflowRecoveryEnvelope {
+        try await request(method: "workflow.recovery", parameters: EmptyParameters(), kind: .readOnly)
+    }
+
+    func recoverWorkflow() async throws -> WorkflowRecoveryEnvelope {
+        try await request(method: "workflow.recover", parameters: EmptyParameters(), kind: .mutation)
+    }
+
     func planRestore(backupID: String) async throws -> RestorePlanEnvelope {
         try await request(
             method: "restore.plan",
@@ -399,6 +506,9 @@ actor BridgeClient {
         input = nil
         output = nil
         outputBuffer.removeAll(keepingCapacity: false)
+        binding = nil
+        childStartMarker = ""
+        authenticatedRequestSequence = 0
         if let child, child.isRunning {
             child.terminate()
             await Self.waitForTermination(of: child, timeoutNanoseconds: terminationPolicy.gracePeriodNanoseconds)
@@ -421,11 +531,19 @@ actor BridgeClient {
             throw BridgeClientError.childStopped
         }
         requestSequence += 1
+        let requestID = "desktop-\(requestSequence)"
+        let auth = try makeRequestAuth(
+            requestID: requestID,
+            method: method,
+            parameters: parameters,
+            requiresAuthentication: method != "handshake"
+        )
         let request = BridgeRequest(
             version: Self.protocolVersion,
-            id: "desktop-\(requestSequence)",
+            id: requestID,
             method: method,
-            params: parameters
+            params: parameters,
+            auth: auth
         )
         let encoded = try JSONEncoder().encode(request)
         guard encoded.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
@@ -477,6 +595,82 @@ actor BridgeClient {
             await forceStop()
             throw error
         }
+    }
+
+    private var resolvedAppStateRoot: URL {
+        roots.appStateRoot?.standardizedFileURL
+            ?? URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                .appendingPathComponent(".config", isDirectory: true)
+                .appendingPathComponent("unpin", isDirectory: true)
+    }
+
+    private func makeRequestAuth<Parameters: Encodable>(
+        requestID: String,
+        method: String,
+        parameters: Parameters,
+        requiresAuthentication: Bool
+    ) throws -> BridgeRequestAuth? {
+        guard requiresAuthentication else { return nil }
+        guard let binding, childStartMarker.isEmpty == false, sessionSecret.isEmpty == false else {
+            throw BridgeClientError.childStopped
+        }
+        let encodedParameters = try JSONEncoder().encode(parameters)
+        let parametersValue = try JSONSerialization.jsonObject(with: encodedParameters)
+        let parametersObject = parametersValue as? [String: Any]
+        let operationID = (parametersObject?["operationId"] as? String)
+            ?? (parametersObject?["proposalId"] as? String)
+            ?? requestID
+        let fingerprint = (parametersObject?["planFingerprint"] as? String)
+            ?? (parametersObject?["proposalFingerprint"] as? String)
+            ?? (parametersObject?["operationFingerprint"] as? String)
+            ?? Self.sha256(encodedParameters)
+        authenticatedRequestSequence &+= 1
+        let auth = BridgeRequestAuth(
+            parentPid: binding.parentPid,
+            parentStartMarker: binding.parentStartMarker,
+            childPid: binding.childPid,
+            childStartMarker: binding.childStartMarker,
+            projectRoot: binding.projectRoot,
+            appStateRoot: binding.appStateRoot,
+            processGeneration: binding.processGeneration,
+            sequence: authenticatedRequestSequence,
+            operationId: operationID,
+            fingerprint: fingerprint,
+            authTag: ""
+        )
+        var signed = auth
+        signed.authTag = Self.requestTag(
+            secret: sessionSecret,
+            requestID: requestID,
+            method: method,
+            sequence: auth.sequence,
+            operationID: auth.operationId,
+            fingerprint: auth.fingerprint
+        )
+        return signed
+    }
+
+    private static func randomHexSecret() -> String {
+        let key = SymmetricKey(size: .bits256)
+        return key.withUnsafeBytes { bytes in
+            bytes.map { String(format: "%02x", $0) }.joined()
+        }
+    }
+
+    private static func sha256(_ data: Data) -> String {
+        SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func requestTag(
+        secret: String,
+        requestID: String,
+        method: String,
+        sequence: UInt64,
+        operationID: String,
+        fingerprint: String
+    ) -> String {
+        let material = "unpin.desktop.bridge.request.v1\u{0}\(secret)\u{0}\(sequence)\u{0}\(requestID)\u{0}\(method)\u{0}\(operationID)\u{0}\(fingerprint)"
+        return sha256(Data(material.utf8))
     }
 
     private nonisolated static func waitForTermination(
@@ -553,6 +747,31 @@ private struct BridgeRequest<Parameters: Encodable>: Encodable {
     let id: String
     let method: String
     let params: Parameters
+    let auth: BridgeRequestAuth?
+}
+
+private struct BridgeRequestAuth: Encodable {
+    let parentPid: UInt32
+    let parentStartMarker: String
+    let childPid: UInt32
+    let childStartMarker: String
+    let projectRoot: String
+    let appStateRoot: String
+    let processGeneration: String
+    let sequence: UInt64
+    let operationId: String
+    let fingerprint: String
+    var authTag: String
+}
+
+private struct BridgeSessionBinding: Sendable {
+    let parentPid: UInt32
+    let parentStartMarker: String
+    let childPid: UInt32
+    let childStartMarker: String
+    let projectRoot: String
+    let appStateRoot: String
+    let processGeneration: String
 }
 
 private struct BridgeResponse<Result: Decodable>: Decodable {
@@ -565,6 +784,15 @@ private struct BridgeResponse<Result: Decodable>: Decodable {
 private struct BridgeErrorPayload: Decodable { let code: String }
 private struct DiscardedReview: Decodable { let discarded: Bool }
 private struct EmptyParameters: Codable {}
+private struct BridgeHandshakeParameters: Encodable {
+    let sessionSecret: String
+    let parentPid: UInt32
+    let parentStartMarker: String
+    let childPid: UInt32
+    let processGeneration: String
+    let projectRoot: String
+    let appStateRoot: String
+}
 private struct GroupPlanParameters: Codable { let qualifiedName: String; let target: String }
 private struct AgentPluginInspectParameters: Codable { let logicalId: String }
 private struct AgentPluginPlanParameters: Codable {
@@ -604,7 +832,22 @@ struct GroupDefinitionPlanParameters: Encodable {
     }
 }
 
-struct BridgeHandshake: Decodable { let protocolVersion: Int; let binaryVersion: String; let capabilities: [String] }
+struct BridgeHandshake: Decodable {
+    let protocolVersion: Int
+    let binaryVersion: String
+    let capabilities: [String]
+    let binding: BridgeHandshakeBinding?
+}
+
+struct BridgeHandshakeBinding: Decodable {
+    let parentPid: UInt32
+    let parentStartMarker: String
+    let childPid: UInt32
+    let childStartMarker: String
+    let projectRoot: String
+    let appStateRoot: String
+    let processGeneration: String
+}
 struct BridgeSnapshot: Decodable {
     let capturedAtUnix: Int
     let inventory: [InventoryItem]
@@ -1125,3 +1368,355 @@ struct RestorePlanEnvelope: Decodable { let operationId: String; let plan: Resto
 struct RestorePlan: Decodable { let backupId: String; let providers: [String]; let authentication: String; let affectedResourceIds: [String]; let planFingerprint: String }
 struct RestoreApplyEnvelope: Decodable { let result: RestoreApplyResult }
 struct RestoreApplyResult: Decodable { let status: RestoreStatus; let backupId: String; let affectedTargetCount: Int }
+
+// MARK: - Workflow mode router bridge contract
+
+struct WorkflowModeDraft: Codable, Identifiable, Equatable {
+    let name: String
+    let profileId: String
+
+    var id: String { name }
+}
+
+struct WorkflowDraft: Codable, Equatable {
+    let workflowId: String
+    let displayName: String
+    let description: String?
+    let provider: String
+    let baselineProfileId: String
+    let entryMode: String
+    let modes: [WorkflowModeDraft]
+    let workflowRevision: String
+
+    private enum CodingKeys: String, CodingKey {
+        case workflowId, id, displayName, description, provider
+        case baselineProfileId, entryMode, modes, workflowRevision
+    }
+
+    init(
+        workflowId: String,
+        displayName: String,
+        description: String? = nil,
+        provider: String,
+        baselineProfileId: String,
+        entryMode: String,
+        modes: [WorkflowModeDraft],
+        workflowRevision: String = ""
+    ) {
+        self.workflowId = workflowId
+        self.displayName = displayName
+        self.description = description
+        self.provider = provider
+        self.baselineProfileId = baselineProfileId
+        self.entryMode = entryMode
+        self.modes = modes
+        self.workflowRevision = workflowRevision
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workflowId = try container.decodeIfPresent(String.self, forKey: .workflowId)
+            ?? container.decode(String.self, forKey: .id)
+        displayName = try container.decode(String.self, forKey: .displayName)
+        description = try container.decodeIfPresent(String.self, forKey: .description)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider) ?? ""
+        baselineProfileId = try container.decode(String.self, forKey: .baselineProfileId)
+        entryMode = try container.decode(String.self, forKey: .entryMode)
+        modes = try container.decode([WorkflowModeDraft].self, forKey: .modes)
+        workflowRevision = try container.decodeIfPresent(String.self, forKey: .workflowRevision) ?? ""
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(workflowId, forKey: .workflowId)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encodeIfPresent(description, forKey: .description)
+        try container.encode(provider, forKey: .provider)
+        try container.encode(baselineProfileId, forKey: .baselineProfileId)
+        try container.encode(entryMode, forKey: .entryMode)
+        try container.encode(modes, forKey: .modes)
+        try container.encode(workflowRevision, forKey: .workflowRevision)
+    }
+}
+
+struct WorkflowComposeParameters: Encodable {
+    let workflowId: String
+    let displayName: String
+    let description: String?
+    let provider: String
+    let baselineProfileId: String
+    let entryMode: String
+    let modes: [WorkflowModeDraft]
+
+    private enum CodingKeys: String, CodingKey {
+        case workflowId, displayName, description, provider
+        case baselineProfileId, entryMode, modes
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(workflowId, forKey: .workflowId)
+        try container.encode(displayName, forKey: .displayName)
+        try container.encodeIfPresent(description, forKey: .description)
+        try container.encode(provider, forKey: .provider)
+        try container.encode(baselineProfileId, forKey: .baselineProfileId)
+        try container.encode(entryMode, forKey: .entryMode)
+        try container.encode(modes, forKey: .modes)
+    }
+}
+
+struct WorkflowValidateParameters: Encodable {
+    let workflowId: String
+    let provider: String
+    let workflowRevision: String?
+}
+
+struct WorkflowProposeParameters: Encodable {
+    let prompt: String
+    let workflowId: String?
+    let provider: String?
+}
+
+struct WorkflowLaunchParameters: Encodable {
+    let proposalId: String
+    let proposalFingerprint: String
+    let hostCommand: [String]
+
+    init(
+        proposalId: String,
+        proposalFingerprint: String,
+        hostCommand: [String] = []
+    ) {
+        self.proposalId = proposalId
+        self.proposalFingerprint = proposalFingerprint
+        self.hostCommand = hostCommand
+    }
+}
+
+struct WorkflowTransitionParameters: Encodable {
+    let operationId: String
+    let operationFingerprint: String
+    let sourceStateSequence: UInt64
+    let targetMode: String
+    let requestedAtUnix: Int
+}
+
+struct WorkflowCancelParameters: Encodable {
+    let operationId: String
+}
+
+struct WorkflowComposeEnvelope: Decodable {
+    let workflow: WorkflowDraft?
+    let workflowRevision: String?
+    let status: String?
+    let errors: [String]
+
+    private enum CodingKeys: String, CodingKey { case workflow, workflowRevision, status, errors }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        workflow = try container.decodeIfPresent(WorkflowDraft.self, forKey: .workflow)
+        workflowRevision = try container.decodeIfPresent(String.self, forKey: .workflowRevision)
+        status = try container.decodeIfPresent(String.self, forKey: .status)
+        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
+    }
+}
+
+struct WorkflowValidationEnvelope: Decodable {
+    let valid: Bool
+    let workflow: WorkflowDraft?
+    let workflowRevision: String?
+    let provider: String?
+    let capabilityCount: Int?
+    let reloadLimitation: String?
+    let errors: [String]
+
+    private enum CodingKeys: String, CodingKey {
+        case valid, workflow, workflowRevision, provider, capabilityCount
+        case reloadLimitation, errors, status
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        valid = try container.decodeIfPresent(Bool.self, forKey: .valid)
+            ?? (container.decodeIfPresent(String.self, forKey: .status) == "valid")
+        workflow = try container.decodeIfPresent(WorkflowDraft.self, forKey: .workflow)
+        workflowRevision = try container.decodeIfPresent(String.self, forKey: .workflowRevision)
+        provider = try container.decodeIfPresent(String.self, forKey: .provider)
+        capabilityCount = try container.decodeIfPresent(Int.self, forKey: .capabilityCount)
+        reloadLimitation = try container.decodeIfPresent(String.self, forKey: .reloadLimitation)
+        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
+    }
+}
+
+struct WorkflowProposal: Decodable, Identifiable, Equatable {
+    let schemaVersion: Int?
+    let proposalId: String
+    let proposalFingerprint: String
+    let workflowId: String
+    let entryMode: String
+    let provider: String
+    let repositoryKey: String?
+    let workspaceKey: String?
+    let catalogRevision: String?
+    let workflowRevision: String
+    let promptDigest: String?
+    let capabilityCount: Int?
+    let gatewayRequired: Bool?
+    let reloadLimitation: String?
+    let approvalExpectation: String?
+    let nextAction: String?
+
+    var id: String { proposalId }
+
+    private enum CodingKeys: String, CodingKey {
+        case schemaVersion, proposalId, proposalFingerprint, workflowId, entryMode
+        case provider, repositoryKey, workspaceKey, catalogRevision, workflowRevision
+        case promptDigest, capabilityCount, gatewayRequired, reloadLimitation
+        case approvalExpectation, nextAction
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        proposalId = try container.decode(String.self, forKey: .proposalId)
+        proposalFingerprint = try container.decode(String.self, forKey: .proposalFingerprint)
+        workflowId = try container.decode(String.self, forKey: .workflowId)
+        entryMode = try container.decode(String.self, forKey: .entryMode)
+        provider = try container.decode(String.self, forKey: .provider)
+        workflowRevision = try container.decode(String.self, forKey: .workflowRevision)
+        schemaVersion = try container.decodeIfPresent(Int.self, forKey: .schemaVersion)
+        repositoryKey = try container.decodeIfPresent(String.self, forKey: .repositoryKey)
+        workspaceKey = try container.decodeIfPresent(String.self, forKey: .workspaceKey)
+        catalogRevision = try container.decodeIfPresent(String.self, forKey: .catalogRevision)
+        promptDigest = try container.decodeIfPresent(String.self, forKey: .promptDigest)
+        capabilityCount = try container.decodeIfPresent(Int.self, forKey: .capabilityCount)
+        gatewayRequired = try container.decodeIfPresent(Bool.self, forKey: .gatewayRequired)
+        reloadLimitation = try container.decodeIfPresent(String.self, forKey: .reloadLimitation)
+        approvalExpectation = try container.decodeIfPresent(String.self, forKey: .approvalExpectation)
+        nextAction = try container.decodeIfPresent(String.self, forKey: .nextAction)
+    }
+}
+
+struct WorkflowProposalEnvelope: Decodable {
+    let proposal: WorkflowProposal?
+    let candidates: [WorkflowCandidate]
+    let status: String?
+    let confirmationRequired: Bool?
+    let nextAction: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case proposal, candidates, status, confirmationRequired, nextAction
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        proposal = try container.decodeIfPresent(WorkflowProposal.self, forKey: .proposal)
+        candidates = try container.decodeIfPresent([WorkflowCandidate].self, forKey: .candidates) ?? []
+        status = try container.decodeIfPresent(String.self, forKey: .status)
+        confirmationRequired = try container.decodeIfPresent(Bool.self, forKey: .confirmationRequired)
+        nextAction = try container.decodeIfPresent(String.self, forKey: .nextAction)
+    }
+}
+
+struct WorkflowCandidate: Decodable, Identifiable, Equatable {
+    let workflowId: String
+    let displayName: String?
+    let scope: String?
+    let score: Int?
+    let entryMode: String?
+
+    var id: String { workflowId }
+}
+
+struct WorkflowLaunchEnvelope: Decodable {
+    let session: WorkflowSessionSnapshot?
+    let sessionId: String?
+    let status: String?
+    let nextAction: String?
+}
+
+struct WorkflowSessionSnapshot: Decodable, Identifiable, Equatable {
+    let sessionId: String
+    let workflowId: String?
+    let proposalId: String?
+    let activeMode: String?
+    let observedMode: String?
+    let desiredExposureRevision: String?
+    let observedExposureRevision: String?
+    let stateSequence: UInt64?
+    let liveStatus: String?
+    let admissionOpen: Bool?
+    let operationHistory: [WorkflowOperationSnapshot]
+
+    var id: String { sessionId }
+}
+
+struct WorkflowOperationSnapshot: Decodable, Identifiable, Equatable {
+    let operationId: String
+    let lifecycle: String?
+    let reasonCode: String?
+    let sourceMode: String?
+    let targetMode: String?
+    let sourceStateSequence: UInt64?
+    let targetStateSequence: UInt64?
+    let operationFingerprint: String?
+
+    var id: String { operationId }
+}
+
+struct WorkflowTransitionEnvelope: Decodable {
+    let result: WorkflowTransitionResult?
+    let session: WorkflowSessionSnapshot?
+    let status: String?
+}
+
+struct WorkflowCancelEnvelope: Decodable {
+    let session: WorkflowSessionSnapshot?
+    let status: String?
+    let operationId: String?
+}
+
+struct WorkflowTransitionResult: Decodable, Equatable {
+    let operationId: String
+    let lifecycle: String?
+    let reasonCode: String?
+    let previousMode: String?
+    let desiredMode: String?
+    let previousExposureRevision: String?
+    let desiredExposureRevision: String?
+    let leaseStateSequence: UInt64?
+    let nextAction: String?
+}
+
+struct WorkflowObserveEnvelope: Decodable {
+    let session: WorkflowSessionSnapshot?
+    let status: WorkflowStatusSnapshot?
+}
+
+struct WorkflowStatusEnvelope: Decodable {
+    let session: WorkflowSessionSnapshot?
+    let status: WorkflowStatusSnapshot?
+    let operations: [WorkflowOperationSnapshot]
+    let liveStatus: String?
+    let recoveryRequired: Bool?
+}
+
+struct WorkflowStatusSnapshot: Decodable, Equatable {
+    let sessionId: String?
+    let workflowId: String?
+    let activeMode: String?
+    let desiredMode: String?
+    let observedMode: String?
+    let stateSequence: UInt64?
+    let liveStatus: String?
+    let admissionOpen: Bool?
+    let recoveryRequired: Bool?
+}
+
+struct WorkflowRecoveryEnvelope: Decodable {
+    let status: String?
+    let recoveryRequired: Bool?
+    let operations: [WorkflowOperationSnapshot]
+    let session: WorkflowSessionSnapshot?
+    let message: String?
+}

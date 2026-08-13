@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -11,10 +11,18 @@ use unpin_core::{
         GatewayConnectionRole, GatewayError, GatewayExposure, GatewayLimits, GatewayRefreshOutcome,
         GatewayService, ListChangeSupport,
     },
+    profiles::{
+        CapabilityLockSnapshot, PROFILE_DEFINITION_VERSION, ProfileDefinition, ProfileSourceScope,
+        compile_profile,
+    },
     providers::ProviderId,
     sessions::{
         BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, PinnedExposure,
-        PinnedProfile, ProcessEvidence, SessionAuthorityKey, SessionManager,
+        PinnedProfile, PinnedWorkflowEnvelope, ProcessEvidence, SessionAuthorityKey,
+        SessionManager, WorkflowOperationLifecycle, WorkflowTransitionRequest,
+    },
+    workflows::{
+        WORKFLOW_DEFINITION_VERSION, WorkflowDefinition, WorkflowModeDefinition, compile_workflow,
     },
 };
 
@@ -120,6 +128,219 @@ fn service_named(
     )
     .expect("control plane");
     GatewayService::new(control, exposure, GatewayLimits::default()).expect("gateway service")
+}
+
+fn workflow_service(root: &Path) -> GatewayService {
+    let catalog = Catalog::default();
+    let profile = |id: &str| {
+        compile_profile(
+            &ProfileDefinition {
+                version: PROFILE_DEFINITION_VERSION,
+                id: id.to_string(),
+                display_name: id.to_string(),
+                description: None,
+                members: Vec::new(),
+                provider_members: BTreeMap::new(),
+                supported_providers: BTreeSet::from([ProviderId::Codex]),
+            },
+            &catalog,
+            ProfileSourceScope::Session,
+        )
+        .unwrap()
+    };
+    let baseline_profile = profile("baseline");
+    let planning_profile = profile("planning");
+    let implementation_profile = profile("implementation");
+    let profiles = BTreeMap::from([
+        (baseline_profile.profile_id.clone(), baseline_profile),
+        (planning_profile.profile_id.clone(), planning_profile),
+        (
+            implementation_profile.profile_id.clone(),
+            implementation_profile,
+        ),
+    ]);
+    let compiled_workflow = compile_workflow(
+        &WorkflowDefinition {
+            version: WORKFLOW_DEFINITION_VERSION,
+            id: "delivery".to_string(),
+            display_name: "Delivery".to_string(),
+            description: None,
+            baseline_profile_id: "baseline".to_string(),
+            entry_mode: "planning".to_string(),
+            modes: vec![
+                WorkflowModeDefinition::new("implementation", "implementation"),
+                WorkflowModeDefinition::new("planning", "planning"),
+            ],
+        },
+        &profiles,
+        &catalog,
+        &CapabilityLockSnapshot::empty(ProviderId::Codex),
+        ProviderId::Codex,
+        ProfileSourceScope::Session,
+    )
+    .unwrap();
+    let pinned = |mode: &str| {
+        let profile = &compiled_workflow.effective_profiles[mode];
+        PinnedExposure {
+            revision: profile.digest.clone(),
+            profile: PinnedProfile::Profile {
+                profile_id: profile.profile_id.clone(),
+                profile_digest: profile.digest.clone(),
+                origin_scope: ProfileSourceScope::Session,
+                definition_digest: compiled_workflow.digest.clone(),
+            },
+            capability_locks: None,
+        }
+    };
+    let planning = pinned("planning");
+    let implementation = pinned("implementation");
+    let manager = SessionManager::with_authority_key(root, SessionAuthorityKey::new([0x73; 32]));
+    let request = BootstrapRequest {
+        provider: ProviderId::Codex,
+        repository_key: "workflow-integrity-repository".to_string(),
+        workspace_key: "workflow-integrity-workspace".to_string(),
+        workspace_revision: Some(digest('1')),
+        exposure: planning.clone(),
+        process: ProcessEvidence {
+            pid: 42,
+            start_marker: "workflow-integrity-process".to_string(),
+        },
+        connection_scope_id: "workflow-integrity-connection".to_string(),
+        isolation: IsolationLevel::Strict,
+        coverage: CoverageLevel::VerifiedMasked,
+        protected_resources: BTreeSet::from(["resource-workflow-integrity".to_string()]),
+        lease_expires_at_unix: 2_000,
+    };
+    let authority = manager.prepare_bootstrap(request.clone(), 1_000).unwrap();
+    let claimed = manager
+        .claim_bootstrap(
+            &authority,
+            &ConnectionClaim {
+                connection_owner_id: "workflow-integrity-owner".to_string(),
+                provider: request.provider,
+                repository_key: request.repository_key.clone(),
+                workspace_key: request.workspace_key.clone(),
+                process: request.process.clone(),
+                connection_scope_id: request.connection_scope_id.clone(),
+            },
+            1_001,
+        )
+        .unwrap();
+    let workflow = PinnedWorkflowEnvelope {
+        workflow_id: "delivery".to_string(),
+        workflow_revision: compiled_workflow.digest.clone(),
+        baseline_profile_id: compiled_workflow.baseline_profile_id.clone(),
+        baseline_profile_digest: compiled_workflow.baseline_profile_digest.clone(),
+        profile_revisions: compiled_workflow
+            .effective_profiles
+            .iter()
+            .map(|(mode, profile)| (mode.clone(), profile.digest.clone()))
+            .collect(),
+        active_mode: "planning".to_string(),
+        active_effective_profile_digest: planning.revision.clone(),
+        maximum_envelope_digest: compiled_workflow.maximum_envelope.digest.clone(),
+        capability_lock_digest: compiled_workflow.capability_lock_digest.clone(),
+        catalog_revision: digest('c'),
+        proposal_id: "workflow-integrity-proposal".to_string(),
+        proposal_fingerprint: digest('f'),
+        state_sequence: 1,
+        sealed_generation: 1,
+    };
+    manager
+        .pin_workflow(
+            &claimed.handle,
+            &claimed.lease.revision,
+            workflow,
+            planning.clone(),
+            1_002,
+        )
+        .unwrap();
+    let limits = GatewayLimits::default();
+    let planning_exposure = GatewayExposure::compile_workflow_profile(
+        planning,
+        ProviderId::Codex,
+        &catalog,
+        &compiled_workflow.effective_profiles["planning"],
+        Vec::new(),
+        limits,
+    )
+    .unwrap();
+    let implementation_exposure = GatewayExposure::compile_workflow_profile(
+        implementation,
+        ProviderId::Codex,
+        &catalog,
+        &compiled_workflow.effective_profiles["implementation"],
+        Vec::new(),
+        limits,
+    )
+    .unwrap();
+    let control = unpin_core::gateway::GatewayControlPlane::new(
+        manager,
+        claimed.handle,
+        limits.maximum_concurrent_calls,
+    )
+    .unwrap();
+    let service = GatewayService::new(control, planning_exposure, limits).unwrap();
+    service
+        .register_workflow_exposure(implementation_exposure)
+        .unwrap();
+    service
+}
+
+#[test]
+fn auxiliary_transition_stages_only_primary_and_replacement_uses_observed_revision() {
+    let root = PrivateTempDir::new();
+    let service = workflow_service(root.path());
+    let primary = service.issue_connection_claim().unwrap();
+    let auxiliary = service.accept_connection().unwrap();
+    let snapshot = service.control_plane().snapshot().unwrap();
+    let implementation_revision =
+        snapshot.lease.workflow.as_ref().unwrap().profile_revisions["implementation"].clone();
+    let request = WorkflowTransitionRequest {
+        operation_id: "enter-implementation".to_string(),
+        operation_fingerprint: digest('8'),
+        source_state_sequence: snapshot.revision.sequence,
+        target_mode: "implementation".to_string(),
+        requested_at_unix: 1_010,
+    };
+    let (transition, outcome) = service
+        .enter_workflow_mode_for_connection(
+            &auxiliary,
+            request,
+            ListChangeSupport::Negotiated,
+            1_010,
+        )
+        .unwrap();
+    assert_eq!(transition.lifecycle, WorkflowOperationLifecycle::Staged);
+    assert_eq!(outcome, GatewayRefreshOutcome::NotificationRequired);
+    assert_eq!(
+        service
+            .connection_status(&primary)
+            .unwrap()
+            .pending_exposure_revision,
+        Some(implementation_revision.clone())
+    );
+    assert_eq!(
+        service
+            .connection_status(&auxiliary)
+            .unwrap()
+            .pending_exposure_revision,
+        None
+    );
+    service
+        .notify_tools_changed_for_connection(&primary, 1_011)
+        .unwrap();
+    service.list_tools_for_connection(&primary, 1_012).unwrap();
+    service.connection_registry().disconnect(&primary).unwrap();
+    let replacement = service.issue_connection_claim().unwrap();
+    assert_eq!(replacement.role(), GatewayConnectionRole::Primary);
+    assert_eq!(
+        service
+            .connection_status(&replacement)
+            .unwrap()
+            .observed_exposure_revision,
+        implementation_revision
+    );
 }
 
 #[test]

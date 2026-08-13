@@ -53,6 +53,140 @@ use unpin_core::{
     sessions::{GatewayModeManager, GatewayModeTarget},
 };
 
+#[cfg(unix)]
+const BRIDGE_TEST_SECRET: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+
+#[cfg(unix)]
+fn bridge_handshake_request(
+    id: &str,
+    child_pid: u32,
+    project_root: &Path,
+    app_state_root: &Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "version": 2,
+        "id": id,
+        "method": "handshake",
+        "params": {
+            "sessionSecret": BRIDGE_TEST_SECRET,
+            "parentPid": std::process::id(),
+            "parentStartMarker": "cli-integration-parent",
+            "childPid": child_pid,
+            "processGeneration": "cli-integration-generation",
+            "projectRoot": project_root,
+            "appStateRoot": app_state_root,
+        },
+    })
+}
+
+#[cfg(unix)]
+fn authenticated_bridge_request(
+    mut request: serde_json::Value,
+    binding: &serde_json::Value,
+    sequence: u64,
+) -> serde_json::Value {
+    let id = request["id"].as_str().expect("bridge request id");
+    let method = request["method"].as_str().expect("bridge request method");
+    let params = request
+        .get("params")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let operation_id = params
+        .get("operationId")
+        .or_else(|| params.get("proposalId"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(id)
+        .to_string();
+    let fallback_fingerprint =
+        unpin_core::sha256_digest(&serde_json::to_vec(&params).expect("bridge params serialize"));
+    let fingerprint = params
+        .get("planFingerprint")
+        .or_else(|| params.get("proposalFingerprint"))
+        .or_else(|| params.get("operationFingerprint"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(&fallback_fingerprint)
+        .to_string();
+    let material = format!(
+        "unpin.desktop.bridge.request.v1\0{}\0{sequence}\0{id}\0{method}\0{operation_id}\0{fingerprint}",
+        BRIDGE_TEST_SECRET
+    );
+    request["auth"] = serde_json::json!({
+        "parentPid": binding["parentPid"],
+        "parentStartMarker": binding["parentStartMarker"],
+        "childPid": binding["childPid"],
+        "childStartMarker": binding["childStartMarker"],
+        "projectRoot": binding["projectRoot"],
+        "appStateRoot": binding["appStateRoot"],
+        "processGeneration": binding["processGeneration"],
+        "sequence": sequence,
+        "operationId": operation_id,
+        "fingerprint": fingerprint,
+        "authTag": unpin_core::sha256_digest(material.as_bytes()),
+    });
+    request
+}
+
+#[cfg(unix)]
+fn exchange_bridge_frame(
+    input: &mut impl Write,
+    output: &mut impl BufRead,
+    value: &serde_json::Value,
+) -> serde_json::Value {
+    writeln!(input, "{value}").expect("write bridge request");
+    input.flush().expect("flush bridge request");
+    let mut line = String::new();
+    output.read_line(&mut line).expect("read bridge response");
+    serde_json::from_str(&line).expect("bridge response JSON")
+}
+
+#[cfg(unix)]
+fn run_authenticated_bridge_requests(
+    fixture_root: &Path,
+    project_root: &Path,
+    app_state_root: &Path,
+    requests: impl IntoIterator<Item = serde_json::Value>,
+) -> Vec<serde_json::Value> {
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_unpin"))
+        .args(["desktop", "bridge"])
+        .arg("--fixture-root")
+        .arg(fixture_root)
+        .arg("--home-root")
+        .arg(fixture_root)
+        .arg("--project-root")
+        .arg(project_root)
+        .arg("--app-state-root")
+        .arg(app_state_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch desktop bridge");
+    let mut input = child.stdin.take().expect("bridge stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("bridge stdout"));
+    let handshake = exchange_bridge_frame(
+        &mut input,
+        &mut output,
+        &bridge_handshake_request("handshake-1", child.id(), project_root, app_state_root),
+    );
+    let binding = handshake["result"]["binding"].clone();
+    let mut responses = vec![handshake];
+    for (index, request) in requests.into_iter().enumerate() {
+        responses.push(exchange_bridge_frame(
+            &mut input,
+            &mut output,
+            &authenticated_bridge_request(
+                request,
+                &binding,
+                u64::try_from(index + 1).expect("bridge sequence"),
+            ),
+        ));
+    }
+    drop(input);
+    let status = child.wait().expect("wait bridge");
+    assert!(status.success(), "desktop bridge should stop cleanly");
+    responses
+}
+
 fn session_authority_key(app_state_root: &Path) -> SessionAuthorityKey {
     SessionAuthorityKey::new(
         fixture_credential_key(app_state_root, FixtureCredentialPurpose::SessionAuthority)
@@ -282,43 +416,17 @@ fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
     fs::create_dir_all(project_root.join(".git")).expect("workspace");
     fs::create_dir_all(&app_state_root).expect("app state");
 
-    let requests = [
-        serde_json::json!({"version": 2, "id": "handshake-1", "method": "handshake"}),
-        serde_json::json!({"version": 2, "id": "snapshot-1", "method": "snapshot"}),
-    ]
-    .into_iter()
-    .map(|request| serde_json::to_string(&request).expect("request JSON"))
-    .collect::<Vec<_>>()
-    .join("\n");
-    let output = Command::cargo_bin("unpin")
-        .expect("unpin binary")
-        .args(["desktop", "bridge"])
-        .arg("--fixture-root")
-        .arg(&fixture_root)
-        .arg("--home-root")
-        .arg(&fixture_root)
-        .arg("--project-root")
-        .arg(&project_root)
-        .arg("--app-state-root")
-        .arg(&app_state_root)
-        .write_stdin(format!("{requests}\n"))
-        .output()
-        .expect("desktop bridge output");
-
-    assert!(
-        output.status.success(),
-        "desktop bridge failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+    let responses = run_authenticated_bridge_requests(
+        &fixture_root,
+        &project_root,
+        &app_state_root,
+        [serde_json::json!({
+            "version": 2,
+            "id": "snapshot-1",
+            "method": "snapshot",
+            "params": {},
+        })],
     );
-    assert!(
-        output.stderr.is_empty(),
-        "bridge diagnostics leaked to stderr"
-    );
-    let responses = String::from_utf8(output.stdout)
-        .expect("bridge stdout is UTF-8")
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("response JSON"))
-        .collect::<Vec<_>>();
     assert_eq!(responses.len(), 2);
     assert_eq!(responses[0]["id"], "handshake-1");
     assert_eq!(responses[0]["result"]["protocolVersion"], 2);
@@ -344,9 +452,7 @@ fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request()
     fs::create_dir_all(&app_state_root).expect("app state");
 
     let oversized = "x".repeat(1_048_577);
-    let handshake = serde_json::json!({"version": 2, "id": "after-large", "method": "handshake"});
-    let output = Command::cargo_bin("unpin")
-        .expect("unpin binary")
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_unpin"))
         .args(["desktop", "bridge"])
         .arg("--fixture-root")
         .arg(&fixture_root)
@@ -356,20 +462,35 @@ fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request()
         .arg(&project_root)
         .arg("--app-state-root")
         .arg(&app_state_root)
-        .write_stdin(format!("{oversized}\n{handshake}\n"))
-        .output()
-        .expect("desktop bridge output");
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch desktop bridge");
+    let mut input = child.stdin.take().expect("bridge stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("bridge stdout"));
 
-    assert!(output.status.success());
-    let responses = String::from_utf8(output.stdout)
-        .expect("bridge stdout is UTF-8")
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("response JSON"))
-        .collect::<Vec<_>>();
-    assert_eq!(responses.len(), 2);
-    assert_eq!(responses[0]["error"]["code"], "frame-too-large");
-    assert_eq!(responses[1]["id"], "after-large");
-    assert_eq!(responses[1]["result"]["protocolVersion"], 2);
+    writeln!(input, "{oversized}").expect("write oversized bridge frame");
+    input.flush().expect("flush oversized bridge frame");
+    let mut line = String::new();
+    output
+        .read_line(&mut line)
+        .expect("read oversized response");
+    let oversized_response: serde_json::Value =
+        serde_json::from_str(&line).expect("oversized response JSON");
+    assert_eq!(oversized_response["error"]["code"], "frame-too-large");
+
+    let handshake = exchange_bridge_frame(
+        &mut input,
+        &mut output,
+        &bridge_handshake_request("after-large", child.id(), &project_root, &app_state_root),
+    );
+    assert_eq!(handshake["id"], "after-large");
+    assert_eq!(handshake["result"]["protocolVersion"], 2);
+
+    drop(input);
+    let status = child.wait().expect("wait bridge");
+    assert!(status.success(), "desktop bridge should stop cleanly");
 }
 
 #[cfg(unix)]
@@ -443,12 +564,25 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
         .expect("launch desktop bridge");
     let mut input = child.stdin.take().expect("bridge stdin");
     let mut output = BufReader::new(child.stdout.take().expect("bridge stdout"));
+    let handshake = exchange_bridge_frame(
+        &mut input,
+        &mut output,
+        &bridge_handshake_request(
+            "handshake-approval",
+            child.id(),
+            &project_root,
+            &app_state_root,
+        ),
+    );
+    let binding = handshake["result"]["binding"].clone();
+    let mut sequence = 0_u64;
     let mut request = |value: serde_json::Value| {
-        writeln!(input, "{value}").expect("write bridge request");
-        input.flush().expect("flush bridge request");
-        let mut line = String::new();
-        output.read_line(&mut line).expect("read bridge response");
-        serde_json::from_str::<serde_json::Value>(&line).expect("bridge response JSON")
+        sequence += 1;
+        exchange_bridge_frame(
+            &mut input,
+            &mut output,
+            &authenticated_bridge_request(value, &binding, sequence),
+        )
     };
 
     let definition_plan = request(serde_json::json!({
@@ -832,35 +966,272 @@ fn desktop_bridge_group_apply_and_restore_require_current_one_time_local_approva
 
     let other_project_root = root.path().join("other-workspace");
     fs::create_dir_all(other_project_root.join(".git")).expect("other workspace");
-    let foreign_recovery = Command::cargo_bin("unpin")
-        .expect("unpin binary")
+    let foreign_responses = run_authenticated_bridge_requests(
+        &fixture_root,
+        &other_project_root,
+        &app_state_root,
+        [serde_json::json!({
+                "version": 2,
+                "id": "foreign-recovery",
+                "method": "recovery.snapshot",
+                "params": {},
+        })],
+    );
+    let foreign_recovery = &foreign_responses[1];
+    assert_eq!(
+        foreign_recovery["result"]["groupOperationStatus"],
+        "available"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn desktop_bridge_workflow_launch_uses_real_session_and_gateway_controls() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let root = TempDir::new().expect("tempdir");
+    let root_path = fs::canonicalize(root.path()).expect("canonical tempdir");
+    let fixture_root = root_path.join("fixtures");
+    let project_root = root_path.join("workspace");
+    let app_state_root = root_path.join("state");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(&app_state_root).expect("app state");
+    fs::set_permissions(&app_state_root, fs::Permissions::from_mode(0o700))
+        .expect("private app state permissions");
+
+    let discovery_roots =
+        DiscoveryRoots::fixture_root(&fixture_root).with_app_state_root(&app_state_root);
+    let discovery = discover_all(&discovery_roots).expect("workflow fixture discovery");
+    let catalog = Catalog::from_discovery(&discovery).expect("workflow fixture catalog");
+    let implementation_record = catalog
+        .records
+        .values()
+        .find(|record| {
+            record.kind == unpin_core::catalog::CapabilityKind::Skill
+                && record.provider_views.iter().any(|view| {
+                    view.provider == ProviderId::Codex
+                        && view.discovery_id.contains("example-shared-global-skill")
+                })
+        })
+        .expect("shared Codex workflow fixture skill");
+    let implementation_member = implementation_record.id.clone();
+    let profile_store = ProfileStore::new(&app_state_root);
+    for profile_id in ["baseline", "planning", "implementation"] {
+        let members = if profile_id == "implementation" {
+            vec![implementation_member.clone()]
+        } else {
+            Vec::new()
+        };
+        profile_store
+            .save_global_definition(
+                &ProfileDefinition {
+                    version: PROFILE_DEFINITION_VERSION,
+                    id: profile_id.to_string(),
+                    display_name: profile_id.to_string(),
+                    description: None,
+                    members,
+                    provider_members: Default::default(),
+                    supported_providers: Default::default(),
+                },
+                None,
+                OwnerGeneration::new(format!("desktop-workflow-{profile_id}"), 1)
+                    .expect("profile owner"),
+            )
+            .expect("global workflow profile");
+    }
+
+    let stop = root_path.join("stop-host");
+    let host = root_path.join("workflow-host.sh");
+    write_text(
+        &host,
+        r#"#!/bin/sh
+set -eu
+stop="$1"
+{
+  printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":true}},"clientInfo":{"name":"unpin-workflow-fixture","version":"1"}}}'
+  printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+  while [ ! -e "$stop" ]; do sleep 0.05; done
+} | "$UNPIN_GATEWAY_PROXY_EXECUTABLE" gateway-session-proxy --socket "$UNPIN_GATEWAY_SOCKET" >/dev/null
+"#,
+    );
+    fs::set_permissions(&host, fs::Permissions::from_mode(0o700))
+        .expect("workflow host permissions");
+
+    let mut child = StdCommand::new(env!("CARGO_BIN_EXE_unpin"))
         .args(["desktop", "bridge"])
         .arg("--fixture-root")
         .arg(&fixture_root)
         .arg("--home-root")
         .arg(&fixture_root)
         .arg("--project-root")
-        .arg(&other_project_root)
+        .arg(&project_root)
         .arg("--app-state-root")
         .arg(&app_state_root)
-        .write_stdin(
-            serde_json::json!({
-                "version": 2,
-                "id": "foreign-recovery",
-                "method": "recovery.snapshot",
-                "params": {},
-            })
-            .to_string()
-                + "\n",
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch desktop bridge");
+    let mut input = child.stdin.take().expect("bridge stdin");
+    let mut output = BufReader::new(child.stdout.take().expect("bridge stdout"));
+    let handshake = exchange_bridge_frame(
+        &mut input,
+        &mut output,
+        &bridge_handshake_request(
+            "workflow-handshake",
+            child.id(),
+            &project_root,
+            &app_state_root,
+        ),
+    );
+    let binding = handshake["result"]["binding"].clone();
+    let mut sequence = 0_u64;
+    let mut request = |value: serde_json::Value| {
+        sequence += 1;
+        exchange_bridge_frame(
+            &mut input,
+            &mut output,
+            &authenticated_bridge_request(value, &binding, sequence),
         )
-        .output()
-        .expect("foreign recovery output");
-    assert!(foreign_recovery.status.success());
-    let foreign_recovery = serde_json::from_slice::<serde_json::Value>(&foreign_recovery.stdout)
-        .expect("foreign recovery JSON");
+    };
+
+    let composed = request(serde_json::json!({
+        "version": 2,
+        "id": "workflow-compose-real",
+        "method": "workflow.compose",
+        "params": {
+            "workflowId": "delivery",
+            "displayName": "Delivery",
+            "provider": "codex",
+            "baselineProfileId": "baseline",
+            "entryMode": "planning",
+            "modes": [
+                {"name": "planning", "profileId": "planning"},
+                {"name": "implementation", "profileId": "implementation"},
+            ],
+        },
+    }));
+    assert_eq!(composed["result"]["status"], "composed");
+
+    let proposed = request(serde_json::json!({
+        "version": 2,
+        "id": "workflow-propose-real",
+        "method": "workflow.propose",
+        "params": {"prompt": "plan the implementation", "provider": "codex"},
+    }));
     assert_eq!(
-        foreign_recovery["result"]["groupOperationStatus"],
-        "available"
+        proposed["result"]["status"], "proposed",
+        "workflow proposal response: {proposed}"
+    );
+    let proposal_id = proposed["result"]["proposal"]["proposalId"]
+        .as_str()
+        .expect("proposal id")
+        .to_string();
+    let proposal_fingerprint = proposed["result"]["proposal"]["proposalFingerprint"]
+        .as_str()
+        .expect("proposal fingerprint")
+        .to_string();
+
+    let launched = request(serde_json::json!({
+        "version": 2,
+        "id": "workflow-launch-real",
+        "method": "workflow.launch",
+        "params": {
+            "proposalId": proposal_id,
+            "proposalFingerprint": proposal_fingerprint,
+            "hostCommand": [host, stop],
+        },
+    }));
+    assert_eq!(
+        launched["result"]["status"], "launched",
+        "workflow launch response: {launched}"
+    );
+    let session_id = launched["result"]["session"]["sessionId"]
+        .as_str()
+        .expect("session id")
+        .to_string();
+    assert_eq!(launched["result"]["session"]["activeMode"], "planning");
+
+    let status = request(serde_json::json!({
+        "version": 2,
+        "id": "workflow-status-real",
+        "method": "workflow.status",
+        "params": {},
+    }));
+    assert_eq!(status["result"]["session"]["sessionId"], session_id);
+    let source_sequence = status["result"]["session"]["stateSequence"]
+        .as_u64()
+        .expect("session state sequence");
+    let overlay = unpin_core::config::get_session_overlay_root(&app_state_root, &session_id);
+    assert!(
+        overlay.join("gateway-session.json").is_file(),
+        "gateway overlay missing; overlay={} entries={:?}",
+        overlay.display(),
+        fs::read_dir(&overlay)
+            .map(|entries| entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name())
+                .collect::<Vec<_>>())
+            .ok()
+    );
+
+    let transitioned = request(serde_json::json!({
+        "version": 2,
+        "id": "workflow-transition-real",
+        "method": "workflow.transition",
+        "params": {
+            "operationId": "desktop-transition-1",
+            "operationFingerprint": "1".repeat(64),
+            "targetMode": "implementation",
+            "sourceStateSequence": source_sequence,
+            "requestedAtUnix": std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system clock")
+                .as_secs(),
+        },
+    }));
+    let transition = &transitioned["result"]["result"]["transition"];
+    assert_eq!(
+        transition["desiredMode"], "implementation",
+        "workflow transition response: {transitioned}"
+    );
+    let operation_id = transition["operationId"]
+        .as_str()
+        .expect("transition operation id")
+        .to_string();
+
+    let cancelled = request(serde_json::json!({
+        "version": 2,
+        "id": "workflow-cancel-real",
+        "method": "workflow.cancel-transition",
+        "params": {"operationId": operation_id},
+    }));
+    assert_eq!(
+        cancelled["result"]["status"], "cancelled",
+        "workflow cancel response: {cancelled}"
+    );
+    assert_eq!(cancelled["result"]["session"]["activeMode"], "planning");
+
+    fs::write(&stop, b"stop").expect("stop workflow host");
+    thread::sleep(Duration::from_millis(250));
+    drop(request);
+    drop(input);
+    let bridge_status = child.wait().expect("wait for bridge");
+    assert!(
+        bridge_status.success(),
+        "desktop bridge should stop cleanly"
+    );
+
+    let manager =
+        SessionManager::with_authority_key(&app_state_root, session_authority_key(&app_state_root));
+    assert!(
+        manager
+            .list()
+            .expect("workflow sessions after host exit")
+            .iter()
+            .all(|session| session.lease.session_id != session_id),
+        "workflow child session should be cleaned after host exit"
     );
 }
 

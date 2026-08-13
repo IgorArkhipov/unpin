@@ -213,7 +213,6 @@ fn transition_request(operation_id: &str, source_state_sequence: u64) -> Workflo
         operation_fingerprint: digest('1'),
         source_state_sequence,
         target_mode: "implementation".to_string(),
-        target_exposure: exposure('a'),
         requested_at_unix: 1_003,
     }
 }
@@ -374,6 +373,114 @@ fn transition_stages_exact_mode_and_cancel_restores_observed_exposure_idempotent
 }
 
 #[test]
+fn staged_transition_remains_cancellable_after_expected_live_status_publication() {
+    for (status, label) in [
+        (LiveExposureStatus::NotificationSent, "notification-sent"),
+        (LiveExposureStatus::ReloadRequired, "reload-required"),
+    ] {
+        let (_temp, root) = private_temp();
+        let (manager, claimed) = claimed_session(&root);
+        let pinned = manager
+            .pin_workflow(
+                &claimed.handle,
+                &claimed.lease.revision,
+                workflow(),
+                exposure('b'),
+                1_002,
+            )
+            .expect("pin workflow");
+        let router = WorkflowRouter::new(manager.clone());
+        let operation_id = format!("transition-{label}");
+        router
+            .enter_mode(
+                &claimed.handle,
+                &pinned.revision,
+                transition_request(&operation_id, pinned.revision.sequence),
+            )
+            .expect("stage transition");
+        let staged = manager
+            .load_for_handle(&claimed.handle)
+            .expect("staged lease");
+        let published = manager
+            .observe_exposure(&claimed.handle, &staged.revision, status, 1_004)
+            .expect("publish live status");
+
+        let cancelled = router
+            .cancel_transition(&claimed.handle, &published.revision, &operation_id, 1_005)
+            .expect("cancel after live-status publication");
+        assert_eq!(
+            cancelled.lease.desired_exposure,
+            cancelled.lease.observed_exposure
+        );
+        assert_eq!(
+            cancelled.lease.workflow.as_ref().unwrap().active_mode,
+            "planning"
+        );
+        assert!(cancelled.lease.admission_open);
+    }
+}
+
+#[test]
+fn unrelated_state_drift_does_not_extend_transition_cancellation_binding() {
+    let (_temp, root) = private_temp();
+    let (manager, claimed) = claimed_session(&root);
+    let pinned = manager
+        .pin_workflow(
+            &claimed.handle,
+            &claimed.lease.revision,
+            workflow(),
+            exposure('b'),
+            1_002,
+        )
+        .expect("pin workflow");
+    let router = WorkflowRouter::new(manager.clone());
+    router
+        .enter_mode(
+            &claimed.handle,
+            &pinned.revision,
+            transition_request("transition-with-drift", pinned.revision.sequence),
+        )
+        .expect("stage transition");
+    let staged = manager
+        .load_for_handle(&claimed.handle)
+        .expect("staged lease");
+    let published = manager
+        .observe_exposure(
+            &claimed.handle,
+            &staged.revision,
+            LiveExposureStatus::NotificationSent,
+            1_004,
+        )
+        .expect("publish notification status");
+    let drifted = manager
+        .report_workspace_revision(
+            &claimed.handle,
+            &published.revision,
+            Some(digest('9')),
+            1_005,
+        )
+        .expect("report unrelated workspace drift");
+
+    assert!(matches!(
+        router.cancel_transition(
+            &claimed.handle,
+            &drifted.revision,
+            "transition-with-drift",
+            1_006,
+        ),
+        Err(WorkflowRouterError::OperationBindingMismatch)
+    ));
+    let current = manager
+        .load_for_handle(&claimed.handle)
+        .expect("lease after rejected cancellation");
+    assert_eq!(current.revision, drifted.revision);
+    assert_ne!(
+        current.lease.desired_exposure,
+        current.lease.observed_exposure
+    );
+}
+
+#[test]
 fn out_of_envelope_and_stale_or_foreign_requests_do_not_mutate_lease_or_journal() {
     let (_temp, root) = private_temp();
     let (manager, claimed) = claimed_session(&root);
@@ -392,7 +499,6 @@ fn out_of_envelope_and_stale_or_foreign_requests_do_not_mutate_lease_or_journal(
         operation_fingerprint: digest('2'),
         source_state_sequence: pinned.revision.sequence,
         target_mode: "secret-mode".to_string(),
-        target_exposure: exposure('e'),
         requested_at_unix: 1_003,
     };
     assert!(matches!(
@@ -440,7 +546,6 @@ fn out_of_envelope_and_stale_or_foreign_requests_do_not_mutate_lease_or_journal(
         operation_fingerprint: digest('3'),
         source_state_sequence: pinned.revision.sequence - 1,
         target_mode: "implementation".to_string(),
-        target_exposure: exposure('a'),
         requested_at_unix: 1_003,
     };
     assert!(matches!(
