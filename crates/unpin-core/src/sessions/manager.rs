@@ -502,6 +502,44 @@ impl SessionManager {
         })
     }
 
+    /// Keep the current observed exposure callable when the host can only
+    /// apply a requested workflow mode to a future session. The transition
+    /// remains journaled and cancellable, but the live lease stays pinned to
+    /// the current mode and exposure.
+    pub(crate) fn defer_workflow_mode_to_next_session(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        observed_mode: &str,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        validate_identifier("workflow mode", observed_mode).map_err(LeaseError::from)?;
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            let workflow = lease
+                .workflow
+                .as_mut()
+                .ok_or(LeaseError::WorkflowNotPinned)?;
+            if workflow.profile_revisions.get(observed_mode)
+                != Some(&lease.observed_exposure.revision)
+            {
+                return Err(LeaseError::InvalidState(
+                    "observed workflow mode does not match current exposure".to_string(),
+                ));
+            }
+            workflow.active_mode = observed_mode.to_string();
+            workflow.active_effective_profile_digest = lease.observed_exposure.revision.clone();
+            workflow.state_sequence = workflow
+                .state_sequence
+                .checked_add(1)
+                .ok_or(LeaseError::OwnerGenerationOverflow)?;
+            lease.desired_exposure = lease.observed_exposure.clone();
+            lease.live_status = LiveExposureStatus::NextSessionOnly;
+            lease.admission_open = true;
+            Ok(())
+        })
+    }
+
     pub(crate) fn cancel_workflow_transition(
         &self,
         handle: &SessionHandle,
@@ -567,6 +605,9 @@ impl SessionManager {
             require_active(lease)?;
             if status == LiveExposureStatus::ObservedRefresh {
                 lease.observed_exposure = lease.desired_exposure.clone();
+                lease.admission_open = true;
+            } else if status == LiveExposureStatus::NextSessionOnly {
+                lease.desired_exposure = lease.observed_exposure.clone();
                 lease.admission_open = true;
             }
             lease.live_status = status;

@@ -152,6 +152,55 @@ impl WorkflowJournal {
         self.has_nonterminal_except(session_id, None)
     }
 
+    /// Terminalize the one staged transition whose target is now the
+    /// authenticated observed workflow exposure. A successful gateway
+    /// re-list is the authority for this change; notification alone is not.
+    pub(crate) fn observe_matching_transition(
+        &self,
+        session_id: &str,
+        target_mode: &str,
+        target_exposure_revision: &str,
+        target_state_sequence: u64,
+        owner_id: &str,
+        now_unix: i64,
+    ) -> Result<Option<String>, WorkflowJournalError> {
+        validate_identifier("session id", session_id)?;
+        validate_identifier("workflow mode", target_mode)?;
+        validate_digest("workflow exposure revision", target_exposure_revision)?;
+        let directory = self.operation_directory(session_id);
+        let snapshots = match self.nonterminal_snapshots(&directory, session_id)? {
+            Some(snapshots) => snapshots,
+            None => return Ok(None),
+        };
+        let mut matching = snapshots
+            .into_iter()
+            .filter(|snapshot| {
+                snapshot.value.kind == WorkflowOperationKind::Transition
+                    && snapshot.value.lifecycle == WorkflowOperationLifecycle::Staged
+                    && snapshot.value.target_mode.as_deref() == Some(target_mode)
+                    && snapshot.value.target_state_sequence <= target_state_sequence
+            })
+            .collect::<Vec<_>>();
+        if matching.len() > 1 {
+            return Err(WorkflowJournalError::InvalidRecord);
+        }
+        let Some(snapshot) = matching.pop() else {
+            return Ok(None);
+        };
+        let mut observed = snapshot.value;
+        observed.lifecycle = WorkflowOperationLifecycle::Observed;
+        observed.reason_code = "workflow-transition-observed".to_string();
+        observed.target_state_sequence = target_state_sequence;
+        observed.terminal_at_unix = Some(now_unix);
+        let operation_id = observed.operation_id.clone();
+        self.compare_and_swap(
+            &observed,
+            Some(&snapshot.revision),
+            OwnerGeneration::new(owner_id, target_state_sequence)?,
+        )?;
+        Ok(Some(operation_id))
+    }
+
     pub fn has_nonterminal_except(
         &self,
         session_id: &str,
@@ -161,11 +210,7 @@ impl WorkflowJournal {
         if let Some(operation_id) = operation_id {
             validate_identifier("workflow operation id", operation_id)?;
         }
-        let directory = self
-            .app_state_root
-            .join("sessions")
-            .join("workflow-operations")
-            .join(crate::encode_path_segment(session_id));
+        let directory = self.operation_directory(session_id);
         let metadata = match fs::symlink_metadata(&directory) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
@@ -203,6 +248,56 @@ impl WorkflowJournal {
             }
         }
         Ok(false)
+    }
+
+    fn operation_directory(&self, session_id: &str) -> PathBuf {
+        self.app_state_root
+            .join("sessions")
+            .join("workflow-operations")
+            .join(crate::encode_path_segment(session_id))
+    }
+
+    fn nonterminal_snapshots(
+        &self,
+        directory: &PathBuf,
+        session_id: &str,
+    ) -> Result<Option<Vec<StateSnapshot<WorkflowOperationRecord>>>, WorkflowJournalError> {
+        let metadata = match fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(state_io_error(directory, error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkflowJournalError::UnexpectedEntry(directory.clone()));
+        }
+        let mut snapshots = Vec::new();
+        for entry in fs::read_dir(directory).map_err(|error| state_io_error(directory, error))? {
+            let entry = entry.map_err(|error| state_io_error(directory, error))?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                return Err(WorkflowJournalError::UnexpectedEntry(entry.path()));
+            };
+            if file_name.starts_with('.') {
+                continue;
+            }
+            let Some(encoded_operation_id) = file_name.strip_suffix(".json") else {
+                return Err(WorkflowJournalError::UnexpectedEntry(entry.path()));
+            };
+            let store = AtomicJsonStore::new(entry.path(), WORKFLOW_OPERATION_SCHEMA_VERSION);
+            let snapshot = store
+                .load::<WorkflowOperationRecord>()?
+                .ok_or_else(|| WorkflowJournalError::UnexpectedEntry(entry.path()))?;
+            snapshot.value.verify()?;
+            if snapshot.value.session_id != session_id
+                || crate::encode_path_segment(&snapshot.value.operation_id) != encoded_operation_id
+            {
+                return Err(WorkflowJournalError::PathMismatch);
+            }
+            if !snapshot.value.lifecycle.is_terminal() {
+                snapshots.push(snapshot);
+            }
+        }
+        Ok(Some(snapshots))
     }
 
     fn store(&self, session_id: &str, operation_id: &str) -> AtomicJsonStore {

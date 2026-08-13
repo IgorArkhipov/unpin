@@ -65,6 +65,25 @@ impl WorkflowRouter {
         expected: &StateRevision,
         request: WorkflowTransitionRequest,
     ) -> Result<WorkflowTransitionResult, WorkflowRouterError> {
+        self.enter_mode_with_timing(handle, expected, request, false)
+    }
+
+    pub(crate) fn enter_mode_next_session_only(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        request: WorkflowTransitionRequest,
+    ) -> Result<WorkflowTransitionResult, WorkflowRouterError> {
+        self.enter_mode_with_timing(handle, expected, request, true)
+    }
+
+    fn enter_mode_with_timing(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        request: WorkflowTransitionRequest,
+        next_session_only: bool,
+    ) -> Result<WorkflowTransitionResult, WorkflowRouterError> {
         validate_identifier("workflow operation id", &request.operation_id)?;
         validate_identifier("workflow mode", &request.target_mode)?;
         validate_digest(
@@ -152,13 +171,22 @@ impl WorkflowRouter {
             self.journal
                 .compare_and_swap(&record, None, owner.clone())?
         };
-        let updated = self.sessions.update_workflow_mode(
-            handle,
-            expected,
-            &request.target_mode,
-            target_exposure.clone(),
-            request.requested_at_unix,
-        )?;
+        let updated = if next_session_only {
+            self.sessions.defer_workflow_mode_to_next_session(
+                handle,
+                expected,
+                &previous_mode,
+                request.requested_at_unix,
+            )?
+        } else {
+            self.sessions.update_workflow_mode(
+                handle,
+                expected,
+                &request.target_mode,
+                target_exposure.clone(),
+                request.requested_at_unix,
+            )?
+        };
         record.lifecycle = WorkflowOperationLifecycle::Staged;
         record.reason_code = "workflow-transition-staged".to_string();
         record.target_state_sequence = updated.revision.sequence;
@@ -176,7 +204,11 @@ impl WorkflowRouter {
             previous_exposure_revision,
             desired_exposure_revision: target_exposure.revision,
             lease_state_sequence: updated.revision.sequence,
-            next_action: "observe-or-cancel-transition".to_string(),
+            next_action: if next_session_only {
+                "start-new-session-or-cancel-transition".to_string()
+            } else {
+                "observe-or-cancel-transition".to_string()
+            },
         })
     }
 
@@ -266,6 +298,13 @@ impl WorkflowRouter {
             if workflow.active_mode != source_mode {
                 return Err(WorkflowRouterError::OperationBindingMismatch);
             }
+            let current = if current.lease.live_status == super::LiveExposureStatus::NextSessionOnly
+            {
+                self.sessions
+                    .restore_observed_exposure(handle, &current.revision, now_unix)?
+            } else {
+                current
+            };
             let mut terminal = operation.value;
             terminal.lifecycle = WorkflowOperationLifecycle::Cancelled;
             terminal.reason_code = "workflow-transition-cancelled".to_string();
@@ -315,9 +354,10 @@ fn transition_binding_matches_current_lease(
         .checked_sub(operation.target_state_sequence);
     match current.lease.live_status {
         super::LiveExposureStatus::Configured => sequence_advance == Some(0),
-        super::LiveExposureStatus::NotificationSent
-        | super::LiveExposureStatus::ReloadRequired
-        | super::LiveExposureStatus::NextSessionOnly => sequence_advance == Some(1),
+        super::LiveExposureStatus::NotificationSent | super::LiveExposureStatus::ReloadRequired => {
+            sequence_advance == Some(1)
+        }
+        super::LiveExposureStatus::NextSessionOnly => sequence_advance == Some(1),
         super::LiveExposureStatus::ObservedRefresh | super::LiveExposureStatus::Unknown => false,
     }
 }

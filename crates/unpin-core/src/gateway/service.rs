@@ -1075,9 +1075,16 @@ impl GatewayService {
             .ok_or(GatewayError::InvalidExposure(
                 "workflow mode exposure is unavailable",
             ))?;
-        let result = self.control.enter_workflow_mode(request)?;
+        let next_session_only = support == ListChangeSupport::NextSessionOnly;
+        let result = self
+            .control
+            .enter_workflow_mode(request, next_session_only)?;
         if result.lifecycle == crate::sessions::WorkflowOperationLifecycle::Observed {
             return Ok((result, GatewayRefreshOutcome::Unchanged));
+        }
+        if support == ListChangeSupport::NextSessionOnly {
+            self.connections.clear_pending(&primary)?;
+            return Ok((result, GatewayRefreshOutcome::NextSessionOnly));
         }
         let outcome =
             self.stage_registered_refresh_for_connection(&primary, exposure, support, now_unix);

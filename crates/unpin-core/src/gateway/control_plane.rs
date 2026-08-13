@@ -122,6 +122,20 @@ impl GatewayControlPlane {
             self.manager
                 .observe_exposure(&self.handle, &snapshot.revision, status, now_unix)?;
         *snapshot = updated.clone();
+        if status == LiveExposureStatus::ObservedRefresh
+            && let Some(workflow) = updated.lease.workflow.as_deref()
+        {
+            crate::sessions::WorkflowJournal::new(self.manager.app_state_root())
+                .observe_matching_transition(
+                    self.handle.session_id(),
+                    &workflow.active_mode,
+                    &updated.lease.observed_exposure.revision,
+                    updated.revision.sequence,
+                    self.handle.owner_id(),
+                    now_unix,
+                )
+                .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        }
         Ok(updated)
     }
 
@@ -188,12 +202,16 @@ impl GatewayControlPlane {
     pub(crate) fn enter_workflow_mode(
         &self,
         request: WorkflowTransitionRequest,
+        next_session_only: bool,
     ) -> Result<WorkflowTransitionResult, GatewayError> {
         let mut snapshot = self.lock_snapshot()?;
         let router = crate::sessions::WorkflowRouter::new(self.manager.clone());
-        let result = router
-            .enter_mode(&self.handle, &snapshot.revision, request)
-            .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        let result = if next_session_only {
+            router.enter_mode_next_session_only(&self.handle, &snapshot.revision, request)
+        } else {
+            router.enter_mode(&self.handle, &snapshot.revision, request)
+        }
+        .map_err(|error| GatewayError::Workflow(error.to_string()))?;
         *snapshot = self.manager.load_for_handle(&self.handle)?;
         Ok(result)
     }

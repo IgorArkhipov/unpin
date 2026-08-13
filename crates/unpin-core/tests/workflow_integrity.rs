@@ -331,6 +331,32 @@ fn auxiliary_transition_stages_only_primary_and_replacement_uses_observed_revisi
         .notify_tools_changed_for_connection(&primary, 1_011)
         .unwrap();
     service.list_tools_for_connection(&primary, 1_012).unwrap();
+    let observed = service.control_plane().snapshot().unwrap();
+    let planning_revision =
+        observed.lease.workflow.as_ref().unwrap().profile_revisions["planning"].clone();
+    let second = WorkflowTransitionRequest {
+        operation_id: "return-planning".to_string(),
+        operation_fingerprint: digest('9'),
+        source_state_sequence: observed.revision.sequence,
+        target_mode: "planning".to_string(),
+        requested_at_unix: 1_013,
+    };
+    let (second_transition, second_outcome) = service
+        .enter_workflow_mode_for_connection(
+            &auxiliary,
+            second,
+            ListChangeSupport::Negotiated,
+            1_013,
+        )
+        .expect("observed transition is terminal before next transition");
+    assert_eq!(
+        second_transition.desired_exposure_revision,
+        planning_revision
+    );
+    assert_eq!(second_outcome, GatewayRefreshOutcome::NotificationRequired);
+    service
+        .cancel_transition_for_connection(&auxiliary, &second_transition.operation_id, 1_014)
+        .expect("cancel second transition");
     service.connection_registry().disconnect(&primary).unwrap();
     let replacement = service.issue_connection_claim().unwrap();
     assert_eq!(replacement.role(), GatewayConnectionRole::Primary);
@@ -521,8 +547,23 @@ fn refresh_fallbacks_preserve_observed_set_and_cancel_restores_it() {
         .expect("next-session status");
     assert_eq!(next.observed_exposure_revision, digest('e'));
     assert_eq!(next.pending_exposure_revision, None);
+    let next_lease = service
+        .control_plane()
+        .snapshot()
+        .expect("next-session lease snapshot");
+    assert!(next_lease.lease.admission_open);
+    assert_eq!(
+        next_lease.lease.desired_exposure,
+        next_lease.lease.observed_exposure
+    );
+    assert!(
+        service
+            .list_tools_for_connection(&primary, 1_017)
+            .expect("current exposure remains callable")
+            .is_empty()
+    );
     service
-        .cancel_refresh_for_connection(&primary, 1_017)
+        .cancel_refresh_for_connection(&primary, 1_018)
         .expect("cancel next-session proposal");
     assert_eq!(
         service
