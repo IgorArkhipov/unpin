@@ -474,6 +474,7 @@ Store captures in `screenshots/`:
 | OpenCode transitions | `opencode-states.png` |
 | Zed transitions | `zed-states.png` |
 | MCP control plane | `mcp-states.png` |
+| Workflow routing | `workflow-routing.png` |
 | Native Packages workbench, Light | `desktop-packages-light.png` |
 | Native Packages workbench, Dark | `desktop-packages-dark.png` |
 

@@ -65,6 +65,7 @@ DASHBOARD_SECTION_IDS = (
     "provider-opencode",
     "provider-zed",
     "mcp-states",
+    "workflow-routing",
 )
 SCREENSHOT_SECTION_IDS = (
     *DASHBOARD_SECTION_IDS,

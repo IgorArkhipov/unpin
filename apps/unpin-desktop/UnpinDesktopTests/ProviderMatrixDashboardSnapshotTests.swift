@@ -82,6 +82,7 @@ final class ProviderMatrixDashboardSnapshotTests: XCTestCase {
         ProviderMatrixSection(id: "provider-opencode", filename: "opencode-states.png"),
         ProviderMatrixSection(id: "provider-zed", filename: "zed-states.png"),
         ProviderMatrixSection(id: "mcp-states", filename: "mcp-states.png"),
+        ProviderMatrixSection(id: "workflow-routing", filename: "workflow-routing.png"),
         ProviderMatrixSection(id: "desktop-packages-light", filename: "desktop-packages-light.png"),
         ProviderMatrixSection(id: "desktop-packages-dark", filename: "desktop-packages-dark.png"),
     ]
