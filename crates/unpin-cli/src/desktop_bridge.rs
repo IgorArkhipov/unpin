@@ -8,6 +8,9 @@ use std::{
 };
 
 use serde_json::{Value, json};
+
+#[cfg(target_os = "macos")]
+use std::ffi::{CStr, c_char, c_int, c_uint, c_void};
 use unpin_core::{
     agent_plugins::{AgentPluginComponentDisposition, AgentPluginInstance, AgentPluginSummary},
     approval::ControlApprovalContext,
@@ -41,7 +44,8 @@ use unpin_core::{
     providers::ProviderId,
     sessions::{
         LeaseSnapshot, PinnedExposure, PinnedProfile, SessionAuthorityKey, SessionManager,
-        WorkflowProposalV1, WorkflowReloadLimitation, WorkflowTransitionRequest,
+        WorkflowJournal, WorkflowOperationRecord, WorkflowProposalV1, WorkflowReloadLimitation,
+        WorkflowTransitionRequest,
     },
     state::atomic_json::OwnerGeneration,
     workflows::{
@@ -75,7 +79,6 @@ const METHOD_WORKFLOW_OBSERVE: &str = "workflow.observe";
 const METHOD_WORKFLOW_CANCEL: &str = "workflow.cancel-transition";
 const METHOD_WORKFLOW_STATUS: &str = "workflow.status";
 const METHOD_WORKFLOW_RECOVERY: &str = "workflow.recovery";
-const METHOD_WORKFLOW_RECOVER: &str = "workflow.recover";
 const METHOD_SNAPSHOT: &str = "snapshot";
 const METHOD_GROUP_PLAN: &str = "group.plan";
 const METHOD_GROUP_APPROVE: &str = "group.approve";
@@ -125,7 +128,6 @@ const BRIDGE_CAPABILITIES: &[&str] = &[
     METHOD_WORKFLOW_CANCEL,
     METHOD_WORKFLOW_STATUS,
     METHOD_WORKFLOW_RECOVERY,
-    METHOD_WORKFLOW_RECOVER,
 ];
 
 pub(crate) struct DesktopBridgeContext {
@@ -587,8 +589,12 @@ fn handle_handshake(state: &mut DesktopBridgeState, params: &Value) -> Result<Va
     if project_root != expected_project_root || app_state_root != expected_app_state_root {
         return Err("bridge-root-mismatch");
     }
+    require_fixture_bridge_sandbox(&state.context)?;
     if child_pid != std::process::id() || parent_pid != current_parent_process_id() {
         return Err("bridge-process-mismatch");
+    }
+    if !state.context.fixture_mode {
+        verify_signed_desktop_parent(parent_pid)?;
     }
     let child_start_marker = unpin_core::sha256_digest(
         format!(
@@ -621,6 +627,83 @@ fn bounded_bridge_string<'a>(params: &'a Value, key: &str) -> Result<&'a str, &'
         return Err("invalid-bridge-binding");
     }
     Ok(value)
+}
+
+#[cfg(target_os = "macos")]
+fn verify_signed_desktop_parent(parent_pid: u32) -> Result<(), &'static str> {
+    const DESKTOP_SIGNING_IDENTITY: &str = "dev.unpin.workbench";
+    const CS_VALID: u32 = 0x0000_0001;
+    const CS_ADHOC: u32 = 0x0000_0002;
+    const CS_OPS_STATUS: c_uint = 0;
+    const CS_OPS_IDENTITY: c_uint = 11;
+    const CS_OPS_TEAMID: c_uint = 14;
+
+    unsafe extern "C" {
+        fn csops(pid: c_int, ops: c_uint, useraddr: *mut c_void, usersize: usize) -> c_int;
+    }
+
+    fn signing_value(pid: u32, operation: c_uint) -> Result<String, &'static str> {
+        let pid = c_int::try_from(pid).map_err(|_| "bridge-signing-identity-unavailable")?;
+        let mut value = [0_u8; 256];
+        // SAFETY: `value` is writable for the duration of this kernel call.
+        let result = unsafe {
+            csops(
+                pid,
+                operation,
+                value.as_mut_ptr().cast::<c_void>(),
+                value.len(),
+            )
+        };
+        if result != 0 || !value.contains(&0) {
+            return Err("bridge-signing-identity-unavailable");
+        }
+        // SAFETY: successful csops identity values are NUL-terminated.
+        let value = unsafe { CStr::from_ptr(value.as_ptr().cast::<c_char>()) };
+        value
+            .to_str()
+            .map(str::to_string)
+            .map_err(|_| "bridge-signing-identity-unavailable")
+    }
+
+    fn signing_status(pid: u32) -> Result<u32, &'static str> {
+        let pid = c_int::try_from(pid).map_err(|_| "bridge-signing-identity-unavailable")?;
+        let mut status = 0_u32;
+        // SAFETY: `status` is a valid writable u32 for this kernel call.
+        let result = unsafe {
+            csops(
+                pid,
+                CS_OPS_STATUS,
+                (&raw mut status).cast::<c_void>(),
+                size_of::<u32>(),
+            )
+        };
+        (result == 0)
+            .then_some(status)
+            .ok_or("bridge-signing-identity-unavailable")
+    }
+
+    let child_pid = std::process::id();
+    let parent_status = signing_status(parent_pid)?;
+    let child_status = signing_status(child_pid)?;
+    if parent_status & CS_VALID == 0
+        || child_status & CS_VALID == 0
+        || parent_status & CS_ADHOC != 0
+        || child_status & CS_ADHOC != 0
+        || signing_value(parent_pid, CS_OPS_IDENTITY)? != DESKTOP_SIGNING_IDENTITY
+    {
+        return Err("bridge-signing-identity-mismatch");
+    }
+    let parent_team = signing_value(parent_pid, CS_OPS_TEAMID)?;
+    let child_team = signing_value(child_pid, CS_OPS_TEAMID)?;
+    if parent_team.is_empty() || parent_team != child_team {
+        return Err("bridge-signing-identity-mismatch");
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn verify_signed_desktop_parent(_parent_pid: u32) -> Result<(), &'static str> {
+    Err("bridge-signing-identity-unavailable")
 }
 
 fn current_parent_process_id() -> u32 {
@@ -689,11 +772,35 @@ fn authenticate_request(
 fn bridge_request_tag(secret: &str, request: &Request, auth: &BridgeRequestAuth) -> String {
     let operation_id = &auth.operation_id;
     let fingerprint = &auth.fingerprint;
+    let params_digest = canonical_params_digest(&request.params);
     let material = format!(
-        "unpin.desktop.bridge.request.v1\0{secret}\0{}\0{}\0{}\0{operation_id}\0{fingerprint}",
+        "unpin.desktop.bridge.request.v1\0{secret}\0{}\0{}\0{}\0{operation_id}\0{fingerprint}\0{params_digest}",
         auth.sequence, request.id, request.method,
     );
     unpin_core::sha256_digest(material.as_bytes())
+}
+
+fn canonical_params_digest(params: &Value) -> String {
+    fn canonicalize(value: &Value) -> Value {
+        match value {
+            Value::Object(object) => {
+                let mut entries = object.iter().collect::<Vec<_>>();
+                entries.sort_by(|left, right| left.0.cmp(right.0));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key.clone(), canonicalize(value)))
+                        .collect(),
+                )
+            }
+            Value::Array(array) => Value::Array(array.iter().map(canonicalize).collect()),
+            value => value.clone(),
+        }
+    }
+
+    let canonical = canonicalize(params);
+    let encoded = serde_json::to_vec(&canonical).expect("bridge params are JSON");
+    unpin_core::sha256_digest(&encoded)
 }
 
 fn constant_time_text_equal(left: &str, right: &str) -> bool {
@@ -744,8 +851,7 @@ fn handle_request(state: &mut DesktopBridgeState, request: Request) -> Value {
             METHOD_WORKFLOW_OBSERVE => observe_workflow(state, &request.params),
             METHOD_WORKFLOW_CANCEL => cancel_workflow_transition(state, &request.params),
             METHOD_WORKFLOW_STATUS => workflow_status(state),
-            METHOD_WORKFLOW_RECOVERY => workflow_recovery(state, false),
-            METHOD_WORKFLOW_RECOVER => workflow_recovery(state, true),
+            METHOD_WORKFLOW_RECOVERY => workflow_recovery(state),
             METHOD_SHUTDOWN => Ok(json!({"shutdown": true})),
             _ => Err("unknown-method"),
         }
@@ -1051,10 +1157,11 @@ fn launch_workflow(state: &mut DesktopBridgeState, params: &Value) -> Result<Val
     state.workflow_session_id = Some(established.session_id.clone());
     state.reviewed_workflow_launches.remove(proposal_id);
     let session = current_workflow_session(state)?;
+    let operations = workflow_operations(state, Some(&session))?;
     Ok(json!({
         "status": "launched",
         "sessionId": established.session_id,
-        "session": workflow_session_value(&session),
+        "session": workflow_session_value(&session, &operations),
         "nextAction": "inspect-workflow-status",
     }))
 }
@@ -1106,9 +1213,10 @@ fn transition_workflow(
     )
     .map_err(|_| "workflow-transition-blocked")?;
     let session = current_workflow_session(state)?;
+    let operations = workflow_operations(state, Some(&session))?;
     Ok(json!({
         "result": result.get("result").cloned().unwrap_or(result),
-        "session": workflow_session_value(&session),
+        "session": workflow_session_value(&session, &operations),
         "status": workflow_status_value(Some(&session)),
     }))
 }
@@ -1116,8 +1224,9 @@ fn transition_workflow(
 fn observe_workflow(state: &mut DesktopBridgeState, params: &Value) -> Result<Value, &'static str> {
     require_only_params(params, &[])?;
     let session = current_workflow_session(state)?;
+    let operations = workflow_operations(state, Some(&session))?;
     Ok(json!({
-        "session": workflow_session_value(&session),
+        "session": workflow_session_value(&session, &operations),
         "status": workflow_status_value(Some(&session)),
     }))
 }
@@ -1137,43 +1246,73 @@ fn cancel_workflow_transition(
     )
     .map_err(|_| "workflow-cancel-blocked")?;
     let session = current_workflow_session(state)?;
+    let operations = workflow_operations(state, Some(&session))?;
     Ok(json!({
         "status": "cancelled",
         "operationId": operation_id,
-        "session": workflow_session_value(&session),
+        "session": workflow_session_value(&session, &operations),
     }))
 }
 
 fn workflow_status(state: &mut DesktopBridgeState) -> Result<Value, &'static str> {
-    let session = state
-        .workflow_session_id
+    let session = discover_current_workflow_session(state)?;
+    if state.workflow_session_id.is_none() {
+        state.workflow_session_id = session
+            .as_ref()
+            .map(|snapshot| snapshot.lease.session_id.clone());
+    }
+    let operations = workflow_operations(state, session.as_ref())?;
+    let recovery_required =
+        session.as_ref().is_some_and(workflow_recovery_required) || !operations.is_empty();
+    let workflows = state
+        .workflows
+        .values()
+        .map(workflow_draft_value)
+        .collect::<Vec<_>>();
+    let selected_workflow_id = session
+        .as_ref()
+        .and_then(|session| session.lease.workflow.as_deref())
+        .map(|workflow| workflow.workflow_id.clone())
+        .or_else(|| {
+            (workflows.len() == 1)
+                .then(|| state.workflows.keys().next().cloned())
+                .flatten()
+        });
+    let selected_workflow = selected_workflow_id
         .as_deref()
-        .map(|_| current_workflow_session(state))
-        .transpose()?;
+        .and_then(|workflow_id| state.workflows.get(workflow_id))
+        .map(workflow_draft_value);
     Ok(json!({
         "status": workflow_status_value(session.as_ref()),
-        "session": session.as_ref().map(workflow_session_value),
-        "operations": [],
-        "recoveryRequired": session.as_ref().is_some_and(workflow_recovery_required),
+        "session": session.as_ref().map(|session| workflow_session_value(session, &operations)),
+        "workflow": selected_workflow,
+        "workflows": workflows,
+        "selectedWorkflowId": selected_workflow_id,
+        "operations": operations,
+        "recoveryRequired": recovery_required,
     }))
 }
 
-fn workflow_recovery(state: &mut DesktopBridgeState, recover: bool) -> Result<Value, &'static str> {
-    let session = state
-        .workflow_session_id
-        .as_deref()
-        .map(|_| current_workflow_session(state))
-        .transpose()?;
-    let recovery_required = session.as_ref().is_some_and(workflow_recovery_required);
-    if recover && recovery_required {
-        return Err("workflow-owner-recovery-required");
+fn workflow_recovery(state: &mut DesktopBridgeState) -> Result<Value, &'static str> {
+    let session = discover_current_workflow_session(state)?;
+    if state.workflow_session_id.is_none() {
+        state.workflow_session_id = session
+            .as_ref()
+            .map(|snapshot| snapshot.lease.session_id.clone());
     }
+    let operations = workflow_operations(state, session.as_ref())?;
+    let recovery_required =
+        session.as_ref().is_some_and(workflow_recovery_required) || !operations.is_empty();
     Ok(json!({
         "status": if recovery_required { "recovery-required" } else { "ready" },
         "recoveryRequired": recovery_required,
-        "operations": [],
-        "session": session.as_ref().map(workflow_session_value),
-        "message": if recovery_required { "End and relaunch the routed child session after inspecting status." } else { "No workflow recovery is required." },
+        "operations": operations,
+        "session": session.as_ref().map(|session| workflow_session_value(session, &operations)),
+        "message": if recovery_required {
+            "Inspect the pending transition before choosing cancel or relaunch."
+        } else {
+            "No workflow recovery is required."
+        },
     }))
 }
 
@@ -1244,6 +1383,54 @@ fn current_workflow_session(state: &DesktopBridgeState) -> Result<LeaseSnapshot,
         .into_iter()
         .find(|snapshot| snapshot.lease.session_id == session_id)
         .ok_or("workflow-session-unavailable")
+}
+
+fn discover_current_workflow_session(
+    state: &DesktopBridgeState,
+) -> Result<Option<LeaseSnapshot>, &'static str> {
+    let authority_key = credentials::resolve_session_authority_key(
+        state.context.fixture_mode,
+        &state.context.config.app_state_root,
+    )
+    .map_err(|_| "workflow-session-authority-unavailable")?
+    .ok_or("workflow-session-authority-unavailable")?;
+    let identity = state
+        .context
+        .config
+        .workspace_identity()
+        .map_err(|_| "workspace-identity-unavailable")?;
+    let sessions =
+        SessionManager::with_authority_key(&state.context.config.app_state_root, authority_key)
+            .list()
+            .map_err(|_| "workflow-session-unavailable")?;
+    if let Some(session_id) = state.workflow_session_id.as_deref() {
+        return Ok(sessions
+            .into_iter()
+            .find(|snapshot| snapshot.lease.session_id == session_id));
+    }
+    let mut matches = sessions.into_iter().filter(|snapshot| {
+        snapshot.lease.lifecycle == unpin_core::sessions::LeaseLifecycle::Active
+            && snapshot.lease.workflow.is_some()
+            && snapshot.lease.repository_key == identity.repository_key
+            && snapshot.lease.workspace_key == identity.workspace_key
+    });
+    let selected = matches.next();
+    if matches.next().is_some() {
+        return Err("workflow-session-selection-required");
+    }
+    Ok(selected)
+}
+
+fn workflow_operations(
+    state: &DesktopBridgeState,
+    session: Option<&LeaseSnapshot>,
+) -> Result<Vec<WorkflowOperationRecord>, &'static str> {
+    let Some(session) = session else {
+        return Ok(Vec::new());
+    };
+    WorkflowJournal::new(&state.context.config.app_state_root)
+        .nonterminal_records(&session.lease.session_id)
+        .map_err(|_| "workflow-operation-history-unavailable")
 }
 
 fn workflow_recovery_required(session: &LeaseSnapshot) -> bool {
@@ -1356,20 +1543,24 @@ fn workflow_draft_value(draft: &WorkflowDraft) -> Value {
     })
 }
 
-fn workflow_session_value(session: &LeaseSnapshot) -> Value {
+fn workflow_session_value(
+    session: &LeaseSnapshot,
+    operation_history: &[WorkflowOperationRecord],
+) -> Value {
     let workflow = session.lease.workflow.as_deref();
     json!({
         "sessionId": session.lease.session_id,
         "workflowId": workflow.map(|workflow| workflow.workflow_id.as_str()),
         "proposalId": workflow.map(|workflow| workflow.proposal_id.as_str()),
-        "activeMode": workflow.map(|workflow| workflow.active_mode.as_str()),
+        "activeMode": observed_workflow_mode(session),
+        "desiredMode": workflow.map(|workflow| workflow.active_mode.as_str()),
         "observedMode": observed_workflow_mode(session),
         "desiredExposureRevision": session.lease.desired_exposure.revision,
         "observedExposureRevision": session.lease.observed_exposure.revision,
         "stateSequence": session.revision.sequence,
         "liveStatus": session.lease.live_status,
         "admissionOpen": session.lease.admission_open,
-        "operationHistory": [],
+        "operationHistory": operation_history,
     })
 }
 
@@ -1391,7 +1582,7 @@ fn workflow_status_value(session: Option<&LeaseSnapshot>) -> Value {
             json!({
                 "sessionId": session.lease.session_id,
                 "workflowId": workflow.map(|workflow| workflow.workflow_id.as_str()),
-                "activeMode": workflow.map(|workflow| workflow.active_mode.as_str()),
+                "activeMode": observed_workflow_mode(session),
                 "desiredMode": workflow.map(|workflow| workflow.active_mode.as_str()),
                 "observedMode": observed_workflow_mode(session),
                 "stateSequence": session.revision.sequence,
@@ -2066,6 +2257,15 @@ fn require_group_write_sandbox(context: &DesktopBridgeContext) -> Result<(), &'s
         context.fixture_mode,
         group_context.app_state_root(),
         group_context.workspace_root(),
+        &context.discovery_roots,
+    )
+}
+
+fn require_fixture_bridge_sandbox(context: &DesktopBridgeContext) -> Result<(), &'static str> {
+    require_fixture_group_write_sandbox(
+        context.fixture_mode,
+        &context.config.app_state_root,
+        &context.config.project_root,
         &context.discovery_roots,
     )
 }
@@ -3142,12 +3342,14 @@ mod tests {
     }
 
     fn agent_plugin_fixture_context(root: &std::path::Path) -> DesktopBridgeContext {
-        let fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let source_fixture_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("CLI crate has a workspace crates parent")
             .join("unpin-core")
             .join("tests")
             .join("fixtures");
+        let fixture_root = root.join("fixtures");
+        copy_test_directory(&source_fixture_root, &fixture_root);
         let app_state_root = root.join("state");
         let project_root = root.join("project");
         std::fs::create_dir_all(&app_state_root).expect("temporary bridge app state");
@@ -3165,6 +3367,39 @@ mod tests {
         DesktopBridgeContext::new(config, DiscoveryRoots::fixture_root(fixture_root), true)
     }
 
+    fn copy_test_directory(source: &std::path::Path, destination: &std::path::Path) {
+        std::fs::create_dir_all(destination).expect("create fixture destination");
+        for entry in std::fs::read_dir(source).expect("read fixture source") {
+            let entry = entry.expect("read fixture entry");
+            let source_path = entry.path();
+            let destination_path = destination.join(entry.file_name());
+            if source_path.is_dir() {
+                copy_test_directory(&source_path, &destination_path);
+            } else {
+                std::fs::copy(&source_path, &destination_path).expect("copy fixture file");
+            }
+        }
+    }
+
+    #[test]
+    fn fixture_handshake_rejects_roots_outside_private_temporary_storage() {
+        let temporary = tempfile::tempdir().expect("temporary fixture root");
+        let mut context = bridge_test_context(temporary.path());
+        context.config.project_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let app_state_root = context.config.app_state_root.clone();
+        let mut state = bridge_state(context);
+        let encoded = test_handshake_request("handshake", &state.context);
+        let handshake = parse_request(&encoded)
+            .unwrap_or_else(|error| panic!("test handshake request failed: {}", error.code));
+
+        assert_eq!(
+            handle_request(&mut state, handshake)["error"]["code"],
+            "fixture-write-sandbox-blocked"
+        );
+        assert!(!app_state_root.exists());
+        assert!(state.binding.is_none());
+    }
+
     fn bridge_state(context: DesktopBridgeContext) -> DesktopBridgeState {
         DesktopBridgeState {
             context,
@@ -3179,6 +3414,132 @@ mod tests {
             workflow_session_id: None,
             next_definition_plan_id: 0,
         }
+    }
+
+    fn create_test_workflow_session(context: &DesktopBridgeContext, suffix: &str) {
+        let authority_key = SessionAuthorityKey::new(
+            unpin_core::fixture::fixture_credential_key(
+                &context.config.app_state_root,
+                unpin_core::fixture::FixtureCredentialPurpose::SessionAuthority,
+            )
+            .expect("fixture session authority"),
+        );
+        let manager =
+            SessionManager::with_authority_key(&context.config.app_state_root, authority_key);
+        let identity = context
+            .config
+            .workspace_identity()
+            .expect("workspace identity");
+        let now = unix_now();
+        let request = unpin_core::sessions::BootstrapRequest {
+            provider: ProviderId::Codex,
+            repository_key: identity.repository_key,
+            workspace_key: identity.workspace_key,
+            workspace_revision: identity.diagnostics.head,
+            exposure: PinnedExposure {
+                revision: "a".repeat(64),
+                profile: PinnedProfile::None,
+                capability_locks: None,
+            },
+            process: unpin_core::sessions::ProcessEvidence {
+                pid: std::process::id(),
+                start_marker: format!("desktop-test-{suffix}"),
+            },
+            connection_scope_id: format!("desktop-test-scope-{suffix}"),
+            isolation: unpin_core::sessions::IsolationLevel::Strict,
+            coverage: unpin_core::sessions::CoverageLevel::VerifiedMasked,
+            protected_resources: BTreeSet::from([format!("desktop-test-resource-{suffix}")]),
+            lease_expires_at_unix: now + 3_600,
+        };
+        let authority = manager
+            .prepare_bootstrap(request.clone(), now)
+            .expect("prepare workflow session");
+        let claimed = manager
+            .claim_bootstrap(
+                &authority,
+                &unpin_core::sessions::ConnectionClaim {
+                    connection_owner_id: format!("desktop-test-owner-{suffix}"),
+                    provider: request.provider,
+                    repository_key: request.repository_key,
+                    workspace_key: request.workspace_key,
+                    process: request.process,
+                    connection_scope_id: request.connection_scope_id,
+                },
+                now + 1,
+            )
+            .expect("claim workflow session");
+        let digest = "b".repeat(64);
+        manager
+            .pin_workflow(
+                &claimed.handle,
+                &claimed.lease.revision,
+                unpin_core::sessions::PinnedWorkflowEnvelope {
+                    workflow_id: format!("delivery-{suffix}"),
+                    workflow_revision: "c".repeat(64),
+                    baseline_profile_id: "baseline".to_string(),
+                    baseline_profile_digest: "d".repeat(64),
+                    profile_revisions: BTreeMap::from([("planning".to_string(), digest.clone())]),
+                    active_mode: "planning".to_string(),
+                    active_effective_profile_digest: digest.clone(),
+                    maximum_envelope_digest: "e".repeat(64),
+                    capability_lock_digest: "f".repeat(64),
+                    catalog_revision: "1".repeat(64),
+                    proposal_id: format!("proposal-{suffix}"),
+                    proposal_fingerprint: "2".repeat(64),
+                    state_sequence: 1,
+                    sealed_generation: 1,
+                },
+                PinnedExposure {
+                    revision: digest.clone(),
+                    profile: PinnedProfile::Profile {
+                        profile_id: format!("delivery-{suffix}.planning"),
+                        profile_digest: digest,
+                        origin_scope: ProfileSourceScope::Session,
+                        definition_digest: "c".repeat(64),
+                    },
+                    capability_locks: None,
+                },
+                now + 2,
+            )
+            .expect("pin workflow");
+    }
+
+    #[test]
+    fn workflow_status_reports_observed_active_mode_while_transition_is_pending() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let root = std::fs::canonicalize(temporary.path()).expect("canonical temporary root");
+        let context = bridge_test_context(&root);
+        std::fs::create_dir_all(&context.config.project_root).expect("temporary workflow project");
+        let authority_key = SessionAuthorityKey::new(
+            unpin_core::fixture::fixture_credential_key(
+                &context.config.app_state_root,
+                unpin_core::fixture::FixtureCredentialPurpose::SessionAuthority,
+            )
+            .expect("fixture session authority"),
+        );
+        let manager =
+            SessionManager::with_authority_key(&context.config.app_state_root, authority_key);
+        create_test_workflow_session(&context, "pending-status");
+        let current = manager
+            .list()
+            .expect("list workflow sessions")
+            .into_iter()
+            .next()
+            .expect("workflow session");
+        let mut staged = current;
+        staged
+            .lease
+            .workflow
+            .as_mut()
+            .expect("pinned workflow")
+            .active_mode = "implementation".to_string();
+        staged.lease.desired_exposure.revision = "3".repeat(64);
+        staged.lease.admission_open = false;
+
+        let status = workflow_status_value(Some(&staged));
+        assert_eq!(status["activeMode"], "planning");
+        assert_eq!(status["observedMode"], "planning");
+        assert_eq!(status["desiredMode"], "implementation");
     }
 
     fn encoded_request(id: &str, method: &str, params: Option<Value>) -> Vec<u8> {
@@ -3297,6 +3658,46 @@ mod tests {
         let mut second = parsed_request("snapshot-2", METHOD_SNAPSHOT, json!({}));
         authenticate_test_request(&state, &mut second, 2);
         assert!(handle_request(&mut state, second).get("result").is_some());
+    }
+
+    #[test]
+    fn authenticated_requests_bind_canonical_parameters() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let context = agent_plugin_fixture_context(temporary.path());
+        let mut state = bridge_state(context);
+        complete_test_handshake(&mut state);
+
+        let mut request = parsed_request(
+            "snapshot-tamper",
+            METHOD_SNAPSHOT,
+            json!({"nested": {"before": true}}),
+        );
+        authenticate_test_request(&state, &mut request, 1);
+        request.params["nested"]["before"] = json!(false);
+        assert_eq!(
+            handle_request(&mut state, request)["error"]["code"],
+            "bridge-authentication-failed"
+        );
+    }
+
+    #[test]
+    fn reconnect_requires_explicit_selection_for_multiple_matching_workflow_sessions() {
+        let temporary = tempfile::tempdir().expect("temporary bridge state");
+        let root =
+            std::fs::canonicalize(temporary.path()).expect("canonical temporary bridge state");
+        let context = agent_plugin_fixture_context(&root);
+        create_test_workflow_session(&context, "one");
+        create_test_workflow_session(&context, "two");
+        let mut state = bridge_state(context);
+        complete_test_handshake(&mut state);
+        let mut request = parsed_request("workflow-status", METHOD_WORKFLOW_STATUS, json!({}));
+        authenticate_test_request(&state, &mut request, 1);
+
+        assert_eq!(
+            handle_request(&mut state, request)["error"]["code"],
+            "workflow-session-selection-required"
+        );
+        assert!(state.workflow_session_id.is_none());
     }
 
     #[test]

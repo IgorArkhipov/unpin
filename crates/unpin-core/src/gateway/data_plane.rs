@@ -246,7 +246,7 @@ impl GatewayDataPlane {
         limit: usize,
         now_unix: i64,
     ) -> Result<Vec<SkillMetadata>, GatewayError> {
-        self.with_local_call_for_exposure(&exposure, now_unix, || {
+        self.with_local_call(&exposure, now_unix, || {
             exposure.skills().search(query, limit)
         })
     }
@@ -262,7 +262,7 @@ impl GatewayDataPlane {
         reference: &str,
         now_unix: i64,
     ) -> Result<LoadedSkill, GatewayError> {
-        self.with_local_call_for_exposure(&exposure, now_unix, || exposure.skills().load(reference))
+        self.with_local_call(&exposure, now_unix, || exposure.skills().load(reference))
     }
 
     pub fn admit_tool(
@@ -509,23 +509,6 @@ impl GatewayDataPlane {
     }
 
     fn with_local_call<T>(
-        &self,
-        exposure: &GatewayExposure,
-        now_unix: i64,
-        operation: impl FnOnce() -> Result<T, GatewayError>,
-    ) -> Result<T, GatewayError> {
-        let admission = self
-            .control
-            .admit_call(&exposure.pinned().revision, now_unix)?;
-        let result = operation();
-        let finished = self.control.finish_call(admission, now_unix);
-        match (result, finished) {
-            (_, Err(error)) => Err(error),
-            (result, Ok(_)) => result,
-        }
-    }
-
-    fn with_local_call_for_exposure<T>(
         &self,
         exposure: &GatewayExposure,
         now_unix: i64,

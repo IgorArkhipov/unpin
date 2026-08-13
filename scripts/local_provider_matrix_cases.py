@@ -161,6 +161,10 @@ class McpSession:
             "unpin_plan_toggle_item",
             "unpin_apply_toggle_item",
             "unpin_restore_backup",
+            "unpin_list_workflows",
+            "unpin_validate_workflow",
+            "unpin_propose_session_workflow",
+            "unpin_plan_workflow_session_launch",
         }
         if initialized.get("serverInfo", {}).get("name") != "unpin":
             raise MatrixFailure("MCP initialize returned unexpected server identity")
@@ -614,10 +618,13 @@ def authenticated_desktop_bridge_request(
             json.dumps(params, separators=(",", ":"), sort_keys=True).encode("utf-8")
         ).hexdigest()
     )
+    params_digest = hashlib.sha256(
+        json.dumps(params, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
     material = (
         "unpin.desktop.bridge.request.v1\0"
         f"{session_secret}\0{sequence}\0{request_id}\0{method}\0"
-        f"{operation_id}\0{fingerprint}"
+        f"{operation_id}\0{fingerprint}\0{params_digest}"
     )
     request["auth"] = {
         "parentPid": binding.get("parentPid"),

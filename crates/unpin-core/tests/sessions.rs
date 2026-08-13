@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use tempfile::TempDir as RawTempDir;
 use unpin_core::{
     catalog::CapabilityId,
-    config::{get_session_lease_path, get_session_overlay_root},
+    config::{get_session_lease_path, get_session_leases_dir, get_session_overlay_root},
     profiles::{CapabilityLockSnapshot, CapabilityLockState, ProfileSourceScope},
     providers::ProviderId,
     sessions::{
@@ -347,6 +347,55 @@ fn wait_for_path(path: &Path, timeout: Duration) -> bool {
         thread::sleep(Duration::from_millis(10));
     }
     path.exists()
+}
+
+#[test]
+fn listing_uninitialized_session_state_is_empty_and_read_only() {
+    let temp = TempDir::new();
+    let manager = authenticated_manager(temp.path());
+
+    assert!(manager.list().expect("empty session list").is_empty());
+    assert!(!temp.path().join("runtime").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn listing_uninitialized_session_state_accepts_a_lexical_root_alias() {
+    let temp = TempDir::new();
+    let physical_root = temp.path().join("physical-state");
+    fs::create_dir(&physical_root).expect("physical state root");
+    let aliased_root = temp.path().join("aliased-state");
+    std::os::unix::fs::symlink(&physical_root, &aliased_root).expect("state root alias");
+    let manager = authenticated_manager(&aliased_root);
+
+    assert!(
+        manager
+            .list()
+            .expect("empty aliased session list")
+            .is_empty()
+    );
+    assert!(!physical_root.join("runtime").exists());
+}
+
+#[test]
+fn listing_uninitialized_session_state_does_not_mask_an_invalid_sessions_path() {
+    let temp = TempDir::new();
+    let sessions_path = get_session_leases_dir(temp.path());
+    let runtime_path = sessions_path.parent().expect("sessions parent");
+    fs::create_dir_all(runtime_path).expect("session runtime directory");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(runtime_path, fs::Permissions::from_mode(0o700))
+            .expect("private session runtime directory");
+    }
+    fs::write(&sessions_path, b"not a directory").expect("invalid sessions path");
+    let manager = authenticated_manager(temp.path());
+
+    assert!(matches!(
+        manager.list(),
+        Err(LeaseError::State(StateError::NotRegularFile { path })) if path == sessions_path
+    ));
 }
 
 #[test]

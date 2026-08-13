@@ -11,7 +11,8 @@ planning -> implementation -> review exposures, exact advertised MCP tools,
 skill search results and loaded body bytes, hooks, desired/observed revisions,
 same-primary re-list ordering, fallback/cancel behavior, connection and session
 isolation, Agent Plugin contributions, protected-root evidence, bridge-auth
-binding, cross-surface parity, and native-state invariance.
+binding, role-specific surface coverage, canonical observation comparisons,
+and native-state invariance.
 
 Unpin supports Claude Code, Codex, Cursor, Pi, OpenCode, and Zed. It inventories current
 provider configuration, plans changes without writing by default, and applies
@@ -93,6 +94,15 @@ package is not toggled, native provider bytes and hashes remain unchanged,
 auxiliary connections are control-only, stale connection epochs and cross-
 session claims fail closed, and `next-session-only` never closes current
 admission or changes the observed exposure.
+
+Workflow surface evidence is role-based rather than a blanket parity claim.
+The gateway is the authoritative live runtime; MCP evidence comes from the real
+gateway `tools/list` observation; CLI validates definitions and owns the human
+launch handoff; desktop is the primary human workbench; and the TUI is a
+projection-and-handoff surface, not a workflow editor or independent live-state
+authority. The validator compares the canonical observed gateway and MCP fields
+directly and rejects mismatches, synthetic MCP tool evidence, or TUI live/editing
+claims.
 
 Examples below use `/absolute/path/to/unpin` for built binary. Replace it with
 output of `realpath target/debug/unpin`.

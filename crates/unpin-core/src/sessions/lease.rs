@@ -26,6 +26,7 @@ const BOOTSTRAP_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-bootstrap-v2\0";
 const LEASE_AUTHENTICATION_PURPOSE_V2: &[u8] = b"unpin-session-lease-v2\0";
 const LEASE_AUTHENTICATION_PURPOSE_V3: &[u8] = b"unpin-session-lease-v3\0";
 const LAUNCH_CONTROL_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-launch-control-v1\0";
+const RUNTIME_REGISTRATION_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-runtime-registration-v1\0";
 const INVENTORY_GROUP_AUTHENTICATION_PURPOSE: &[u8] =
     b"unpin-inventory-group-session-authority-v1\0";
 const REACH_AWARE_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-reach-aware-operation-v2\0";
@@ -61,6 +62,16 @@ impl SessionAuthorityKey {
 
     pub fn verify_launch_control(&self, payload: &[u8], tag: &str) -> Result<(), String> {
         self.verify(LAUNCH_CONTROL_AUTHENTICATION_PURPOSE, payload, tag)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn authenticate_runtime_registration(&self, payload: &[u8]) -> Result<String, String> {
+        self.authenticate(RUNTIME_REGISTRATION_AUTHENTICATION_PURPOSE, payload)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn verify_runtime_registration(&self, payload: &[u8], tag: &str) -> Result<(), String> {
+        self.verify(RUNTIME_REGISTRATION_AUTHENTICATION_PURPOSE, payload, tag)
             .map_err(|error| error.to_string())
     }
 
@@ -681,6 +692,7 @@ impl SessionLease {
                         | LiveExposureStatus::NotificationSent
                         | LiveExposureStatus::ReloadRequired
                 ))
+            && !(self.workflow.is_some() && self.live_status == LiveExposureStatus::Unknown)
         {
             return Err(LeaseValidationError::InvalidLifecycle);
         }

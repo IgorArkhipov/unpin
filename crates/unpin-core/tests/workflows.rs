@@ -15,7 +15,7 @@ use unpin_core::{
         ProfileSourceScope, compile_profile,
     },
     providers::ProviderId,
-    state::atomic_json::{AtomicJsonStore, OwnerGeneration, StateError},
+    state::atomic_json::{AtomicJsonStore, OwnerGeneration, StateRevision},
     workflows::{
         GENERAL_MODE, IMPLEMENTATION_MODE, PLANNING_MODE, REVIEW_MODE, WORKFLOW_DEFINITION_VERSION,
         WorkflowControl, WorkflowControlEffect, WorkflowDefinition, WorkflowModeDefinition,
@@ -26,6 +26,22 @@ use unpin_core::{
 
 fn id(value: &str) -> CapabilityId {
     CapabilityId::new(value).expect("valid capability id")
+}
+
+fn seed_global_workflow(
+    app_state_root: &std::path::Path,
+    definition: &WorkflowDefinition,
+    expected: Option<&StateRevision>,
+    owner: OwnerGeneration,
+) -> StateRevision {
+    AtomicJsonStore::new(
+        app_state_root
+            .join("workflows")
+            .join(format!("{}.json", definition.id)),
+        1,
+    )
+    .compare_and_swap(expected, owner, definition)
+    .expect("seed global workflow definition")
 }
 
 fn record(value: &str, kind: CapabilityKind) -> CatalogRecord {
@@ -437,9 +453,7 @@ fn workflow_store_round_trips_trusted_definitions_and_immutable_revisions() {
     fs::create_dir(&workspace).unwrap();
     let store = WorkflowStore::new(&app_state);
     let definition = workflow_definition();
-    store
-        .save_global_definition(&definition, None, owner())
-        .unwrap();
+    seed_global_workflow(&app_state, &definition, None, owner());
     assert_eq!(
         store
             .load_global_definition("delivery")
@@ -472,40 +486,30 @@ fn workflow_store_round_trips_trusted_definitions_and_immutable_revisions() {
 }
 
 #[test]
-fn workflow_store_delete_requires_the_current_revision() {
+fn workflow_store_never_opens_dotenv_named_json_entries() {
     let temp = tempfile::tempdir().unwrap();
     let root = fs::canonicalize(temp.path()).unwrap();
-    let store = WorkflowStore::new(root.join("state"));
+    let app_state = root.join("state");
+    let workspace = root.join("workspace");
+    fs::create_dir_all(&workspace).unwrap();
+    let store = WorkflowStore::new(&app_state);
     let definition = workflow_definition();
-    let first = store
-        .save_global_definition(&definition, None, owner())
-        .unwrap();
+    seed_global_workflow(&app_state, &definition, None, owner());
 
-    let mut changed = definition.clone();
-    changed.display_name = "Changed".to_string();
-    let second = store
-        .save_global_definition(
-            &changed,
-            Some(&first),
-            OwnerGeneration::new("workflow-test", 2).unwrap(),
-        )
-        .unwrap();
+    let global_directory = app_state.join("workflows");
+    fs::write(global_directory.join(".env.json"), b"not-json").unwrap();
+    fs::write(global_directory.join(".env.local.json"), b"not-json").unwrap();
 
-    assert!(matches!(
-        store.delete_global_definition(&definition.id, &first),
-        Err(WorkflowStoreError::State(StateError::StaleRevision {
-            expected: Some(expected),
-            actual: Some(actual),
-        })) if expected == first && actual == second
-    ));
-    store
-        .delete_global_definition(&definition.id, &second)
-        .unwrap();
+    let workspace_directory = workspace_workflows_dir(&workspace);
+    fs::create_dir_all(&workspace_directory).unwrap();
+    fs::write(workspace_directory.join(".env.json"), b"not-json").unwrap();
+    fs::write(workspace_directory.join(".env.local.json"), b"not-json").unwrap();
+
+    assert_eq!(store.list_global_definitions().unwrap().len(), 1);
     assert!(
-        store
-            .load_global_definition(&definition.id)
+        WorkflowStore::list_workspace_definitions(&workspace)
             .unwrap()
-            .is_none()
+            .is_empty()
     );
 }
 

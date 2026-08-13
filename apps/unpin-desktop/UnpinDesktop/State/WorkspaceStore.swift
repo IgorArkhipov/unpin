@@ -127,6 +127,7 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var workspaceName: String?
     @Published private(set) var mutationUncertaintyBlocker: String?
     @Published private(set) var workflowDraft: WorkflowDraft?
+    @Published private(set) var workflowDefinitions: [WorkflowDraft] = []
     @Published private(set) var workflowValidation: WorkflowValidationEnvelope?
     @Published private(set) var workflowProposal: WorkflowProposal?
     @Published private(set) var workflowCandidates: [WorkflowCandidate] = []
@@ -285,6 +286,8 @@ final class WorkspaceStore: ObservableObject {
             self.bridge = bridge
             try await refresh(connectionGeneration: generation)
             guard connectionIsCurrent(generation) else { return }
+            await refreshWorkflowStatus(connectionGeneration: generation)
+            guard connectionIsCurrent(generation) else { return }
             if loadRecovery {
                 await refreshRecovery(connectionGeneration: generation)
             } else {
@@ -343,6 +346,7 @@ final class WorkspaceStore: ObservableObject {
         lastRestoreBlocker = nil
         lastRestore = nil
         workflowDraft = nil
+        workflowDefinitions = []
         workflowValidation = nil
         workflowProposal = nil
         workflowCandidates = []
@@ -457,6 +461,20 @@ final class WorkspaceStore: ObservableObject {
         ))
     }
 
+    @MainActor
+    func selectWorkflow(workflowID: String) {
+        guard let selected = workflowDefinitions.first(where: { $0.workflowId == workflowID }) else {
+            workflowBlocker = "The selected workflow is no longer available. Refresh workflow status and choose it again."
+            return
+        }
+        workflowDraft = selected
+        workflowValidation = nil
+        workflowProposal = nil
+        workflowCandidates = []
+        workflowHostCommand = []
+        workflowBlocker = nil
+    }
+
     func validateWorkflow() async {
         guard guardActionsAllowed() else { return }
         guard let draft = workflowDraft else {
@@ -477,12 +495,20 @@ final class WorkspaceStore: ObservableObject {
 
     func proposeWorkflow(prompt: String, provider: String? = nil) async {
         guard guardActionsAllowed() else { return }
-        let workflowID = workflowDraft?.workflowId
+        guard let draft = workflowDraft else {
+            workflowBlocker = "Select a hydrated workflow before proposing a session."
+            return
+        }
+        let selectedProvider = provider ?? draft.provider
+        guard selectedProvider.isEmpty == false else {
+            workflowBlocker = "The selected workflow has no provider. Refresh workflow status and choose a complete workflow."
+            return
+        }
         await performWorkflowRead { bridge in
             try await bridge.proposeWorkflow(WorkflowProposeParameters(
                 prompt: prompt,
-                workflowId: workflowID,
-                provider: provider ?? self.workflowDraft?.provider
+                workflowId: draft.workflowId,
+                provider: selectedProvider
             ))
         } onSuccess: { proposal in
             self.workflowProposal = proposal.proposal
@@ -547,6 +573,7 @@ final class WorkspaceStore: ObservableObject {
             if mutationMayBeUnconfirmed(error) {
                 workflowBlocker = "The workflow launch was not confirmed. Inspect workflow recovery before retrying."
                 workflowRecoveryRequired = true
+                workflowRequestInFlight = false
                 await refreshWorkflowRecovery(connectionGeneration: expectedGeneration)
             } else {
                 workflowBlocker = error.localizedDescription
@@ -565,8 +592,12 @@ final class WorkspaceStore: ObservableObject {
             workflowBlocker = "Launch a workflow session before changing modes."
             return
         }
+        guard targetMode.isEmpty == false else {
+            workflowBlocker = "Choose a target workflow mode before transitioning."
+            return
+        }
         let sourceSequence = session.stateSequence ?? 0
-        let generatedOperationID = operationID ?? "workflow-transition-(UUID().uuidString.lowercased())"
+        let generatedOperationID = operationID ?? Self.workflowTransitionOperationID()
         let generatedFingerprint = operationFingerprint ?? Self.workflowFingerprint(
             operationID: generatedOperationID,
             sourceSequence: sourceSequence,
@@ -591,6 +622,12 @@ final class WorkspaceStore: ObservableObject {
                 requestedAtUnix: Int(Date().timeIntervalSince1970)
             ))
             guard connectionIsCurrent(expectedGeneration) else { return }
+            if let session = envelope.session {
+                workflowSession = session
+            }
+            if let status = envelope.status {
+                workflowStatus = status
+            }
             if let result = envelope.result {
                 workflowOperations.append(WorkflowOperationSnapshot(
                     operationId: result.operationId,
@@ -615,6 +652,7 @@ final class WorkspaceStore: ObservableObject {
             workflowBlocker = error.localizedDescription
             if mutationMayBeUnconfirmed(error) {
                 workflowRecoveryRequired = true
+                workflowRequestInFlight = false
                 await refreshWorkflowRecovery(connectionGeneration: expectedGeneration)
             } else {
                 state = .blocked(error.localizedDescription)
@@ -660,7 +698,6 @@ final class WorkspaceStore: ObservableObject {
     }
 
     func refreshWorkflowStatus(connectionGeneration expectedGeneration: Int? = nil) async {
-        guard guardActionsAllowed() else { return }
         let generation = expectedGeneration ?? connectionGeneration
         guard connectionIsCurrent(generation) else { return }
         await performWorkflowRead(
@@ -668,7 +705,27 @@ final class WorkspaceStore: ObservableObject {
                 try await bridge.workflowStatus()
             },
             onSuccess: { status in
-                if let session = status.session { self.workflowSession = session }
+                let hydratedDefinitions = status.workflows
+                    + (status.workflow.map { [ $0 ] } ?? [])
+                if hydratedDefinitions.isEmpty == false {
+                    var uniqueDefinitions = [WorkflowDraft]()
+                    for definition in hydratedDefinitions where uniqueDefinitions.contains(where: {
+                        $0.workflowId == definition.workflowId
+                    }) == false {
+                        uniqueDefinitions.append(definition)
+                    }
+                    self.workflowDefinitions = uniqueDefinitions
+                    let selectedID = status.selectedWorkflowId
+                        ?? status.status?.workflowId
+                        ?? status.session?.workflowId
+                    if let selectedID,
+                       let selected = uniqueDefinitions.first(where: { $0.workflowId == selectedID }) {
+                        self.workflowDraft = selected
+                    } else if self.workflowDraft == nil, uniqueDefinitions.count == 1 {
+                        self.workflowDraft = uniqueDefinitions[0]
+                    }
+                }
+        self.workflowSession = status.session
                 if let snapshot = status.status { self.workflowStatus = snapshot }
                 self.workflowOperations = status.operations
                 self.workflowRecoveryRequired = status.recoveryRequired == true
@@ -702,35 +759,17 @@ final class WorkspaceStore: ObservableObject {
         }
     }
 
-    func recoverWorkflow() async {
+    func refreshWorkflowRecovery() async {
         guard controlRequestInFlight == false else { return }
         let expectedGeneration = connectionGeneration
-        controlRequestInFlight = true
-        workflowRequestInFlight = true
-        defer {
-            controlRequestInFlight = false
-            workflowRequestInFlight = false
+        await refreshWorkflowRecovery(connectionGeneration: expectedGeneration)
+        guard connectionIsCurrent(expectedGeneration) else { return }
+        if workflowRecoveryRequired {
+            workflowBlocker = workflowRecovery?.message
+                ?? "End the routed child session and relaunch it after inspecting recovery evidence."
+            return
         }
-        do {
-            guard let bridge else { throw BridgeClientError.childStopped }
-            if let hook = testHooks.beforeWorkflowControl { await hook() }
-            let recovery = try await bridge.recoverWorkflow()
-            guard connectionIsCurrent(expectedGeneration) else { return }
-            workflowRecovery = recovery
-            workflowOperations = recovery.operations
-            workflowRecoveryRequired = recovery.recoveryRequired == true
-            workflowBlocker = recovery.message
-            if workflowRecoveryRequired == false {
-                workflowRequestInFlight = false
-                await observeWorkflow()
-                workflowRequestInFlight = true
-            }
-        } catch {
-            guard connectionIsCurrent(expectedGeneration) else { return }
-            workflowRecoveryRequired = true
-            workflowBlocker = error.localizedDescription
-            state = .blocked(error.localizedDescription)
-        }
+        await refreshWorkflowStatus(connectionGeneration: expectedGeneration)
     }
 
     private func performWorkflowRead<Response: Decodable>(
@@ -764,6 +803,10 @@ final class WorkspaceStore: ObservableObject {
     ) -> String {
         let material = "unpin.desktop.workflow.transition.v1\u{0}\(operationID)\u{0}\(sourceSequence)\u{0}\(targetMode)\u{0}\(workflowID)"
         return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func workflowTransitionOperationID() -> String {
+        "workflow-transition-\(UUID().uuidString.lowercased())"
     }
 
     private static func normalizedWorkflowHostCommand(_ command: [String]) -> [String] {

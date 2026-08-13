@@ -164,10 +164,18 @@ final class BridgeClientTests: XCTestCase {
         while IFS= read -r request; do
             case "$request" in
                 *group.approve*)
-                    case "$request" in
-                        *'"auth"'*'"parentPid"'*'"authTag"'*) ;;
-                        *) exit 42 ;;
-                    esac
+                        case "$request" in
+                            *'"auth"'*) ;;
+                            *) exit 42 ;;
+                        esac
+                        case "$request" in
+                            *'"parentPid"'*) ;;
+                            *) exit 42 ;;
+                        esac
+                        case "$request" in
+                            *'"authTag"'*) ;;
+                            *) exit 42 ;;
+                        esac
                     while :; do sleep 1; done
                     ;;
                 *handshake*)
@@ -178,7 +186,7 @@ final class BridgeClientTests: XCTestCase {
                     generation=$(printf '%s' "$request" | sed -n 's/.*"processGeneration":"\\([^"]*\\)".*/\\1/p')
                     project_root=$(printf '%s' "$request" | sed -n 's/.*"projectRoot":"\\([^"]*\\)".*/\\1/p')
                     app_state_root=$(printf '%s' "$request" | sed -n 's/.*"appStateRoot":"\\([^"]*\\)".*/\\1/p')
-                    printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard","workflow.compose","workflow.validate","workflow.propose","workflow.launch","workflow.transition","workflow.observe","workflow.cancel-transition","workflow.status","workflow.recovery","workflow.recover"],"binding":{"parentPid":'"$parent_pid"',"parentStartMarker":"'"$parent_marker"'","childPid":'"$child_pid"',"childStartMarker":"fake-child-start","projectRoot":"'"$project_root"'","appStateRoot":"'"$app_state_root"'","processGeneration":"'"$generation"'"}}}'
+                    printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard","workflow.compose","workflow.validate","workflow.propose","workflow.launch","workflow.transition","workflow.observe","workflow.cancel-transition","workflow.status","workflow.recovery"],"binding":{"parentPid":'"$parent_pid"',"parentStartMarker":"'"$parent_marker"'","childPid":'"$child_pid"',"childStartMarker":"fake-child-start","projectRoot":"'"$project_root"'","appStateRoot":"'"$app_state_root"'","processGeneration":"'"$generation"'"}}}'
                     ;;
             esac
         done
@@ -224,10 +232,18 @@ final class BridgeClientTests: XCTestCase {
         while IFS= read -r request; do
             case "$request" in
                 *group.approve*)
-                    case "$request" in
-                        *'"auth"'*'"parentPid"'*'"authTag"'*) ;;
-                        *) exit 42 ;;
-                    esac
+                        case "$request" in
+                            *'"auth"'*) ;;
+                            *) exit 42 ;;
+                        esac
+                        case "$request" in
+                            *'"parentPid"'*) ;;
+                            *) exit 42 ;;
+                        esac
+                        case "$request" in
+                            *'"authTag"'*) ;;
+                            *) exit 42 ;;
+                        esac
                     while :; do :; done
                     ;;
                 *handshake*)
@@ -238,7 +254,7 @@ final class BridgeClientTests: XCTestCase {
                     generation=$(printf '%s' "$request" | sed -n 's/.*"processGeneration":"\\([^"]*\\)".*/\\1/p')
                     project_root=$(printf '%s' "$request" | sed -n 's/.*"projectRoot":"\\([^"]*\\)".*/\\1/p')
                     app_state_root=$(printf '%s' "$request" | sed -n 's/.*"appStateRoot":"\\([^"]*\\)".*/\\1/p')
-                    printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard","workflow.compose","workflow.validate","workflow.propose","workflow.launch","workflow.transition","workflow.observe","workflow.cancel-transition","workflow.status","workflow.recovery","workflow.recover"],"binding":{"parentPid":'"$parent_pid"',"parentStartMarker":"'"$parent_marker"'","childPid":'"$child_pid"',"childStartMarker":"fake-child-start","projectRoot":"'"$project_root"'","appStateRoot":"'"$app_state_root"'","processGeneration":"'"$generation"'"}}}'
+                    printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard","workflow.compose","workflow.validate","workflow.propose","workflow.launch","workflow.transition","workflow.observe","workflow.cancel-transition","workflow.status","workflow.recovery"],"binding":{"parentPid":'"$parent_pid"',"parentStartMarker":"'"$parent_marker"'","childPid":'"$child_pid"',"childStartMarker":"fake-child-start","projectRoot":"'"$project_root"'","appStateRoot":"'"$app_state_root"'","processGeneration":"'"$generation"'"}}}'
                     ;;
             esac
         done
@@ -480,15 +496,18 @@ final class BridgeClientTests: XCTestCase {
             from: Data(#"""
             {
               "result": {
-                "operationId": "workflow-transition-1",
-                "lifecycle": "staged",
-                "reasonCode": "workflow-transition-staged",
-                "previousMode": "planning",
-                "desiredMode": "implementation",
-                "previousExposureRevision": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
-                "desiredExposureRevision": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
-                "leaseStateSequence": 8,
-                "nextAction": "observe-or-cancel-transition"
+                "transition": {
+                  "operationId": "workflow-transition-1",
+                  "lifecycle": "staged",
+                  "reasonCode": "workflow-transition-staged",
+                  "previousMode": "planning",
+                  "desiredMode": "implementation",
+                  "previousExposureRevision": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "desiredExposureRevision": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+                  "leaseStateSequence": 8,
+                  "nextAction": "observe-or-cancel-transition"
+                },
+                "refreshOutcome": "notification-sent"
               },
               "session": {
                 "sessionId": "session-1",
@@ -502,16 +521,102 @@ final class BridgeClientTests: XCTestCase {
                 "liveStatus": "reload-required",
                 "admissionOpen": false,
                 "operationHistory": []
+              },
+              "status": {
+                "sessionId": "session-1",
+                "workflowId": "delivery",
+                "activeMode": "implementation",
+                "desiredMode": "implementation",
+                "observedMode": "planning",
+                "stateSequence": 8,
+                "liveStatus": "notification-sent",
+                "admissionOpen": false,
+                "recoveryRequired": false
               }
             }
             """#.utf8)
         )
 
         XCTAssertEqual(envelope.result?.lifecycle, "staged")
+        XCTAssertEqual(envelope.refreshOutcome, "notification-sent")
         XCTAssertEqual(envelope.result?.desiredMode, "implementation")
         XCTAssertEqual(envelope.result?.leaseStateSequence, 8)
         XCTAssertEqual(envelope.session?.id, "session-1")
         XCTAssertEqual(envelope.session?.liveStatus, "reload-required")
+        XCTAssertEqual(envelope.status?.liveStatus, "notification-sent")
+    }
+
+    func testWorkflowStatusDecodesHydratedDefinitionsAndDurableOperations() throws {
+        let envelope = try JSONDecoder().decode(
+            WorkflowStatusEnvelope.self,
+            from: Data(#"""
+            {
+              "status": {
+                "sessionId": "session-1",
+                "workflowId": "delivery",
+                "activeMode": "planning",
+                "desiredMode": "implementation",
+                "observedMode": "planning",
+                "stateSequence": 8,
+                "liveStatus": "notification-sent",
+                "admissionOpen": false,
+                "recoveryRequired": false
+              },
+              "session": {
+                "sessionId": "session-1",
+                "workflowId": "delivery",
+                "proposalId": "proposal-1",
+                "activeMode": "planning",
+                "observedMode": "planning",
+                "desiredExposureRevision": "revision-2",
+                "observedExposureRevision": "revision-1",
+                "stateSequence": 8,
+                "liveStatus": "notification-sent",
+                "admissionOpen": false,
+                "operationHistory": [{
+                  "operationId": "transition-1",
+                  "lifecycle": "staged",
+                  "reasonCode": "workflow-transition-staged",
+                  "sourceMode": "planning",
+                  "targetMode": "implementation",
+                  "sourceStateSequence": 7,
+                  "targetStateSequence": 8,
+                  "operationFingerprint": "fingerprint-1"
+                }]
+              },
+              "workflows": [{
+                "workflowId": "delivery",
+                "displayName": "Delivery",
+                "description": "Plan and implement",
+                "provider": "codex",
+                "baselineProfileId": "baseline",
+                "entryMode": "planning",
+                "modes": [{"name": "planning", "profileId": "planning"}, {"name": "implementation", "profileId": "implementation"}],
+                "workflowRevision": "revision-workflow"
+              }],
+              "selectedWorkflowId": "delivery",
+              "operations": [{
+                "operationId": "transition-1",
+                "lifecycle": "staged",
+                "reasonCode": "workflow-transition-staged",
+                "sourceMode": "planning",
+                "targetMode": "implementation",
+                "sourceStateSequence": 7,
+                "targetStateSequence": 8,
+                "operationFingerprint": "fingerprint-1"
+              }],
+              "liveStatus": "notification-sent",
+              "recoveryRequired": false
+            }
+            """#.utf8)
+        )
+
+        XCTAssertEqual(envelope.workflows.map(\.workflowId), ["delivery"])
+        XCTAssertEqual(envelope.workflow?.workflowId, nil)
+        XCTAssertEqual(envelope.selectedWorkflowId, "delivery")
+        XCTAssertEqual(envelope.status?.liveStatus, "notification-sent")
+        XCTAssertEqual(envelope.session?.operationHistory.first?.operationId, "transition-1")
+        XCTAssertEqual(envelope.operations.first?.lifecycle, "staged")
     }
 
     func testWorkflowHandshakeBindingDecodesProcessBinding() throws {
@@ -592,7 +697,7 @@ final class BridgeClientTests: XCTestCase {
                         *) exit 47 ;;
                     esac
                     case "$request" in
-                        *'"authTag"'*) ;
+                        *'"authTag"'*) ;;
                         *) exit 48 ;;
                     esac
                     id=$(printf '%s' "$request" | sed -n 's/.*"id":"\\([^"\\]*\\)".*/\\1/p')
@@ -606,7 +711,7 @@ final class BridgeClientTests: XCTestCase {
                     generation=$(printf '%s' "$request" | sed -n 's/.*"processGeneration":"\\([^"]*\\)".*/\\1/p')
                     project_root=$(printf '%s' "$request" | sed -n 's/.*"projectRoot":"\\([^"]*\\)".*/\\1/p')
                     app_state_root=$(printf '%s' "$request" | sed -n 's/.*"appStateRoot":"\\([^"]*\\)".*/\\1/p')
-                    printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard","workflow.compose","workflow.validate","workflow.propose","workflow.launch","workflow.transition","workflow.observe","workflow.cancel-transition","workflow.status","workflow.recovery","workflow.recover"],"binding":{"parentPid":'"$parent_pid"',"parentStartMarker":"'"$parent_marker"'","childPid":'"$child_pid"',"childStartMarker":"fake-child-start","projectRoot":"'"$project_root"'","appStateRoot":"'"$app_state_root"'","processGeneration":"'"$generation"'"}}}'
+                    printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard","workflow.compose","workflow.validate","workflow.propose","workflow.launch","workflow.transition","workflow.observe","workflow.cancel-transition","workflow.status","workflow.recovery"],"binding":{"parentPid":'"$parent_pid"',"parentStartMarker":"'"$parent_marker"'","childPid":'"$child_pid"',"childStartMarker":"fake-child-start","projectRoot":"'"$project_root"'","appStateRoot":"'"$app_state_root"'","processGeneration":"'"$generation"'"}}}'
                     ;;
             esac
         done

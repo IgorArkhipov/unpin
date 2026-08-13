@@ -3151,6 +3151,7 @@ dependencies = [
  "hmac 0.13.0",
  "jsonc-parser",
  "reqwest",
+ "rmcp",
  "rusqlite",
  "serde",
  "serde_json",
@@ -3159,6 +3160,7 @@ dependencies = [
  "tempfile",
  "time",
  "tokio",
+ "unpin-cli",
  "zeroize",
 ]
 

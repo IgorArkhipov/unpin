@@ -34,6 +34,10 @@ pub struct GatewayControlPlane {
 }
 
 impl GatewayControlPlane {
+    pub(crate) fn app_state_root(&self) -> &std::path::Path {
+        self.manager.app_state_root()
+    }
+
     pub fn new(
         manager: SessionManager,
         handle: SessionHandle,
@@ -125,7 +129,7 @@ impl GatewayControlPlane {
         if status == LiveExposureStatus::ObservedRefresh
             && let Some(workflow) = updated.lease.workflow.as_deref()
         {
-            crate::sessions::WorkflowJournal::new(self.manager.app_state_root())
+            let terminalized = crate::sessions::WorkflowJournal::new(self.manager.app_state_root())
                 .observe_matching_transition(
                     self.handle.session_id(),
                     &workflow.active_mode,
@@ -133,8 +137,25 @@ impl GatewayControlPlane {
                     updated.revision.sequence,
                     self.handle.owner_id(),
                     now_unix,
-                )
-                .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+                );
+            if let Err(error) = terminalized {
+                let quarantine = self.manager.quarantine_workflow_observation(
+                    &self.handle,
+                    &updated.revision,
+                    now_unix,
+                );
+                return match quarantine {
+                    Ok(quarantined) => {
+                        *snapshot = quarantined;
+                        Err(GatewayError::Workflow(format!(
+                            "workflow observation quarantined: {error}"
+                        )))
+                    }
+                    Err(quarantine_error) => Err(GatewayError::Workflow(format!(
+                        "workflow observation failed: {error}; quarantine failed: {quarantine_error}"
+                    ))),
+                };
+            }
         }
         Ok(updated)
     }

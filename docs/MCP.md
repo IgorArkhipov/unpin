@@ -23,6 +23,31 @@ additional mutation permission is introduced by the newer protocol edition.
 
 ## Safety boundary
 
+### Regular workflow tools
+
+The regular MCP server exposes four read-only workflow tools:
+
+- `unpin_list_workflows` lists effective stored workflow metadata;
+- `unpin_validate_workflow` compiles one stored workflow against stored
+  profiles, the current catalog, and capability locks;
+- `unpin_propose_session_workflow` ranks stored workflows and returns only a
+  digest of the supplied prompt;
+- `unpin_plan_workflow_session_launch` recompiles one stored workflow and
+  returns a CLI/desktop handoff.
+
+These tools operate only on stored workflow definitions and profiles. The
+proposal accepts a prompt only for ranking and returns its digest rather than
+echoing the prompt. Their schemas do not accept inline definitions, arbitrary
+paths, commands, argument vectors, or child commands. They do not materialize a
+workflow revision, spawn a process, write state, mint approval, or expose
+session authority.
+
+A launch plan is therefore a human handoff, not a launch: it reports
+`materializationRequired: true` and `materialized: false`. Complete revision
+materialization and confirm the session through the Unpin CLI or desktop. These
+regular tools are separate from, and do not enlarge, the routed session's fixed
+four-control allowlist below.
+
 ### Routed workflow sessions
 
 A confirmed workflow session receives one immutable maximum envelope and one

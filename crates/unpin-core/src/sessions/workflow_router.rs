@@ -112,6 +112,17 @@ impl WorkflowRouter {
                 && record.source_mode.as_deref() == Some(workflow.active_mode.as_str())
                 && record.target_mode.as_deref() == Some(request.target_mode.as_str())
         });
+        let exact_already_active_retry = existing.as_ref().is_some_and(|snapshot| {
+            let record = &snapshot.value;
+            record.kind == super::WorkflowOperationKind::Transition
+                && record.lifecycle == WorkflowOperationLifecycle::Observed
+                && record.reason_code == "workflow-mode-already-active"
+                && record.source_state_sequence == expected.sequence
+                && record.target_state_sequence == expected.sequence
+                && record.operation_fingerprint == request.operation_fingerprint
+                && record.source_mode.as_deref() == Some(workflow.active_mode.as_str())
+                && record.target_mode.as_deref() == Some(request.target_mode.as_str())
+        });
         if current.lease.desired_exposure != current.lease.observed_exposure
             || self.journal.has_nonterminal_except(
                 handle.session_id(),
@@ -120,7 +131,7 @@ impl WorkflowRouter {
         {
             return Err(WorkflowRouterError::TransitionInProgress);
         }
-        if existing.is_some() && !exact_proposed_retry {
+        if existing.is_some() && !exact_proposed_retry && !exact_already_active_retry {
             return Err(WorkflowRouterError::TransitionInProgress);
         }
         let previous_mode = workflow.active_mode.clone();
@@ -137,6 +148,28 @@ impl WorkflowRouter {
             current.lease.desired_exposure.capability_locks.clone(),
         );
         if previous_mode == request.target_mode {
+            if !exact_already_active_retry {
+                let record = WorkflowOperationRecord {
+                    schema_version: super::WORKFLOW_OPERATION_SCHEMA_VERSION,
+                    session_id: handle.session_id().to_string(),
+                    operation_id: request.operation_id.clone(),
+                    kind: super::WorkflowOperationKind::Transition,
+                    lifecycle: WorkflowOperationLifecycle::Observed,
+                    reason_code: "workflow-mode-already-active".to_string(),
+                    source_state_sequence: expected.sequence,
+                    target_state_sequence: expected.sequence,
+                    operation_fingerprint: request.operation_fingerprint.clone(),
+                    source_mode: Some(previous_mode.clone()),
+                    target_mode: Some(request.target_mode.clone()),
+                    created_at_unix: request.requested_at_unix,
+                    terminal_at_unix: Some(request.requested_at_unix),
+                };
+                self.journal.compare_and_swap(
+                    &record,
+                    None,
+                    OwnerGeneration::new(handle.owner_id(), expected.sequence)?,
+                )?;
+            }
             return Ok(WorkflowTransitionResult {
                 operation_id: request.operation_id,
                 lifecycle: WorkflowOperationLifecycle::Observed,
@@ -165,6 +198,15 @@ impl WorkflowRouter {
             terminal_at_unix: None,
         };
         let owner = OwnerGeneration::new(handle.owner_id(), expected.sequence)?;
+        let compensation_owner = OwnerGeneration::new(
+            handle.owner_id(),
+            expected
+                .sequence
+                .checked_add(1)
+                .ok_or(WorkflowRouterError::State(
+                    "workflow owner generation overflow".to_string(),
+                ))?,
+        )?;
         let journal_revision = if let Some(existing) = existing {
             existing.revision
         } else {
@@ -177,7 +219,7 @@ impl WorkflowRouter {
                 expected,
                 &previous_mode,
                 request.requested_at_unix,
-            )?
+            )
         } else {
             self.sessions.update_workflow_mode(
                 handle,
@@ -185,16 +227,56 @@ impl WorkflowRouter {
                 &request.target_mode,
                 target_exposure.clone(),
                 request.requested_at_unix,
-            )?
+            )
+        };
+        let updated = match updated {
+            Ok(updated) => updated,
+            Err(error) => {
+                if let Err(compensation) = self.cancel_proposed_record(
+                    &record,
+                    &journal_revision,
+                    compensation_owner.clone(),
+                    request.requested_at_unix,
+                ) {
+                    return Err(WorkflowRouterError::RecoveryRequired(format!(
+                        "workflow lease update failed: {error}; proposed-record compensation failed: {compensation}"
+                    )));
+                }
+                return Err(error.into());
+            }
         };
         record.lifecycle = WorkflowOperationLifecycle::Staged;
         record.reason_code = "workflow-transition-staged".to_string();
         record.target_state_sequence = updated.revision.sequence;
-        self.journal.compare_and_swap(
+        if let Err(error) = self.journal.compare_and_swap(
             &record,
             Some(&journal_revision),
             OwnerGeneration::new(handle.owner_id(), expected.sequence + 1)?,
-        )?;
+        ) {
+            let rollback = self.sessions.cancel_workflow_transition(
+                handle,
+                &updated.revision,
+                &previous_mode,
+                current.lease.observed_exposure.clone(),
+                request.requested_at_unix,
+            );
+            if let Err(rollback_error) = rollback {
+                return Err(WorkflowRouterError::RecoveryRequired(format!(
+                    "workflow staging journal failed: {error}; lease rollback failed: {rollback_error}"
+                )));
+            }
+            if let Err(compensation) = self.cancel_proposed_record(
+                &record,
+                &journal_revision,
+                compensation_owner,
+                request.requested_at_unix,
+            ) {
+                return Err(WorkflowRouterError::RecoveryRequired(format!(
+                    "workflow staging journal failed: {error}; proposed-record compensation failed: {compensation}"
+                )));
+            }
+            return Err(error.into());
+        }
         Ok(WorkflowTransitionResult {
             operation_id: request.operation_id,
             lifecycle: WorkflowOperationLifecycle::Staged,
@@ -210,6 +292,22 @@ impl WorkflowRouter {
                 "observe-or-cancel-transition".to_string()
             },
         })
+    }
+
+    fn cancel_proposed_record(
+        &self,
+        record: &WorkflowOperationRecord,
+        revision: &StateRevision,
+        owner: OwnerGeneration,
+        now_unix: i64,
+    ) -> Result<(), WorkflowRouterError> {
+        let mut cancelled = record.clone();
+        cancelled.lifecycle = WorkflowOperationLifecycle::Cancelled;
+        cancelled.reason_code = "workflow-transition-cancelled-before-lease".to_string();
+        cancelled.terminal_at_unix = Some(now_unix);
+        self.journal
+            .compare_and_swap(&cancelled, Some(revision), owner)?;
+        Ok(())
     }
 
     fn record_denial(
@@ -241,7 +339,7 @@ impl WorkflowRouter {
             created_at_unix: request.requested_at_unix,
             terminal_at_unix: Some(request.requested_at_unix),
         };
-        self.journal.compare_and_swap(
+        self.journal.compare_and_swap_denial(
             &record,
             None,
             OwnerGeneration::new(handle.owner_id(), current.revision.sequence)?,
@@ -293,6 +391,47 @@ impl WorkflowRouter {
             || operation.value.target_state_sequence > current.revision.sequence
         {
             return Err(WorkflowRouterError::OperationBindingMismatch);
+        }
+        // A failed post-observation journal write quarantines the lease with
+        // desired == observed and admission closed. The normal staged-binding
+        // predicate intentionally rejects that shape, so use the authenticated
+        // operation's source mode to restore the prior exposure explicitly.
+        if current.lease.live_status == super::LiveExposureStatus::Unknown
+            && !current.lease.admission_open
+            && workflow.active_mode == target_mode
+            && workflow
+                .profile_revisions
+                .get(&target_mode)
+                .is_some_and(|revision| revision == &current.lease.observed_exposure.revision)
+        {
+            let source_revision = workflow
+                .profile_revisions
+                .get(&source_mode)
+                .ok_or(WorkflowRouterError::OperationBindingMismatch)?;
+            let source_exposure = resolved_mode_exposure(
+                workflow,
+                &source_mode,
+                source_revision,
+                current.lease.observed_exposure.capability_locks.clone(),
+            );
+            let restored = self.sessions.cancel_workflow_transition(
+                handle,
+                expected,
+                &source_mode,
+                source_exposure,
+                now_unix,
+            )?;
+            let mut terminal = operation.value;
+            terminal.lifecycle = WorkflowOperationLifecycle::Cancelled;
+            terminal.reason_code = "workflow-transition-cancelled".to_string();
+            terminal.target_state_sequence = restored.revision.sequence;
+            terminal.terminal_at_unix = Some(now_unix);
+            self.journal.compare_and_swap(
+                &terminal,
+                Some(&operation.revision),
+                OwnerGeneration::new(handle.owner_id(), restored.revision.sequence)?,
+            )?;
+            return Ok(restored);
         }
         if current.lease.desired_exposure == current.lease.observed_exposure {
             if workflow.active_mode != source_mode {
@@ -804,6 +943,7 @@ pub enum WorkflowRouterError {
     OperationNotFound,
     OperationNotCancellable,
     OperationBindingMismatch,
+    RecoveryRequired(String),
     Session(String),
     Journal(String),
     State(String),
@@ -860,6 +1000,9 @@ impl fmt::Display for WorkflowRouterError {
             }
             Self::OperationBindingMismatch => {
                 formatter.write_str("workflow operation binding does not match session state")
+            }
+            Self::RecoveryRequired(message) => {
+                write!(formatter, "workflow recovery required: {message}")
             }
             Self::Session(message)
             | Self::Journal(message)

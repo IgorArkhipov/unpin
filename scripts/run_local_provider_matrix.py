@@ -7,6 +7,7 @@ import collections
 import datetime as dt
 import html
 import json
+import math
 import os
 import re
 import stat
@@ -602,7 +603,7 @@ def validate_workflow_routing_evidence(evidence: dict[str, Any]) -> None:
     connections = evidence.get("connections") or {}
     plugin = evidence.get("agentPlugin") or {}
     safety = evidence.get("safety") or {}
-    parity = evidence.get("crossSurfaceParity") or {}
+    surface_coverage = evidence.get("surfaceCoverage") or {}
 
     if workflow.get("modeOrder") != ["planning", "implementation", "review"]:
         raise MatrixFailure("workflow routing modes are incomplete or out of order")
@@ -610,6 +611,10 @@ def validate_workflow_routing_evidence(evidence: dict[str, Any]) -> None:
         raise MatrixFailure("workflow routing per-mode evidence is incomplete")
     required_mode_fields = {
         "advertisedToolNames",
+        "gatewayToolsListNames",
+        "expectedToolDescriptors",
+        "observedToolDescriptors",
+        "mcpObservationSource",
         "skillSearchResults",
         "loadedSkillBodyBytes",
         "hookIds",
@@ -620,8 +625,60 @@ def validate_workflow_routing_evidence(evidence: dict[str, Any]) -> None:
     for mode_name, mode in modes.items():
         if not required_mode_fields.issubset(mode):
             raise MatrixFailure(f"workflow routing mode evidence is incomplete: {mode_name}")
-        if not mode["advertisedToolNames"] or not mode["skillSearchResults"]:
+        if (
+            not mode["advertisedToolNames"]
+            or not mode["gatewayToolsListNames"]
+            or not mode["skillSearchResults"]
+        ):
             raise MatrixFailure(f"workflow routing mode exposure is empty: {mode_name}")
+        if (
+            mode["mcpObservationSource"]
+            != "GatewayMcpServer RMCP tools/list"
+        ):
+            raise MatrixFailure(
+                f"workflow routing MCP evidence is not from gateway tools/list: {mode_name}"
+            )
+        if not set(mode["gatewayToolsListNames"]).issubset(
+            mode["advertisedToolNames"]
+        ):
+            raise MatrixFailure(
+                f"workflow routing advertised tools do not include gateway tools/list: {mode_name}"
+            )
+        if mode["expectedToolDescriptors"] != mode["observedToolDescriptors"]:
+            raise MatrixFailure(
+                f"workflow routing RMCP descriptors do not match production surface: {mode_name}"
+            )
+        expected_descriptor_names = [
+            descriptor.get("name")
+            for descriptor in mode["expectedToolDescriptors"]
+            if isinstance(descriptor, dict)
+        ]
+        observed_descriptor_names = [
+            descriptor.get("name")
+            for descriptor in mode["observedToolDescriptors"]
+            if isinstance(descriptor, dict)
+        ]
+        if (
+            expected_descriptor_names != mode["advertisedToolNames"]
+            or observed_descriptor_names != mode["gatewayToolsListNames"]
+        ):
+            raise MatrixFailure(
+                f"workflow routing RMCP descriptor names are inconsistent: {mode_name}"
+            )
+        observed_schema_bytes = len(
+            json.dumps(
+                mode["observedToolDescriptors"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if (
+            mode["schemaBytes"] != observed_schema_bytes
+            or mode["estimatedTokens"] != math.ceil(observed_schema_bytes / 4)
+        ):
+            raise MatrixFailure(
+                f"workflow routing RMCP schema metrics are inconsistent: {mode_name}"
+            )
 
     required_thresholds = {
         "initialActiveLessThanUnrouted",
@@ -716,8 +773,62 @@ def validate_workflow_routing_evidence(evidence: dict[str, Any]) -> None:
     protected = safety.get("protectedRootEvidence") or {}
     if protected.get("repositoryConfigMayRedirect") is not False:
         raise MatrixFailure("workflow routing protected-root evidence failed")
-    if not all(parity.get(surface) is True for surface in ("cli", "mcp", "tui", "desktop")):
-        raise MatrixFailure("workflow routing cross-surface evidence is incomplete")
+    canonical_fields = [
+        "workflowId",
+        "activeMode",
+        "desiredExposureRevision",
+        "observedExposureRevision",
+        "liveStatus",
+        "nextAction",
+    ]
+    if surface_coverage.get("canonicalObservedFields") != canonical_fields:
+        raise MatrixFailure("workflow routing canonical surface fields are incomplete")
+    roles = surface_coverage.get("roles") or {}
+    expected_roles = {
+        "gateway": "authoritative-live-runtime",
+        "mcp": "gateway-tools-list-and-read-only-session-planning",
+        "cli": "definition-validation-and-human-launch-handoff",
+        "desktop": "primary-human-workbench",
+        "tui": "projection-and-handoff",
+    }
+    if any(
+        (roles.get(surface) or {}).get("role") != role
+        for surface, role in expected_roles.items()
+    ):
+        raise MatrixFailure("workflow routing surface coverage roles are incomplete")
+    tui = roles.get("tui") or {}
+    if tui.get("editing") is not False or tui.get("liveParityClaimed") is not False:
+        raise MatrixFailure(
+            "workflow routing TUI must remain projection-and-handoff without editing or live parity"
+        )
+    observations = surface_coverage.get("observations") or {}
+    gateway_observation = observations.get("gateway") or {}
+    mcp_observation = observations.get("mcp") or {}
+    if any(
+        field not in gateway_observation or field not in mcp_observation
+        for field in canonical_fields
+    ):
+        raise MatrixFailure("workflow routing canonical surface observation is incomplete")
+    mismatches = [
+        field
+        for field in canonical_fields
+        if gateway_observation[field] != mcp_observation[field]
+    ]
+    if mismatches:
+        raise MatrixFailure(
+            "workflow routing canonical surface observation mismatch: "
+            + ", ".join(mismatches)
+        )
+    if (
+        mcp_observation.get("observationSource")
+        != "GatewayMcpServer RMCP tools/list"
+        or not mcp_observation.get("observedToolNames")
+        or mcp_observation.get("observedToolNames")
+        != modes["review"].get("gatewayToolsListNames")
+    ):
+        raise MatrixFailure(
+            "workflow routing MCP observation is not backed by gateway tools/list"
+        )
 
 
 def capture_workflow_routing_evidence(

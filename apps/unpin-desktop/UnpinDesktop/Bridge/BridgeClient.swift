@@ -150,7 +150,6 @@ actor BridgeClient {
         "workflow.cancel-transition",
         "workflow.status",
         "workflow.recovery",
-        "workflow.recover",
     ]
     private static let maximumFrameBytes = 1_048_576
     private static let readOnlyRequestTimeoutMilliseconds = 15_000
@@ -455,10 +454,6 @@ actor BridgeClient {
         try await request(method: "workflow.recovery", parameters: EmptyParameters(), kind: .readOnly)
     }
 
-    func recoverWorkflow() async throws -> WorkflowRecoveryEnvelope {
-        try await request(method: "workflow.recover", parameters: EmptyParameters(), kind: .mutation)
-    }
-
     func planRestore(backupID: String) async throws -> RestorePlanEnvelope {
         try await request(
             method: "restore.plan",
@@ -623,7 +618,11 @@ actor BridgeClient {
         let fingerprint = (parametersObject?["planFingerprint"] as? String)
             ?? (parametersObject?["proposalFingerprint"] as? String)
             ?? (parametersObject?["operationFingerprint"] as? String)
-            ?? Self.sha256(encodedParameters)
+            ?? Self.sha256(Self.canonicalJSONData(parametersValue))
+        let normalizedFingerprint = fingerprint.hasPrefix("sha256:")
+            ? String(fingerprint.dropFirst("sha256:".count))
+            : fingerprint
+        let parametersDigest = Self.sha256(Self.canonicalJSONData(parametersValue))
         authenticatedRequestSequence &+= 1
         let auth = BridgeRequestAuth(
             parentPid: binding.parentPid,
@@ -635,7 +634,7 @@ actor BridgeClient {
             processGeneration: binding.processGeneration,
             sequence: authenticatedRequestSequence,
             operationId: operationID,
-            fingerprint: fingerprint,
+            fingerprint: normalizedFingerprint,
             authTag: ""
         )
         var signed = auth
@@ -645,7 +644,8 @@ actor BridgeClient {
             method: method,
             sequence: auth.sequence,
             operationID: auth.operationId,
-            fingerprint: auth.fingerprint
+            fingerprint: auth.fingerprint,
+            parametersDigest: parametersDigest
         )
         return signed
     }
@@ -661,15 +661,23 @@ actor BridgeClient {
         SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
     }
 
+    private static func canonicalJSONData(_ value: Any) -> Data {
+        (try? JSONSerialization.data(
+            withJSONObject: value,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )) ?? Data()
+    }
+
     private static func requestTag(
         secret: String,
         requestID: String,
         method: String,
         sequence: UInt64,
         operationID: String,
-        fingerprint: String
+        fingerprint: String,
+        parametersDigest: String
     ) -> String {
-        let material = "unpin.desktop.bridge.request.v1\u{0}\(secret)\u{0}\(sequence)\u{0}\(requestID)\u{0}\(method)\u{0}\(operationID)\u{0}\(fingerprint)"
+        let material = "unpin.desktop.bridge.request.v1\u{0}\(secret)\u{0}\(sequence)\u{0}\(requestID)\u{0}\(method)\u{0}\(operationID)\u{0}\(fingerprint)\u{0}\(parametersDigest)"
         return sha256(Data(material.utf8))
     }
 
@@ -1378,7 +1386,7 @@ struct WorkflowModeDraft: Codable, Identifiable, Equatable {
     var id: String { name }
 }
 
-struct WorkflowDraft: Codable, Equatable {
+struct WorkflowDraft: Codable, Identifiable, Equatable {
     let workflowId: String
     let displayName: String
     let description: String?
@@ -1387,6 +1395,8 @@ struct WorkflowDraft: Codable, Equatable {
     let entryMode: String
     let modes: [WorkflowModeDraft]
     let workflowRevision: String
+
+    var id: String { workflowId }
 
     private enum CodingKeys: String, CodingKey {
         case workflowId, id, displayName, description, provider
@@ -1640,6 +1650,7 @@ struct WorkflowSessionSnapshot: Decodable, Identifiable, Equatable {
     let workflowId: String?
     let proposalId: String?
     let activeMode: String?
+    let desiredMode: String?
     let observedMode: String?
     let desiredExposureRevision: String?
     let observedExposureRevision: String?
@@ -1666,8 +1677,37 @@ struct WorkflowOperationSnapshot: Decodable, Identifiable, Equatable {
 
 struct WorkflowTransitionEnvelope: Decodable {
     let result: WorkflowTransitionResult?
+    let refreshOutcome: String?
     let session: WorkflowSessionSnapshot?
-    let status: String?
+    let status: WorkflowStatusSnapshot?
+
+    private enum CodingKeys: String, CodingKey {
+        case result, session, status
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if let nested = try container.decodeIfPresent(WorkflowTransitionResultEnvelope.self, forKey: .result),
+           nested.transition != nil {
+            result = nested.transition
+            refreshOutcome = nested.refreshOutcome
+        } else {
+            // Keep decoding older bridge fixtures while preferring the current MCP
+            // structured-content envelope.
+            result = try container.decodeIfPresent(WorkflowTransitionResult.self, forKey: .result)
+            refreshOutcome = nil
+        }
+        session = try container.decodeIfPresent(WorkflowSessionSnapshot.self, forKey: .session)
+        // The bridge returns the projected status object for workflow.transition. Older
+        // fixtures omitted it, so keep the field optional while decoding the exact
+        // object shape when it is present.
+        status = try container.decodeIfPresent(WorkflowStatusSnapshot.self, forKey: .status)
+    }
+}
+
+private struct WorkflowTransitionResultEnvelope: Decodable {
+    let transition: WorkflowTransitionResult?
+    let refreshOutcome: String?
 }
 
 struct WorkflowCancelEnvelope: Decodable {
@@ -1699,6 +1739,28 @@ struct WorkflowStatusEnvelope: Decodable {
     let operations: [WorkflowOperationSnapshot]
     let liveStatus: String?
     let recoveryRequired: Bool?
+    let workflow: WorkflowDraft?
+    let workflows: [WorkflowDraft]
+    let selectedWorkflowId: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case session, status, operations, liveStatus, recoveryRequired
+        case workflow, workflows, workflowDefinitions, selectedWorkflowId
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        session = try container.decodeIfPresent(WorkflowSessionSnapshot.self, forKey: .session)
+        status = try container.decodeIfPresent(WorkflowStatusSnapshot.self, forKey: .status)
+        operations = try container.decodeIfPresent([WorkflowOperationSnapshot].self, forKey: .operations) ?? []
+        liveStatus = try container.decodeIfPresent(String.self, forKey: .liveStatus)
+        recoveryRequired = try container.decodeIfPresent(Bool.self, forKey: .recoveryRequired)
+        workflow = try container.decodeIfPresent(WorkflowDraft.self, forKey: .workflow)
+        workflows = try container.decodeIfPresent([WorkflowDraft].self, forKey: .workflows)
+            ?? (try container.decodeIfPresent([WorkflowDraft].self, forKey: .workflowDefinitions))
+            ?? []
+        selectedWorkflowId = try container.decodeIfPresent(String.self, forKey: .selectedWorkflowId)
+    }
 }
 
 struct WorkflowStatusSnapshot: Decodable, Equatable {

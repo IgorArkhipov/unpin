@@ -42,7 +42,7 @@ impl WorkflowStore {
         }
     }
 
-    pub fn save_global_definition(
+    pub(super) fn upsert_global_definition(
         &self,
         definition: &WorkflowDefinition,
         expected: Option<&StateRevision>,
@@ -73,7 +73,7 @@ impl WorkflowStore {
     /// Remove one global definition only when the reviewed revision remains
     /// current. Workspace definitions are fixed-source files and are not
     /// mutable through this store.
-    pub fn delete_global_definition(
+    pub(super) fn delete_global_definition(
         &self,
         workflow_id: &str,
         expected: &StateRevision,
@@ -101,6 +101,9 @@ impl WorkflowStore {
             let entry = entry.map_err(WorkflowStoreError::Io)?;
             let file_type = entry.file_type().map_err(WorkflowStoreError::Io)?;
             let path = entry.path();
+            if is_dotenv_named_json(&path) {
+                continue;
+            }
             if file_type.is_symlink() {
                 return Err(WorkflowStoreError::UnsafeDefinitionEntry);
             }
@@ -164,6 +167,9 @@ impl WorkflowStore {
             let entry = entry.map_err(WorkflowStoreError::Io)?;
             let file_type = entry.file_type().map_err(WorkflowStoreError::Io)?;
             let path = entry.path();
+            if is_dotenv_named_json(&path) {
+                continue;
+            }
             if file_type.is_symlink() {
                 return Err(WorkflowStoreError::UnsafeDefinitionEntry);
             }
@@ -263,6 +269,12 @@ pub fn workspace_workflows_dir(workspace_root: impl AsRef<Path>) -> PathBuf {
 fn workspace_definition_path(workspace_root: &Path, workflow_id: &str) -> PathBuf {
     workspace_workflows_dir(workspace_root)
         .join(format!("{}.json", crate::encode_path_segment(workflow_id)))
+}
+
+fn is_dotenv_named_json(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .is_some_and(|name| name == ".env" || name.starts_with(".env."))
 }
 
 fn validate_storage_id(value: &str) -> Result<(), WorkflowStoreError> {

@@ -7,6 +7,7 @@
 mod connection_registry;
 mod control_plane;
 mod data_plane;
+mod runtime_registration;
 mod service;
 mod skills;
 mod tools;
@@ -22,6 +23,11 @@ pub use connection_registry::{
 };
 pub use control_plane::{GatewayControlPlane, GatewaySessionStatus};
 pub use data_plane::{GatewayCallPermit, GatewayDataPlane, GatewayHookCallContext};
+pub use runtime_registration::{
+    RuntimeHookRegistration, RuntimeModeRegistrations, RuntimeRegistrationContext,
+    RuntimeRegistrationError, RuntimeRegistrationStore, RuntimeRegistrationValue,
+    WorkflowRuntimeEnvelope,
+};
 pub use service::{
     GatewayExposure, GatewayHookRegistration, GatewayLimits, GatewayRefreshOutcome, GatewayService,
     ListChangeSupport,

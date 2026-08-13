@@ -3,13 +3,20 @@ use std::{fmt, fs, io, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::state::atomic_json::{
-    AtomicJsonStore, OwnerGeneration, StateError, StateRevision, StateSnapshot,
+    AtomicJsonStore, OwnerGeneration, StateError, StateResourceLock, StateRevision, StateSnapshot,
 };
 
 use super::lease::{validate_digest, validate_identifier};
 
 pub const WORKFLOW_OPERATION_SCHEMA_VERSION: u32 = 1;
 pub const WORKFLOW_TERMINAL_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+pub const MAX_WORKFLOW_OPERATION_RECORDS: usize = 1_024;
+/// Denials are durable audit evidence, but caller-controlled fingerprints must
+/// not be able to exhaust the operation journal. Keep a bounded recent set;
+/// active transitions and observations are never evicted for this budget.
+pub const MAX_WORKFLOW_DENIAL_RECORDS: usize = 64;
+const MAX_WORKFLOW_JOURNAL_ENTRIES: usize =
+    MAX_WORKFLOW_OPERATION_RECORDS + MAX_WORKFLOW_DENIAL_RECORDS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -135,21 +142,169 @@ impl WorkflowJournal {
         owner: OwnerGeneration,
     ) -> Result<StateRevision, WorkflowJournalError> {
         record.verify()?;
+        let _session_lock = self.session_lock(&record.session_id)?;
+        self.compare_and_swap_locked(record, expected, owner)
+    }
+
+    fn compare_and_swap_locked(
+        &self,
+        record: &WorkflowOperationRecord,
+        expected: Option<&StateRevision>,
+        owner: OwnerGeneration,
+    ) -> Result<StateRevision, WorkflowJournalError> {
         if let Some(current) = self.load(&record.session_id, &record.operation_id)?
             && current.value.lifecycle.is_terminal()
         {
-            if current.value == *record && expected == Some(&current.revision) {
+            // Deterministic terminal records (notably repeated denials) are
+            // safe to replay even when the caller has no pre-existing
+            // revision. Terminal records remain immutable otherwise.
+            if current.value == *record
+                && (expected.is_none() || expected == Some(&current.revision))
+            {
                 return Ok(current.revision);
             }
             return Err(WorkflowJournalError::TerminalMutation);
         }
-        self.store(&record.session_id, &record.operation_id)
+        let revision = self
+            .store(&record.session_id, &record.operation_id)
             .compare_and_swap(expected, owner, record)
-            .map_err(Into::into)
+            .map_err(WorkflowJournalError::from)?;
+        if record.lifecycle.is_terminal() {
+            // Retention is best effort. A terminal write must not be reported
+            // as failed merely because an unrelated stale record cannot yet
+            // be pruned.
+            let _ = self.prune_terminal_locked(
+                &record.session_id,
+                record.terminal_at_unix.unwrap_or_default(),
+            );
+        }
+        Ok(revision)
+    }
+
+    /// Persist a denial while reserving journal capacity for workflow
+    /// transitions and observations. When a session has more denial records
+    /// than its bounded budget, the oldest denial is evicted. No non-denial
+    /// record is eligible for this eviction.
+    pub fn compare_and_swap_denial(
+        &self,
+        record: &WorkflowOperationRecord,
+        expected: Option<&StateRevision>,
+        owner: OwnerGeneration,
+    ) -> Result<StateRevision, WorkflowJournalError> {
+        record.verify()?;
+        if record.kind != WorkflowOperationKind::Denial
+            || record.lifecycle != WorkflowOperationLifecycle::Denied
+        {
+            return Err(WorkflowJournalError::InvalidRecord);
+        }
+        let _session_lock = self.session_lock(&record.session_id)?;
+        if self
+            .load(&record.session_id, &record.operation_id)?
+            .is_none()
+        {
+            self.reserve_denial_capacity(&record.session_id, &record.operation_id)?;
+        }
+        self.compare_and_swap_locked(record, expected, owner)
     }
 
     pub fn has_nonterminal(&self, session_id: &str) -> Result<bool, WorkflowJournalError> {
         self.has_nonterminal_except(session_id, None)
+    }
+
+    /// Return the durable operations that still require an owner action.
+    /// Callers use this to make cancellation/recovery explicit instead of
+    /// guessing from the lease's desired and observed revisions.
+    pub fn nonterminal_records(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<WorkflowOperationRecord>, WorkflowJournalError> {
+        validate_identifier("session id", session_id)?;
+        let mut records = self
+            .nonterminal_snapshots(&self.operation_directory(session_id), session_id)?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|snapshot| snapshot.value)
+            .collect::<Vec<_>>();
+        records.sort_by(|left, right| left.operation_id.cmp(&right.operation_id));
+        Ok(records)
+    }
+
+    /// Remove terminal records past the retention window. Nonterminal records
+    /// are never pruned; the revision check makes a concurrent rewrite fail
+    /// closed rather than deleting a newer operation.
+    pub fn prune_terminal(
+        &self,
+        session_id: &str,
+        now_unix: i64,
+    ) -> Result<usize, WorkflowJournalError> {
+        validate_identifier("session id", session_id)?;
+        let _session_lock = self.session_lock(session_id)?;
+        self.prune_terminal_locked(session_id, now_unix)
+    }
+
+    fn prune_terminal_locked(
+        &self,
+        session_id: &str,
+        now_unix: i64,
+    ) -> Result<usize, WorkflowJournalError> {
+        let directory = self.operation_directory(session_id);
+        let snapshots = self.all_snapshots(&directory, session_id)?;
+        let mut removed = 0;
+        for snapshot in snapshots {
+            if snapshot.value.prune_eligible(now_unix, false) {
+                self.store(session_id, &snapshot.value.operation_id)
+                    .remove_if_revision(&snapshot.revision)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn session_lock(&self, session_id: &str) -> Result<StateResourceLock, WorkflowJournalError> {
+        StateResourceLock::acquire(
+            self.operation_directory(session_id)
+                .join(".workflow-journal-session-domain"),
+        )
+        .map_err(WorkflowJournalError::from)
+    }
+
+    fn reserve_denial_capacity(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+    ) -> Result<(), WorkflowJournalError> {
+        let directory = self.operation_directory(session_id);
+        let mut snapshots = self.all_snapshots(&directory, session_id)?;
+        if snapshots
+            .iter()
+            .any(|snapshot| snapshot.value.operation_id == operation_id)
+        {
+            return Ok(());
+        }
+        let mut denials = snapshots
+            .iter()
+            .filter(|snapshot| snapshot.value.kind == WorkflowOperationKind::Denial)
+            .cloned()
+            .collect::<Vec<_>>();
+        if snapshots.len().saturating_sub(denials.len()) >= MAX_WORKFLOW_OPERATION_RECORDS {
+            return Err(WorkflowJournalError::TooManyEntries);
+        }
+        denials.sort_by(|left, right| {
+            left.value
+                .terminal_at_unix
+                .cmp(&right.value.terminal_at_unix)
+                .then_with(|| left.value.operation_id.cmp(&right.value.operation_id))
+        });
+        while denials.len() >= MAX_WORKFLOW_DENIAL_RECORDS {
+            let Some(oldest) = denials.first().cloned() else {
+                return Err(WorkflowJournalError::TooManyEntries);
+            };
+            self.store(session_id, &oldest.value.operation_id)
+                .remove_if_revision(&oldest.revision)?;
+            denials.remove(0);
+            snapshots.retain(|snapshot| snapshot.value.operation_id != oldest.value.operation_id);
+        }
+        Ok(())
     }
 
     /// Terminalize the one staged transition whose target is now the
@@ -219,6 +374,10 @@ impl WorkflowJournal {
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(WorkflowJournalError::UnexpectedEntry(directory));
         }
+        let mut denial_count = 0;
+        let mut operation_count = 0;
+        let mut found = false;
+        let mut entry_count = 0;
         for entry in fs::read_dir(&directory).map_err(|error| state_io_error(&directory, error))? {
             let entry = entry.map_err(|error| state_io_error(&directory, error))?;
             let file_name = entry.file_name();
@@ -227,6 +386,10 @@ impl WorkflowJournal {
             };
             if file_name.starts_with('.') {
                 continue;
+            }
+            entry_count += 1;
+            if entry_count > MAX_WORKFLOW_JOURNAL_ENTRIES {
+                return Err(WorkflowJournalError::TooManyEntries);
             }
             let Some(encoded_operation_id) = file_name.strip_suffix(".json") else {
                 return Err(WorkflowJournalError::UnexpectedEntry(entry.path()));
@@ -241,13 +404,23 @@ impl WorkflowJournal {
             {
                 return Err(WorkflowJournalError::PathMismatch);
             }
+            if snapshot.value.kind == WorkflowOperationKind::Denial {
+                denial_count += 1;
+            } else {
+                operation_count += 1;
+            }
+            if denial_count > MAX_WORKFLOW_DENIAL_RECORDS
+                || operation_count > MAX_WORKFLOW_OPERATION_RECORDS
+            {
+                return Err(WorkflowJournalError::TooManyEntries);
+            }
             if !snapshot.value.lifecycle.is_terminal()
                 && operation_id != Some(snapshot.value.operation_id.as_str())
             {
-                return Ok(true);
+                found = true;
             }
         }
-        Ok(false)
+        Ok(found)
     }
 
     fn operation_directory(&self, session_id: &str) -> PathBuf {
@@ -271,6 +444,9 @@ impl WorkflowJournal {
             return Err(WorkflowJournalError::UnexpectedEntry(directory.clone()));
         }
         let mut snapshots = Vec::new();
+        let mut entry_count = 0;
+        let mut denial_count = 0;
+        let mut operation_count = 0;
         for entry in fs::read_dir(directory).map_err(|error| state_io_error(directory, error))? {
             let entry = entry.map_err(|error| state_io_error(directory, error))?;
             let file_name = entry.file_name();
@@ -279,6 +455,10 @@ impl WorkflowJournal {
             };
             if file_name.starts_with('.') {
                 continue;
+            }
+            entry_count += 1;
+            if entry_count > MAX_WORKFLOW_JOURNAL_ENTRIES {
+                return Err(WorkflowJournalError::TooManyEntries);
             }
             let Some(encoded_operation_id) = file_name.strip_suffix(".json") else {
                 return Err(WorkflowJournalError::UnexpectedEntry(entry.path()));
@@ -293,11 +473,79 @@ impl WorkflowJournal {
             {
                 return Err(WorkflowJournalError::PathMismatch);
             }
+            if snapshot.value.kind == WorkflowOperationKind::Denial {
+                denial_count += 1;
+            } else {
+                operation_count += 1;
+            }
+            if denial_count > MAX_WORKFLOW_DENIAL_RECORDS
+                || operation_count > MAX_WORKFLOW_OPERATION_RECORDS
+            {
+                return Err(WorkflowJournalError::TooManyEntries);
+            }
             if !snapshot.value.lifecycle.is_terminal() {
                 snapshots.push(snapshot);
             }
         }
         Ok(Some(snapshots))
+    }
+
+    fn all_snapshots(
+        &self,
+        directory: &PathBuf,
+        session_id: &str,
+    ) -> Result<Vec<StateSnapshot<WorkflowOperationRecord>>, WorkflowJournalError> {
+        let metadata = match fs::symlink_metadata(directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(state_io_error(directory, error)),
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(WorkflowJournalError::UnexpectedEntry(directory.clone()));
+        }
+        let mut snapshots = Vec::new();
+        let mut denial_count = 0;
+        let mut operation_count = 0;
+        let mut entry_count = 0;
+        for entry in fs::read_dir(directory).map_err(|error| state_io_error(directory, error))? {
+            let entry = entry.map_err(|error| state_io_error(directory, error))?;
+            let file_name = entry.file_name();
+            let Some(file_name) = file_name.to_str() else {
+                return Err(WorkflowJournalError::UnexpectedEntry(entry.path()));
+            };
+            if file_name.starts_with('.') {
+                continue;
+            }
+            entry_count += 1;
+            if entry_count > MAX_WORKFLOW_JOURNAL_ENTRIES {
+                return Err(WorkflowJournalError::TooManyEntries);
+            }
+            let Some(encoded_operation_id) = file_name.strip_suffix(".json") else {
+                return Err(WorkflowJournalError::UnexpectedEntry(entry.path()));
+            };
+            let store = AtomicJsonStore::new(entry.path(), WORKFLOW_OPERATION_SCHEMA_VERSION);
+            let snapshot = store
+                .load::<WorkflowOperationRecord>()?
+                .ok_or_else(|| WorkflowJournalError::UnexpectedEntry(entry.path()))?;
+            snapshot.value.verify()?;
+            if snapshot.value.session_id != session_id
+                || crate::encode_path_segment(&snapshot.value.operation_id) != encoded_operation_id
+            {
+                return Err(WorkflowJournalError::PathMismatch);
+            }
+            if snapshot.value.kind == WorkflowOperationKind::Denial {
+                denial_count += 1;
+            } else {
+                operation_count += 1;
+            }
+            if denial_count > MAX_WORKFLOW_DENIAL_RECORDS
+                || operation_count > MAX_WORKFLOW_OPERATION_RECORDS
+            {
+                return Err(WorkflowJournalError::TooManyEntries);
+            }
+            snapshots.push(snapshot);
+        }
+        Ok(snapshots)
     }
 
     fn store(&self, session_id: &str, operation_id: &str) -> AtomicJsonStore {
@@ -319,6 +567,7 @@ pub enum WorkflowJournalError {
     PathMismatch,
     TerminalMutation,
     UnexpectedEntry(PathBuf),
+    TooManyEntries,
     Lease(String),
 }
 
@@ -350,6 +599,7 @@ impl fmt::Display for WorkflowJournalError {
                     path.display()
                 )
             }
+            Self::TooManyEntries => formatter.write_str("workflow journal has too many records"),
             Self::Lease(message) => formatter.write_str(message),
         }
     }

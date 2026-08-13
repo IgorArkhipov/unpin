@@ -107,8 +107,11 @@ fn authenticated_bridge_request(
         .unwrap_or(&fallback_fingerprint)
         .to_string();
     let material = format!(
-        "unpin.desktop.bridge.request.v1\0{}\0{sequence}\0{id}\0{method}\0{operation_id}\0{fingerprint}",
-        BRIDGE_TEST_SECRET
+        "unpin.desktop.bridge.request.v1\0{}\0{sequence}\0{id}\0{method}\0{operation_id}\0{fingerprint}\0{}",
+        BRIDGE_TEST_SECRET,
+        unpin_core::sha256_digest(
+            &serde_json::to_vec(&params).expect("bridge params canonicalize"),
+        ),
     );
     request["auth"] = serde_json::json!({
         "parentPid": binding["parentPid"],
@@ -403,6 +406,146 @@ fn workflow_cli_lists_validates_proposes_and_plans_without_private_paths_or_prom
         WorkflowStore::load_workspace_definition(&project_root, "delivery")
             .expect("workspace workflow")
             .is_some()
+    );
+}
+
+#[test]
+fn workflow_cli_applies_deletes_and_restores_through_core_control() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = fs::canonicalize(temp.path()).expect("canonical tempdir");
+    let fixture_root = root.join("fixtures");
+    copy_dir_all(&fixtures_root(), &fixture_root);
+    let project_root = root.join("workspace");
+    let app_state_root = root.join("state");
+    fs::create_dir_all(project_root.join(".git")).expect("workspace");
+    fs::create_dir_all(&app_state_root).expect("state");
+
+    let definition = cli_workflow_definition();
+    let definition_path = root.join("delivery.json");
+    write_text(
+        &definition_path,
+        &definition.to_export_json().expect("workflow JSON"),
+    );
+
+    let upsert_plan = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "plan",
+                "--file",
+                definition_path.to_str().expect("workflow path"),
+            ],
+        ),
+        "workflow upsert plan",
+    );
+    let upsert_fingerprint = upsert_plan["plan"]["planFingerprint"]
+        .as_str()
+        .expect("upsert fingerprint");
+    let upserted = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "apply",
+                "--file",
+                definition_path.to_str().expect("workflow path"),
+                "--confirm",
+                "--plan-fingerprint",
+                upsert_fingerprint,
+            ],
+        ),
+        "workflow upsert apply",
+    );
+    assert_eq!(upserted["status"], "applied");
+    assert_eq!(upserted["result"]["status"], "applied");
+    assert_eq!(
+        WorkflowStore::new(&app_state_root)
+            .load_global_definition("delivery")
+            .expect("global workflow")
+            .expect("saved workflow")
+            .value,
+        definition
+    );
+
+    let delete_plan = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &["delete", "--id", "delivery"],
+        ),
+        "workflow delete plan",
+    );
+    let delete_fingerprint = delete_plan["plan"]["planFingerprint"]
+        .as_str()
+        .expect("delete fingerprint");
+    let deleted = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "delete",
+                "--id",
+                "delivery",
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                delete_fingerprint,
+            ],
+        ),
+        "workflow delete apply",
+    );
+    let delete_history_id = deleted["result"]["historyId"]
+        .as_str()
+        .expect("delete history id");
+    assert!(
+        WorkflowStore::new(&app_state_root)
+            .load_global_definition("delivery")
+            .expect("deleted global workflow")
+            .is_none()
+    );
+
+    let restore_plan = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &["restore", "--history-id", delete_history_id],
+        ),
+        "workflow restore plan",
+    );
+    let restore_fingerprint = restore_plan["plan"]["planFingerprint"]
+        .as_str()
+        .expect("restore fingerprint");
+    let restored = assert_success_json(
+        run_workflow_command(
+            &fixture_root,
+            &project_root,
+            &app_state_root,
+            &[
+                "restore",
+                "--history-id",
+                delete_history_id,
+                "--apply",
+                "--confirm",
+                "--plan-fingerprint",
+                restore_fingerprint,
+            ],
+        ),
+        "workflow restore apply",
+    );
+    assert_eq!(restored["result"]["definition"]["id"], "delivery");
+    assert_eq!(
+        WorkflowStore::new(&app_state_root)
+            .load_global_definition("delivery")
+            .expect("restored global workflow")
+            .expect("restored workflow")
+            .value,
+        definition
     );
 }
 
@@ -1178,6 +1321,9 @@ wait "$ready_watcher"
         "method": "workflow.status",
         "params": {},
     }));
+    assert_eq!(status["result"]["selectedWorkflowId"], "delivery");
+    assert_eq!(status["result"]["workflow"]["workflowId"], "delivery");
+    assert_eq!(status["result"]["workflows"][0]["provider"], "codex");
     assert_eq!(status["result"]["session"]["sessionId"], session_id);
     let source_sequence = status["result"]["session"]["stateSequence"]
         .as_u64()
@@ -1223,6 +1369,98 @@ wait "$ready_watcher"
         .as_str()
         .expect("transition operation id")
         .to_string();
+
+    let mut reconnect = StdCommand::new(env!("CARGO_BIN_EXE_unpin"))
+        .args(["desktop", "bridge"])
+        .arg("--fixture-root")
+        .arg(&fixture_root)
+        .arg("--home-root")
+        .arg(&fixture_root)
+        .arg("--project-root")
+        .arg(&project_root)
+        .arg("--app-state-root")
+        .arg(&app_state_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("launch reconnect desktop bridge");
+    let mut reconnect_input = reconnect.stdin.take().expect("reconnect bridge stdin");
+    let mut reconnect_output =
+        BufReader::new(reconnect.stdout.take().expect("reconnect bridge stdout"));
+    let reconnect_handshake = exchange_bridge_frame(
+        &mut reconnect_input,
+        &mut reconnect_output,
+        &bridge_handshake_request(
+            "workflow-reconnect-handshake",
+            reconnect.id(),
+            &project_root,
+            &app_state_root,
+        ),
+    );
+    let reconnect_binding = reconnect_handshake["result"]["binding"].clone();
+    let reconnect_status = exchange_bridge_frame(
+        &mut reconnect_input,
+        &mut reconnect_output,
+        &authenticated_bridge_request(
+            serde_json::json!({
+                "version": 2,
+                "id": "workflow-reconnect-status",
+                "method": "workflow.status",
+                "params": {},
+            }),
+            &reconnect_binding,
+            1,
+        ),
+    );
+    assert_eq!(
+        reconnect_status["result"]["session"]["sessionId"],
+        session_id
+    );
+    assert_eq!(
+        reconnect_status["result"]["operations"][0]["operationId"],
+        operation_id
+    );
+    let reconnect_recovery = exchange_bridge_frame(
+        &mut reconnect_input,
+        &mut reconnect_output,
+        &authenticated_bridge_request(
+            serde_json::json!({
+                "version": 2,
+                "id": "workflow-reconnect-recovery",
+                "method": "workflow.recovery",
+                "params": {},
+            }),
+            &reconnect_binding,
+            2,
+        ),
+    );
+    assert_eq!(
+        reconnect_recovery["result"]["operations"][0]["operationId"],
+        operation_id
+    );
+    assert_eq!(reconnect_recovery["result"]["recoveryRequired"], true);
+    assert_eq!(
+        reconnect_recovery["result"]["message"],
+        "Inspect the pending transition before choosing cancel or relaunch."
+    );
+    let reconnect_shutdown = exchange_bridge_frame(
+        &mut reconnect_input,
+        &mut reconnect_output,
+        &authenticated_bridge_request(
+            serde_json::json!({
+                "version": 2,
+                "id": "workflow-reconnect-shutdown",
+                "method": "shutdown",
+                "params": {},
+            }),
+            &reconnect_binding,
+            3,
+        ),
+    );
+    assert_eq!(reconnect_shutdown["result"]["shutdown"], true);
+    drop(reconnect_input);
+    assert!(reconnect.wait().expect("wait reconnect bridge").success());
 
     let cancelled = request(serde_json::json!({
         "version": 2,
@@ -7167,6 +7405,10 @@ fn mcp_once_lists_stable_tool_surface() {
             "unpin_apply_hook_trust",
             "unpin_propose_session_profile",
             "unpin_validate_profile",
+            "unpin_list_workflows",
+            "unpin_validate_workflow",
+            "unpin_propose_session_workflow",
+            "unpin_plan_workflow_session_launch",
             "unpin_plan_profile_policy",
             "unpin_apply_profile_policy",
             "unpin_plan_profile_provider",

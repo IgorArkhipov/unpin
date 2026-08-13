@@ -60,6 +60,27 @@ fn fixtures_root() -> String {
         .into_owned()
 }
 
+fn copy_dir_all(source: &Path, destination: &Path) {
+    fs::create_dir_all(destination).expect("create fixture destination");
+    for entry in fs::read_dir(source).expect("read fixture source") {
+        let entry = entry.expect("read fixture entry");
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_dir_all(&source_path, &destination_path);
+        } else {
+            fs::copy(&source_path, &destination_path).expect("copy fixture file");
+        }
+    }
+}
+
+fn private_fixtures(state: &TempDir) -> String {
+    let source = Path::new(&fixtures_root()).to_path_buf();
+    let destination = state.path().join("fixtures");
+    copy_dir_all(&source, &destination);
+    destination.to_string_lossy().into_owned()
+}
+
 fn digest(character: char) -> String {
     std::iter::repeat_n(character, 64).collect()
 }
@@ -360,7 +381,7 @@ fn fixture_upstream_identity(state: &TempDir) -> UpstreamIdentity {
             "--home-root".to_string(),
             home.to_string_lossy().into_owned(),
             "--fixture-root".to_string(),
-            fixtures_root(),
+            private_fixtures(state),
             "--app-state-root".to_string(),
             state.path().to_string_lossy().into_owned(),
         ],
@@ -740,7 +761,7 @@ async fn stdio_pool_preserves_pinned_profile_reach_rejection() {
             "--home-root".to_string(),
             home.to_string_lossy().into_owned(),
             "--fixture-root".to_string(),
-            fixtures_root(),
+            private_fixtures(&state),
             "--app-state-root".to_string(),
             state_root.to_string_lossy().into_owned(),
             "--provider".to_string(),
@@ -1439,6 +1460,121 @@ async fn auxiliary_enter_mode_notifies_only_primary_and_primary_relist_observes(
         .connection_registry()
         .disconnect(&primary_claim)
         .expect("disconnect primary claim");
+}
+
+#[tokio::test]
+async fn failed_primary_notification_cancels_the_staged_transition() {
+    let temp = TempDir::new().expect("temporary directory");
+    let gateway = workflow_gateway(&temp);
+    let primary_claim = gateway
+        .issue_connection_claim()
+        .expect("primary connection claim");
+    let auxiliary_claim = gateway
+        .issue_connection_claim()
+        .expect("auxiliary connection claim");
+    let notifier = GatewayPrimaryNotifier::default();
+    let primary_server = GatewayMcpServer::new(
+        Arc::clone(&gateway),
+        Arc::new(NoGatewayCredentials),
+        GatewayRuntimeTimeouts::default(),
+    )
+    .with_connection_claim(primary_claim)
+    .with_primary_notifier(notifier.clone());
+    let auxiliary_server = GatewayMcpServer::new(
+        Arc::clone(&gateway),
+        Arc::new(NoGatewayCredentials),
+        GatewayRuntimeTimeouts::default(),
+    )
+    .with_connection_claim(auxiliary_claim)
+    .with_primary_notifier(notifier);
+    let (primary_client_io, primary_server_io) = tokio::io::duplex(1024 * 1024);
+    let (auxiliary_client_io, auxiliary_server_io) = tokio::io::duplex(1024 * 1024);
+    let primary_server_task = tokio::spawn(async move {
+        let (read, write) = tokio::io::split(primary_server_io);
+        serve_gateway_io(primary_server, read, write).await
+    });
+    let auxiliary_server_task = tokio::spawn(async move {
+        let (read, write) = tokio::io::split(auxiliary_server_io);
+        serve_gateway_io(auxiliary_server, read, write).await
+    });
+    let primary_observer = ListChangeClient::default();
+    let mut primary_client = primary_observer
+        .serve(primary_client_io)
+        .await
+        .expect("connect primary client");
+    let mut auxiliary_client =
+        ().serve(auxiliary_client_io)
+            .await
+            .expect("connect auxiliary client");
+
+    primary_client
+        .close_with_timeout(Duration::from_secs(2))
+        .await
+        .expect("close primary client before notification");
+    primary_server_task
+        .await
+        .expect("primary server task")
+        .expect("primary server");
+
+    let before = gateway
+        .control_plane()
+        .snapshot()
+        .expect("workflow snapshot before transition");
+    let source_sequence = before.revision.sequence;
+    let planning_revision = before.lease.observed_exposure.revision.clone();
+    let transition = auxiliary_client
+        .call_tool(
+            CallToolRequestParams::new("unpin_workflow_enter_mode").with_arguments(
+                serde_json::from_value(serde_json::json!({
+                    "operationId": "runtime-notification-failure",
+                    "operationFingerprint": digest('9'),
+                    "sourceStateSequence": source_sequence,
+                    "targetMode": "implementation",
+                    "requestedAtUnix": now_unix(),
+                }))
+                .expect("transition arguments"),
+            ),
+        )
+        .await;
+    assert!(
+        transition.is_err(),
+        "failed notification must fail the call"
+    );
+
+    let recovered = gateway
+        .control_plane()
+        .snapshot()
+        .expect("workflow snapshot after compensation");
+    assert_eq!(recovered.lease.desired_exposure.revision, planning_revision);
+    assert_eq!(
+        recovered.lease.observed_exposure.revision,
+        planning_revision
+    );
+    assert!(recovered.lease.admission_open);
+    assert_eq!(
+        recovered.lease.workflow.as_ref().unwrap().active_mode,
+        "planning"
+    );
+    assert!(
+        gateway
+            .pending_workflow_operations_for_connection(
+                &gateway
+                    .primary_connection_claim()
+                    .expect("primary claim lookup")
+                    .expect("primary claim remains registered"),
+            )
+            .expect("pending operations after compensation")
+            .is_empty()
+    );
+
+    auxiliary_client
+        .close_with_timeout(Duration::from_secs(2))
+        .await
+        .expect("close auxiliary client");
+    auxiliary_server_task
+        .await
+        .expect("auxiliary server task")
+        .expect("auxiliary server");
 }
 
 #[tokio::test]

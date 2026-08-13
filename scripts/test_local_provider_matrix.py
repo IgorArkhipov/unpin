@@ -1210,13 +1210,40 @@ class McpFinalizationContractTests(unittest.TestCase):
 class WorkflowRoutingEvidenceTests(unittest.TestCase):
     @staticmethod
     def valid_evidence() -> dict[str, object]:
+        descriptor = {
+            "name": "review__inspect",
+            "title": "Inspect",
+            "description": "Inspect review fixture",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": True, "openWorldHint": False},
+            "execution": {"taskSupport": "optional"},
+        }
+        descriptors = [descriptor]
+        schema_bytes = len(
+            json.dumps(descriptors, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
         mode = {
-            "advertisedToolNames": ["unpin_workflow_status"],
+            "advertisedToolNames": ["review__inspect"],
+            "gatewayToolsListNames": ["review__inspect"],
+            "expectedToolDescriptors": descriptors,
+            "observedToolDescriptors": json.loads(json.dumps(descriptors)),
+            "mcpObservationSource": "GatewayMcpServer RMCP tools/list",
             "skillSearchResults": [{"name": "fixture-skill"}],
             "loadedSkillBodyBytes": 10,
             "hookIds": ["fixture-hook"],
-            "schemaBytes": 20,
-            "estimatedTokens": 5,
+            "schemaBytes": schema_bytes,
+            "estimatedTokens": math.ceil(schema_bytes / 4),
             "revision": "a" * 64,
         }
         return {
@@ -1224,9 +1251,9 @@ class WorkflowRoutingEvidenceTests(unittest.TestCase):
             "status": "passed",
             "workflow": {"modeOrder": ["planning", "implementation", "review"]},
             "modes": {
-                "planning": dict(mode),
-                "implementation": dict(mode),
-                "review": dict(mode),
+                "planning": json.loads(json.dumps(mode)),
+                "implementation": json.loads(json.dumps(mode)),
+                "review": json.loads(json.dumps(mode)),
             },
             "metrics": {
                 "initialActiveSchemaBytes": 20,
@@ -1305,11 +1332,50 @@ class WorkflowRoutingEvidenceTests(unittest.TestCase):
                 "bridgeAuthentication": "process-root-generation-sequence-bound",
                 "protectedRootEvidence": {"repositoryConfigMayRedirect": False},
             },
-            "crossSurfaceParity": {
-                "cli": True,
-                "mcp": True,
-                "tui": True,
-                "desktop": True,
+            "surfaceCoverage": {
+                "canonicalObservedFields": [
+                    "workflowId",
+                    "activeMode",
+                    "desiredExposureRevision",
+                    "observedExposureRevision",
+                    "liveStatus",
+                    "nextAction",
+                ],
+                "roles": {
+                    "gateway": {"role": "authoritative-live-runtime"},
+                    "mcp": {
+                        "role": "gateway-tools-list-and-read-only-session-planning"
+                    },
+                    "cli": {
+                        "role": "definition-validation-and-human-launch-handoff"
+                    },
+                    "desktop": {"role": "primary-human-workbench"},
+                    "tui": {
+                        "role": "projection-and-handoff",
+                        "editing": False,
+                        "liveParityClaimed": False,
+                    },
+                },
+                "observations": {
+                    "gateway": {
+                        "workflowId": "delivery",
+                        "activeMode": "review",
+                        "desiredExposureRevision": "a" * 64,
+                        "observedExposureRevision": "a" * 64,
+                        "liveStatus": "observed-refresh",
+                        "nextAction": "continue-in-active-mode",
+                    },
+                    "mcp": {
+                        "workflowId": "delivery",
+                        "activeMode": "review",
+                        "desiredExposureRevision": "a" * 64,
+                        "observedExposureRevision": "a" * 64,
+                        "liveStatus": "observed-refresh",
+                        "nextAction": "continue-in-active-mode",
+ "observationSource": "GatewayMcpServer RMCP tools/list",
+                        "observedToolNames": ["review__inspect"],
+                    },
+                },
             },
         }
 
@@ -1332,6 +1398,81 @@ class WorkflowRoutingEvidenceTests(unittest.TestCase):
         evidence = self.valid_evidence()
         evidence["fallbacks"]["nextSessionCancelObservedRevision"] = "b"
         with self.assertRaisesRegex(MatrixFailure, "next-session-only"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_mismatched_canonical_surface_observation(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["surfaceCoverage"]["observations"]["mcp"]["activeMode"] = (
+            "implementation"
+        )
+        with self.assertRaisesRegex(MatrixFailure, "canonical surface observation"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_synthetic_mcp_observation_source(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["surfaceCoverage"]["observations"]["mcp"][
+            "observationSource"
+        ] = "hard-coded fixture"
+        with self.assertRaisesRegex(MatrixFailure, "gateway tools/list"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_tui_live_or_editing_parity_claim(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["surfaceCoverage"]["roles"]["tui"]["editing"] = True
+        with self.assertRaisesRegex(MatrixFailure, "TUI.*projection-and-handoff"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_missing_observed_descriptor(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"] = []
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_changed_descriptor_description(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"][0][
+            "description"
+        ] = "Changed"
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_changed_descriptor_input_schema(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"][0]["inputSchema"][
+            "additionalProperties"
+        ] = True
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_changed_descriptor_annotations_and_output_schema(self) -> None:
+        for field, value in (
+            ("annotations", {"readOnlyHint": False}),
+            ("outputSchema", {"type": "string"}),
+        ):
+            with self.subTest(field=field):
+                evidence = self.valid_evidence()
+                evidence["modes"]["planning"]["observedToolDescriptors"][0][field] = (
+                    value
+                )
+                with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+                    validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_same_names_with_mismatched_descriptor_content(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"][0]["execution"] = {
+            "taskSupport": "forbidden"
+        }
+        self.assertEqual(
+            evidence["modes"]["planning"]["gatewayToolsListNames"],
+            ["review__inspect"],
+        )
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_schema_bytes_not_measured_from_observed_descriptors(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["schemaBytes"] += 1
+        with self.assertRaisesRegex(MatrixFailure, "schema metrics"):
             validate_workflow_routing_evidence(evidence)
 
 
@@ -1542,7 +1683,8 @@ class LiveInventoryFilterTests(unittest.TestCase):
         fingerprint = hashlib.sha256(b"{}").hexdigest()
         material = (
             "unpin.desktop.bridge.request.v1\0"
-            f"{session_secret}\0{1}\0snapshot\0snapshot\0snapshot\0{fingerprint}"
+            f"{session_secret}\0{1}\0snapshot\0snapshot\0snapshot\0{fingerprint}\0"
+            f"{hashlib.sha256(b'{}').hexdigest()}"
         )
         self.assertEqual(
             request["auth"],

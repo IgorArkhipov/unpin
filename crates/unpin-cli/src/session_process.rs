@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     ffi::OsString,
     fs::{self, File, OpenOptions},
     io::{self, Write},
@@ -16,10 +16,15 @@ use rmcp::{ServiceExt, model::CallToolRequestParams};
 
 use unpin_core::{
     approval::ControlApprovalContext,
-    catalog::{Catalog, adoption::authenticated_adopted_skill_catalog_for_capabilities},
+    catalog::{
+        CapabilityKind, Catalog, adoption::authenticated_adopted_skill_catalog_for_capabilities,
+    },
     config::get_session_overlay_root,
     discovery::{DiscoveryMutability, DiscoveryRoots, discover_all},
-    gateway::{GatewayControlPlane, GatewayExposure, GatewayLimits, GatewayService},
+    gateway::{
+        GatewayControlPlane, GatewayError, GatewayExposure, GatewayLimits, GatewayService,
+        RuntimeRegistrationContext, RuntimeRegistrationStore, WorkflowRuntimeEnvelope,
+    },
     mutation::{
         BackupAuthenticationKey, NativeToggleController, RestoreController,
         load_backup_summaries_authenticated,
@@ -29,12 +34,18 @@ use unpin_core::{
     sessions::{
         BootstrapRequest, ClaimedSession, CoverageLevel, GatewayModeTarget,
         GatewayNativeViewController, IsolationLevel, LeaseError, LeaseLifecycle, PinnedExposure,
-        PinnedProfile, PinnedWorkflowEnvelope, SESSION_OVERLAY_MARKER, SessionAuthorityKey,
-        SessionHandle, SessionManager, WORKFLOW_PROPOSAL_SCHEMA_VERSION, WorkflowReloadLimitation,
+        PinnedProfile, PinnedWorkflowEnvelope, ProcessEvidence, SESSION_OVERLAY_MARKER,
+        SessionAuthorityKey, SessionHandle, SessionManager, WORKFLOW_PROPOSAL_SCHEMA_VERSION,
+        WorkflowJournal, WorkflowOperationLifecycle, WorkflowReloadLimitation,
         capture_process_evidence, gateway_mode_resource_id, resolved_mode_exposure,
     },
     state::atomic_json::{AtomicJsonStore, OwnerGeneration},
     workflows::WorkflowStore,
+};
+
+use unpin_cli::mcp_runtime::{
+    BoundBearerToken, GatewayCredentialResolver, GatewayHookAuthorizationSource,
+    GatewayRuntimeError, GatewayRuntimeTimeouts,
 };
 
 use crate::gateway_session::GatewaySessionRuntime;
@@ -97,6 +108,55 @@ pub struct WorkflowLaunchRequest {
 struct PreparedWorkflowLaunch {
     revision: unpin_core::workflows::CompiledWorkflowRevision,
     request: WorkflowLaunchRequest,
+    runtime: WorkflowRuntimeEnvelope,
+}
+
+struct SessionGatewayCredentials {
+    tokens: BTreeMap<(String, String), Zeroizing<String>>,
+}
+
+impl std::fmt::Debug for SessionGatewayCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SessionGatewayCredentials")
+            .field("bindings", &self.tokens.len())
+            .field("tokens", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl GatewayCredentialResolver for SessionGatewayCredentials {
+    fn resolve(
+        &self,
+        key_id: &str,
+        identity: &unpin_core::gateway::UpstreamIdentity,
+    ) -> Result<BoundBearerToken, GatewayRuntimeError> {
+        let token = self
+            .tokens
+            .get(&(key_id.to_string(), identity.digest.clone()))
+            .ok_or(GatewayRuntimeError::CredentialUnavailable)?;
+        BoundBearerToken::new(key_id, identity, token.as_str().to_owned())
+    }
+}
+
+#[derive(Debug)]
+struct SessionGatewayHookAuthorizations;
+
+impl GatewayHookAuthorizationSource for SessionGatewayHookAuthorizations {
+    fn authorizations_for(
+        &self,
+        _plan: &unpin_core::hooks::HookDispatchPlan,
+    ) -> Result<Vec<unpin_core::hooks::HookRewriteAuthorization>, GatewayError> {
+        // Launch preparation rejects every registered hook that can rewrite
+        // arguments or results. Returning no authorizations is therefore an
+        // explicit invariant for this immutable runtime, not a silent fallback.
+        Ok(Vec::new())
+    }
+}
+
+struct GatewayRuntimeSources {
+    credentials: Arc<dyn GatewayCredentialResolver>,
+    hook_authorizations: Arc<dyn GatewayHookAuthorizationSource>,
 }
 
 impl PreparedWorkflowLaunch {
@@ -126,6 +186,59 @@ impl PreparedWorkflowLaunch {
     }
 }
 
+fn gateway_runtime_sources(
+    request: &SessionLaunchRequest,
+    workflow: Option<&PreparedWorkflowLaunch>,
+) -> Result<GatewayRuntimeSources, SessionProcessError> {
+    let mut required_credentials = BTreeMap::new();
+    if let Some(workflow) = workflow {
+        for profile in workflow.revision.effective_profiles.values() {
+            let registrations = workflow
+                .runtime
+                .registrations_for(profile)
+                .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+            for registration in registrations.tools {
+                if let Some(binding) = registration.credential {
+                    required_credentials.insert(
+                        (binding.key_id, registration.identity.digest.clone()),
+                        registration.identity,
+                    );
+                }
+            }
+            for registration in registrations.hooks {
+                let transformations = registration.handler.transformations();
+                if transformations.argument_rewrite || transformations.result_modification {
+                    return Err(SessionProcessError::GatewayPreparation(
+                        "workflow hook rewrite authorization source is unavailable".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    let mut tokens = BTreeMap::new();
+    for ((key_id, identity_digest), identity) in required_credentials {
+        let token = crate::credentials::resolve_gateway_credential(
+            request.fixture_mode,
+            &request.app_state_root,
+            &key_id,
+        )
+        .map_err(SessionProcessError::GatewayPreparation)?
+        .ok_or_else(|| {
+            SessionProcessError::GatewayPreparation(
+                "workflow gateway credential is unavailable".to_string(),
+            )
+        })?;
+        BoundBearerToken::new(&key_id, &identity, token.as_str().to_owned())
+            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+        tokens.insert((key_id, identity_digest), token);
+    }
+    Ok(GatewayRuntimeSources {
+        credentials: Arc::new(SessionGatewayCredentials { tokens }),
+        hook_authorizations: Arc::new(SessionGatewayHookAuthorizations),
+    })
+}
+
 #[derive(Debug, Clone)]
 struct LaunchControl {
     version: u32,
@@ -137,6 +250,7 @@ struct LaunchControl {
     provider: String,
     bridge_socket: Option<PathBuf>,
     gateway_socket: Option<PathBuf>,
+    process: ProcessEvidence,
     algorithm: String,
     authority_key_id: String,
     authentication_tag: String,
@@ -154,6 +268,7 @@ impl LaunchControl {
             "provider": self.provider,
             "bridgeSocket": self.bridge_socket,
             "gatewaySocket": self.gateway_socket,
+            "process": self.process,
             "algorithm": self.algorithm,
             "authorityKeyId": self.authority_key_id,
         }))
@@ -171,6 +286,7 @@ impl LaunchControl {
             "provider": self.provider,
             "bridgeSocket": self.bridge_socket,
             "gatewaySocket": self.gateway_socket,
+            "process": self.process,
             "algorithm": self.algorithm,
             "authorityKeyId": self.authority_key_id,
             "authenticationTag": self.authentication_tag,
@@ -180,7 +296,7 @@ impl LaunchControl {
     fn from_value(value: &serde_json::Value) -> Result<Self, SessionProcessError> {
         let object = value
             .as_object()
-            .filter(|object| object.len() == 12)
+            .filter(|object| object.len() == 13)
             .ok_or(SessionProcessError::InvalidControl("document"))?;
         let version = object
             .get("version")
@@ -212,6 +328,14 @@ impl LaunchControl {
             }
             None => return Err(SessionProcessError::InvalidControl("gatewaySocket")),
         };
+        let process = object
+            .get("process")
+            .cloned()
+            .ok_or(SessionProcessError::InvalidControl("process"))
+            .and_then(|value| {
+                serde_json::from_value(value)
+                    .map_err(|_| SessionProcessError::InvalidControl("process"))
+            })?;
         Ok(Self {
             version,
             control_path: PathBuf::from(required("controlPath")?),
@@ -222,6 +346,7 @@ impl LaunchControl {
             provider: required("provider")?,
             bridge_socket,
             gateway_socket,
+            process,
             algorithm: required("algorithm")?,
             authority_key_id: required("authorityKeyId")?,
             authentication_tag: required("authenticationTag")?,
@@ -417,6 +542,59 @@ fn prepare_workflow_launch(
             ));
         }
     }
+    let skill_capability_ids = revision
+        .maximum_envelope
+        .members
+        .iter()
+        .filter_map(|member| {
+            catalog
+                .get(&member.capability_id)
+                .filter(|record| record.kind == CapabilityKind::Skill)
+                .map(|_| member.capability_id.clone())
+        })
+        .collect::<Vec<_>>();
+    let immutable_skill_catalog = if skill_capability_ids.is_empty() {
+        Catalog::default()
+    } else if request.fixture_mode {
+        Catalog::from_records(
+            skill_capability_ids
+                .iter()
+                .map(|capability_id| {
+                    catalog.get(capability_id).cloned().ok_or_else(|| {
+                        SessionProcessError::WorkflowLaunch(
+                            "workflow-skill-capability-missing".to_string(),
+                        )
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        )
+        .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?
+    } else {
+        authenticated_adopted_skill_catalog_for_capabilities(
+            &request.app_state_root,
+            &request.repository_key,
+            &request.workspace_key,
+            request.provider,
+            &skill_capability_ids,
+            &request.backup_authentication_key,
+        )
+        .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?
+    };
+    let runtime_context = RuntimeRegistrationContext::new(
+        &request.repository_key,
+        &request.workspace_key,
+        request.provider,
+    )
+    .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?;
+    let runtime =
+        RuntimeRegistrationStore::new(&request.app_state_root, request.authority_key.clone())
+            .load_workflow_envelope_with_skill_catalog(
+                &runtime_context,
+                &revision,
+                &catalog,
+                &immutable_skill_catalog,
+            )
+            .map_err(|error| SessionProcessError::WorkflowLaunch(error.to_string()))?;
     let locks = request.exposure.capability_locks.as_ref().ok_or_else(|| {
         SessionProcessError::WorkflowLaunch("workflow-capability-locks-missing".to_string())
     })?;
@@ -466,6 +644,7 @@ fn prepare_workflow_launch(
     Ok(Some(PreparedWorkflowLaunch {
         revision,
         request: workflow_request,
+        runtime,
     }))
 }
 
@@ -552,14 +731,14 @@ pub(crate) fn preflight_bridge_socket(path: Option<&Path>) -> Result<(), Session
 /// Resolve the private gateway socket published for an established session.
 ///
 /// The overlay is created by the authenticated session launcher and is kept
-/// private to the app-state root. The returned socket is still authenticated
-/// by the gateway when a client connects: the transport receives a
-/// server-issued connection claim and auxiliary clients are limited to the
-/// typed workflow control surface.
-pub(crate) fn gateway_socket_for_session(
+/// private to the app-state root. The returned socket still requires the
+/// process-generation-bound transport handshake before the gateway issues a
+/// connection claim; auxiliary clients are limited to the typed workflow
+/// control surface.
+fn gateway_transport_metadata_for_session(
     app_state_root: &Path,
     session_id: &str,
-) -> Result<PathBuf, SessionProcessError> {
+) -> Result<(PathBuf, ProcessEvidence, bool), SessionProcessError> {
     if session_id.is_empty()
         || session_id.len() > 128
         || !session_id
@@ -602,13 +781,28 @@ pub(crate) fn gateway_socket_for_session(
     if gateway.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
         return Err(SessionProcessError::GatewayControlUnavailable);
     }
+    if gateway.get("sessionId").and_then(serde_json::Value::as_str) != Some(session_id) {
+        return Err(SessionProcessError::GatewayControlUnavailable);
+    }
+    let process = gateway
+        .get("process")
+        .cloned()
+        .ok_or(SessionProcessError::GatewayControlUnavailable)
+        .and_then(|value| {
+            serde_json::from_value(value)
+                .map_err(|_| SessionProcessError::GatewayControlUnavailable)
+        })?;
+    let fixture_mode = gateway
+        .get("fixtureMode")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or(SessionProcessError::GatewayControlUnavailable)?;
     let socket = gateway
         .get("socket")
         .and_then(serde_json::Value::as_str)
         .filter(|socket| !socket.is_empty())
         .map(PathBuf::from)
         .ok_or(SessionProcessError::GatewayControlUnavailable)?;
-    verified_gateway_socket(&socket)
+    Ok((verified_gateway_socket(&socket)?, process, fixture_mode))
 }
 
 #[cfg(unix)]
@@ -641,7 +835,36 @@ pub(crate) fn call_gateway_control(
     tool_name: &str,
     arguments: serde_json::Value,
 ) -> Result<serde_json::Value, SessionProcessError> {
-    let socket = gateway_socket_for_session(app_state_root, session_id)?;
+    call_gateway_control_with_timeouts(
+        app_state_root,
+        session_id,
+        tool_name,
+        arguments,
+        GatewayRuntimeTimeouts::default(),
+    )
+}
+
+#[cfg(unix)]
+fn call_gateway_control_with_timeouts(
+    app_state_root: &Path,
+    session_id: &str,
+    tool_name: &str,
+    arguments: serde_json::Value,
+    timeouts: GatewayRuntimeTimeouts,
+) -> Result<serde_json::Value, SessionProcessError> {
+    let (socket, process, fixture_mode) =
+        gateway_transport_metadata_for_session(app_state_root, session_id)?;
+    let authority_key =
+        crate::credentials::resolve_session_authority_key(fixture_mode, app_state_root)
+            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?
+            .ok_or(SessionProcessError::GatewayControlUnavailable)?;
+    let authentication_tag = crate::gateway_session::gateway_transport_authentication_tag(
+        &authority_key,
+        session_id,
+        &process,
+        &socket,
+    )
+    .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
     let object = arguments
         .as_object()
         .cloned()
@@ -651,17 +874,34 @@ pub(crate) fn call_gateway_control(
         .build()
         .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
     runtime.block_on(async move {
-        let stream = tokio::net::UnixStream::connect(socket)
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream =
+            tokio::time::timeout(timeouts.connect, tokio::net::UnixStream::connect(socket))
+                .await
+                .map_err(|_| SessionProcessError::GatewayControlUnavailable)?
+                .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+        let frame = crate::gateway_session::gateway_transport_handshake_frame_for_client(
+            &authentication_tag,
+        )
+        .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+        tokio::time::timeout(timeouts.call, stream.write_all(&frame))
             .await
+            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?
             .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
-        let mut client = ()
-            .serve(stream)
+        let mut client = tokio::time::timeout(timeouts.call, ().serve(stream))
             .await
+            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?
             .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
-        let response = client
-            .call_tool(CallToolRequestParams::new(tool_name.to_string()).with_arguments(object))
-            .await
-            .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
+        let response = tokio::time::timeout(
+            timeouts.call,
+            client.call_tool(
+                CallToolRequestParams::new(tool_name.to_string()).with_arguments(object),
+            ),
+        )
+        .await
+        .map_err(|_| SessionProcessError::GatewayControlUnavailable)?
+        .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
         let value = serde_json::to_value(response)
             .map_err(|_| SessionProcessError::GatewayControlUnavailable)?;
         let _ = client
@@ -743,24 +983,8 @@ fn build_gateway_service(
             }
         }
     }
-    let catalog = if workflow.is_some() && request.fixture_mode {
-        let discovery = discover_all(&request.discovery_roots)
-            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
-        let catalog = Catalog::from_discovery(&discovery)
-            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
-        Catalog::from_records(
-            capability_ids
-                .iter()
-                .map(|capability_id| {
-                    catalog.get(capability_id).cloned().ok_or_else(|| {
-                        SessionProcessError::GatewayPreparation(format!(
-                            "workflow capability is unavailable: {capability_id}"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )
-        .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?
+    let catalog = if let Some(workflow) = workflow {
+        workflow.runtime.catalog().clone()
     } else if capability_ids.is_empty() {
         Catalog::default()
     } else {
@@ -791,12 +1015,17 @@ fn build_gateway_service(
                     "compiled workflow entry profile is unavailable".to_string(),
                 )
             })?;
-        GatewayExposure::compile_workflow_profile(
+        let registrations = workflow
+            .runtime
+            .registrations_for(profile)
+            .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+        GatewayExposure::compile_workflow_profile_with_hooks(
             request.exposure.clone(),
             request.provider,
             &catalog,
             profile,
-            Vec::new(),
+            registrations.tools,
+            registrations.hooks,
             limits,
         )
     } else {
@@ -825,12 +1054,17 @@ fn build_gateway_service(
                 &profile.digest,
                 request.exposure.capability_locks.clone(),
             );
-            let exposure = GatewayExposure::compile_workflow_profile(
+            let registrations = workflow
+                .runtime
+                .registrations_for(profile)
+                .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
+            let exposure = GatewayExposure::compile_workflow_profile_with_hooks(
                 pinned,
                 request.provider,
                 &catalog,
                 profile,
-                Vec::new(),
+                registrations.tools,
+                registrations.hooks,
                 limits,
             )
             .map_err(|error| SessionProcessError::GatewayPreparation(error.to_string()))?;
@@ -857,6 +1091,8 @@ fn duplicate_session_handle(handle: &SessionHandle) -> Result<SessionHandle, Ses
 
 fn write_gateway_overlay(
     overlay_root: &Path,
+    session_id: &str,
+    process: &ProcessEvidence,
     request: &SessionLaunchRequest,
     socket_path: &Path,
 ) -> Result<(), SessionProcessError> {
@@ -864,6 +1100,9 @@ fn write_gateway_overlay(
     let path = overlay_root.join("gateway-session.json");
     let value = serde_json::json!({
         "version": 1,
+        "sessionId": session_id,
+        "process": process,
+        "fixtureMode": request.fixture_mode,
         "provider": request.provider,
         "attachment": "fixture-harness-only",
         "nativeMaskVerified": false,
@@ -953,7 +1192,7 @@ where
             provider: request.provider,
             repository_key: request.repository_key.clone(),
             workspace_key: request.workspace_key.clone(),
-            process,
+            process: process.clone(),
             connection_scope_id,
         },
         now_unix,
@@ -1014,26 +1253,52 @@ where
         None
     };
     let mut gateway_runtime = match gateway {
-        Some(gateway) => match GatewaySessionRuntime::start(gateway, &overlay_root) {
-            Ok(runtime) => Some(runtime),
-            Err(error) => {
-                return Err(startup_failure_after_claim(
+        Some(gateway) => {
+            let sources = gateway_runtime_sources(request, workflow).map_err(|error| {
+                startup_failure_after_claim(
                     manager,
                     &claimed,
                     authority.session_id(),
                     None,
                     None,
-                    SessionProcessError::GatewayPreparation(error.to_string()),
-                ));
+                    error,
+                )
+            })?;
+            match GatewaySessionRuntime::start(
+                gateway,
+                &overlay_root,
+                sources.credentials,
+                sources.hook_authorizations,
+                request.authority_key.clone(),
+                authority.session_id().to_string(),
+                process.clone(),
+            ) {
+                Ok(runtime) => Some(runtime),
+                Err(error) => {
+                    return Err(startup_failure_after_claim(
+                        manager,
+                        &claimed,
+                        authority.session_id(),
+                        None,
+                        None,
+                        SessionProcessError::GatewayPreparation(error.to_string()),
+                    ));
+                }
             }
-        },
+        }
         None => None,
     };
     let gateway_socket = gateway_runtime
         .as_ref()
         .map(|runtime| runtime.socket_path().to_path_buf());
     if let Some(socket_path) = gateway_socket.as_deref()
-        && let Err(error) = write_gateway_overlay(&overlay_root, request, socket_path)
+        && let Err(error) = write_gateway_overlay(
+            &overlay_root,
+            authority.session_id(),
+            &process,
+            request,
+            socket_path,
+        )
     {
         return Err(startup_failure_after_claim(
             manager,
@@ -1059,6 +1324,7 @@ where
             authority.session_id(),
             &overlay_root,
             gateway_socket.clone(),
+            process.clone(),
             request,
             &request.authority_key,
         )?;
@@ -1225,16 +1491,64 @@ fn cleanup_claimed_session(
     reason: &str,
 ) -> Result<(), LeaseError> {
     match manager.load_for_handle(&claimed.handle) {
-        Ok(current) if current.lease.in_flight_calls == 0 => manager.close_owned(
-            &claimed.handle,
-            &current.revision,
-            reason,
-            unix_now().map_err(|error| LeaseError::InvalidState(error.to_string()))?,
-        ),
+        Ok(current) if current.lease.in_flight_calls == 0 => {
+            let now_unix =
+                unix_now().map_err(|error| LeaseError::InvalidState(error.to_string()))?;
+            cleanup_claimed_workflows(manager, &claimed.handle, &current, reason, now_unix)?;
+            manager.close_owned(&claimed.handle, &current.revision, reason, now_unix)
+        }
         Ok(_) => Err(LeaseError::SessionDraining),
         Err(LeaseError::SessionNotFound) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+fn cleanup_claimed_workflows(
+    manager: &SessionManager,
+    handle: &SessionHandle,
+    current: &unpin_core::sessions::LeaseSnapshot,
+    reason: &str,
+    now_unix: i64,
+) -> Result<(), LeaseError> {
+    let journal = WorkflowJournal::new(manager.app_state_root());
+    let lifecycle = if reason == "child-exit" {
+        WorkflowOperationLifecycle::Cancelled
+    } else {
+        WorkflowOperationLifecycle::RecoveryRequired
+    };
+    let reason_code = if reason == "child-exit" {
+        "session-ended-workflow-cancelled"
+    } else {
+        "session-cleanup-workflow-recovery-required"
+    };
+    let owner = OwnerGeneration::new(handle.owner_id(), current.revision.sequence)
+        .map_err(LeaseError::from)?;
+
+    for record in journal
+        .nonterminal_records(handle.session_id())
+        .map_err(|error| LeaseError::InvalidState(error.to_string()))?
+    {
+        let Some(snapshot) = journal
+            .load(handle.session_id(), &record.operation_id)
+            .map_err(|error| LeaseError::InvalidState(error.to_string()))?
+        else {
+            continue;
+        };
+        if !matches!(
+            snapshot.value.lifecycle,
+            WorkflowOperationLifecycle::Proposed | WorkflowOperationLifecycle::Staged
+        ) {
+            continue;
+        }
+        let mut terminal = snapshot.value;
+        terminal.lifecycle = lifecycle;
+        terminal.reason_code = reason_code.to_string();
+        terminal.terminal_at_unix = Some(now_unix);
+        journal
+            .compare_and_swap(&terminal, Some(&snapshot.revision), owner.clone())
+            .map_err(|error| LeaseError::InvalidState(error.to_string()))?;
+    }
+    Ok(())
 }
 
 fn cleanup_claimed_resources(
@@ -1347,6 +1661,12 @@ pub fn run_child_wrapper(
             None => return Err(SessionProcessError::ControlTimeout),
         }
     };
+    let current_process = capture_process_evidence(std::process::id())?;
+    if current_process != control.process {
+        return Err(SessionProcessError::ControlAuthentication(
+            "launch control process generation mismatch".to_string(),
+        ));
+    }
     let mut target = Command::new(&command[0]);
     target
         .args(&command[1..])
@@ -1360,7 +1680,15 @@ pub fn run_child_wrapper(
         target.env("UNPIN_BRIDGE_SOCKET", bridge_socket);
     }
     if let Some(gateway_socket) = &control.gateway_socket {
+        let authentication_tag = crate::gateway_session::gateway_transport_authentication_tag(
+            authority_key,
+            &control.session_id,
+            &control.process,
+            gateway_socket,
+        )
+        .map_err(SessionProcessError::ControlAuthentication)?;
         target.env("UNPIN_GATEWAY_SOCKET", gateway_socket);
+        target.env("UNPIN_GATEWAY_AUTHENTICATION_TAG", authentication_tag);
         target.env("UNPIN_GATEWAY_PROXY_EXECUTABLE", std::env::current_exe()?);
     }
 
@@ -1386,6 +1714,7 @@ fn write_control(
     session_id: &str,
     overlay_root: &Path,
     gateway_socket: Option<PathBuf>,
+    process: ProcessEvidence,
     request: &SessionLaunchRequest,
     authority_key: &SessionAuthorityKey,
 ) -> Result<(), SessionProcessError> {
@@ -1400,6 +1729,7 @@ fn write_control(
         provider: request.provider.as_str().to_string(),
         bridge_socket: request.bridge_socket.clone(),
         gateway_socket,
+        process,
         algorithm: String::new(),
         authority_key_id: String::new(),
         authentication_tag: String::new(),
@@ -1663,7 +1993,10 @@ impl std::error::Error for SessionProcessError {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use unpin_core::sessions::{ConnectionClaim, ProcessEvidence};
+    use unpin_core::sessions::{
+        ConnectionClaim, ProcessEvidence, WORKFLOW_OPERATION_SCHEMA_VERSION, WorkflowOperationKind,
+        WorkflowOperationRecord,
+    };
 
     type LaunchControlMutation = (&'static str, fn(&mut LaunchControl));
 
@@ -1772,6 +2105,116 @@ mod tests {
         assert_eq!(result.to_json()["status"], "recovery-required");
     }
 
+    #[test]
+    fn child_exit_terminalizes_claimed_workflow_records_before_closing_session() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let key = SessionAuthorityKey::new([0x54; 32]);
+        let manager = SessionManager::with_authority_key(&root, key);
+        let now = unix_now().unwrap();
+        let request = BootstrapRequest {
+            provider: ProviderId::Codex,
+            repository_key: "repo".to_string(),
+            workspace_key: "worktree".to_string(),
+            workspace_revision: None,
+            exposure: PinnedExposure {
+                revision: "e".repeat(64),
+                profile: PinnedProfile::Native,
+                capability_locks: None,
+            },
+            process: ProcessEvidence {
+                pid: std::process::id(),
+                start_marker: "workflow-cleanup-test".to_string(),
+            },
+            connection_scope_id: "workflow-cleanup-connection".to_string(),
+            isolation: IsolationLevel::Strict,
+            coverage: CoverageLevel::VerifiedMasked,
+            protected_resources: BTreeSet::new(),
+            lease_expires_at_unix: now + 600,
+        };
+        let claim = ConnectionClaim {
+            connection_owner_id: "workflow-cleanup-owner".to_string(),
+            provider: request.provider,
+            repository_key: request.repository_key.clone(),
+            workspace_key: request.workspace_key.clone(),
+            process: request.process.clone(),
+            connection_scope_id: request.connection_scope_id.clone(),
+        };
+        let authority = manager.prepare_bootstrap(request, now).unwrap();
+        let claimed = manager
+            .claim_bootstrap(&authority, &claim, now + 1)
+            .unwrap();
+        let overlay_root = get_session_overlay_root(&root, authority.session_id());
+        create_overlay(&root, &overlay_root, authority.session_id()).unwrap();
+
+        let journal = WorkflowJournal::new(&root);
+        let operation_id = "transition-one";
+        let record = WorkflowOperationRecord {
+            schema_version: WORKFLOW_OPERATION_SCHEMA_VERSION,
+            session_id: authority.session_id().to_string(),
+            operation_id: operation_id.to_string(),
+            kind: WorkflowOperationKind::Transition,
+            lifecycle: WorkflowOperationLifecycle::Staged,
+            reason_code: "workflow-transition-staged".to_string(),
+            source_state_sequence: 1,
+            target_state_sequence: 2,
+            operation_fingerprint: "a".repeat(64),
+            source_mode: Some("review".to_string()),
+            target_mode: Some("implementation".to_string()),
+            created_at_unix: now,
+            terminal_at_unix: None,
+        };
+        journal
+            .compare_and_swap(
+                &record,
+                None,
+                OwnerGeneration::new(claimed.handle.owner_id(), claimed.lease.revision.sequence)
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let failures = cleanup_claimed_resources(
+            &manager,
+            &claimed,
+            authority.session_id(),
+            None,
+            None,
+            "child-exit",
+        );
+
+        assert!(failures.is_empty(), "cleanup failures: {failures:?}");
+        assert!(!overlay_root.exists());
+        assert!(matches!(
+            manager.load_for_handle(&claimed.handle),
+            Err(LeaseError::SessionNotFound)
+        ));
+        assert!(
+            journal
+                .nonterminal_records(authority.session_id())
+                .unwrap()
+                .is_empty()
+        );
+        let terminal = journal
+            .load(authority.session_id(), operation_id)
+            .unwrap()
+            .expect("terminal workflow audit record");
+        assert_eq!(
+            terminal.value.lifecycle,
+            WorkflowOperationLifecycle::Cancelled
+        );
+        assert_eq!(
+            terminal.value.reason_code,
+            "session-ended-workflow-cancelled"
+        );
+        assert!(terminal.value.terminal_at_unix.is_some());
+        assert!(terminal.value.terminal_at_unix.unwrap() >= now);
+    }
+
     fn sealed_control() -> (LaunchControl, SessionAuthorityKey) {
         let key = SessionAuthorityKey::new([0x53; 32]);
         let mut control = LaunchControl {
@@ -1784,6 +2227,10 @@ mod tests {
             provider: "codex".to_string(),
             bridge_socket: Some(PathBuf::from("/tmp/unpin-bridge-a.sock")),
             gateway_socket: Some(PathBuf::from("/tmp/unpin-gateway-a.sock")),
+            process: ProcessEvidence {
+                pid: 42,
+                start_marker: "process-a".to_string(),
+            },
             algorithm: String::new(),
             authority_key_id: String::new(),
             authentication_tag: String::new(),
@@ -1841,7 +2288,7 @@ mod tests {
         control
             .verify(&control.control_path, &key)
             .expect("valid launch control");
-        let mutations: [LaunchControlMutation; 12] = [
+        let mutations: [LaunchControlMutation; 13] = [
             ("version", |value| value.version += 1),
             ("controlPath", |value| {
                 value.control_path = PathBuf::from("/tmp/unpin-control-b.json");
@@ -1864,6 +2311,9 @@ mod tests {
             }),
             ("gatewaySocket", |value| {
                 value.gateway_socket = Some(PathBuf::from("/tmp/unpin-gateway-b.sock"));
+            }),
+            ("process", |value| {
+                value.process.start_marker = "process-b".to_string();
             }),
             ("algorithm", |value| {
                 value.algorithm = "hmac-sha512".to_string();
@@ -1901,5 +2351,84 @@ mod tests {
         let mut value = control.to_value();
         value["forgedField"] = serde_json::json!(true);
         assert!(LaunchControl::from_value(&value).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn accepted_silent_gateway_control_peer_is_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::net::UnixListener;
+
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let session_id = "silent-gateway";
+        let overlay_root = get_session_overlay_root(&root, session_id);
+        create_overlay(&root, &overlay_root, session_id).unwrap();
+        let socket_path = root.join("silent-gateway.sock");
+        let listener = UnixListener::bind(&socket_path).unwrap();
+        let process = ProcessEvidence {
+            pid: std::process::id(),
+            start_marker: "silent-gateway-process".to_string(),
+        };
+        fs::write(
+            overlay_root.join("gateway-session.json"),
+            serde_json::json!({
+                "version": 1,
+                "sessionId": session_id,
+                "process": process,
+                "fixtureMode": true,
+                "socket": socket_path,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let accept_thread = thread::spawn(move || {
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        let _stream = stream;
+                        let _ = release_rx.recv_timeout(Duration::from_secs(1));
+                        break;
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                        if release_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(error) => panic!("silent gateway peer accept failed: {error}"),
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let error = call_gateway_control_with_timeouts(
+            &root,
+            session_id,
+            "unpin_workflow_status",
+            serde_json::json!({}),
+            GatewayRuntimeTimeouts {
+                connect: Duration::from_millis(250),
+                call: Duration::from_millis(50),
+            },
+        )
+        .expect_err("silent peer must not complete gateway control");
+        release_tx.send(()).unwrap();
+        accept_thread.join().unwrap();
+
+        assert!(matches!(
+            error,
+            SessionProcessError::GatewayControlUnavailable
+        ));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "silent gateway control exceeded its deadline: {:?}",
+            started.elapsed()
+        );
     }
 }

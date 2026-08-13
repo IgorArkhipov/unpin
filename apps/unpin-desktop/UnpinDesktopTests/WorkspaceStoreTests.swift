@@ -105,6 +105,17 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertFalse(store.hasWorkspace)
     }
 
+    func testWorkflowProposalRequiresHydratedWorkflowSelection() async {
+        let store = WorkspaceStore()
+
+        await store.proposeWorkflow(prompt: "Start a reviewed workflow")
+
+        XCTAssertEqual(
+            store.workflowBlocker,
+            "Select a hydrated workflow before proposing a session."
+        )
+    }
+
     func testDefinitionPlanRetryClearsBlockedState() async throws {
         let fixture = try makeFixtureStore()
         defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }

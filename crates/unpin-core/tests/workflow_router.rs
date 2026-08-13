@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    sync::mpsc,
+    sync::{Arc, Barrier, mpsc},
     thread,
     time::Duration,
 };
@@ -12,7 +12,8 @@ use unpin_core::{
     providers::ProviderId,
     sessions::{
         BootstrapRequest, ConnectionClaim, CoverageLevel, IsolationLevel, LeaseError,
-        LiveExposureStatus, PinnedExposure, PinnedProfile, PinnedWorkflowEnvelope, ProcessEvidence,
+        LiveExposureStatus, MAX_WORKFLOW_DENIAL_RECORDS, MAX_WORKFLOW_OPERATION_RECORDS,
+        PinnedExposure, PinnedProfile, PinnedWorkflowEnvelope, ProcessEvidence,
         SessionAuthorityKey, SessionManager, WORKFLOW_OPERATION_SCHEMA_VERSION, WorkflowHighWater,
         WorkflowHighWaterError, WorkflowHighWaterStore, WorkflowJournal,
         WorkflowOperationLifecycle, WorkflowOperationRecord, WorkflowProposalV1,
@@ -368,6 +369,133 @@ fn transition_stages_exact_mode_and_cancel_restores_observed_exposure_idempotent
     );
     assert!(matches!(
         router.cancel_transition(&claimed.handle, &pinned.revision, "transition-one", 1_006),
+        Err(WorkflowRouterError::StaleOperation)
+    ));
+}
+
+#[test]
+fn already_active_transition_is_idempotent_and_persists_journal_evidence() {
+    let (_temp, root) = private_temp();
+    let (manager, claimed) = claimed_session(&root);
+    let pinned = manager
+        .pin_workflow(
+            &claimed.handle,
+            &claimed.lease.revision,
+            workflow(),
+            exposure('b'),
+            1_002,
+        )
+        .expect("pin workflow");
+    let router = WorkflowRouter::new(manager.clone());
+    let request = WorkflowTransitionRequest {
+        operation_id: "already-planning".to_string(),
+        operation_fingerprint: digest('2'),
+        source_state_sequence: pinned.revision.sequence,
+        target_mode: "planning".to_string(),
+        requested_at_unix: 1_003,
+    };
+
+    let result = router
+        .enter_mode(&claimed.handle, &pinned.revision, request.clone())
+        .expect("already active transition");
+
+    assert_eq!(result.lifecycle, WorkflowOperationLifecycle::Observed);
+    assert_eq!(result.reason_code, "workflow-mode-already-active");
+    assert_eq!(result.lease_state_sequence, pinned.revision.sequence);
+    assert_eq!(
+        manager
+            .load_for_handle(&claimed.handle)
+            .expect("unchanged lease"),
+        pinned
+    );
+    let journal = WorkflowJournal::new(&root);
+    let operation = journal
+        .load(claimed.handle.session_id(), "already-planning")
+        .expect("journal lookup")
+        .expect("already-active operation evidence");
+    assert_eq!(
+        operation.value.kind,
+        unpin_core::sessions::WorkflowOperationKind::Transition
+    );
+    assert_eq!(
+        operation.value.lifecycle,
+        WorkflowOperationLifecycle::Observed
+    );
+    assert_eq!(operation.value.reason_code, "workflow-mode-already-active");
+    assert_eq!(
+        operation.value.operation_fingerprint,
+        request.operation_fingerprint
+    );
+    assert_eq!(
+        operation.value.source_state_sequence,
+        pinned.revision.sequence
+    );
+    assert_eq!(
+        operation.value.target_state_sequence,
+        pinned.revision.sequence
+    );
+    assert_eq!(operation.value.source_mode.as_deref(), Some("planning"));
+    assert_eq!(operation.value.target_mode.as_deref(), Some("planning"));
+    assert_eq!(operation.value.terminal_at_unix, Some(1_003));
+
+    let retry = router
+        .enter_mode(&claimed.handle, &pinned.revision, request.clone())
+        .expect("exact already-active retry");
+    assert_eq!(retry, result);
+    assert_eq!(
+        journal
+            .load(claimed.handle.session_id(), "already-planning")
+            .expect("retry journal lookup")
+            .expect("retry operation evidence")
+            .revision,
+        operation.revision
+    );
+}
+
+#[test]
+fn already_active_operation_id_cannot_be_reused_with_conflicting_request() {
+    let (_temp, root) = private_temp();
+    let (manager, claimed) = claimed_session(&root);
+    let pinned = manager
+        .pin_workflow(
+            &claimed.handle,
+            &claimed.lease.revision,
+            workflow(),
+            exposure('b'),
+            1_002,
+        )
+        .expect("pin workflow");
+    let router = WorkflowRouter::new(manager.clone());
+    let request = WorkflowTransitionRequest {
+        operation_id: "already-planning-reuse".to_string(),
+        operation_fingerprint: digest('2'),
+        source_state_sequence: pinned.revision.sequence,
+        target_mode: "planning".to_string(),
+        requested_at_unix: 1_003,
+    };
+    router
+        .enter_mode(&claimed.handle, &pinned.revision, request.clone())
+        .expect("already active transition");
+
+    let mut conflicting_fingerprint = request.clone();
+    conflicting_fingerprint.operation_fingerprint = digest('3');
+    assert!(matches!(
+        router.enter_mode(&claimed.handle, &pinned.revision, conflicting_fingerprint,),
+        Err(WorkflowRouterError::TransitionInProgress)
+    ));
+
+    let mut conflicting_target = request.clone();
+    conflicting_target.operation_fingerprint = digest('4');
+    conflicting_target.target_mode = "implementation".to_string();
+    assert!(matches!(
+        router.enter_mode(&claimed.handle, &pinned.revision, conflicting_target),
+        Err(WorkflowRouterError::TransitionInProgress)
+    ));
+
+    let mut conflicting_source = request;
+    conflicting_source.source_state_sequence += 1;
+    assert!(matches!(
+        router.enter_mode(&claimed.handle, &pinned.revision, conflicting_source),
         Err(WorkflowRouterError::StaleOperation)
     ));
 }
@@ -807,6 +935,147 @@ fn cancel_checks_revision_and_operation_binding_before_mutation() {
 }
 
 #[test]
+fn unique_denial_retries_cannot_consume_capacity_for_a_legitimate_transition() {
+    let (_temp, root) = private_temp();
+    let (manager, claimed) = claimed_session(&root);
+    let pinned = manager
+        .pin_workflow(
+            &claimed.handle,
+            &claimed.lease.revision,
+            workflow(),
+            exposure('b'),
+            1_002,
+        )
+        .expect("pin workflow");
+    let router = WorkflowRouter::new(manager.clone());
+
+    for attempt in 0..=MAX_WORKFLOW_OPERATION_RECORDS {
+        let request = WorkflowTransitionRequest {
+            operation_id: format!("denial-retry-{attempt}"),
+            operation_fingerprint: format!("{attempt:064x}"),
+            source_state_sequence: pinned.revision.sequence,
+            target_mode: "secret-mode".to_string(),
+            requested_at_unix: 1_003 + i64::try_from(attempt).expect("attempt timestamp"),
+        };
+        assert!(matches!(
+            router.enter_mode(&claimed.handle, &pinned.revision, request),
+            Err(WorkflowRouterError::ExpansionRequiresOperatorReview)
+        ));
+    }
+
+    let staged = router
+        .enter_mode(
+            &claimed.handle,
+            &pinned.revision,
+            WorkflowTransitionRequest {
+                operation_id: "legitimate-transition-after-denials".to_string(),
+                operation_fingerprint: digest('4'),
+                source_state_sequence: pinned.revision.sequence,
+                target_mode: "implementation".to_string(),
+                requested_at_unix: 2_100,
+            },
+        )
+        .expect("legitimate transition must remain journalable");
+    assert_eq!(staged.lifecycle, WorkflowOperationLifecycle::Staged);
+
+    let directory = root
+        .join("sessions")
+        .join("workflow-operations")
+        .join(encode_path_segment(claimed.handle.session_id()));
+    let record_count = fs::read_dir(directory)
+        .expect("workflow journal directory")
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "json")
+        })
+        .count();
+    assert!(record_count <= MAX_WORKFLOW_OPERATION_RECORDS);
+    assert!(record_count <= MAX_WORKFLOW_DENIAL_RECORDS + 1);
+}
+
+#[test]
+fn concurrent_denial_reservation_keeps_recent_records_bounded_and_readable() {
+    let (_temp, root) = private_temp();
+    let journal = Arc::new(WorkflowJournal::new(&root));
+    for index in 0..2 {
+        let record = WorkflowOperationRecord {
+            schema_version: WORKFLOW_OPERATION_SCHEMA_VERSION,
+            session_id: "session-one".to_string(),
+            operation_id: format!("initial-denial-{index}"),
+            kind: unpin_core::sessions::WorkflowOperationKind::Denial,
+            lifecycle: WorkflowOperationLifecycle::Denied,
+            reason_code: "workflow-envelope-expansion-review-required".to_string(),
+            source_state_sequence: 1,
+            target_state_sequence: 1,
+            operation_fingerprint: format!("{index:064x}"),
+            source_mode: None,
+            target_mode: None,
+            created_at_unix: 100 + index,
+            terminal_at_unix: Some(100 + index),
+        };
+        journal
+            .compare_and_swap_denial(&record, None, owner(index as u64 + 1))
+            .expect("initial denial");
+    }
+
+    let barrier = Arc::new(Barrier::new(MAX_WORKFLOW_DENIAL_RECORDS));
+    let workers = (0..MAX_WORKFLOW_DENIAL_RECORDS - 1)
+        .map(|index| {
+            let journal = Arc::clone(&journal);
+            let barrier = Arc::clone(&barrier);
+            thread::spawn(move || {
+                let record = WorkflowOperationRecord {
+                    schema_version: WORKFLOW_OPERATION_SCHEMA_VERSION,
+                    session_id: "session-one".to_string(),
+                    operation_id: format!("concurrent-denial-{index}"),
+                    kind: unpin_core::sessions::WorkflowOperationKind::Denial,
+                    lifecycle: WorkflowOperationLifecycle::Denied,
+                    reason_code: "workflow-envelope-expansion-review-required".to_string(),
+                    source_state_sequence: 1,
+                    target_state_sequence: 1,
+                    operation_fingerprint: format!("{:064x}", index + 2),
+                    source_mode: None,
+                    target_mode: None,
+                    created_at_unix: 200 + index as i64,
+                    terminal_at_unix: Some(200 + index as i64),
+                };
+                barrier.wait();
+                journal
+                    .compare_and_swap_denial(&record, None, owner(index as u64 + 3))
+                    .expect("concurrent denial");
+            })
+        })
+        .collect::<Vec<_>>();
+    barrier.wait();
+    for worker in workers {
+        worker.join().expect("concurrent denial worker");
+    }
+
+    let directory = root
+        .join("sessions")
+        .join("workflow-operations")
+        .join(encode_path_segment("session-one"));
+    let operation_ids = fs::read_dir(&directory)
+        .expect("workflow journal directory")
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let file_name = entry.file_name().into_string().ok()?;
+            Some(file_name.strip_suffix(".json")?.to_string())
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(operation_ids.len(), MAX_WORKFLOW_DENIAL_RECORDS);
+    for operation_id in operation_ids {
+        journal
+            .load("session-one", &operation_id)
+            .expect("read concurrent denial")
+            .expect("concurrent denial remains readable");
+    }
+}
+
+#[test]
 fn terminal_journal_records_are_immutable_idempotent_and_retained() {
     let (_temp, root) = private_temp();
     let journal = WorkflowJournal::new(&root);
@@ -834,6 +1103,12 @@ fn terminal_journal_records_are_immutable_idempotent_and_retained() {
             .expect("identical terminal retry"),
         revision
     );
+    assert_eq!(
+        journal
+            .compare_and_swap(&record, None, owner(3))
+            .expect("identical terminal retry without a revision"),
+        revision
+    );
     let mut changed = record.clone();
     changed.reason_code = "different-reason".to_string();
     assert!(matches!(
@@ -844,6 +1119,70 @@ fn terminal_journal_records_are_immutable_idempotent_and_retained() {
     assert!(!record.prune_eligible(100 + retention - 1, false));
     assert!(record.prune_eligible(100 + retention, false));
     assert!(!record.prune_eligible(100 + retention, true));
+}
+
+#[test]
+fn workflow_journal_discovers_nonterminal_and_prunes_old_terminal_records() {
+    let (_temp, root) = private_temp();
+    let journal = WorkflowJournal::new(&root);
+    let terminal = WorkflowOperationRecord {
+        schema_version: WORKFLOW_OPERATION_SCHEMA_VERSION,
+        session_id: "session-one".to_string(),
+        operation_id: "old-terminal".to_string(),
+        kind: unpin_core::sessions::WorkflowOperationKind::Denial,
+        lifecycle: WorkflowOperationLifecycle::Denied,
+        reason_code: "workflow-envelope-expansion-review-required".to_string(),
+        source_state_sequence: 1,
+        target_state_sequence: 1,
+        operation_fingerprint: digest('1'),
+        source_mode: None,
+        target_mode: None,
+        created_at_unix: 100,
+        terminal_at_unix: Some(100),
+    };
+    journal
+        .compare_and_swap(&terminal, None, owner(1))
+        .expect("terminal record");
+    let mut pending = terminal.clone();
+    pending.operation_id = "pending-transition".to_string();
+    pending.kind = unpin_core::sessions::WorkflowOperationKind::Transition;
+    pending.lifecycle = WorkflowOperationLifecycle::Staged;
+    pending.reason_code = "workflow-transition-staged".to_string();
+    pending.target_state_sequence = 2;
+    pending.operation_fingerprint = digest('2');
+    pending.source_mode = Some("planning".to_string());
+    pending.target_mode = Some("implementation".to_string());
+    pending.terminal_at_unix = None;
+    journal
+        .compare_and_swap(&pending, None, owner(2))
+        .expect("pending record");
+
+    let operations = journal
+        .nonterminal_records("session-one")
+        .expect("discover pending operations");
+    assert_eq!(operations.len(), 1);
+    assert_eq!(operations[0].operation_id, "pending-transition");
+    assert_eq!(
+        journal
+            .prune_terminal(
+                "session-one",
+                100 + unpin_core::sessions::WORKFLOW_TERMINAL_RETENTION_SECONDS,
+            )
+            .expect("prune terminal records"),
+        1
+    );
+    assert!(
+        journal
+            .load("session-one", "old-terminal")
+            .expect("load pruned record")
+            .is_none()
+    );
+    assert!(
+        journal
+            .load("session-one", "pending-transition")
+            .expect("load pending record")
+            .is_some()
+    );
 }
 
 #[test]

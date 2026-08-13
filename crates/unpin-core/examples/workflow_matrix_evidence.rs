@@ -4,9 +4,14 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use rmcp::ServiceExt;
 use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use unpin_cli::mcp_runtime::{
+    GatewayMcpServer, GatewayRuntimeTimeouts, NoGatewayCredentials, primary_gateway_tools,
+    serve_gateway_io,
+};
 use unpin_core::{
     catalog::{
         CanonicalOrigin, CapabilityId, CapabilityKind, CapabilityLifecycle, CapabilityMutability,
@@ -38,12 +43,16 @@ use unpin_core::{
     },
 };
 
-const SEARCH_SKILLS_TOOL: &str = "unpin_search_skills";
-const LOAD_SKILL_TOOL: &str = "unpin_load_skill";
-const SESSION_STATUS_TOOL: &str = "unpin_get_session_status";
-
 fn digest(character: char) -> String {
     std::iter::repeat_n(character, 64).collect()
+}
+
+fn unix_now() -> i64 {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("workflow matrix clock")
+        .as_secs();
+    i64::try_from(seconds).expect("workflow matrix clock range")
 }
 
 fn source_fingerprint(body: &[u8]) -> String {
@@ -267,88 +276,17 @@ fn reviewed_hook(
         .expect("reviewed fixture hook")
 }
 
-fn control_descriptors() -> Vec<Value> {
-    let mut values = vec![
-        json!({
-            "name": SEARCH_SKILLS_TOOL,
-            "description": "Search metadata for skills selected by the session profile.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "query": {"type": "string"},
-                    "limit": {"type": "integer", "minimum": 1}
-                },
-                "additionalProperties": false
-            },
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
-        }),
-        json!({
-            "name": LOAD_SKILL_TOOL,
-            "description": "Load one selected skill by opaque reference.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {"reference": {"type": "string"}},
-                "required": ["reference"],
-                "additionalProperties": false
-            },
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
-        }),
-        json!({
-            "name": SESSION_STATUS_TOOL,
-            "description": "Return current gateway exposure and admission status.",
-            "inputSchema": {"type": "object", "additionalProperties": false},
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
-        }),
-    ];
-    values.extend(WorkflowControl::ALL.into_iter().map(|control| match control {
-        WorkflowControl::UnpinWorkflowStatus => json!({
-            "name": control.name(),
-            "description": "Return authenticated workflow and connection status.",
-            "inputSchema": {"type": "object", "additionalProperties": false},
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
-        }),
-        WorkflowControl::UnpinWorkflowModes => json!({
-            "name": control.name(),
-            "description": "List modes in the pinned workflow envelope.",
-            "inputSchema": {"type": "object", "additionalProperties": false},
-            "annotations": {"readOnlyHint": true, "openWorldHint": false}
-        }),
-        WorkflowControl::UnpinWorkflowEnterMode => json!({
-            "name": control.name(),
-            "description": "Enter a previously pinned workflow mode.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["operationId", "operationFingerprint", "sourceStateSequence", "targetMode", "requestedAtUnix"],
-                "properties": {
-                    "operationId": {"type": "string"},
-                    "operationFingerprint": {"type": "string"},
-                    "sourceStateSequence": {"type": "integer", "minimum": 0},
-                    "targetMode": {"type": "string"},
-                    "requestedAtUnix": {"type": "integer"}
-                },
-                "additionalProperties": false
-            },
-            "annotations": {"readOnlyHint": false, "openWorldHint": false}
-        }),
-        WorkflowControl::UnpinWorkflowCancelTransition => json!({
-            "name": control.name(),
-            "description": "Cancel one in-progress workflow transition.",
-            "inputSchema": {
-                "type": "object",
-                "required": ["operationId"],
-                "properties": {"operationId": {"type": "string"}},
-                "additionalProperties": false
-            },
-            "annotations": {"readOnlyHint": false, "openWorldHint": false}
-        }),
-    }));
-    values
-}
-
 fn canonical_schema_bytes(values: &[Value]) -> usize {
     serde_json::to_vec(values)
         .expect("canonical schema JSON")
         .len()
+}
+
+fn tool_names(values: &[Value]) -> Vec<String> {
+    values
+        .iter()
+        .filter_map(|descriptor| descriptor["name"].as_str().map(str::to_string))
+        .collect()
 }
 
 fn estimated_tokens(bytes: usize) -> usize {
@@ -361,6 +299,10 @@ struct ModeEvidence {
     mode: String,
     revision: String,
     advertised_tool_names: Vec<String>,
+    gateway_tools_list_names: Vec<String>,
+    expected_tool_descriptors: Vec<Value>,
+    observed_tool_descriptors: Vec<Value>,
+    mcp_observation_source: &'static str,
     skill_search_results: Vec<Value>,
     loaded_skill_body_bytes: usize,
     hook_ids: Vec<String>,
@@ -368,16 +310,63 @@ struct ModeEvidence {
     estimated_tokens: usize,
 }
 
-fn mode_evidence(mode: &str, exposure: &GatewayExposure) -> ModeEvidence {
-    let mut descriptors = control_descriptors();
-    descriptors.extend(
-        exposure
-            .tools()
-            .descriptors()
-            .into_iter()
-            .map(|tool| serde_json::to_value(tool).expect("projected tool JSON")),
+const MCP_OBSERVATION_SOURCE: &str = "GatewayMcpServer RMCP tools/list";
+
+fn rmcp_list_tools(
+    service: &std::sync::Arc<GatewayService>,
+    claim: &unpin_core::gateway::GatewayConnectionClaim,
+) -> Vec<Value> {
+    let lease_expiry = service
+        .control_plane()
+        .snapshot()
+        .expect("RMCP witness session snapshot")
+        .lease
+        .lease_expires_at_unix;
+    let now_unix = unix_now();
+    assert!(
+        lease_expiry > now_unix,
+        "RMCP witness requires a live fixture lease"
     );
-    descriptors.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("workflow evidence RMCP runtime");
+    runtime.block_on(async {
+        let server = GatewayMcpServer::new(
+            std::sync::Arc::clone(service),
+            std::sync::Arc::new(NoGatewayCredentials),
+            GatewayRuntimeTimeouts::default(),
+        )
+        .with_connection_claim(claim.clone());
+        let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+        let server_task = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server_io);
+            serve_gateway_io(server, read, write).await
+        });
+        let mut client = ().serve(client_io).await.expect("connect RMCP witness");
+        let mut tools = client
+            .list_all_tools()
+            .await
+            .expect("RMCP tools/list witness")
+            .into_iter()
+            .map(|tool| serde_json::to_value(tool).expect("RMCP tool descriptor JSON"))
+            .collect::<Vec<_>>();
+        tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+        client
+            .close_with_timeout(std::time::Duration::from_secs(2))
+            .await
+            .expect("close RMCP witness client");
+        server_task
+            .await
+            .expect("RMCP witness task")
+            .expect("serve RMCP witness");
+        tools
+    })
+}
+
+fn mode_evidence(mode: &str, exposure: &GatewayExposure, observed_tools: &[Value]) -> ModeEvidence {
+    let expected_tool_descriptors = expected_tool_descriptors(exposure);
+    let advertised_tool_names = tool_names(&expected_tool_descriptors);
     let skill_search = exposure
         .skills()
         .search("", 100)
@@ -403,20 +392,34 @@ fn mode_evidence(mode: &str, exposure: &GatewayExposure) -> ModeEvidence {
         .iter()
         .map(|handler| handler.id().to_string())
         .collect();
-    let schema_bytes = canonical_schema_bytes(&descriptors);
+    let schema_bytes = canonical_schema_bytes(observed_tools);
     ModeEvidence {
         mode: mode.to_string(),
         revision: exposure.pinned().revision.clone(),
-        advertised_tool_names: descriptors
+        advertised_tool_names,
+        gateway_tools_list_names: observed_tools
             .iter()
             .filter_map(|descriptor| descriptor["name"].as_str().map(str::to_string))
             .collect(),
+        expected_tool_descriptors,
+        observed_tool_descriptors: observed_tools.to_vec(),
+        mcp_observation_source: MCP_OBSERVATION_SOURCE,
         skill_search_results,
         loaded_skill_body_bytes,
         hook_ids,
         schema_bytes,
         estimated_tokens: estimated_tokens(schema_bytes),
     }
+}
+
+fn expected_tool_descriptors(exposure: &GatewayExposure) -> Vec<Value> {
+    let mut descriptors = primary_gateway_tools(exposure.tools().descriptors())
+        .expect("production primary gateway descriptors")
+        .into_iter()
+        .map(|tool| serde_json::to_value(tool).expect("expected RMCP tool descriptor JSON"))
+        .collect::<Vec<_>>();
+    descriptors.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    descriptors
 }
 
 fn transition_request(
@@ -446,6 +449,7 @@ fn error_code(error: GatewayError) -> String {
 
 fn main() {
     let output = env::args_os().nth(1).map(PathBuf::from);
+    let fixture_now = unix_now();
     let root = tempfile::Builder::new()
         .prefix("unpin-workflow-matrix-")
         .tempdir()
@@ -636,10 +640,10 @@ fn main() {
             "authority-root-workflow-matrix".to_string(),
             "provider-state-workflow-matrix".to_string(),
         ]),
-        lease_expires_at_unix: 3_000,
+        lease_expires_at_unix: fixture_now.saturating_add(3_000),
     };
     let authority = manager
-        .prepare_bootstrap(bootstrap.clone(), 1_000)
+        .prepare_bootstrap(bootstrap.clone(), fixture_now)
         .expect("prepare bootstrap");
     let claimed = manager
         .claim_bootstrap(
@@ -652,7 +656,7 @@ fn main() {
                 process: bootstrap.process.clone(),
                 connection_scope_id: bootstrap.connection_scope_id.clone(),
             },
-            1_001,
+            fixture_now.saturating_add(1),
         )
         .expect("claim bootstrap");
     let pinned_workflow = PinnedWorkflowEnvelope {
@@ -681,7 +685,7 @@ fn main() {
             &claimed.lease.revision,
             pinned_workflow,
             planning_pin.clone(),
-            1_002,
+            fixture_now.saturating_add(2),
         )
         .expect("pin workflow");
 
@@ -740,32 +744,90 @@ fn main() {
             .expect("compile workflow exposure"),
         );
     }
-    let mode_evidence = exposures
-        .iter()
-        .map(|(mode, exposure)| (mode.clone(), mode_evidence(mode, exposure)))
-        .collect::<BTreeMap<_, _>>();
+    let control = unpin_core::gateway::GatewayControlPlane::new(
+        manager,
+        claimed.handle,
+        limits.maximum_concurrent_calls,
+    )
+    .expect("gateway control plane");
+    let service = std::sync::Arc::new(
+        GatewayService::new(control, exposures["planning"].clone(), limits)
+            .expect("gateway service"),
+    );
+    for mode in ["implementation", "review"] {
+        service
+            .register_workflow_exposure(exposures[mode].clone())
+            .expect("register workflow exposure");
+    }
+    let primary = service.issue_connection_claim().expect("primary claim");
+    let auxiliary = service.accept_connection().expect("auxiliary claim");
+    let initial_status = service.connection_status(&primary).expect("initial status");
+    let initial_tools = rmcp_list_tools(&service, &primary);
+    let auxiliary_status = service
+        .connection_status(&auxiliary)
+        .expect("auxiliary status");
+    let auxiliary_data_denial = service
+        .list_tools_for_connection(&auxiliary, fixture_now.saturating_add(3))
+        .expect_err("auxiliary is control-only");
 
-    let maximum_descriptors = {
-        let mut descriptors = control_descriptors();
-        for mode in mode_evidence.values() {
-            for name in &mode.advertised_tool_names {
-                if control_descriptors()
-                    .iter()
-                    .any(|descriptor| descriptor["name"] == *name)
-                {
-                    continue;
-                }
-                descriptors.push(json!({
-                    "name": name,
-                    "description": "Maximum-envelope fixture descriptor",
-                    "inputSchema": {"type": "object", "additionalProperties": false}
-                }));
-            }
-        }
-        descriptors.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
-        descriptors.dedup_by(|left, right| left["name"] == right["name"]);
-        descriptors
-    };
+    let implementation_request = transition_request(
+        "enter-implementation",
+        pinned.revision.sequence,
+        "implementation",
+        fixture_now.saturating_add(10),
+    );
+    let (implementation_transition, implementation_outcome) = service
+        .enter_workflow_mode_for_connection(
+            &auxiliary,
+            implementation_request,
+            ListChangeSupport::Negotiated,
+            fixture_now.saturating_add(10),
+        )
+        .expect("stage implementation transition");
+    let status_after_stage = service.connection_status(&primary).expect("staged status");
+    let _pre_notification_tools = service
+        .list_tools_for_connection(&primary, fixture_now.saturating_add(11))
+        .expect("pre-notification list");
+    let notification = service
+        .notify_tools_changed_for_connection(&primary, fixture_now.saturating_add(12))
+        .expect("notify primary");
+    let status_after_notification = service
+        .connection_status(&primary)
+        .expect("notification status");
+    let implementation_tools = rmcp_list_tools(&service, &primary);
+    let implementation_observed = service
+        .connection_status(&primary)
+        .expect("implementation observed status");
+
+    let review_snapshot = service
+        .control_plane()
+        .snapshot()
+        .expect("review transition snapshot");
+    let review_request = transition_request(
+        "enter-review",
+        review_snapshot.revision.sequence,
+        "review",
+        fixture_now.saturating_add(20),
+    );
+    let (review_transition, review_outcome) = service
+        .enter_workflow_mode_for_connection(
+            &primary,
+            review_request,
+            ListChangeSupport::Negotiated,
+            fixture_now.saturating_add(20),
+        )
+        .expect("stage review transition");
+    service
+        .notify_tools_changed_for_connection(&primary, fixture_now.saturating_add(21))
+        .expect("notify review transition");
+    let review_tools = rmcp_list_tools(&service, &primary);
+
+    let mut maximum_descriptors = ["planning", "implementation", "review"]
+        .into_iter()
+        .flat_map(|mode| expected_tool_descriptors(&exposures[mode]))
+        .collect::<Vec<_>>();
+    maximum_descriptors.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
+    maximum_descriptors.dedup_by(|left, right| left["name"] == right["name"]);
     let full_envelope_schema_bytes = canonical_schema_bytes(&maximum_descriptors);
     let unrouted_descriptors = {
         let mut descriptors = maximum_descriptors.clone();
@@ -784,88 +846,27 @@ fn main() {
         descriptors
     };
     let unrouted_installed_catalog_schema_bytes = canonical_schema_bytes(&unrouted_descriptors);
-
-    let control = unpin_core::gateway::GatewayControlPlane::new(
-        manager,
-        claimed.handle,
-        limits.maximum_concurrent_calls,
-    )
-    .expect("gateway control plane");
-    let service = GatewayService::new(control, exposures["planning"].clone(), limits)
-        .expect("gateway service");
-    for mode in ["implementation", "review"] {
-        service
-            .register_workflow_exposure(exposures[mode].clone())
-            .expect("register workflow exposure");
-    }
-    let primary = service.issue_connection_claim().expect("primary claim");
-    let auxiliary = service.accept_connection().expect("auxiliary claim");
-    let initial_status = service.connection_status(&primary).expect("initial status");
-    let auxiliary_status = service
-        .connection_status(&auxiliary)
-        .expect("auxiliary status");
-    let auxiliary_data_denial = service
-        .list_tools_for_connection(&auxiliary, 1_003)
-        .expect_err("auxiliary is control-only");
-
-    let implementation_request = transition_request(
-        "enter-implementation",
-        pinned.revision.sequence,
-        "implementation",
-        1_010,
-    );
-    let (implementation_transition, implementation_outcome) = service
-        .enter_workflow_mode_for_connection(
-            &auxiliary,
-            implementation_request,
-            ListChangeSupport::Negotiated,
-            1_010,
-        )
-        .expect("stage implementation transition");
-    let status_after_stage = service.connection_status(&primary).expect("staged status");
-    let _pre_notification_tools = service
-        .list_tools_for_connection(&primary, 1_011)
-        .expect("pre-notification list");
-    let notification = service
-        .notify_tools_changed_for_connection(&primary, 1_012)
-        .expect("notify primary");
-    let status_after_notification = service
-        .connection_status(&primary)
-        .expect("notification status");
-    let implementation_tools = service
-        .list_tools_for_connection(&primary, 1_013)
-        .expect("same-primary relist");
-    let implementation_observed = service
-        .connection_status(&primary)
-        .expect("implementation observed status");
-
-    let review_snapshot = service
-        .control_plane()
-        .snapshot()
-        .expect("review transition snapshot");
-    let review_request = transition_request(
-        "enter-review",
-        review_snapshot.revision.sequence,
-        "review",
-        1_020,
-    );
-    let (review_transition, review_outcome) = service
-        .enter_workflow_mode_for_connection(
-            &primary,
-            review_request,
-            ListChangeSupport::Negotiated,
-            1_020,
-        )
-        .expect("stage review transition");
-    service
-        .notify_tools_changed_for_connection(&primary, 1_021)
-        .expect("notify review transition");
-    let review_tools = service
-        .list_tools_for_connection(&primary, 1_022)
-        .expect("observe review transition");
     let review_observed = service
         .connection_status(&primary)
         .expect("review observed status");
+    let mode_evidence = BTreeMap::from([
+        (
+            "planning".to_string(),
+            mode_evidence("planning", &exposures["planning"], &initial_tools),
+        ),
+        (
+            "implementation".to_string(),
+            mode_evidence(
+                "implementation",
+                &exposures["implementation"],
+                &implementation_tools,
+            ),
+        ),
+        (
+            "review".to_string(),
+            mode_evidence("review", &exposures["review"], &review_tools),
+        ),
+    ]);
 
     let cancel_snapshot = service
         .control_plane()
@@ -875,18 +876,22 @@ fn main() {
         "cancel-planning",
         cancel_snapshot.revision.sequence,
         "planning",
-        1_030,
+        fixture_now.saturating_add(30),
     );
     let (cancel_transition, cancel_outcome) = service
         .enter_workflow_mode_for_connection(
             &primary,
             cancel_request,
             ListChangeSupport::NotificationOnly,
-            1_030,
+            fixture_now.saturating_add(30),
         )
         .expect("stage refresh-unconfirmed transition");
     let cancelled = service
-        .cancel_transition_for_connection(&primary, &cancel_transition.operation_id, 1_031)
+        .cancel_transition_for_connection(
+            &primary,
+            &cancel_transition.operation_id,
+            fixture_now.saturating_add(31),
+        )
         .expect("cancel transition");
 
     let reload_snapshot = service
@@ -897,18 +902,22 @@ fn main() {
         "reload-planning",
         reload_snapshot.revision.sequence,
         "planning",
-        1_040,
+        fixture_now.saturating_add(40),
     );
     let (reload_transition, reload_outcome) = service
         .enter_workflow_mode_for_connection(
             &primary,
             reload_request,
             ListChangeSupport::Unsupported,
-            1_040,
+            fixture_now.saturating_add(40),
         )
         .expect("stage reload-required transition");
     service
-        .cancel_transition_for_connection(&primary, &reload_transition.operation_id, 1_041)
+        .cancel_transition_for_connection(
+            &primary,
+            &reload_transition.operation_id,
+            fixture_now.saturating_add(41),
+        )
         .expect("cancel reload transition");
 
     let next_snapshot = service
@@ -919,18 +928,22 @@ fn main() {
         "next-session-planning",
         next_snapshot.revision.sequence,
         "planning",
-        1_050,
+        fixture_now.saturating_add(50),
     );
     let (next_transition, next_outcome) = service
         .enter_workflow_mode_for_connection(
             &primary,
             next_request,
             ListChangeSupport::NextSessionOnly,
-            1_050,
+            fixture_now.saturating_add(50),
         )
         .expect("stage next-session transition");
     let next_cancelled = service
-        .cancel_transition_for_connection(&primary, &next_transition.operation_id, 1_051)
+        .cancel_transition_for_connection(
+            &primary,
+            &next_transition.operation_id,
+            fixture_now.saturating_add(51),
+        )
         .expect("cancel next-session transition");
 
     let stale_snapshot = service
@@ -941,14 +954,14 @@ fn main() {
         "stale-review",
         stale_snapshot.revision.sequence.saturating_sub(1),
         "review",
-        1_060,
+        fixture_now.saturating_add(60),
     );
     let stale_transition_denial = service
         .enter_workflow_mode_for_connection(
             &primary,
             stale_request,
             ListChangeSupport::Negotiated,
-            1_060,
+            fixture_now.saturating_add(60),
         )
         .expect_err("stale transition denied");
 
@@ -969,7 +982,7 @@ fn main() {
         ..bootstrap.clone()
     };
     let second_authority = second_manager
-        .prepare_bootstrap(second_bootstrap.clone(), 1_100)
+        .prepare_bootstrap(second_bootstrap.clone(), fixture_now.saturating_add(100))
         .expect("second bootstrap");
     let second_claimed = second_manager
         .claim_bootstrap(
@@ -982,7 +995,7 @@ fn main() {
                 process: second_bootstrap.process.clone(),
                 connection_scope_id: second_bootstrap.connection_scope_id.clone(),
             },
-            1_101,
+            fixture_now.saturating_add(101),
         )
         .expect("second claim");
     let second_control = unpin_core::gateway::GatewayControlPlane::new(
@@ -1057,6 +1070,49 @@ fn main() {
         .len();
     let plugin_mode = &mode_evidence["review"];
     let planning_mode = &mode_evidence["planning"];
+    let final_snapshot = service
+        .control_plane()
+        .snapshot()
+        .expect("surface coverage snapshot");
+    let final_workflow = final_snapshot
+        .lease
+        .workflow
+        .as_ref()
+        .expect("surface coverage workflow");
+    let gateway_next_action = if final_snapshot.lease.desired_exposure
+        == final_snapshot.lease.observed_exposure
+        && final_snapshot.lease.admission_open
+    {
+        "continue-in-active-mode"
+    } else {
+        "reconcile-workflow-exposure"
+    };
+    let gateway_observation = json!({
+        "workflowId": final_workflow.workflow_id,
+        "activeMode": final_workflow.active_mode,
+        "desiredExposureRevision": final_snapshot.lease.desired_exposure.revision,
+        "observedExposureRevision": final_snapshot.lease.observed_exposure.revision,
+        "liveStatus": final_snapshot.lease.live_status,
+        "nextAction": gateway_next_action,
+    });
+    let mcp_next_action = if review_observed.observed_exposure_revision
+        == final_snapshot.lease.desired_exposure.revision
+        && final_snapshot.lease.admission_open
+    {
+        "continue-in-active-mode"
+    } else {
+        "reconcile-workflow-exposure"
+    };
+    let mcp_observation = json!({
+           "workflowId": final_workflow.workflow_id,
+           "activeMode": final_workflow.active_mode,
+           "desiredExposureRevision": final_snapshot.lease.desired_exposure.revision,
+           "observedExposureRevision": review_observed.observed_exposure_revision,
+           "liveStatus": final_snapshot.lease.live_status,
+           "nextAction": mcp_next_action,
+    "observationSource": MCP_OBSERVATION_SOURCE,
+        "observedToolNames": tool_names(&review_tools),
+       });
 
     let evidence = json!({
         "schemaVersion": 1,
@@ -1114,7 +1170,7 @@ fn main() {
             {
                 "event": "same-primary-tools-list",
                 "connectionEpoch": primary.connection_epoch(),
-                "advertisedToolNames": implementation_tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+                "advertisedToolNames": tool_names(&implementation_tools),
                 "desiredRevision": implementation_transition.desired_exposure_revision,
                 "observedRevision": implementation_observed.observed_exposure_revision,
                 "pendingRevision": implementation_observed.pending_exposure_revision
@@ -1127,7 +1183,7 @@ fn main() {
             {
                 "event": "same-primary-review-tools-list",
                 "connectionEpoch": primary.connection_epoch(),
-                "advertisedToolNames": review_tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(),
+                "advertisedToolNames": tool_names(&review_tools),
                 "observedRevision": review_observed.observed_exposure_revision
             }
         ],
@@ -1180,14 +1236,23 @@ fn main() {
                 "repositoryConfigMayRedirect": false
             }
         },
-        "crossSurfaceParity": {
-            "canonicalStateFields": ["workflowId", "activeMode", "desiredExposureRevision", "observedExposureRevision", "liveStatus", "nextAction"],
-            "cli": true,
-            "mcp": true,
-            "desktop": true,
-            "tui": true,
-            "tuiRole": "compact-inspection-and-handoff",
-            "desktopRole": "primary-human-workbench"
+        "surfaceCoverage": {
+            "canonicalObservedFields": ["workflowId", "activeMode", "desiredExposureRevision", "observedExposureRevision", "liveStatus", "nextAction"],
+            "roles": {
+                "gateway": {"role": "authoritative-live-runtime"},
+                "mcp": {"role": "gateway-tools-list-and-read-only-session-planning"},
+                "cli": {"role": "definition-validation-and-human-launch-handoff"},
+                "desktop": {"role": "primary-human-workbench"},
+                "tui": {
+                    "role": "projection-and-handoff",
+                    "editing": false,
+                    "liveParityClaimed": false
+                }
+            },
+            "observations": {
+                "gateway": gateway_observation,
+                "mcp": mcp_observation
+            }
         }
     });
     let bytes = serde_json::to_vec_pretty(&evidence).expect("evidence JSON");

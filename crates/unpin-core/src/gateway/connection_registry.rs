@@ -342,7 +342,7 @@ impl GatewayConnectionRegistry {
         &self,
         claim: &GatewayConnectionClaim,
         desired_revision: &str,
-    ) -> Result<Option<Arc<GatewayExposure>>, GatewayError> {
+    ) -> Result<Option<(Arc<GatewayExposure>, u64)>, GatewayError> {
         self.require_primary(claim)?;
         let mut state = self.lock_state()?;
         let connection = state
@@ -354,7 +354,10 @@ impl GatewayConnectionRegistry {
             .as_ref()
             .is_some_and(|pending| pending.pinned().revision == desired_revision)
         {
-            Ok(connection.pending.take())
+            Ok(connection
+                .pending
+                .take()
+                .map(|exposure| (exposure, connection.observation_sequence)))
         } else {
             Ok(None)
         }
@@ -372,6 +375,10 @@ impl GatewayConnectionRegistry {
             .get_mut(&claim.connection_epoch)
             .ok_or(GatewayError::ConnectionEpochStale)?;
         connection.pending = Some(exposure);
+        connection.observation_sequence = connection
+            .observation_sequence
+            .checked_add(1)
+            .ok_or(GatewayError::ConnectionEpochStale)?;
         Ok(())
     }
 
@@ -379,6 +386,7 @@ impl GatewayConnectionRegistry {
         &self,
         claim: &GatewayConnectionClaim,
         exposure: Arc<GatewayExposure>,
+        expected_sequence: u64,
     ) -> Result<(), GatewayError> {
         self.require_primary(claim)?;
         let mut state = self.lock_state()?;
@@ -386,6 +394,9 @@ impl GatewayConnectionRegistry {
             .connections
             .get_mut(&claim.connection_epoch)
             .ok_or(GatewayError::ConnectionEpochStale)?;
+        if connection.observation_sequence != expected_sequence {
+            return Err(GatewayError::ConnectionEpochStale);
+        }
         connection.observed = exposure;
         connection.pending = None;
         connection.observation_sequence = connection

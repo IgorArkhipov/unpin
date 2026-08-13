@@ -18,7 +18,9 @@ final class WorkbenchFlowTests: XCTestCase {
         try FileManager.default.createDirectory(at: appStateRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
 
-        let fixtureRoot = try FixtureResources.root()
+        let sourceFixtureRoot = try FixtureResources.root()
+        let fixtureRoot = temporary.appendingPathComponent("fixtures", isDirectory: true)
+        try FileManager.default.copyItem(at: sourceFixtureRoot, to: fixtureRoot)
         let store = WorkspaceStore(bridgeRoots: BridgeLaunchRoots(
             fixtureRoot: fixtureRoot,
             homeRoot: fixtureRoot,
@@ -969,6 +971,14 @@ final class WorkbenchFlowTests: XCTestCase {
             classifyWorkflowSurface(WorkflowSurfaceFacts(
                 presentation: ready,
                 hasSession: true,
+                reloadLimitation: "notification-sent"
+            )),
+            .notificationSent
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
                 reloadLimitation: "refresh-unconfirmed"
             )),
             .refreshUnconfirmed
@@ -1003,6 +1013,16 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertTrue(parseWorkflowHostCommand("   ").isEmpty)
         XCTAssertTrue(parseWorkflowHostCommand("codex 'unterminated").isEmpty)
         XCTAssertTrue(parseWorkflowHostCommand(#"codex \"#).isEmpty)
+    }
+
+    func testWorkflowTransitionOperationIDsAreUniqueAndInterpolated() {
+        let first = WorkspaceStore.workflowTransitionOperationID()
+        let second = WorkspaceStore.workflowTransitionOperationID()
+
+        XCTAssertTrue(first.hasPrefix("workflow-transition-"))
+        XCTAssertTrue(second.hasPrefix("workflow-transition-"))
+        XCTAssertNotEqual(first, second)
+        XCTAssertFalse(first.contains("UUID().uuidString"))
     }
 
     private func inventoryItem(

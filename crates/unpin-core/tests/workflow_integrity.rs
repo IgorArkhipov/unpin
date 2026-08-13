@@ -2,6 +2,8 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
+    sync::{Arc, Barrier},
+    thread,
 };
 
 use tempfile::TempDir as RawTempDir;
@@ -288,7 +290,7 @@ fn workflow_service(root: &Path) -> GatewayService {
 }
 
 #[test]
-fn auxiliary_transition_stages_only_primary_and_replacement_uses_observed_revision() {
+fn auxiliary_control_stages_only_the_primary_workflow_exposure() {
     let root = PrivateTempDir::new();
     let service = workflow_service(root.path());
     let primary = service.issue_connection_claim().unwrap();
@@ -367,6 +369,265 @@ fn auxiliary_transition_stages_only_primary_and_replacement_uses_observed_revisi
             .observed_exposure_revision,
         implementation_revision
     );
+}
+
+#[test]
+fn terminal_operation_cancellation_cannot_clear_a_new_pending_transition() {
+    let root = PrivateTempDir::new();
+    let service = workflow_service(root.path());
+    let primary = service.issue_connection_claim().unwrap();
+    let auxiliary = service.accept_connection().unwrap();
+    let initial = service.control_plane().snapshot().unwrap();
+
+    let first = WorkflowTransitionRequest {
+        operation_id: "first-transition".to_string(),
+        operation_fingerprint: digest('1'),
+        source_state_sequence: initial.revision.sequence,
+        target_mode: "implementation".to_string(),
+        requested_at_unix: 1_010,
+    };
+    let (first_transition, _) = service
+        .enter_workflow_mode_for_connection(&primary, first, ListChangeSupport::Negotiated, 1_010)
+        .expect("stage first transition");
+    service
+        .notify_tools_changed_for_connection(&primary, 1_011)
+        .expect("notify first transition");
+    service
+        .list_tools_for_connection(&primary, 1_012)
+        .expect("observe first transition");
+
+    let after_first = service.control_plane().snapshot().unwrap();
+    let second = WorkflowTransitionRequest {
+        operation_id: "second-transition".to_string(),
+        operation_fingerprint: digest('2'),
+        source_state_sequence: after_first.revision.sequence,
+        target_mode: "planning".to_string(),
+        requested_at_unix: 1_013,
+    };
+    let (_, outcome) = service
+        .enter_workflow_mode_for_connection(&primary, second, ListChangeSupport::Negotiated, 1_013)
+        .expect("stage second transition");
+    assert_eq!(outcome, GatewayRefreshOutcome::NotificationRequired);
+    let pending_before = service.connection_status(&primary).unwrap();
+    assert_eq!(
+        pending_before.pending_exposure_revision,
+        Some(
+            service
+                .control_plane()
+                .snapshot()
+                .unwrap()
+                .lease
+                .desired_exposure
+                .revision
+                .clone()
+        )
+    );
+
+    assert!(
+        service
+            .cancel_transition_for_connection(&primary, &first_transition.operation_id, 1_014)
+            .is_err()
+    );
+    let pending_after_terminal = service.connection_status(&primary).unwrap();
+    assert_eq!(
+        pending_after_terminal.pending_exposure_revision,
+        pending_before.pending_exposure_revision
+    );
+
+    assert!(matches!(
+        service.cancel_transition_for_connection(&auxiliary, &first_transition.operation_id, 1_015),
+        Err(GatewayError::Workflow(_))
+    ));
+    let pending_after_auxiliary = service.connection_status(&primary).unwrap();
+    assert_eq!(
+        pending_after_auxiliary.pending_exposure_revision,
+        pending_before.pending_exposure_revision
+    );
+}
+
+#[test]
+fn cancellation_and_primary_relist_are_serialized() {
+    let root = PrivateTempDir::new();
+    let service = Arc::new(workflow_service(root.path()));
+    let primary = service.issue_connection_claim().unwrap();
+    let snapshot = service.control_plane().snapshot().unwrap();
+    let request = WorkflowTransitionRequest {
+        operation_id: "cancel-vs-relist".to_string(),
+        operation_fingerprint: digest('3'),
+        source_state_sequence: snapshot.revision.sequence,
+        target_mode: "implementation".to_string(),
+        requested_at_unix: 1_010,
+    };
+    let (transition, outcome) = service
+        .enter_workflow_mode_for_connection(&primary, request, ListChangeSupport::Negotiated, 1_010)
+        .expect("stage transition");
+    assert_eq!(outcome, GatewayRefreshOutcome::NotificationRequired);
+    service
+        .notify_tools_changed_for_connection(&primary, 1_011)
+        .expect("notify transition");
+
+    let barrier = Arc::new(Barrier::new(3));
+    let cancel_service = Arc::clone(&service);
+    let cancel_claim = primary.clone();
+    let cancel_barrier = Arc::clone(&barrier);
+    let operation_id = transition.operation_id.clone();
+    let cancel = thread::spawn(move || {
+        cancel_barrier.wait();
+        cancel_service.cancel_transition_for_connection(&cancel_claim, &operation_id, 1_012)
+    });
+    let relist_service = Arc::clone(&service);
+    let relist_claim = primary.clone();
+    let relist_barrier = Arc::clone(&barrier);
+    let relist = thread::spawn(move || {
+        relist_barrier.wait();
+        relist_service.list_tools_for_connection(&relist_claim, 1_013)
+    });
+    barrier.wait();
+
+    let cancel_result = cancel.join().expect("cancel worker");
+    let relist_result = relist.join().expect("relist worker");
+    assert!(relist_result.is_ok(), "relist result: {relist_result:?}");
+    assert!(
+        cancel_result.is_ok() || matches!(cancel_result, Err(GatewayError::Workflow(_))),
+        "cancel result: {cancel_result:?}"
+    );
+    let status = service.connection_status(&primary).unwrap();
+    assert_eq!(status.pending_exposure_revision, None);
+    let final_snapshot = service.control_plane().snapshot().unwrap();
+    assert_eq!(
+        final_snapshot.lease.desired_exposure,
+        final_snapshot.lease.observed_exposure
+    );
+}
+
+#[test]
+fn journal_failure_quarantines_and_operation_specific_cancel_recovers() {
+    let root = PrivateTempDir::new();
+    let service = workflow_service(root.path());
+    let primary = service.issue_connection_claim().unwrap();
+    let snapshot = service.control_plane().snapshot().unwrap();
+    let target_revision =
+        snapshot.lease.workflow.as_ref().unwrap().profile_revisions["implementation"].clone();
+    let request = WorkflowTransitionRequest {
+        operation_id: "journal-failure-transition".to_string(),
+        operation_fingerprint: digest('7'),
+        source_state_sequence: snapshot.revision.sequence,
+        target_mode: "implementation".to_string(),
+        requested_at_unix: 1_010,
+    };
+    service
+        .enter_workflow_mode_for_connection(&primary, request, ListChangeSupport::Negotiated, 1_010)
+        .expect("stage transition");
+
+    let journal_root = root.path().join("sessions").join("workflow-operations");
+    let operation_dir = fs::read_dir(&journal_root)
+        .expect("workflow operation directory")
+        .next()
+        .expect("session operation directory")
+        .expect("session operation entry")
+        .path();
+    fs::write(operation_dir.join("malformed-entry"), b"fault")
+        .expect("inject journal read failure");
+    service
+        .notify_tools_changed_for_connection(&primary, 1_011)
+        .expect("notify transition");
+    service
+        .list_tools_for_connection(&primary, 1_012)
+        .expect_err("journal failure must stop relist");
+    fs::remove_file(operation_dir.join("malformed-entry")).expect("remove fault");
+    let quarantined = service.connection_status(&primary).unwrap();
+    assert!(quarantined.recovery_required, "status: {quarantined:?}");
+    let lease = service.control_plane().snapshot().unwrap();
+    assert_eq!(
+        lease.lease.live_status,
+        unpin_core::sessions::LiveExposureStatus::Unknown
+    );
+    assert!(!lease.lease.admission_open);
+    assert_eq!(lease.lease.observed_exposure.revision, target_revision);
+    assert_eq!(
+        service
+            .pending_workflow_operations_for_connection(&primary)
+            .unwrap()
+            .len(),
+        1
+    );
+    service
+        .cancel_transition_for_connection(&primary, "journal-failure-transition", 1_013)
+        .expect("operation-specific quarantine cancellation");
+    let recovered = service.control_plane().snapshot().unwrap();
+    assert_eq!(
+        recovered.lease.live_status,
+        unpin_core::sessions::LiveExposureStatus::ObservedRefresh
+    );
+    assert!(recovered.lease.admission_open);
+    assert_eq!(
+        recovered.lease.desired_exposure,
+        recovered.lease.observed_exposure
+    );
+}
+
+#[test]
+fn failed_transition_compensation_restores_pending_connection_state() {
+    let root = PrivateTempDir::new();
+    let service = workflow_service(root.path());
+    let primary = service.issue_connection_claim().expect("primary claim");
+    let snapshot = service
+        .control_plane()
+        .snapshot()
+        .expect("workflow snapshot");
+    let planning_revision = snapshot.lease.observed_exposure.revision.clone();
+    let request = WorkflowTransitionRequest {
+        operation_id: "compensation-failure-transition".to_string(),
+        operation_fingerprint: digest('8'),
+        source_state_sequence: snapshot.revision.sequence,
+        target_mode: "implementation".to_string(),
+        requested_at_unix: 1_010,
+    };
+    service
+        .enter_workflow_mode_for_connection(&primary, request, ListChangeSupport::Negotiated, 1_010)
+        .expect("stage transition");
+    let staged = service
+        .connection_status(&primary)
+        .expect("staged connection status");
+    let pending_revision = staged
+        .pending_exposure_revision
+        .clone()
+        .expect("pending exposure revision");
+
+    let journal_root = root.path().join("sessions").join("workflow-operations");
+    let operation_dir = fs::read_dir(&journal_root)
+        .expect("workflow operation directory")
+        .next()
+        .expect("session operation directory")
+        .expect("session operation entry")
+        .path();
+    let operation_path = operation_dir.join("compensation-failure-transition.json");
+    let operation_bytes = fs::read(&operation_path).expect("read staged operation");
+    fs::write(&operation_path, b"fault").expect("inject journal cancellation failure");
+
+    assert!(
+        service
+            .cancel_transition_for_connection(&primary, "compensation-failure-transition", 1_011,)
+            .is_err()
+    );
+    let restored = service
+        .connection_status(&primary)
+        .expect("connection status after failed compensation");
+    assert_eq!(
+        restored.pending_exposure_revision.as_deref(),
+        Some(pending_revision.as_str())
+    );
+    assert_eq!(restored.observed_exposure_revision, planning_revision);
+
+    fs::write(&operation_path, operation_bytes).expect("restore staged operation");
+    service
+        .cancel_transition_for_connection(&primary, "compensation-failure-transition", 1_012)
+        .expect("retry compensation");
+    let recovered = service
+        .connection_status(&primary)
+        .expect("recovered connection status");
+    assert_eq!(recovered.pending_exposure_revision, None);
+    assert_eq!(recovered.observed_exposure_revision, planning_revision);
 }
 
 #[test]
@@ -472,6 +733,51 @@ fn only_the_same_primary_relist_promotes_pending_exposure() {
             .observed_exposure_revision,
         digest('f')
     );
+}
+
+#[test]
+fn concurrent_same_primary_relists_serialize_one_observation() {
+    let root = PrivateTempDir::new();
+    let service = Arc::new(service(root.path()));
+    let primary = service.issue_connection_claim().expect("primary claim");
+    let (next_pinned, next_exposure) = empty_exposure('f');
+    service
+        .control_plane()
+        .request_exposure(next_pinned, 1_011)
+        .expect("request exposure");
+    service
+        .stage_refresh_for_connection(
+            &primary,
+            next_exposure,
+            ListChangeSupport::Negotiated,
+            1_012,
+        )
+        .expect("stage refresh");
+    service
+        .notify_tools_changed_for_connection(&primary, 1_013)
+        .expect("notify primary");
+
+    let barrier = Arc::new(Barrier::new(3));
+    let workers = [1_014, 1_015].map(|now_unix| {
+        let service = Arc::clone(&service);
+        let primary = primary.clone();
+        let barrier = Arc::clone(&barrier);
+        thread::spawn(move || {
+            barrier.wait();
+            service.list_tools_for_connection(&primary, now_unix)
+        })
+    });
+    barrier.wait();
+    for worker in workers {
+        assert!(worker.join().expect("relist worker").is_ok());
+    }
+
+    let status = service
+        .connection_status(&primary)
+        .expect("primary status after concurrent relists");
+    assert_eq!(status.observed_exposure_revision, digest('f'));
+    assert_eq!(status.pending_exposure_revision, None);
+    assert!(!status.recovery_required);
 }
 
 #[test]

@@ -382,6 +382,13 @@ impl SessionManager {
     }
 
     pub fn list(&self) -> Result<Vec<LeaseSnapshot>, LeaseError> {
+        self.authority_key()?;
+        let leases_directory = get_session_leases_dir(&self.app_state_root);
+        match fs::symlink_metadata(&leases_directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Ok(_) => {}
+            Err(error) => return Err(state_io_error(&leases_directory, error)),
+        }
         let _registry = self.registry_lock()?;
         self.list_unlocked()
     }
@@ -559,6 +566,7 @@ impl SessionManager {
                 .state_sequence
                 .checked_add(1)
                 .ok_or(LeaseError::OwnerGenerationOverflow)?;
+            lease.observed_exposure = observed_exposure.clone();
             lease.desired_exposure = observed_exposure;
             lease.live_status = LiveExposureStatus::ObservedRefresh;
             lease.admission_open = true;
@@ -580,6 +588,25 @@ impl SessionManager {
             lease.desired_exposure = lease.observed_exposure.clone();
             lease.live_status = LiveExposureStatus::ObservedRefresh;
             lease.admission_open = true;
+            Ok(())
+        })
+    }
+
+    /// Quarantine a workflow observation whose journal terminalization could
+    /// not be completed or rolled back. Desired and observed exposure remain
+    /// authenticated, but admission is closed and the unknown status forces
+    /// an explicit owner recovery instead of serving a partially reconciled
+    /// projection.
+    pub(crate) fn quarantine_workflow_observation(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            lease.live_status = LiveExposureStatus::Unknown;
+            lease.admission_open = false;
             Ok(())
         })
     }

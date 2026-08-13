@@ -8,10 +8,7 @@ use std::{
 use clap::{Args, Subcommand, ValueEnum};
 use serde_json::json;
 use unpin_core::{
-    approval::{
-        ApprovalExpectation, ApprovalResourceBinding, CONTROL_APPROVAL_AUDIENCE,
-        CONTROL_APPROVAL_ISSUER,
-    },
+    approval::{ApprovalExpectation, ControlApprovalContext},
     catalog::Catalog,
     control_operation::{ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle},
     discovery::discover_all,
@@ -21,14 +18,12 @@ use unpin_core::{
     },
     providers::ProviderId,
     sessions::WorkflowReloadLimitation,
-    state::{
-        atomic_json::{OwnerGeneration, StateRevision},
-        workspace::WorkspaceIdentity,
-    },
+    state::workspace::WorkspaceIdentity,
     transitions::EffectActivation,
     workflows::{
-        CompiledWorkflowRevision, WorkflowDefinition, WorkflowDefinitionEntry, WorkflowStore,
-        compile_workflow,
+        CompiledWorkflowRevision, WorkflowDefinition, WorkflowDefinitionController,
+        WorkflowDefinitionEntry, WorkflowDefinitionErrorClass, WorkflowDefinitionMutationRequest,
+        WorkflowDefinitionPlan, WorkflowStore, compile_workflow, rank_workflow_definitions,
     },
 };
 
@@ -172,21 +167,23 @@ pub(crate) enum WorkflowCommands {
         #[arg(long)]
         operator_credential_fd: Option<i32>,
     },
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkflowDefinitionPlan {
-    schema_version: u32,
-    operation_id: String,
-    operation_kind: String,
-    action: WorkflowMutationActionArg,
-    workflow_id: String,
-    scope: ProfileSourceScope,
-    definition_digest: Option<String>,
-    expected_revision: Option<StateRevision>,
-    plan_fingerprint: String,
-    activation: String,
-    human_approval_required: bool,
+    /// Restore one authenticated workflow definition history record.
+    Restore {
+        #[command(flatten)]
+        options: WorkflowRootOptions,
+        /// Authenticated workflow history id to restore.
+        #[arg(long)]
+        history_id: String,
+        /// Apply the reviewed restoration. Omit for a dry-run plan.
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        confirm: bool,
+        #[arg(long, requires = "apply")]
+        plan_fingerprint: Option<String>,
+        #[arg(long)]
+        operator_credential_fd: Option<i32>,
+    },
 }
 
 #[derive(Debug)]
@@ -195,6 +192,7 @@ struct WorkflowContext {
     store: WorkflowStore,
     profiles: ProfileStore,
     identity: WorkspaceIdentity,
+    approval_context: ControlApprovalContext,
 }
 
 pub(crate) fn run(command: WorkflowCommands) -> ExitCode {
@@ -235,6 +233,7 @@ pub(crate) fn run(command: WorkflowCommands) -> ExitCode {
             false,
             None,
             None,
+            None,
         ),
         WorkflowCommands::Apply {
             options,
@@ -255,6 +254,7 @@ pub(crate) fn run(command: WorkflowCommands) -> ExitCode {
             confirm,
             plan_fingerprint.as_deref(),
             operator_credential_fd,
+            None,
         ),
         WorkflowCommands::Delete {
             options,
@@ -274,6 +274,26 @@ pub(crate) fn run(command: WorkflowCommands) -> ExitCode {
             confirm,
             plan_fingerprint.as_deref(),
             operator_credential_fd,
+            None,
+        ),
+        WorkflowCommands::Restore {
+            options,
+            history_id,
+            apply,
+            confirm,
+            plan_fingerprint,
+            operator_credential_fd,
+        } => mutation(
+            options,
+            None,
+            None,
+            WorkflowMutationActionArg::Upsert,
+            WorkflowScopeArg::Global,
+            apply,
+            confirm,
+            plan_fingerprint.as_deref(),
+            operator_credential_fd,
+            Some(&history_id),
         ),
     }
 }
@@ -283,11 +303,15 @@ fn context(options: &WorkflowRootOptions) -> Result<WorkflowContext, String> {
     let identity = config
         .workspace_identity()
         .map_err(|error| error.to_string())?;
+    let approval_context =
+        ControlApprovalContext::new(&identity.repository_key, &identity.workspace_key)
+            .map_err(|error| error.to_string())?;
     Ok(WorkflowContext {
         store: WorkflowStore::new(&config.app_state_root),
         profiles: ProfileStore::new(&config.app_state_root),
         config,
         identity,
+        approval_context,
     })
 }
 
@@ -476,33 +500,25 @@ fn propose(options: WorkflowRootOptions, prompt: &str, provider: Option<&str>) -
         Ok(mut workspace) => workflows.append(&mut workspace),
         Err(error) => return command_error_exit(options.json, "failed", &error.to_string()),
     }
-    let prompt_terms = text_terms(prompt);
-    if prompt_terms.is_empty() {
-        return command_error_exit(
-            options.json,
-            "failed",
-            "workflow proposal prompt has no routable terms",
-        );
-    }
-    workflows.sort_by(|left, right| {
-        workflow_score(right, &prompt_terms)
-            .cmp(&workflow_score(left, &prompt_terms))
-            .then_with(|| left.definition.id.cmp(&right.definition.id))
-    });
+    let workflows = match rank_workflow_definitions(prompt, workflows) {
+        Ok(workflows) => workflows,
+        Err(error) => return command_error_exit(options.json, "failed", &error.to_string()),
+    };
     let candidates = workflows
         .iter()
         .take(20)
-        .map(|entry| {
+        .map(|ranked| {
+            let entry = &ranked.entry;
             json!({
                 "workflowId": entry.definition.id,
                 "displayName": entry.definition.display_name,
                 "scope": entry.scope,
-                "score": workflow_score(entry, &prompt_terms),
+                "score": ranked.score,
                 "entryMode": entry.definition.entry_mode,
             })
         })
         .collect::<Vec<_>>();
-    let Some(entry) = workflows.first() else {
+    let Some(ranked) = workflows.first() else {
         return render_proposal(
             &options,
             "selection-required",
@@ -517,6 +533,7 @@ fn propose(options: WorkflowRootOptions, prompt: &str, provider: Option<&str>) -
             }),
         );
     };
+    let entry = &ranked.entry;
     let Some(provider) = provider else {
         return render_proposal(
             &options,
@@ -606,6 +623,7 @@ fn mutation(
     confirm: bool,
     reviewed_fingerprint: Option<&str>,
     operator_credential_fd: Option<i32>,
+    restore_history_id: Option<&str>,
 ) -> ExitCode {
     if !scope.allows_global() || scope == WorkflowScopeArg::Workspace {
         return command_error_exit(
@@ -614,24 +632,45 @@ fn mutation(
             "workflow definition mutation is global-only; workspace definitions are fixed-source",
         );
     }
-    if action == WorkflowMutationActionArg::Upsert && id.is_none() && file.is_none() {
+    if restore_history_id.is_none()
+        && action == WorkflowMutationActionArg::Upsert
+        && id.is_none()
+        && file.is_none()
+    {
         return command_error_exit(options.json, "failed", "upsert requires --file or --id");
     }
-    if action == WorkflowMutationActionArg::Delete && id.is_none() {
+    if restore_history_id.is_none() && action == WorkflowMutationActionArg::Delete && id.is_none() {
         return command_error_exit(options.json, "failed", "delete requires --id");
     }
     let context = match context(&options) {
         Ok(context) => context,
         Err(error) => return command_error_exit(options.json, "failed", &error),
     };
-    let (plan, definition, current_owner_generation) = match build_plan(&context, id, file, action)
-    {
-        Ok(value) => value,
+    let backup_key = match credentials::resolve_backup_authentication_key(
+        options.roots.fixture_root.is_some(),
+        &context.config.app_state_root,
+    ) {
+        Ok(key) => key,
+        Err(error) => return command_error_exit(options.json, "blocked", &error),
+    };
+    let controller = match backup_key {
+        Some(key) => WorkflowDefinitionController::with_backup_authentication_key(
+            &context.config.app_state_root,
+            key,
+        ),
+        None => WorkflowDefinitionController::new(&context.config.app_state_root),
+    };
+    let request = match build_mutation_request(&context, id, file, action, restore_history_id) {
+        Ok(request) => request,
         Err(error) => return command_error_exit(options.json, "failed", &error),
     };
-    let expectation = match mutation_expectation(&plan, &context.identity) {
+    let plan = match controller.plan(request, &context.approval_context) {
+        Ok(plan) => plan,
+        Err(error) => return workflow_control_error_exit(&options, &error),
+    };
+    let expectation = match plan.approval_expectation(&context.approval_context) {
         Ok(expectation) => expectation,
-        Err(error) => return command_error_exit(options.json, "failed", &error),
+        Err(error) => return workflow_control_error_exit(&options, &error),
     };
     if !apply {
         return render_mutation_plan(&options, &plan, &expectation);
@@ -676,50 +715,10 @@ fn mutation(
         Ok(authorization) => authorization,
         Err(error) => return command_error_exit(options.json, "blocked", &error),
     };
-    let result = match action {
-        WorkflowMutationActionArg::Upsert => {
-            let definition = definition.expect("upsert plan has definition");
-            let generation = match current_owner_generation.checked_add(1) {
-                Some(generation) => generation,
-                None => {
-                    return command_error_exit(
-                        options.json,
-                        "recovery-required",
-                        "workflow owner generation overflow",
-                    );
-                }
-            };
-            let owner = match OwnerGeneration::new(plan.operation_id.clone(), generation) {
-                Ok(owner) => owner,
-                Err(error) => {
-                    return command_error_exit(options.json, "blocked", &error.to_string());
-                }
-            };
-            match context.store.save_global_definition(
-                &definition,
-                plan.expected_revision.as_ref(),
-                owner,
-            ) {
-                Ok(revision) => json!({"revision": revision, "definition": definition}),
-                Err(error) => {
-                    return command_error_exit(
-                        options.json,
-                        "recovery-required",
-                        &error.to_string(),
-                    );
-                }
-            }
-        }
-        WorkflowMutationActionArg::Delete => {
-            let expected = plan.expected_revision.as_ref().expect("delete revision");
-            if let Err(error) = context
-                .store
-                .delete_global_definition(&plan.workflow_id, expected)
-            {
-                return command_error_exit(options.json, "recovery-required", &error.to_string());
-            }
-            json!({"workflowId": plan.workflow_id, "deleted": true})
-        }
+    let decision_digest = authorization.decision_digest().to_string();
+    let result = match controller.apply(&plan, authorization, &context.approval_context) {
+        Ok(result) => result,
+        Err(error) => return workflow_control_error_exit(&options, &error),
     };
     let operation = ControlOperationEnvelope::from_expectation(
         &expectation,
@@ -729,7 +728,7 @@ fn mutation(
         None,
         false,
         Vec::new(),
-        json!({"result": result, "decisionDigest": authorization.decision_digest()}),
+        json!({"result": result, "decisionDigest": decision_digest}),
     );
     if options.json {
         println!(
@@ -751,13 +750,17 @@ fn mutation(
     ExitCode::SUCCESS
 }
 
-fn build_plan(
+fn build_mutation_request(
     context: &WorkflowContext,
     id: Option<&str>,
     file: Option<&Path>,
     action: WorkflowMutationActionArg,
-) -> Result<(WorkflowDefinitionPlan, Option<WorkflowDefinition>, u64), String> {
-    let (workflow_id, definition, expected_revision, current_owner_generation) = match action {
+    restore_history_id: Option<&str>,
+) -> Result<WorkflowDefinitionMutationRequest, String> {
+    if let Some(history_id) = restore_history_id {
+        return Ok(WorkflowDefinitionMutationRequest::restore(history_id));
+    }
+    match action {
         WorkflowMutationActionArg::Upsert => {
             let definition = if let Some(file) = file {
                 if file
@@ -783,97 +786,26 @@ fn build_plan(
             {
                 return Err("workflow id does not match definition id".to_string());
             }
-            let snapshot = context
-                .store
-                .load_global_definition(&definition.id)
-                .map_err(|error| error.to_string())?;
-            (
-                definition.id.clone(),
-                Some(definition),
-                snapshot.as_ref().map(|snapshot| snapshot.revision.clone()),
-                snapshot.map_or(0, |snapshot| snapshot.owner.generation),
-            )
+            Ok(WorkflowDefinitionMutationRequest::upsert(definition))
         }
         WorkflowMutationActionArg::Delete => {
             let id = id.ok_or_else(|| "delete requires --id".to_string())?;
-            let snapshot = context
-                .store
-                .load_global_definition(id)
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "workflow not found".to_string())?;
-            (
-                id.to_string(),
-                None,
-                Some(snapshot.revision),
-                snapshot.owner.generation,
-            )
+            Ok(WorkflowDefinitionMutationRequest::delete(id))
         }
-    };
-    let definition_digest = definition
-        .as_ref()
-        .map(|definition| {
-            definition
-                .definition_digest()
-                .map_err(|error| error.to_string())
-        })
-        .transpose()?;
-    let action_text = match action {
-        WorkflowMutationActionArg::Upsert => "upsert",
-        WorkflowMutationActionArg::Delete => "delete",
-    };
-    let fingerprint = digest(
-        &serde_json::to_vec(&(
-            1_u32,
-            action_text,
-            &workflow_id,
-            &definition_digest,
-            &expected_revision,
-        ))
-        .map_err(|error| error.to_string())?,
-    );
-    let operation_id = format!("workflow-definition-{}", &fingerprint[..24]);
-    Ok((
-        WorkflowDefinitionPlan {
-            schema_version: 1,
-            operation_id,
-            operation_kind: "workflow-definition".to_string(),
-            action,
-            workflow_id,
-            scope: ProfileSourceScope::Global,
-            definition_digest,
-            expected_revision,
-            plan_fingerprint: fingerprint,
-            activation: "next-session-only".to_string(),
-            human_approval_required: true,
-        },
-        definition,
-        current_owner_generation,
-    ))
+    }
 }
 
-fn mutation_expectation(
-    plan: &WorkflowDefinitionPlan,
-    identity: &WorkspaceIdentity,
-) -> Result<ApprovalExpectation, String> {
-    let resource_fingerprint = plan
-        .expected_revision
-        .as_ref()
-        .map(|revision| digest(revision.fingerprint.as_bytes()));
-    Ok(ApprovalExpectation {
-        issuer: CONTROL_APPROVAL_ISSUER.to_string(),
-        audience: CONTROL_APPROVAL_AUDIENCE.to_string(),
-        operation_id: plan.operation_id.clone(),
-        operation_kind: plan.operation_kind.clone(),
-        effect_graph_digest: plan.plan_fingerprint.clone(),
-        repository_key: identity.repository_key.clone(),
-        workspace_key: identity.workspace_key.clone(),
-        session_id: None,
-        profile_digest: plan.definition_digest.clone(),
-        resources: vec![ApprovalResourceBinding {
-            resource_id: format!("workflow-definition-{}", plan.workflow_id),
-            pre_state_fingerprint: resource_fingerprint,
-        }],
-    })
+fn workflow_control_error_exit(
+    options: &WorkflowRootOptions,
+    error: &unpin_core::workflows::WorkflowDefinitionControlError,
+) -> ExitCode {
+    let status = match error.class() {
+        WorkflowDefinitionErrorClass::Blocked | WorkflowDefinitionErrorClass::ReplanRequired => {
+            "blocked"
+        }
+        WorkflowDefinitionErrorClass::RecoveryRequired => "recovery-required",
+    };
+    command_error_exit(options.json, status, &error.to_string())
 }
 
 fn render_mutation_plan(
@@ -1019,39 +951,6 @@ fn load_profile_definition(
         .map_err(|error| error.to_string())
 }
 
-fn workflow_score(entry: &WorkflowDefinitionEntry, terms: &BTreeSet<String>) -> usize {
-    let mut text = format!(
-        "{} {} {} {}",
-        entry.definition.id,
-        entry.definition.display_name,
-        entry.definition.description.as_deref().unwrap_or_default(),
-        entry.definition.entry_mode
-    )
-    .to_ascii_lowercase();
-    text.push(' ');
-    text.push_str(
-        &entry
-            .definition
-            .modes
-            .iter()
-            .map(|mode| mode.name.as_str())
-            .collect::<Vec<_>>()
-            .join(" "),
-    );
-    terms
-        .iter()
-        .filter(|term| text.contains(term.as_str()))
-        .count()
-}
-
-fn text_terms(value: &str) -> BTreeSet<String> {
-    value
-        .split(|character: char| !character.is_ascii_alphanumeric())
-        .filter(|term| term.len() >= 2)
-        .map(str::to_ascii_lowercase)
-        .collect()
-}
-
 fn catalog_digest(catalog: &Catalog) -> String {
     digest(&serde_json::to_vec(catalog).expect("catalog serialization"))
 }
@@ -1061,20 +960,5 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 fn workflow_plan_value(plan: &WorkflowDefinitionPlan) -> serde_json::Value {
-    json!({
-        "schemaVersion": plan.schema_version,
-        "operationId": plan.operation_id,
-        "operationKind": plan.operation_kind,
-        "action": match plan.action {
-            WorkflowMutationActionArg::Upsert => "upsert",
-            WorkflowMutationActionArg::Delete => "delete",
-        },
-        "workflowId": plan.workflow_id,
-        "scope": "global",
-        "definitionDigest": plan.definition_digest,
-        "expectedRevision": plan.expected_revision,
-        "planFingerprint": plan.plan_fingerprint,
-        "activation": plan.activation,
-        "humanApprovalRequired": plan.human_approval_required,
-    })
+    serde_json::to_value(plan).expect("workflow definition plan JSON")
 }

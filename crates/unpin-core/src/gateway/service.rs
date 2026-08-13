@@ -17,8 +17,8 @@ use crate::{
     },
     providers::ProviderId,
     sessions::{
-        LiveExposureStatus, PinnedExposure, PinnedProfile, WorkflowTransitionRequest,
-        WorkflowTransitionResult,
+        LiveExposureStatus, PinnedExposure, PinnedProfile, WorkflowJournal,
+        WorkflowOperationLifecycle, WorkflowTransitionRequest, WorkflowTransitionResult,
     },
 };
 
@@ -588,6 +588,12 @@ pub struct GatewayService {
     exposures: Mutex<BTreeMap<String, Arc<GatewayExposure>>>,
     connections: GatewayConnectionRegistry,
     pending: Mutex<Option<Arc<GatewayExposure>>>,
+    /// Binds a connection-local pending exposure to the workflow operation
+    /// that staged it. The binding is runtime-only; durable operation records
+    /// remain the audit source and public status serialization is unchanged.
+    pending_workflow_operation: Mutex<Option<(u64, String)>>,
+    /// Serializes same-primary re-list promotion with durable observation.
+    relist_lock: Mutex<()>,
     limits: GatewayLimits,
 }
 
@@ -620,6 +626,8 @@ impl GatewayService {
             exposures: Mutex::new(exposures),
             connections,
             pending: Mutex::new(None),
+            pending_workflow_operation: Mutex::new(None),
+            relist_lock: Mutex::new(()),
             limits,
         })
     }
@@ -692,8 +700,74 @@ impl GatewayService {
         self.connections.status(claim)
     }
 
+    /// Discover durable workflow operations that still need owner action.
+    /// This is deliberately read-only and claim-authenticated so a caller can
+    /// select the exact operation for cancellation after reconnecting.
+    pub fn pending_workflow_operations_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+    ) -> Result<Vec<crate::sessions::WorkflowOperationRecord>, GatewayError> {
+        self.connections.status(claim)?;
+        crate::sessions::WorkflowJournal::new(self.control.app_state_root())
+            .nonterminal_records(claim.session_id())
+            .map_err(|error| GatewayError::Workflow(error.to_string()))
+    }
+
     pub fn primary_connection_claim(&self) -> Result<Option<GatewayConnectionClaim>, GatewayError> {
         self.connections.primary_claim()
+    }
+
+    fn bind_pending_workflow_operation(
+        &self,
+        claim: &GatewayConnectionClaim,
+        operation_id: Option<&str>,
+    ) -> Result<(), GatewayError> {
+        let mut binding = self
+            .pending_workflow_operation
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?;
+        *binding =
+            operation_id.map(|operation_id| (claim.connection_epoch(), operation_id.to_string()));
+        Ok(())
+    }
+
+    fn clear_pending_workflow_operation(
+        &self,
+        claim: &GatewayConnectionClaim,
+    ) -> Result<(), GatewayError> {
+        let mut binding = self
+            .pending_workflow_operation
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?;
+        if binding
+            .as_ref()
+            .is_some_and(|(epoch, _)| *epoch == claim.connection_epoch())
+        {
+            *binding = None;
+        }
+        Ok(())
+    }
+
+    fn pending_is_bound_to_workflow_operation(
+        &self,
+        claim: &GatewayConnectionClaim,
+        operation_id: &str,
+    ) -> Result<bool, GatewayError> {
+        let binding = self
+            .pending_workflow_operation
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?;
+        Ok(binding.as_ref().is_some_and(|(epoch, pending_operation)| {
+            *epoch == claim.connection_epoch() && pending_operation == operation_id
+        }))
+    }
+
+    fn clear_pending_for_connection(
+        &self,
+        claim: &GatewayConnectionClaim,
+    ) -> Result<(), GatewayError> {
+        self.connections.clear_pending(claim)?;
+        self.clear_pending_workflow_operation(claim)
     }
 
     /// Register one immutable workflow-mode exposure before accepting live
@@ -777,6 +851,7 @@ impl GatewayService {
         let status = self.connections.status(claim)?;
         self.connections.disconnect(claim)?;
         if status.role == GatewayConnectionRole::Primary {
+            self.clear_pending_workflow_operation(claim)?;
             self.control.reconcile_stopped_runtime(now_unix)?;
         }
         Ok(())
@@ -809,30 +884,33 @@ impl GatewayService {
                 // set. Keep the old observed registry intact and surface the
                 // limitation to the host. A workflow operation can later use
                 // cancel_transition_for_connection to restore admission.
-                self.connections.clear_pending(claim)?;
+                self.clear_pending_for_connection(claim)?;
                 self.control
                     .observe_exposure(LiveExposureStatus::NextSessionOnly, now_unix)?;
                 Ok(GatewayRefreshOutcome::NextSessionOnly)
             }
             ListChangeSupport::Unsupported => {
                 self.connections.stage_pending(claim, exposure)?;
+                self.bind_pending_workflow_operation(claim, None)?;
                 if let Err(error) = self
                     .control
                     .observe_exposure(LiveExposureStatus::ReloadRequired, now_unix)
                 {
-                    let _ = self.connections.clear_pending(claim);
+                    let _ = self.clear_pending_for_connection(claim);
                     return Err(error);
                 }
                 Ok(GatewayRefreshOutcome::ReloadRequired)
             }
             ListChangeSupport::NotificationOnly => {
                 self.connections.stage_pending(claim, exposure)?;
+                self.bind_pending_workflow_operation(claim, None)?;
                 self.control
                     .observe_exposure(LiveExposureStatus::NotificationSent, now_unix)?;
                 Ok(GatewayRefreshOutcome::RefreshUnconfirmed)
             }
             ListChangeSupport::Negotiated => {
                 self.connections.stage_pending(claim, exposure)?;
+                self.bind_pending_workflow_operation(claim, None)?;
                 Ok(GatewayRefreshOutcome::NotificationRequired)
             }
         }
@@ -846,6 +924,10 @@ impl GatewayService {
         claim: &GatewayConnectionClaim,
         now_unix: i64,
     ) -> Result<GatewayRefreshOutcome, GatewayError> {
+        let _relist = self
+            .relist_lock
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?;
         self.connections.require_primary(claim)?;
         let pending = self
             .connections
@@ -870,12 +952,23 @@ impl GatewayService {
         claim: &GatewayConnectionClaim,
         now_unix: i64,
     ) -> Result<Vec<ProjectedTool>, GatewayError> {
+        let _relist = self
+            .relist_lock
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?;
         self.connections.require_primary(claim)?;
         let snapshot = self.control.snapshot()?;
+        if snapshot.lease.live_status == LiveExposureStatus::Unknown
+            && !snapshot.lease.admission_open
+        {
+            return Err(GatewayError::Workflow(
+                "workflow observation requires owner recovery".to_string(),
+            ));
+        }
         let pending = self
             .connections
             .take_pending(claim, &snapshot.lease.desired_exposure.revision)?;
-        if let Some(exposure) = pending {
+        if let Some((exposure, observation_sequence)) = pending {
             if snapshot.lease.live_status != LiveExposureStatus::NotificationSent {
                 self.connections.restore_pending(claim, exposure)?;
             } else {
@@ -887,7 +980,9 @@ impl GatewayService {
                     self.connections.restore_pending(claim, exposure)?;
                     return Err(error);
                 }
-                self.connections.mark_observed(claim, exposure)?;
+                self.connections
+                    .mark_observed(claim, exposure, observation_sequence)?;
+                self.clear_pending_workflow_operation(claim)?;
             }
         }
         let exposure = self.connections.observed(claim)?;
@@ -1026,20 +1121,53 @@ impl GatewayService {
         operation_id: &str,
         now_unix: i64,
     ) -> Result<GatewayConnectionStatus, GatewayError> {
+        // Cancellation and primary re-list/notification share one runtime
+        // fence. Otherwise cancellation can clear pending state while a
+        // concurrent re-list still promotes the same exposure.
+        let _relist = self
+            .relist_lock
+            .lock()
+            .map_err(|_| GatewayError::StatePoisoned)?;
+        // Auxiliary claims may issue the typed workflow control, but pending
+        // exposure belongs exclusively to the currently authenticated primary
+        // data-plane claim.
         self.connections.status(claim)?;
         let primary = self
             .connections
             .primary_claim()?
             .ok_or(GatewayError::ConnectionClaimInvalid)?;
+        let pending = self.connections.pending(&primary)?;
+        let pending_matches_operation = pending.is_some()
+            && self.pending_is_bound_to_workflow_operation(&primary, operation_id)?;
+        let journal = WorkflowJournal::new(self.control.app_state_root());
+        let before = journal
+            .load(primary.session_id(), operation_id)
+            .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        let before_revision = before.as_ref().map(|snapshot| snapshot.revision.clone());
         self.control
             .cancel_workflow_transition(operation_id, now_unix)?;
-        self.connections.clear_pending(&primary)?;
+        let after = journal
+            .load(claim.session_id(), operation_id)
+            .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        let non_noop_cancellation = before.as_ref().is_some_and(|snapshot| {
+            matches!(
+                snapshot.value.lifecycle,
+                WorkflowOperationLifecycle::Proposed | WorkflowOperationLifecycle::Staged
+            )
+        }) && after.as_ref().is_some_and(|snapshot| {
+            snapshot.value.lifecycle == WorkflowOperationLifecycle::Cancelled
+                && before_revision.as_ref() != Some(&snapshot.revision)
+        });
+        if pending_matches_operation && non_noop_cancellation {
+            self.clear_pending_for_connection(&primary)?;
+        }
         self.connections.status(&primary)
     }
 
-    /// Route a typed workflow transition through the authenticated primary
-    /// connection. Auxiliary connections are deliberately control-only and
-    /// cannot mutate the active workflow envelope.
+    /// Route a typed workflow transition from any authenticated connection,
+    /// while staging and observing exposure only on the primary data-plane
+    /// connection. This permits desktop/CLI control connections without
+    /// granting them managed tool-list or call authority.
     pub fn enter_workflow_mode_for_connection(
         &self,
         claim: &GatewayConnectionClaim,
@@ -1083,15 +1211,24 @@ impl GatewayService {
             return Ok((result, GatewayRefreshOutcome::Unchanged));
         }
         if support == ListChangeSupport::NextSessionOnly {
-            self.connections.clear_pending(&primary)?;
+            self.clear_pending_for_connection(&primary)?;
             return Ok((result, GatewayRefreshOutcome::NextSessionOnly));
         }
-        let outcome =
-            self.stage_registered_refresh_for_connection(&primary, exposure, support, now_unix);
+        let outcome = self.stage_registered_refresh_for_connection(
+            &primary,
+            exposure,
+            support,
+            Some(&result.operation_id),
+            now_unix,
+        );
         match outcome {
             Ok(outcome) => Ok((result, outcome)),
             Err(error) => {
-                match self.cancel_transition_for_connection(claim, &result.operation_id, now_unix) {
+                match self.cancel_transition_for_connection(
+                    &primary,
+                    &result.operation_id,
+                    now_unix,
+                ) {
                     Ok(_) => Err(error),
                     Err(cancel_error) => Err(GatewayError::Workflow(format!(
                         "workflow refresh staging failed: {error}; compensation failed: {cancel_error}"
@@ -1106,6 +1243,7 @@ impl GatewayService {
         claim: &GatewayConnectionClaim,
         exposure: Arc<GatewayExposure>,
         support: ListChangeSupport,
+        operation_id: Option<&str>,
         now_unix: i64,
     ) -> Result<GatewayRefreshOutcome, GatewayError> {
         self.connections.require_primary(claim)?;
@@ -1119,30 +1257,33 @@ impl GatewayService {
         }
         match support {
             ListChangeSupport::NextSessionOnly => {
-                self.connections.clear_pending(claim)?;
+                self.clear_pending_for_connection(claim)?;
                 self.control
                     .observe_exposure(LiveExposureStatus::NextSessionOnly, now_unix)?;
                 Ok(GatewayRefreshOutcome::NextSessionOnly)
             }
             ListChangeSupport::Unsupported => {
                 self.connections.stage_pending(claim, exposure)?;
+                self.bind_pending_workflow_operation(claim, operation_id)?;
                 if let Err(error) = self
                     .control
                     .observe_exposure(LiveExposureStatus::ReloadRequired, now_unix)
                 {
-                    let _ = self.connections.clear_pending(claim);
+                    let _ = self.clear_pending_for_connection(claim);
                     return Err(error);
                 }
                 Ok(GatewayRefreshOutcome::ReloadRequired)
             }
             ListChangeSupport::NotificationOnly => {
                 self.connections.stage_pending(claim, exposure)?;
+                self.bind_pending_workflow_operation(claim, operation_id)?;
                 self.control
                     .observe_exposure(LiveExposureStatus::NotificationSent, now_unix)?;
                 Ok(GatewayRefreshOutcome::RefreshUnconfirmed)
             }
             ListChangeSupport::Negotiated => {
                 self.connections.stage_pending(claim, exposure)?;
+                self.bind_pending_workflow_operation(claim, operation_id)?;
                 Ok(GatewayRefreshOutcome::NotificationRequired)
             }
         }
@@ -1202,8 +1343,19 @@ impl GatewayService {
         now_unix: i64,
     ) -> Result<GatewayConnectionStatus, GatewayError> {
         self.connections.require_primary(claim)?;
-        self.control.restore_observed_exposure(now_unix)?;
+        let pending = self.connections.pending(claim)?;
         self.connections.clear_pending(claim)?;
+        if let Err(error) = self.control.restore_observed_exposure(now_unix) {
+            if let Some(pending) = pending
+                && let Err(restore_error) = self.connections.restore_pending(claim, pending)
+            {
+                return Err(GatewayError::Workflow(format!(
+                    "refresh cancellation failed: {error}; pending restoration failed: {restore_error}"
+                )));
+            }
+            return Err(error);
+        }
+        self.clear_pending_workflow_operation(claim)?;
         self.connections.status(claim)
     }
 

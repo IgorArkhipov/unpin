@@ -30,4 +30,6 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+rmcp.workspace = true
 tempfile.workspace = true
+unpin-cli = { path = "../unpin-cli", version = "=1.2.0" }

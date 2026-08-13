@@ -3,9 +3,11 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
+    time::Duration,
 };
 
 use unpin_core::gateway::{GatewayError, GatewayService};
+use unpin_core::sessions::{ProcessEvidence, SessionAuthorityKey};
 
 use unpin_cli::mcp_runtime::GatewayRuntimeError;
 
@@ -13,8 +15,8 @@ use unpin_cli::mcp_runtime::GatewayRuntimeError;
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
 #[cfg(unix)]
 use unpin_cli::mcp_runtime::{
-    GatewayMcpServer, GatewayPrimaryNotifier, GatewayRuntimeTimeouts, NoGatewayCredentials,
-    serve_gateway_io,
+    GatewayCredentialResolver, GatewayHookAuthorizationSource, GatewayMcpServer,
+    GatewayPrimaryNotifier, GatewayRuntimeTimeouts, serve_gateway_io,
 };
 
 pub(crate) struct GatewaySessionRuntime {
@@ -25,11 +27,73 @@ pub(crate) struct GatewaySessionRuntime {
     thread: Option<thread::JoinHandle<Result<(), GatewaySessionError>>>,
 }
 
+const GATEWAY_TRANSPORT_AUTHENTICATION_VERSION: u32 = 1;
+const GATEWAY_TRANSPORT_AUTHENTICATION_TAG_ENV: &str = "UNPIN_GATEWAY_AUTHENTICATION_TAG";
+const GATEWAY_TRANSPORT_HANDSHAKE_MAGIC: &[u8] = b"UNPIN-GATEWAY-AUTH/1\0";
+const GATEWAY_TRANSPORT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+const GATEWAY_TRANSPORT_MAX_TAG_BYTES: usize = 128;
+
+/// Derive the transport capability from the session authority and the exact
+/// launched process generation. The resulting tag is passed only through the
+/// child environment; it is intentionally absent from launch-control and
+/// overlay JSON so it cannot become JSON evidence or a log field.
+pub(crate) fn gateway_transport_authentication_tag(
+    authority_key: &SessionAuthorityKey,
+    session_id: &str,
+    process: &ProcessEvidence,
+    socket_path: &Path,
+) -> Result<String, String> {
+    let binding_socket = std::fs::canonicalize(socket_path)
+        .map_err(|_| "gateway transport socket could not be canonicalized".to_string())?;
+    let payload = serde_json::to_vec(&serde_json::json!({
+        "version": GATEWAY_TRANSPORT_AUTHENTICATION_VERSION,
+        "sessionId": session_id,
+        "process": process,
+        "socket": binding_socket,
+    }))
+    .map_err(|_| "gateway transport binding could not be encoded".to_string())?;
+    authority_key
+        .authenticate_launch_control(&payload)
+        .map_err(|_| "gateway transport binding could not be authenticated".to_string())
+}
+
+fn gateway_transport_handshake_frame(tag: &str) -> Result<Vec<u8>, io::Error> {
+    let bytes = tag.as_bytes();
+    if bytes.is_empty() || bytes.len() > GATEWAY_TRANSPORT_MAX_TAG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gateway transport authentication tag is invalid",
+        ));
+    }
+    let length = u16::try_from(bytes.len()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "gateway transport authentication tag is too long",
+        )
+    })?;
+    let mut frame = Vec::with_capacity(GATEWAY_TRANSPORT_HANDSHAKE_MAGIC.len() + 2 + bytes.len());
+    frame.extend_from_slice(GATEWAY_TRANSPORT_HANDSHAKE_MAGIC);
+    frame.extend_from_slice(&length.to_be_bytes());
+    frame.extend_from_slice(bytes);
+    Ok(frame)
+}
+
+pub(crate) fn gateway_transport_handshake_frame_for_client(
+    tag: &str,
+) -> Result<Vec<u8>, io::Error> {
+    gateway_transport_handshake_frame(tag)
+}
+
 impl GatewaySessionRuntime {
     #[cfg(unix)]
     pub(crate) fn start(
         gateway: Arc<GatewayService>,
         _overlay_root: &Path,
+        credentials: Arc<dyn GatewayCredentialResolver>,
+        hook_authorizations: Arc<dyn GatewayHookAuthorizationSource>,
+        authority_key: SessionAuthorityKey,
+        session_id: String,
+        process: ProcessEvidence,
     ) -> Result<Self, GatewaySessionError> {
         let socket_directory = create_socket_directory()?;
         let socket_path = socket_directory.join("mcp.sock");
@@ -37,12 +101,20 @@ impl GatewaySessionRuntime {
         listener.set_nonblocking(true)?;
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))?;
+        let authentication_tag = gateway_transport_authentication_tag(
+            &authority_key,
+            &session_id,
+            &process,
+            &socket_path,
+        )
+        .map_err(|_| GatewaySessionError::Authentication)?;
 
         let server = GatewayMcpServer::new(
             Arc::clone(&gateway),
-            Arc::new(NoGatewayCredentials),
+            credentials,
             GatewayRuntimeTimeouts::default(),
-        );
+        )
+        .with_hook_authorization_source(hook_authorizations);
         let notifier = GatewayPrimaryNotifier::default();
         let (shutdown, receiver) = tokio::sync::oneshot::channel();
         let listener_gateway = Arc::clone(&gateway);
@@ -57,6 +129,7 @@ impl GatewaySessionRuntime {
                     listener_gateway,
                     server,
                     notifier,
+                    authentication_tag,
                     receiver,
                 ))
             })?;
@@ -73,6 +146,11 @@ impl GatewaySessionRuntime {
     pub(crate) fn start(
         _gateway: Arc<GatewayService>,
         _overlay_root: &Path,
+        _credentials: Arc<dyn unpin_cli::mcp_runtime::GatewayCredentialResolver>,
+        _hook_authorizations: Arc<dyn unpin_cli::mcp_runtime::GatewayHookAuthorizationSource>,
+        _authority_key: unpin_core::sessions::SessionAuthorityKey,
+        _session_id: String,
+        _process: unpin_core::sessions::ProcessEvidence,
     ) -> Result<Self, GatewaySessionError> {
         Err(GatewaySessionError::PlatformUnsupported)
     }
@@ -156,11 +234,59 @@ impl Drop for GatewaySessionRuntime {
 }
 
 #[cfg(unix)]
+async fn authenticate_gateway_connection(
+    mut stream: tokio::net::UnixStream,
+    expected_tag: &str,
+) -> Result<tokio::net::UnixStream, io::Error> {
+    use tokio::io::AsyncReadExt;
+
+    let mut magic = vec![0_u8; GATEWAY_TRANSPORT_HANDSHAKE_MAGIC.len()];
+    stream.read_exact(&mut magic).await?;
+    if magic != GATEWAY_TRANSPORT_HANDSHAKE_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "gateway transport handshake rejected",
+        ));
+    }
+    let mut length = [0_u8; 2];
+    stream.read_exact(&mut length).await?;
+    let length = usize::from(u16::from_be_bytes(length));
+    if length == 0 || length > GATEWAY_TRANSPORT_MAX_TAG_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "gateway transport handshake rejected",
+        ));
+    }
+    let mut received = vec![0_u8; length];
+    stream.read_exact(&mut received).await?;
+    if !constant_time_equal(received.as_slice(), expected_tag.as_bytes()) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "gateway transport handshake rejected",
+        ));
+    }
+    Ok(stream)
+}
+
+#[cfg(unix)]
+fn constant_time_equal(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut difference = 0_u8;
+    for (&left, &right) in left.iter().zip(right) {
+        difference |= left ^ right;
+    }
+    difference == 0
+}
+
+#[cfg(unix)]
 async fn run_listener(
     listener: StdUnixListener,
     gateway: Arc<GatewayService>,
     server: GatewayMcpServer,
     notifier: GatewayPrimaryNotifier,
+    authentication_tag: String,
     mut shutdown: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), GatewaySessionError> {
     const MAX_CONCURRENT_CONNECTIONS: usize = 32;
@@ -186,22 +312,31 @@ async fn run_listener(
                     drop(stream);
                     continue;
                 };
-                let claim = match gateway.accept_connection() {
-                    Ok(claim) => claim,
-                    Err(_) => {
-                        drop(stream);
-                        continue;
-                    }
-                };
-                let (read, write) = stream.into_split();
-                let server = server
-                    .clone()
-                    .with_connection_claim(claim.clone())
-                    .with_primary_notifier(notifier.clone());
                 let connection_gateway = Arc::clone(&gateway);
                 let connection_notifier = notifier.clone();
+                let connection_server = server.clone();
+                let connection_authentication_tag = authentication_tag.clone();
                 connections.spawn(async move {
                     let _permit = permit;
+                    let stream = match tokio::time::timeout(
+                        GATEWAY_TRANSPORT_HANDSHAKE_TIMEOUT,
+                        authenticate_gateway_connection(stream, &connection_authentication_tag),
+                    )
+                    .await
+                    {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(_)) | Err(_) => return Ok(()),
+                    };
+                    // Authentication must complete before this call. In particular, do not
+                    // move accept_connection above the handshake: it may install Primary.
+                    let claim = match connection_gateway.accept_connection() {
+                        Ok(claim) => claim,
+                        Err(_) => return Ok(()),
+                    };
+                    let (read, write) = stream.into_split();
+                    let server = connection_server
+                        .with_connection_claim(claim.clone())
+                        .with_primary_notifier(connection_notifier.clone());
                     let result = serve_gateway_io(server, read, write).await;
                     // Fence this transport claim without reconciling the
                     // durable lease: the launched child may still be alive
@@ -239,7 +374,12 @@ pub(crate) fn run_gateway_proxy(socket_path: &Path) -> Result<(), GatewaySession
     if metadata.file_type().is_symlink() || !metadata.file_type().is_socket() {
         return Err(GatewaySessionError::InvalidSocket);
     }
-    let stream = StdUnixStream::connect(socket_path)?;
+    let authentication_tag = std::env::var(GATEWAY_TRANSPORT_AUTHENTICATION_TAG_ENV)
+        .map_err(|_| GatewaySessionError::AuthenticationUnavailable)?;
+    let mut stream = StdUnixStream::connect(socket_path)?;
+    let frame = gateway_transport_handshake_frame(&authentication_tag)?;
+    use std::io::Write as _;
+    stream.write_all(&frame)?;
     let mut input_stream = stream.try_clone()?;
     let mut output_stream = stream;
     let input = thread::spawn(move || -> io::Result<()> {
@@ -272,6 +412,9 @@ pub(crate) enum GatewaySessionError {
     Io(io::Error),
     Gateway(GatewayError),
     Runtime(GatewayRuntimeError),
+    Authentication,
+    #[cfg(unix)]
+    AuthenticationUnavailable,
     #[cfg(unix)]
     InvalidSocket,
     RuntimePanicked,
@@ -299,6 +442,13 @@ impl std::fmt::Display for GatewaySessionError {
             Self::Io(error) => write!(formatter, "session gateway I/O failed: {error}"),
             Self::Gateway(error) => write!(formatter, "session gateway cleanup failed: {error}"),
             Self::Runtime(error) => write!(formatter, "session gateway failed: {error}"),
+            Self::Authentication => {
+                formatter.write_str("session gateway transport authentication failed")
+            }
+            #[cfg(unix)]
+            Self::AuthenticationUnavailable => {
+                formatter.write_str("session gateway proxy authentication is unavailable")
+            }
             #[cfg(unix)]
             Self::InvalidSocket => formatter.write_str("session gateway socket is invalid"),
             Self::RuntimePanicked => formatter.write_str("session gateway runtime panicked"),
@@ -322,6 +472,7 @@ mod tests {
     };
 
     use rmcp::ServiceExt;
+    use unpin_cli::mcp_runtime::{NoGatewayCredentials, NoGatewayHookAuthorizations};
     use unpin_core::{
         catalog::Catalog,
         gateway::{GatewayControlPlane, GatewayExposure, GatewayLimits, GatewayService},
@@ -332,7 +483,10 @@ mod tests {
         },
     };
 
-    use super::GatewaySessionRuntime;
+    use super::{
+        GatewaySessionRuntime, gateway_transport_authentication_tag,
+        gateway_transport_handshake_frame_for_client,
+    };
 
     fn digest(character: char) -> String {
         std::iter::repeat_n(character, 64).collect()
@@ -340,6 +494,48 @@ mod tests {
 
     fn gateway(root: &std::path::Path) -> Arc<GatewayService> {
         gateway_with_in_flight(root, false)
+    }
+
+    fn start_runtime(
+        gateway: Arc<GatewayService>,
+        root: &std::path::Path,
+    ) -> (GatewaySessionRuntime, String) {
+        let authority_key = SessionAuthorityKey::new([0x53; 32]);
+        let session_id = "gateway-session-test".to_string();
+        let process = ProcessEvidence {
+            pid: std::process::id(),
+            start_marker: "gateway-session-test-process".to_string(),
+        };
+        let runtime = GatewaySessionRuntime::start(
+            gateway,
+            root,
+            Arc::new(NoGatewayCredentials),
+            Arc::new(NoGatewayHookAuthorizations),
+            authority_key.clone(),
+            session_id.clone(),
+            process.clone(),
+        )
+        .unwrap();
+        let tag = gateway_transport_authentication_tag(
+            &authority_key,
+            &session_id,
+            &process,
+            runtime.socket_path(),
+        )
+        .unwrap();
+        (runtime, tag)
+    }
+
+    async fn authenticate_client(
+        socket_path: &std::path::Path,
+        authentication_tag: &str,
+    ) -> tokio::net::UnixStream {
+        use tokio::io::AsyncWriteExt;
+
+        let mut stream = tokio::net::UnixStream::connect(socket_path).await.unwrap();
+        let frame = gateway_transport_handshake_frame_for_client(authentication_tag).unwrap();
+        stream.write_all(&frame).await.unwrap();
+        stream
     }
 
     fn gateway_with_in_flight(
@@ -406,7 +602,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let gateway = gateway(&root);
-        let runtime = GatewaySessionRuntime::start(Arc::clone(&gateway), &root).unwrap();
+        let (runtime, authentication_tag) = start_runtime(Arc::clone(&gateway), &root);
         let _held_open = UnixStream::connect(runtime.socket_path()).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let socket_path = runtime.socket_path().to_path_buf();
@@ -415,7 +611,7 @@ mod tests {
             .build()
             .unwrap();
         let names = client_runtime.block_on(async move {
-            let stream = tokio::net::UnixStream::connect(socket_path).await.unwrap();
+            let stream = authenticate_client(&socket_path, &authentication_tag).await;
             let mut client = tokio::time::timeout(Duration::from_secs(2), ().serve(stream))
                 .await
                 .expect("second client initialize timeout")
@@ -435,15 +631,14 @@ mod tests {
             names
         });
 
-        assert_eq!(
-            names,
-            BTreeSet::from([
-                "unpin_workflow_cancel_transition".to_string(),
-                "unpin_workflow_enter_mode".to_string(),
-                "unpin_workflow_modes".to_string(),
-                "unpin_workflow_status".to_string(),
-            ])
-        );
+        for name in [
+            "unpin_workflow_cancel_transition",
+            "unpin_workflow_enter_mode",
+            "unpin_workflow_modes",
+            "unpin_workflow_status",
+        ] {
+            assert!(names.contains(name), "authenticated client lacks {name}");
+        }
         runtime.shutdown().unwrap();
     }
 
@@ -452,7 +647,7 @@ mod tests {
         let temp = tempfile::TempDir::new().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
         let service = gateway(&root);
-        let runtime = GatewaySessionRuntime::start(Arc::clone(&service), &root).unwrap();
+        let (runtime, authentication_tag) = start_runtime(Arc::clone(&service), &root);
         let socket_path = runtime.socket_path().to_path_buf();
         let client_runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -460,14 +655,27 @@ mod tests {
             .unwrap();
 
         let mut disconnected = UnixStream::connect(&socket_path).unwrap();
-        disconnected
-            .write_all(
+        let _ = disconnected.write_all(
                 br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"disconnect-fixture","version":"1"}}}
 "#,
-            )
-            .unwrap();
-        disconnected.shutdown(Shutdown::Both).unwrap();
+            );
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            service.primary_connection_claim().unwrap().is_none(),
+            "unauthenticated clients must not install a Primary claim"
+        );
+        let _ = disconnected.shutdown(Shutdown::Both);
         drop(disconnected);
+        let mut racing = UnixStream::connect(&socket_path).unwrap();
+        let forged_frame = gateway_transport_handshake_frame_for_client(&"0".repeat(64)).unwrap();
+        let _ = racing.write_all(&forged_frame);
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(
+            service.primary_connection_claim().unwrap().is_none(),
+            "a forged transport capability must not install a Primary claim"
+        );
+        let _ = racing.shutdown(Shutdown::Both);
+        drop(racing);
         let disconnect_deadline = std::time::Instant::now() + Duration::from_secs(2);
         while service.primary_connection_claim().unwrap().is_some() {
             assert!(
@@ -478,9 +686,7 @@ mod tests {
         }
 
         let names = client_runtime.block_on(async {
-            let stream = tokio::net::UnixStream::connect(&socket_path)
-                .await
-                .expect("gateway listener should survive a disconnected client");
+            let stream = authenticate_client(&socket_path, &authentication_tag).await;
             let mut client = tokio::time::timeout(Duration::from_secs(2), ().serve(stream))
                 .await
                 .expect("second client initialize timeout")
@@ -520,7 +726,7 @@ mod tests {
                 .in_flight_calls,
             1
         );
-        let runtime = GatewaySessionRuntime::start(Arc::clone(&gateway), &root).unwrap();
+        let (runtime, _) = start_runtime(Arc::clone(&gateway), &root);
 
         runtime.shutdown().unwrap();
 

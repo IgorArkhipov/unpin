@@ -111,7 +111,6 @@ impl GatewayPrimaryNotifier {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .is_some()
     }
-
     fn gate_for(&self, claim: &GatewayConnectionClaim) -> Option<Arc<RwLock<()>>> {
         self.peer
             .lock()
@@ -886,9 +885,11 @@ impl GatewayMcpServer {
                 let status = tokio::task::spawn_blocking(move || {
                     let connection = gateway.connection_status(&claim)?;
                     let session = gateway.control_plane().status()?;
+                    let operations = gateway.pending_workflow_operations_for_connection(&claim)?;
                     Ok::<_, GatewayError>(json!({
                         "connection": connection,
                         "session": session,
+                        "operations": operations,
                     }))
                 })
                 .await
@@ -1013,7 +1014,9 @@ impl GatewayMcpServer {
                 .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
                 .await;
         }
-        if notifier.notify_tools_changed().await.is_err() {
+        let notification =
+            tokio::time::timeout(self.timeouts.call, notifier.notify_tools_changed()).await;
+        if !matches!(notification, Ok(Ok(()))) {
             return self
                 .cancel_transition_after_notification_failure(primary, operation_id, now_unix)
                 .await;
@@ -2068,18 +2071,21 @@ impl ServerHandler for GatewayMcpServer {
         .await
         .map_err(|_| internal_error())?
         .map_err(gateway_request_error)?;
-        let mut tools = if self.claim.as_ref().is_some_and(|claim| !claim.is_primary()) {
+        let tools = if self.claim.as_ref().is_some_and(|claim| !claim.is_primary()) {
             workflow_control_tools()?
+        } else if self
+            .claim
+            .as_ref()
+            .is_some_and(GatewayConnectionClaim::is_primary)
+        {
+            primary_gateway_tools(projected)?
         } else {
             let mut tools = control_tools()?;
-            if self.claim.is_some() {
-                tools.extend(workflow_control_tools()?);
+            for tool in projected {
+                tools.push(projected_tool(tool)?);
             }
             tools
         };
-        for tool in projected {
-            tools.push(projected_tool(tool)?);
-        }
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -2511,6 +2517,18 @@ fn workflow_control_tools() -> Result<Vec<Tool>, McpError> {
             serde_json::from_value(value).map_err(|_| internal_error())
         })
         .collect()
+}
+
+/// Build the exact primary-connection tool surface from production descriptor
+/// builders. Evidence generators use this function so expected schemas cannot
+/// drift from the RMCP runtime implementation.
+pub fn primary_gateway_tools(projected: Vec<ProjectedTool>) -> Result<Vec<Tool>, McpError> {
+    let mut tools = control_tools()?;
+    tools.extend(workflow_control_tools()?);
+    for tool in projected {
+        tools.push(projected_tool(tool)?);
+    }
+    Ok(tools)
 }
 
 fn projected_tool(projected: ProjectedTool) -> Result<Tool, McpError> {
@@ -4031,5 +4049,94 @@ mod tests {
             .cancel_tool(&mut outer, now_unix + 1)
             .expect("outer call cleanup");
         assert_eq!(gateway.control_plane().status().unwrap().in_flight_calls, 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unresponsive_primary_notification_is_bounded_and_releases_gate() {
+        let (_temp, gateway, _name, now_unix) = permit_gateway();
+        let primary = gateway.issue_connection_claim().expect("primary claim");
+        let notifier = GatewayPrimaryNotifier::default();
+        let server = GatewayMcpServer::new(
+            Arc::clone(&gateway),
+            Arc::new(NoGatewayCredentials),
+            GatewayRuntimeTimeouts {
+                connect: Duration::from_secs(1),
+                call: Duration::from_millis(50),
+            },
+        )
+        .with_connection_claim(primary.clone())
+        .with_primary_notifier(notifier.clone());
+        let controller = server.clone();
+        let (client_io, server_io) = tokio::io::duplex(1);
+        let server_task = tokio::spawn(async move {
+            let (read, write) = tokio::io::split(server_io);
+            serve_gateway_io(server, read, write).await
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_io);
+        let mut client_read = BufReader::new(client_read);
+        let initialize = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {"name": "unresponsive-test", "version": "1"}
+            }
+        });
+        client_write
+            .write_all(serde_json::to_string(&initialize).unwrap().as_bytes())
+            .await
+            .expect("initialize request");
+        client_write
+            .write_all(b"\n")
+            .await
+            .expect("initialize frame");
+        let mut response = Vec::new();
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            client_read.read_until(b'\n', &mut response),
+        )
+        .await
+        .expect("initialize response deadline")
+        .expect("initialize response");
+        let initialized = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized",
+            "params": {}
+        });
+        client_write
+            .write_all(serde_json::to_string(&initialized).unwrap().as_bytes())
+            .await
+            .expect("initialized notification");
+        client_write
+            .write_all(b"\n")
+            .await
+            .expect("initialized frame");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !notifier.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("primary notifier installation deadline");
+
+        let started = std::time::Instant::now();
+        let error = controller
+            .notify_primary_for_transition(&primary, "unresponsive-operation", now_unix)
+            .await
+            .expect_err("unresponsive primary notification must fail closed");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(error.to_string().contains("notification"));
+
+        let gate = Arc::clone(&controller.list_change_gate);
+        let _guard = tokio::time::timeout(Duration::from_secs(1), gate.write())
+            .await
+            .expect("list-change gate must be released after notification timeout");
+
+        drop(client_write);
+        server_task.abort();
+        let _ = server_task.await;
     }
 }
