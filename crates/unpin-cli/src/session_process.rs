@@ -43,9 +43,11 @@ use unpin_core::{
     workflows::WorkflowStore,
 };
 
+#[cfg(unix)]
+use unpin_cli::mcp_runtime::GatewayRuntimeTimeouts;
 use unpin_cli::mcp_runtime::{
     BoundBearerToken, GatewayCredentialResolver, GatewayHookAuthorizationSource,
-    GatewayRuntimeError, GatewayRuntimeTimeouts,
+    GatewayRuntimeError,
 };
 
 use crate::gateway_session::GatewaySessionRuntime;
@@ -735,6 +737,7 @@ pub(crate) fn preflight_bridge_socket(path: Option<&Path>) -> Result<(), Session
 /// process-generation-bound transport handshake before the gateway issues a
 /// connection claim; auxiliary clients are limited to the typed workflow
 /// control surface.
+#[cfg(unix)]
 fn gateway_transport_metadata_for_session(
     app_state_root: &Path,
     session_id: &str,
@@ -818,11 +821,6 @@ fn verified_gateway_socket(path: &Path) -> Result<PathBuf, SessionProcessError> 
         return Err(SessionProcessError::GatewayControlUnavailable);
     }
     fs::canonicalize(path).map_err(|_| SessionProcessError::GatewayControlUnavailable)
-}
-
-#[cfg(not(unix))]
-fn verified_gateway_socket(_path: &Path) -> Result<PathBuf, SessionProcessError> {
-    Err(SessionProcessError::GatewayControlUnavailable)
 }
 
 /// Call one of the core-declared workflow controls over an authenticated
@@ -1888,6 +1886,7 @@ pub enum SessionProcessError {
     ControlAuthentication(String),
     BridgeControlUnavailable,
     GatewayControlUnavailable,
+    #[cfg(unix)]
     GatewayControlRejected,
     WorkflowLaunch(String),
     ProviderOverlayUnavailable,
@@ -1953,6 +1952,7 @@ impl std::fmt::Display for SessionProcessError {
             Self::GatewayControlUnavailable => {
                 formatter.write_str("session gateway control socket is unavailable")
             }
+            #[cfg(unix)]
             Self::GatewayControlRejected => {
                 formatter.write_str("session gateway control request was rejected")
             }

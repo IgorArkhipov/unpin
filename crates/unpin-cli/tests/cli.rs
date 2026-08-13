@@ -549,6 +549,7 @@ fn workflow_cli_applies_deletes_and_restores_through_core_control() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
     let root = TempDir::new().expect("tempdir");
@@ -584,6 +585,7 @@ fn desktop_bridge_handshake_and_snapshot_use_framed_redacted_state() {
     assert!(responses[1]["result"]["capturedAtUnix"].is_i64());
 }
 
+#[cfg(unix)]
 #[test]
 fn desktop_bridge_rejects_an_oversized_frame_and_recovers_for_the_next_request() {
     let root = TempDir::new().expect("tempdir");

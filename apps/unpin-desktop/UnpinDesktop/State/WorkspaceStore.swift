@@ -772,7 +772,7 @@ final class WorkspaceStore: ObservableObject {
         await refreshWorkflowStatus(connectionGeneration: expectedGeneration)
     }
 
-    private func performWorkflowRead<Response: Decodable>(
+    private func performWorkflowRead<Response: Decodable & Sendable>(
         _ request: @escaping (BridgeClient) async throws -> Response,
         onSuccess: @escaping (Response) throws -> Void,
         connectionGeneration expectedGeneration: Int? = nil

@@ -3,21 +3,22 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
     thread,
-    time::Duration,
 };
 
-use unpin_core::gateway::{GatewayError, GatewayService};
-use unpin_core::sessions::{ProcessEvidence, SessionAuthorityKey};
-
 use unpin_cli::mcp_runtime::GatewayRuntimeError;
+use unpin_core::gateway::{GatewayError, GatewayService};
 
 #[cfg(unix)]
 use std::os::unix::net::{UnixListener as StdUnixListener, UnixStream as StdUnixStream};
+#[cfg(unix)]
+use std::time::Duration;
 #[cfg(unix)]
 use unpin_cli::mcp_runtime::{
     GatewayCredentialResolver, GatewayHookAuthorizationSource, GatewayMcpServer,
     GatewayPrimaryNotifier, GatewayRuntimeTimeouts, serve_gateway_io,
 };
+#[cfg(unix)]
+use unpin_core::sessions::{ProcessEvidence, SessionAuthorityKey};
 
 pub(crate) struct GatewaySessionRuntime {
     gateway: Arc<GatewayService>,
@@ -27,16 +28,22 @@ pub(crate) struct GatewaySessionRuntime {
     thread: Option<thread::JoinHandle<Result<(), GatewaySessionError>>>,
 }
 
+#[cfg(unix)]
 const GATEWAY_TRANSPORT_AUTHENTICATION_VERSION: u32 = 1;
+#[cfg(unix)]
 const GATEWAY_TRANSPORT_AUTHENTICATION_TAG_ENV: &str = "UNPIN_GATEWAY_AUTHENTICATION_TAG";
+#[cfg(unix)]
 const GATEWAY_TRANSPORT_HANDSHAKE_MAGIC: &[u8] = b"UNPIN-GATEWAY-AUTH/1\0";
+#[cfg(unix)]
 const GATEWAY_TRANSPORT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(unix)]
 const GATEWAY_TRANSPORT_MAX_TAG_BYTES: usize = 128;
 
 /// Derive the transport capability from the session authority and the exact
 /// launched process generation. The resulting tag is passed only through the
 /// child environment; it is intentionally absent from launch-control and
 /// overlay JSON so it cannot become JSON evidence or a log field.
+#[cfg(unix)]
 pub(crate) fn gateway_transport_authentication_tag(
     authority_key: &SessionAuthorityKey,
     session_id: &str,
@@ -57,6 +64,7 @@ pub(crate) fn gateway_transport_authentication_tag(
         .map_err(|_| "gateway transport binding could not be authenticated".to_string())
 }
 
+#[cfg(unix)]
 fn gateway_transport_handshake_frame(tag: &str) -> Result<Vec<u8>, io::Error> {
     let bytes = tag.as_bytes();
     if bytes.is_empty() || bytes.len() > GATEWAY_TRANSPORT_MAX_TAG_BYTES {
@@ -78,6 +86,7 @@ fn gateway_transport_handshake_frame(tag: &str) -> Result<Vec<u8>, io::Error> {
     Ok(frame)
 }
 
+#[cfg(unix)]
 pub(crate) fn gateway_transport_handshake_frame_for_client(
     tag: &str,
 ) -> Result<Vec<u8>, io::Error> {
@@ -412,6 +421,7 @@ pub(crate) enum GatewaySessionError {
     Io(io::Error),
     Gateway(GatewayError),
     Runtime(GatewayRuntimeError),
+    #[cfg(unix)]
     Authentication,
     #[cfg(unix)]
     AuthenticationUnavailable,
@@ -442,6 +452,7 @@ impl std::fmt::Display for GatewaySessionError {
             Self::Io(error) => write!(formatter, "session gateway I/O failed: {error}"),
             Self::Gateway(error) => write!(formatter, "session gateway cleanup failed: {error}"),
             Self::Runtime(error) => write!(formatter, "session gateway failed: {error}"),
+            #[cfg(unix)]
             Self::Authentication => {
                 formatter.write_str("session gateway transport authentication failed")
             }
