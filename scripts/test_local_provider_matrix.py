@@ -32,6 +32,7 @@ from run_local_provider_matrix import (
     live_inventory_exclusion_reason,
     live_item_has_cross_provider_shared_source,
     live_plan_state_paths,
+    validate_workflow_routing_evidence,
 )
 
 
@@ -1203,6 +1204,134 @@ class McpFinalizationContractTests(unittest.TestCase):
                 ]
             )
         )
+
+
+class WorkflowRoutingEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def valid_evidence() -> dict[str, object]:
+        mode = {
+            "advertisedToolNames": ["unpin_workflow_status"],
+            "skillSearchResults": [{"name": "fixture-skill"}],
+            "loadedSkillBodyBytes": 10,
+            "hookIds": ["fixture-hook"],
+            "schemaBytes": 20,
+            "estimatedTokens": 5,
+            "revision": "a" * 64,
+        }
+        return {
+            "schemaVersion": 1,
+            "status": "passed",
+            "workflow": {"modeOrder": ["planning", "implementation", "review"]},
+            "modes": {
+                "planning": dict(mode),
+                "implementation": dict(mode),
+                "review": dict(mode),
+            },
+            "metrics": {
+                "initialActiveSchemaBytes": 20,
+                "unroutedInstalledCatalogSchemaBytes": 40,
+                "activeSchemaBytes": 20,
+                "fullEnvelopeSchemaBytes": 30,
+                "activeEstimatedTokens": 5,
+                "fullEnvelopeEstimatedTokens": 7,
+                "metricDefinition": "deterministic estimates, not billing tokens",
+                "thresholds": {
+                    "initialActiveLessThanUnrouted": True,
+                    "activeLessThanFullEnvelope": True,
+                    "activeEstimatedTokensLessThanFullEnvelope": True,
+                    "initialModeExcludesNonBaselineTool": True,
+                },
+            },
+            "transitionTimeline": [
+                {"event": "initial-primary-list"},
+                {
+                    "event": "implementation-staged",
+                    "desiredRevision": "b",
+                    "pendingRevision": "b",
+                    "observedRevision": "a",
+                },
+                {
+                    "event": "tools-list-changed-notification",
+                    "desiredRevision": "b",
+                    "observedRevision": "a",
+                },
+                {
+                    "event": "same-primary-tools-list",
+                    "desiredRevision": "b",
+                    "observedRevision": "b",
+                    "pendingRevision": None,
+                },
+                {"event": "review-staged"},
+                {"event": "same-primary-review-tools-list"},
+            ],
+            "fallbacks": {
+                "supportedRefresh": "NotificationRequired",
+                "notification": "NotificationSent",
+                "refreshUnconfirmed": "RefreshUnconfirmed",
+                "reloadRequired": "ReloadRequired",
+                "nextSessionOnly": "NextSessionOnly",
+                "cancel": {
+                    "observedRevision": "a",
+                    "pendingRevision": None,
+                    "recoveryRequired": False,
+                },
+                "nextSessionCancelObservedRevision": "a",
+            },
+            "connections": {
+                "primary": {"role": "primary", "sessionId": "session-a"},
+                "auxiliary": {"role": "auxiliary"},
+                "secondSessionPrimary": {"sessionId": "session-b"},
+                "auxiliaryDataDenial": "connection-control-only",
+                "crossSessionClaimDenial": "connection-claim-invalid",
+                "staleDisconnectedPrimaryDenial": "connection-epoch-stale",
+                "staleTransitionDenial": "workflow:stale",
+            },
+            "agentPlugin": {
+                "packageTogglePerformed": False,
+                "nativeStateUnchanged": True,
+                "contributedCapabilityIds": ["plugin-tool"],
+                "advertisedToolNames": ["plugin__tool"],
+                "skillSearchResults": [{"name": "plugin-skill"}],
+                "hookIds": ["plugin-hook"],
+            },
+            "safety": {
+                "fixtureMode": True,
+                "strictMaskingCoverage": "verified-masked",
+                "nativeCapabilities": "native-unmanaged",
+                "nativeProviderStateUnchanged": True,
+                "nativeProviderStateSha256Before": "sha256:same",
+                "nativeProviderStateSha256After": "sha256:same",
+                "bridgeAuthentication": "process-root-generation-sequence-bound",
+                "protectedRootEvidence": {"repositoryConfigMayRedirect": False},
+            },
+            "crossSurfaceParity": {
+                "cli": True,
+                "mcp": True,
+                "tui": True,
+                "desktop": True,
+            },
+        }
+
+    def test_accepts_complete_workflow_routing_evidence(self) -> None:
+        validate_workflow_routing_evidence(self.valid_evidence())
+
+    def test_rejects_failed_context_reduction_threshold(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["metrics"]["thresholds"]["activeLessThanFullEnvelope"] = False
+        with self.assertRaisesRegex(MatrixFailure, "context-reduction"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_notification_promoted_as_observation(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["transitionTimeline"][2]["observedRevision"] = "b"
+        with self.assertRaisesRegex(MatrixFailure, "notification or observation"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_next_session_observed_revision_drift(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["fallbacks"]["nextSessionCancelObservedRevision"] = "b"
+        with self.assertRaisesRegex(MatrixFailure, "next-session-only"):
+            validate_workflow_routing_evidence(evidence)
 
 
 class LiveInventoryFilterTests(unittest.TestCase):

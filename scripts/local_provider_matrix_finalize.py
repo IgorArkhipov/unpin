@@ -127,6 +127,7 @@ def finalize_artifacts(artifact_root: Path) -> dict[str, Any]:
         root / "raw/results.json",
         root / "raw/tui-results.json",
         root / "raw/mcp-results.json",
+        root / "raw/workflow-routing.json",
     ]
     missing = [str(path.relative_to(root)) for path in required if not path.is_file()]
     if missing:
@@ -139,6 +140,8 @@ def finalize_artifacts(artifact_root: Path) -> dict[str, Any]:
         )
     if summary.get("matrix") != MATRIX or summary.get("screenshotsExpected") != SCREENSHOTS:
         raise MatrixFailure("cannot finalize; summary matrix contract is not canonical")
+    if (summary.get("workflowRouting") or {}).get("status") != "passed":
+        raise MatrixFailure("cannot finalize; workflow routing evidence did not pass")
     tested_binary = summary.get("testedBinary") or {}
     required_binary_fields = {
         "sha256",
