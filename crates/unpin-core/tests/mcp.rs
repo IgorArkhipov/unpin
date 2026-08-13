@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     ops::{Deref, DerefMut},
     path::{Path, PathBuf},
@@ -44,6 +44,9 @@ use unpin_core::{
         workspace::resolve_workspace_identity,
     },
     transitions::TransitionJournalStore,
+    workflows::{
+        WORKFLOW_DEFINITION_VERSION, WorkflowControl, WorkflowDefinition, WorkflowModeDefinition,
+    },
 };
 
 fn fixtures_root() -> PathBuf {
@@ -339,6 +342,40 @@ fn required_input_fields(tool: &serde_json::Value) -> Vec<String> {
         .collect()
 }
 
+fn save_mcp_workflow_fixture(context: &McpContext) {
+    let owner = OwnerGeneration::new("mcp-workflow-test", 1).expect("workflow owner");
+    ProfileStore::new(&context.app_state_root)
+        .save_global_definition(
+            &ProfileDefinition {
+                version: PROFILE_DEFINITION_VERSION,
+                id: "planning-profile".to_string(),
+                display_name: "Planning Profile".to_string(),
+                description: Some("Plan delivery work".to_string()),
+                members: Vec::new(),
+                provider_members: BTreeMap::new(),
+                supported_providers: BTreeSet::from([ProviderId::Codex]),
+            },
+            None,
+            owner.clone(),
+        )
+        .expect("global workflow profile");
+    AtomicJsonStore::new(context.app_state_root.join("workflows/delivery.json"), 1)
+        .compare_and_swap(
+            None,
+            owner,
+            &WorkflowDefinition {
+                version: WORKFLOW_DEFINITION_VERSION,
+                id: "delivery".to_string(),
+                display_name: "Delivery Workflow".to_string(),
+                description: Some("Plan and deliver a reviewed change".to_string()),
+                baseline_profile_id: "planning-profile".to_string(),
+                entry_mode: "planning".to_string(),
+                modes: vec![WorkflowModeDefinition::new("planning", "planning-profile")],
+            },
+        )
+        .expect("global workflow definition");
+}
+
 fn line_request(request: serde_json::Value) -> Vec<u8> {
     format!("{request}\n").into_bytes()
 }
@@ -371,6 +408,132 @@ fn agent_plugin_tools_have_stable_descriptors_and_closed_schemas() {
         );
         assert_eq!(descriptor["inputSchema"]["additionalProperties"], false);
         assert_eq!(required_input_fields(&descriptor), required);
+    }
+}
+
+#[test]
+fn workflow_tools_are_regular_read_only_tools_with_closed_stored_only_schemas() {
+    let context = context();
+
+    for (name, required) in [
+        ("unpin_list_workflows", vec![]),
+        ("unpin_validate_workflow", vec!["workflowId"]),
+        ("unpin_propose_session_workflow", vec!["prompt"]),
+        (
+            "unpin_plan_workflow_session_launch",
+            vec!["workflowId", "provider"],
+        ),
+    ] {
+        let descriptor = tool_descriptor(&context, name);
+        assert_eq!(descriptor["annotations"]["readOnlyHint"], true);
+        assert_eq!(descriptor["inputSchema"]["additionalProperties"], false);
+        assert_eq!(required_input_fields(&descriptor), required);
+        let schema = descriptor["inputSchema"].to_string();
+        for forbidden in ["definition", "path", "command", "authorityToken"] {
+            assert!(
+                !schema.contains(forbidden),
+                "{name} schema exposed forbidden field {forbidden}: {schema}"
+            );
+        }
+    }
+
+    assert_eq!(WorkflowControl::ALL.len(), 4);
+    assert_eq!(
+        WorkflowControl::ALL.map(WorkflowControl::name),
+        [
+            "unpin_workflow_status",
+            "unpin_workflow_modes",
+            "unpin_workflow_enter_mode",
+            "unpin_workflow_cancel_transition",
+        ]
+    );
+}
+
+#[test]
+fn workflow_tools_list_validate_and_propose_from_stored_definitions_without_prompt_leakage() {
+    let context = context_for_provider(ProviderId::Codex);
+    save_mcp_workflow_fixture(&context);
+
+    let listed = call_tool(&context, "unpin_list_workflows", json!({}));
+    assert_eq!(listed["status"], "ok");
+    assert_eq!(listed["workflows"][0]["workflowId"], "delivery");
+    assert_eq!(listed["workflows"][0]["scope"], "global");
+    assert!(!listed.to_string().contains("sourcePath"));
+
+    let validated = call_tool(
+        &context,
+        "unpin_validate_workflow",
+        json!({"workflowId": "delivery"}),
+    );
+    assert_eq!(validated["status"], "valid");
+    assert_eq!(validated["revisions"][0]["provider"], "codex");
+    assert!(validated["revisions"][0]["workflowRevision"].is_string());
+
+    let private_prompt = "prepare a private delivery plan for customer-blue";
+    let proposed = call_tool(
+        &context,
+        "unpin_propose_session_workflow",
+        json!({"prompt": private_prompt}),
+    );
+    assert_eq!(proposed["status"], "proposed");
+    assert_eq!(proposed["proposal"]["workflowId"], "delivery");
+    assert!(proposed["proposal"]["promptDigest"].is_string());
+    assert!(!proposed.to_string().contains(private_prompt));
+    assert_eq!(proposed["constraints"]["stateWritten"], false);
+    assert_eq!(proposed["constraints"]["approvalMinted"], false);
+    assert_eq!(proposed["constraints"]["authorityExposed"], false);
+}
+
+#[test]
+fn workflow_launch_plan_requires_materialization_and_rejects_inline_or_child_commands() {
+    let context = context_for_provider(ProviderId::Codex);
+    save_mcp_workflow_fixture(&context);
+    let revision_root = context.app_state_root.join("workflows/revisions");
+    assert!(!revision_root.exists());
+
+    let plan = call_tool(
+        &context,
+        "unpin_plan_workflow_session_launch",
+        json!({"workflowId": "delivery", "provider": "codex"}),
+    );
+    assert_eq!(plan["status"], "human-action-required");
+    assert_eq!(plan["materializationRequired"], true);
+    assert_eq!(plan["materialized"], false);
+    assert_eq!(plan["handoff"]["cli"]["required"], true);
+    assert_eq!(plan["handoff"]["desktop"]["required"], true);
+    assert_eq!(plan["constraints"]["processSpawned"], false);
+    assert_eq!(plan["constraints"]["stateWritten"], false);
+    assert_eq!(plan["constraints"]["approvalMinted"], false);
+    assert_eq!(plan["constraints"]["authorityExposed"], false);
+    assert!(!revision_root.exists());
+    let encoded = plan.to_string();
+    for forbidden in ["sessionAuthorityToken", "approvalToken", "childCommand"] {
+        assert!(
+            !encoded.contains(forbidden),
+            "launch plan exposed {forbidden}"
+        );
+    }
+
+    for (field, value) in [
+        ("definition", json!({"id": "inline"})),
+        ("path", json!("/tmp/workflow.json")),
+        ("childCommand", json!(["sh", "-c", "echo unsafe"])),
+        ("command", json!("echo unsafe")),
+        ("argv", json!(["echo", "unsafe"])),
+    ] {
+        let error = call_tool_error(
+            &context,
+            "unpin_plan_workflow_session_launch",
+            json!({
+                "workflowId": "delivery",
+                "provider": "codex",
+                field: value,
+            }),
+        );
+        assert!(
+            error.contains(field),
+            "rejection should name {field}: {error}"
+        );
     }
 }
 

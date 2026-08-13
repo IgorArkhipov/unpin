@@ -343,6 +343,7 @@ SCREENSHOTS = [
     "opencode-states.png",
     "zed-states.png",
     "mcp-states.png",
+    "workflow-routing.png",
     "desktop-packages-light.png",
     "desktop-packages-dark.png",
 ]

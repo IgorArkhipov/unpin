@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 
 enum WorkspaceStatusText {
@@ -56,6 +57,8 @@ struct WorkspaceStoreTestHooks {
     var beforeDefinitionApply: (() async -> Void)?
     var beforeRestoreApply: (() async -> Void)?
     var beforeRecoveryRefresh: (() async -> Void)?
+    var beforeWorkflowRequest: (() async -> Void)?
+    var beforeWorkflowControl: (() async -> Void)?
     var beforeWorkspaceConnect: (() async throws -> Void)?
 
     init(
@@ -69,6 +72,8 @@ struct WorkspaceStoreTestHooks {
         beforeDefinitionApply: (() async -> Void)? = nil,
         beforeRestoreApply: (() async -> Void)? = nil,
         beforeRecoveryRefresh: (() async -> Void)? = nil,
+        beforeWorkflowRequest: (() async -> Void)? = nil,
+        beforeWorkflowControl: (() async -> Void)? = nil,
         beforeWorkspaceConnect: (() async throws -> Void)? = nil
     ) {
         self.beforeReadResponse = beforeReadResponse
@@ -81,6 +86,8 @@ struct WorkspaceStoreTestHooks {
         self.beforeDefinitionApply = beforeDefinitionApply
         self.beforeRestoreApply = beforeRestoreApply
         self.beforeRecoveryRefresh = beforeRecoveryRefresh
+        self.beforeWorkflowRequest = beforeWorkflowRequest
+        self.beforeWorkflowControl = beforeWorkflowControl
         self.beforeWorkspaceConnect = beforeWorkspaceConnect
     }
 }
@@ -119,6 +126,18 @@ final class WorkspaceStore: ObservableObject {
     @Published private(set) var lastRestore: RestoreApplyResult?
     @Published private(set) var workspaceName: String?
     @Published private(set) var mutationUncertaintyBlocker: String?
+    @Published private(set) var workflowDraft: WorkflowDraft?
+    @Published private(set) var workflowDefinitions: [WorkflowDraft] = []
+    @Published private(set) var workflowValidation: WorkflowValidationEnvelope?
+    @Published private(set) var workflowProposal: WorkflowProposal?
+    @Published private(set) var workflowCandidates: [WorkflowCandidate] = []
+    @Published private(set) var workflowSession: WorkflowSessionSnapshot?
+    @Published private(set) var workflowStatus: WorkflowStatusSnapshot?
+    @Published private(set) var workflowOperations: [WorkflowOperationSnapshot] = []
+    @Published private(set) var workflowRecovery: WorkflowRecoveryEnvelope?
+    @Published private(set) var workflowBlocker: String?
+    @Published private(set) var workflowRecoveryRequired = false
+    @Published private(set) var workflowHostCommand: [String] = []
 
     private var bridge: BridgeClient?
     private var workspaceRoot: URL?
@@ -130,6 +149,7 @@ final class WorkspaceStore: ObservableObject {
     private var recoveryRequestGeneration = 0
     @Published private(set) var controlRequestInFlight = false
     @Published private(set) var recoveryRequestInFlight = false
+    @Published private(set) var workflowRequestInFlight = false
 
     init(bridgeRoots: BridgeLaunchRoots = BridgeLaunchRoots()) {
         self.bridgeRoots = bridgeRoots
@@ -163,7 +183,7 @@ final class WorkspaceStore: ObservableObject {
     var hasWorkspace: Bool { workspaceRoot != nil }
 
     var actionsBlocked: Bool {
-        recoveryBlocker != nil || mutationUncertaintyBlocker != nil
+        recoveryBlocker != nil || mutationUncertaintyBlocker != nil || workflowRecoveryRequired
     }
 
     var mutationsBlocked: Bool {
@@ -172,7 +192,7 @@ final class WorkspaceStore: ObservableObject {
 
     var isBusy: Bool {
         if case .loading = state { return true }
-        return controlRequestInFlight || recoveryRequestInFlight
+        return controlRequestInFlight || recoveryRequestInFlight || workflowRequestInFlight
     }
 
     func launch() async {
@@ -266,6 +286,8 @@ final class WorkspaceStore: ObservableObject {
             self.bridge = bridge
             try await refresh(connectionGeneration: generation)
             guard connectionIsCurrent(generation) else { return }
+            await refreshWorkflowStatus(connectionGeneration: generation)
+            guard connectionIsCurrent(generation) else { return }
             if loadRecovery {
                 await refreshRecovery(connectionGeneration: generation)
             } else {
@@ -323,6 +345,18 @@ final class WorkspaceStore: ObservableObject {
         approvedRestoreFingerprint = nil
         lastRestoreBlocker = nil
         lastRestore = nil
+        workflowDraft = nil
+        workflowDefinitions = []
+        workflowValidation = nil
+        workflowProposal = nil
+        workflowCandidates = []
+        workflowSession = nil
+        workflowStatus = nil
+        workflowOperations = []
+        workflowRecovery = nil
+        workflowBlocker = nil
+        workflowRecoveryRequired = false
+        workflowHostCommand = []
     }
 
     func refresh(connectionGeneration: Int? = nil) async throws {
@@ -387,6 +421,402 @@ final class WorkspaceStore: ObservableObject {
             ) else { return }
             setRecoveryUnavailable()
         }
+    }
+
+    // MARK: - Workflow mode routing
+
+    func composeWorkflow(_ parameters: WorkflowComposeParameters) async {
+        guard guardActionsAllowed() else { return }
+        await performWorkflowRead { bridge in
+            try await bridge.composeWorkflow(parameters)
+        } onSuccess: { envelope in
+            guard let draft = envelope.workflow else {
+                throw BridgeClientError.malformedResponse
+            }
+            self.workflowDraft = draft
+            self.workflowValidation = nil
+            self.workflowProposal = nil
+            self.workflowCandidates = []
+            self.workflowBlocker = nil
+        }
+    }
+
+    func composeWorkflow(
+        workflowID: String,
+        displayName: String,
+        description: String? = nil,
+        provider: String,
+        baselineProfileID: String,
+        entryMode: String,
+        modes: [WorkflowModeDraft]
+    ) async {
+        await composeWorkflow(WorkflowComposeParameters(
+            workflowId: workflowID,
+            displayName: displayName,
+            description: description,
+            provider: provider,
+            baselineProfileId: baselineProfileID,
+            entryMode: entryMode,
+            modes: modes
+        ))
+    }
+
+    @MainActor
+    func selectWorkflow(workflowID: String) {
+        guard let selected = workflowDefinitions.first(where: { $0.workflowId == workflowID }) else {
+            workflowBlocker = "The selected workflow is no longer available. Refresh workflow status and choose it again."
+            return
+        }
+        workflowDraft = selected
+        workflowValidation = nil
+        workflowProposal = nil
+        workflowCandidates = []
+        workflowHostCommand = []
+        workflowBlocker = nil
+    }
+
+    func validateWorkflow() async {
+        guard guardActionsAllowed() else { return }
+        guard let draft = workflowDraft else {
+            workflowBlocker = "Compose a workflow before validating it."
+            return
+        }
+        await performWorkflowRead { bridge in
+            try await bridge.validateWorkflow(WorkflowValidateParameters(
+                workflowId: draft.workflowId,
+                provider: draft.provider,
+                workflowRevision: draft.workflowRevision.isEmpty ? nil : draft.workflowRevision
+            ))
+        } onSuccess: { validation in
+            self.workflowValidation = validation
+            self.workflowBlocker = validation.valid ? nil : "Workflow validation was denied. Review the reported constraints before proposing a launch."
+        }
+    }
+
+    func proposeWorkflow(prompt: String, provider: String? = nil) async {
+        guard guardActionsAllowed() else { return }
+        guard let draft = workflowDraft else {
+            workflowBlocker = "Select a hydrated workflow before proposing a session."
+            return
+        }
+        let selectedProvider = provider ?? draft.provider
+        guard selectedProvider.isEmpty == false else {
+            workflowBlocker = "The selected workflow has no provider. Refresh workflow status and choose a complete workflow."
+            return
+        }
+        await performWorkflowRead { bridge in
+            try await bridge.proposeWorkflow(WorkflowProposeParameters(
+                prompt: prompt,
+                workflowId: draft.workflowId,
+                provider: selectedProvider
+            ))
+        } onSuccess: { proposal in
+            self.workflowProposal = proposal.proposal
+            self.workflowCandidates = proposal.candidates
+            self.workflowHostCommand = []
+            self.workflowBlocker = nil
+            if proposal.proposal == nil, proposal.confirmationRequired == true {
+                self.state = .ready
+            }
+        }
+    }
+
+    func setWorkflowHostCommand(_ command: [String]) {
+        workflowHostCommand = Self.normalizedWorkflowHostCommand(command)
+    }
+
+    func launchReviewedWorkflow(hostCommand: [String]? = nil) async {
+        guard controlRequestInFlight == false, guardActionsAllowed() else { return }
+        guard let proposal = workflowProposal else {
+            workflowBlocker = "Review a workflow proposal before launching a session."
+            return
+        }
+        let requestedHostCommand = hostCommand ?? workflowHostCommand
+        let normalizedHostCommand = Self.normalizedWorkflowHostCommand(requestedHostCommand)
+        guard normalizedHostCommand.isEmpty == false else {
+            workflowBlocker = "Enter a child host command before launching a workflow session."
+            return
+        }
+        workflowHostCommand = normalizedHostCommand
+        let expectedGeneration = connectionGeneration
+        controlRequestInFlight = true
+        workflowRequestInFlight = true
+        defer {
+            controlRequestInFlight = false
+            workflowRequestInFlight = false
+        }
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeWorkflowControl { await hook() }
+            let envelope = try await bridge.launchWorkflow(WorkflowLaunchParameters(
+                proposalId: proposal.proposalId,
+                proposalFingerprint: proposal.proposalFingerprint,
+                hostCommand: normalizedHostCommand
+            ))
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            guard let session = envelope.session else {
+                workflowBlocker = envelope.nextAction
+                    ?? "The workflow launch did not establish a child-host session."
+                return
+            }
+            workflowSession = session
+            workflowProposal = nil
+            workflowBlocker = nil
+            workflowRecoveryRequired = false
+            workflowRequestInFlight = false
+            await refreshWorkflowStatus(connectionGeneration: expectedGeneration)
+            workflowRequestInFlight = true
+            setReadyUnlessDefinitionBlocked()
+        } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            workflowProposal = nil
+            if mutationMayBeUnconfirmed(error) {
+                workflowBlocker = "The workflow launch was not confirmed. Inspect workflow recovery before retrying."
+                workflowRecoveryRequired = true
+                workflowRequestInFlight = false
+                await refreshWorkflowRecovery(connectionGeneration: expectedGeneration)
+            } else {
+                workflowBlocker = error.localizedDescription
+                state = .blocked(error.localizedDescription)
+            }
+        }
+    }
+
+    func transitionWorkflow(
+        targetMode: String,
+        operationID: String? = nil,
+        operationFingerprint: String? = nil
+    ) async {
+        guard controlRequestInFlight == false, guardActionsAllowed() else { return }
+        guard let session = workflowSession else {
+            workflowBlocker = "Launch a workflow session before changing modes."
+            return
+        }
+        guard targetMode.isEmpty == false else {
+            workflowBlocker = "Choose a target workflow mode before transitioning."
+            return
+        }
+        let sourceSequence = session.stateSequence ?? 0
+        let generatedOperationID = operationID ?? Self.workflowTransitionOperationID()
+        let generatedFingerprint = operationFingerprint ?? Self.workflowFingerprint(
+            operationID: generatedOperationID,
+            sourceSequence: sourceSequence,
+            targetMode: targetMode,
+            workflowID: session.workflowId ?? ""
+        )
+        let expectedGeneration = connectionGeneration
+        controlRequestInFlight = true
+        workflowRequestInFlight = true
+        defer {
+            controlRequestInFlight = false
+            workflowRequestInFlight = false
+        }
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeWorkflowControl { await hook() }
+            let envelope = try await bridge.transitionWorkflow(WorkflowTransitionParameters(
+                operationId: generatedOperationID,
+                operationFingerprint: generatedFingerprint,
+                sourceStateSequence: sourceSequence,
+                targetMode: targetMode,
+                requestedAtUnix: Int(Date().timeIntervalSince1970)
+            ))
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            if let session = envelope.session {
+                workflowSession = session
+            }
+            if let status = envelope.status {
+                workflowStatus = status
+            }
+            if let result = envelope.result {
+                workflowOperations.append(WorkflowOperationSnapshot(
+                    operationId: result.operationId,
+                    lifecycle: result.lifecycle,
+                    reasonCode: result.reasonCode,
+                    sourceMode: result.previousMode,
+                    targetMode: result.desiredMode,
+                    sourceStateSequence: sourceSequence,
+                    targetStateSequence: result.leaseStateSequence,
+                    operationFingerprint: generatedFingerprint
+                ))
+            }
+            workflowRequestInFlight = false
+            await observeWorkflow()
+            workflowRequestInFlight = true
+            workflowBlocker = nil
+            if envelope.result?.lifecycle == "denied" {
+                workflowBlocker = "The requested mode would expand the sealed workflow envelope and was denied."
+            }
+        } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            workflowBlocker = error.localizedDescription
+            if mutationMayBeUnconfirmed(error) {
+                workflowRecoveryRequired = true
+                workflowRequestInFlight = false
+                await refreshWorkflowRecovery(connectionGeneration: expectedGeneration)
+            } else {
+                state = .blocked(error.localizedDescription)
+            }
+        }
+    }
+
+    func observeWorkflow() async {
+        guard guardActionsAllowed() else { return }
+        await performWorkflowRead { bridge in
+            try await bridge.observeWorkflow()
+        } onSuccess: { observation in
+            if let session = observation.session { self.workflowSession = session }
+            if let status = observation.status { self.workflowStatus = status }
+            self.workflowBlocker = nil
+            self.setReadyUnlessDefinitionBlocked()
+        }
+    }
+
+    func cancelWorkflowTransition(operationID: String) async {
+        guard controlRequestInFlight == false, guardActionsAllowed() else { return }
+        let expectedGeneration = connectionGeneration
+        controlRequestInFlight = true
+        workflowRequestInFlight = true
+        defer {
+            controlRequestInFlight = false
+            workflowRequestInFlight = false
+        }
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeWorkflowControl { await hook() }
+            let envelope = try await bridge.cancelWorkflowTransition(operationID: operationID)
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            if let session = envelope.session { workflowSession = session }
+            workflowOperations.removeAll { $0.operationId == operationID }
+            workflowBlocker = nil
+            setReadyUnlessDefinitionBlocked()
+        } catch {
+            guard connectionIsCurrent(expectedGeneration) else { return }
+            workflowBlocker = error.localizedDescription
+            state = .blocked(error.localizedDescription)
+        }
+    }
+
+    func refreshWorkflowStatus(connectionGeneration expectedGeneration: Int? = nil) async {
+        let generation = expectedGeneration ?? connectionGeneration
+        guard connectionIsCurrent(generation) else { return }
+        await performWorkflowRead(
+            { bridge in
+                try await bridge.workflowStatus()
+            },
+            onSuccess: { status in
+                let hydratedDefinitions = status.workflows
+                    + (status.workflow.map { [ $0 ] } ?? [])
+                if hydratedDefinitions.isEmpty == false {
+                    var uniqueDefinitions = [WorkflowDraft]()
+                    for definition in hydratedDefinitions where uniqueDefinitions.contains(where: {
+                        $0.workflowId == definition.workflowId
+                    }) == false {
+                        uniqueDefinitions.append(definition)
+                    }
+                    self.workflowDefinitions = uniqueDefinitions
+                    let selectedID = status.selectedWorkflowId
+                        ?? status.status?.workflowId
+                        ?? status.session?.workflowId
+                    if let selectedID,
+                       let selected = uniqueDefinitions.first(where: { $0.workflowId == selectedID }) {
+                        self.workflowDraft = selected
+                    } else if self.workflowDraft == nil, uniqueDefinitions.count == 1 {
+                        self.workflowDraft = uniqueDefinitions[0]
+                    }
+                }
+        self.workflowSession = status.session
+                if let snapshot = status.status { self.workflowStatus = snapshot }
+                self.workflowOperations = status.operations
+                self.workflowRecoveryRequired = status.recoveryRequired == true
+                self.workflowBlocker = self.workflowRecoveryRequired
+                    ? "Workflow recovery is required before another transition."
+                    : nil
+                self.setReadyUnlessDefinitionBlocked()
+            },
+            connectionGeneration: generation
+        )
+    }
+
+    func refreshWorkflowRecovery(connectionGeneration expectedGeneration: Int? = nil) async {
+        guard workflowRequestInFlight == false else { return }
+        let generation = expectedGeneration ?? connectionGeneration
+        workflowRequestInFlight = true
+        defer { workflowRequestInFlight = false }
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeWorkflowRequest { await hook() }
+            let recovery = try await bridge.workflowRecovery()
+            guard connectionIsCurrent(generation) else { return }
+            workflowRecovery = recovery
+            workflowOperations = recovery.operations
+            workflowRecoveryRequired = recovery.recoveryRequired == true
+            if workflowRecoveryRequired == false { workflowBlocker = nil }
+        } catch {
+            guard connectionIsCurrent(generation) else { return }
+            workflowRecoveryRequired = true
+            workflowBlocker = "Workflow recovery evidence is unavailable. Reload the workspace before retrying."
+        }
+    }
+
+    func refreshWorkflowRecovery() async {
+        guard controlRequestInFlight == false else { return }
+        let expectedGeneration = connectionGeneration
+        await refreshWorkflowRecovery(connectionGeneration: expectedGeneration)
+        guard connectionIsCurrent(expectedGeneration) else { return }
+        if workflowRecoveryRequired {
+            workflowBlocker = workflowRecovery?.message
+                ?? "End the routed child session and relaunch it after inspecting recovery evidence."
+            return
+        }
+        await refreshWorkflowStatus(connectionGeneration: expectedGeneration)
+    }
+
+    private func performWorkflowRead<Response: Decodable & Sendable>(
+        _ request: @escaping (BridgeClient) async throws -> Response,
+        onSuccess: @escaping (Response) throws -> Void,
+        connectionGeneration expectedGeneration: Int? = nil
+    ) async {
+        guard workflowRequestInFlight == false else { return }
+        let generation = expectedGeneration ?? connectionGeneration
+        workflowRequestInFlight = true
+        defer { workflowRequestInFlight = false }
+        do {
+            guard let bridge else { throw BridgeClientError.childStopped }
+            if let hook = testHooks.beforeWorkflowRequest { await hook() }
+            let response = try await request(bridge)
+            guard connectionIsCurrent(generation) else { return }
+            try onSuccess(response)
+            setReadyUnlessDefinitionBlocked()
+        } catch {
+            guard connectionIsCurrent(generation) else { return }
+            workflowBlocker = error.localizedDescription
+            state = .blocked(error.localizedDescription)
+        }
+    }
+
+    private static func workflowFingerprint(
+        operationID: String,
+        sourceSequence: UInt64,
+        targetMode: String,
+        workflowID: String
+    ) -> String {
+        let material = "unpin.desktop.workflow.transition.v1\u{0}\(operationID)\u{0}\(sourceSequence)\u{0}\(targetMode)\u{0}\(workflowID)"
+        return SHA256.hash(data: Data(material.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    static func workflowTransitionOperationID() -> String {
+        "workflow-transition-\(UUID().uuidString.lowercased())"
+    }
+
+    private static func normalizedWorkflowHostCommand(_ command: [String]) -> [String] {
+        guard command.isEmpty == false,
+              command.allSatisfy({
+                  $0.isEmpty == false && $0.rangeOfCharacter(from: .controlCharacters) == nil
+              }) else {
+            return []
+        }
+        return command
     }
 
     func plan(group: GroupSummary, target: String) async {

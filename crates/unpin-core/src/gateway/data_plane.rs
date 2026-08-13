@@ -22,6 +22,7 @@ use super::{
 pub struct GatewayCallPermit {
     tool: ProjectedTool,
     exposure: Arc<GatewayExposure>,
+    connection_epoch: u64,
     admission: Option<CallAdmission>,
     hook_policy: Arc<HookPolicy>,
     hook_chain: HookInvocationChain,
@@ -36,6 +37,7 @@ impl std::fmt::Debug for GatewayCallPermit {
             .debug_struct("GatewayCallPermit")
             .field("tool_name", &self.tool.name)
             .field("exposure_revision", &self.exposure.pinned().revision)
+            .field("connection_epoch", &self.connection_epoch)
             .field("admission", &self.admission.as_ref().map(|_| "[REDACTED]"))
             .field("before_hooks_pending", &self.before_hook_plan.is_some())
             .field("after_hooks_pending", &self.pending_after_plan.is_some())
@@ -46,6 +48,7 @@ impl std::fmt::Debug for GatewayCallPermit {
 #[derive(Clone)]
 pub struct GatewayHookCallContext {
     exposure: Arc<GatewayExposure>,
+    connection_epoch: u64,
 }
 
 impl std::fmt::Debug for GatewayHookCallContext {
@@ -53,6 +56,7 @@ impl std::fmt::Debug for GatewayHookCallContext {
         formatter
             .debug_struct("GatewayHookCallContext")
             .field("exposure_revision", &self.exposure.pinned().revision)
+            .field("connection_epoch", &self.connection_epoch)
             .finish_non_exhaustive()
     }
 }
@@ -66,6 +70,11 @@ impl GatewayCallPermit {
     #[must_use]
     pub fn exposure_revision(&self) -> &str {
         &self.exposure.pinned().revision
+    }
+
+    #[must_use]
+    pub const fn connection_epoch(&self) -> u64 {
+        self.connection_epoch
     }
 
     fn admission(&self) -> Result<CallAdmission, GatewayError> {
@@ -88,6 +97,7 @@ impl GatewayCallPermit {
     pub fn hook_call_context(&self) -> GatewayHookCallContext {
         GatewayHookCallContext {
             exposure: Arc::clone(&self.exposure),
+            connection_epoch: self.connection_epoch,
         }
     }
 
@@ -146,6 +156,13 @@ impl GatewayDataPlane {
         Ok(active.tools().descriptors())
     }
 
+    pub(crate) fn list_tools_for_exposure(
+        &self,
+        exposure: &GatewayExposure,
+    ) -> Result<Vec<ProjectedTool>, GatewayError> {
+        Ok(exposure.tools().descriptors())
+    }
+
     pub fn admit_hook_tool(
         &self,
         context: &GatewayHookCallContext,
@@ -171,7 +188,45 @@ impl GatewayDataPlane {
             arguments,
             now_unix,
             hook_chain,
+            context.connection_epoch,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn admit_hook_tool_for_exposure(
+        &self,
+        exposure: Arc<GatewayExposure>,
+        context: &GatewayHookCallContext,
+        server_id: &str,
+        tool_name: &str,
+        arguments: &Value,
+        now_unix: i64,
+        hook_chain: HookInvocationChain,
+        connection_epoch: u64,
+    ) -> Result<GatewayCallPermit, GatewayError> {
+        if exposure.pinned().revision != context.exposure.pinned().revision
+            || context.connection_epoch != connection_epoch
+        {
+            return Err(GatewayError::ConnectionEpochStale);
+        }
+        let projected = context
+            .exposure
+            .tools()
+            .resolve_upstream(server_id, tool_name)
+            .cloned()
+            .ok_or(GatewayError::CapabilityUnavailable)?;
+        self.admit_from_exposure(
+            exposure,
+            &projected.name,
+            arguments,
+            now_unix,
+            hook_chain,
+            connection_epoch,
+        )
+    }
+
+    pub(crate) fn permit_connection_epoch(permit: &GatewayCallPermit) -> u64 {
+        permit.connection_epoch
     }
 
     pub fn search_skills(
@@ -184,9 +239,30 @@ impl GatewayDataPlane {
         self.with_local_call(&active, now_unix, || active.skills().search(query, limit))
     }
 
+    pub(crate) fn search_skills_for_exposure(
+        &self,
+        exposure: Arc<GatewayExposure>,
+        query: &str,
+        limit: usize,
+        now_unix: i64,
+    ) -> Result<Vec<SkillMetadata>, GatewayError> {
+        self.with_local_call(&exposure, now_unix, || {
+            exposure.skills().search(query, limit)
+        })
+    }
+
     pub fn load_skill(&self, reference: &str, now_unix: i64) -> Result<LoadedSkill, GatewayError> {
         let active = self.active_exposure()?;
         self.with_local_call(&active, now_unix, || active.skills().load(reference))
+    }
+
+    pub(crate) fn load_skill_for_exposure(
+        &self,
+        exposure: Arc<GatewayExposure>,
+        reference: &str,
+        now_unix: i64,
+    ) -> Result<LoadedSkill, GatewayError> {
+        self.with_local_call(&exposure, now_unix, || exposure.skills().load(reference))
     }
 
     pub fn admit_tool(
@@ -211,7 +287,26 @@ impl GatewayDataPlane {
         hook_chain: HookInvocationChain,
     ) -> Result<GatewayCallPermit, GatewayError> {
         let exposure = self.active_exposure()?;
-        self.admit_from_exposure(exposure, public_name, arguments, now_unix, hook_chain)
+        self.admit_from_exposure(exposure, public_name, arguments, now_unix, hook_chain, 0)
+    }
+
+    pub(crate) fn admit_tool_for_exposure(
+        &self,
+        exposure: Arc<GatewayExposure>,
+        public_name: &str,
+        arguments: &Value,
+        now_unix: i64,
+        hook_chain: HookInvocationChain,
+        connection_epoch: u64,
+    ) -> Result<GatewayCallPermit, GatewayError> {
+        self.admit_from_exposure(
+            exposure,
+            public_name,
+            arguments,
+            now_unix,
+            hook_chain,
+            connection_epoch,
+        )
     }
 
     fn admit_from_exposure(
@@ -221,6 +316,7 @@ impl GatewayDataPlane {
         arguments: &Value,
         now_unix: i64,
         hook_chain: HookInvocationChain,
+        connection_epoch: u64,
     ) -> Result<GatewayCallPermit, GatewayError> {
         if !arguments.is_object()
             || !json_shape_within(
@@ -266,6 +362,7 @@ impl GatewayDataPlane {
         Ok(GatewayCallPermit {
             tool,
             exposure,
+            connection_epoch,
             admission: Some(admission),
             hook_policy,
             hook_chain,

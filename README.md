@@ -147,6 +147,46 @@ invalid, stop and re-download it; do not disable Gatekeeper or strip quarantine
 metadata. See [the desktop guide](docs/DESKTOP.md) for the full install,
 update, uninstall, and trust boundary.
 
+## Workflow mode routing
+
+Workflows let one confirmed gateway session expose a narrow capability set for
+its current task without toggling provider-native configuration. A workflow
+references a baseline profile plus named mode profiles such as `planning`,
+`implementation`, and `review`; the effective exposure is always baseline plus
+exactly one mode. Mode changes replace the prior mode, never accumulate it.
+
+The confirmed maximum envelope is the session privilege boundary. An agent or
+user may explicitly enter another mode already inside that envelope without a
+new provider mutation or approval. Expansions remain inactive for separately
+authenticated local-operator review. Every routed exposure also includes the
+fixed typed Unpin status, mode-list, enter-mode, and cancel-transition controls.
+
+Routing covers only gateway-owned skill search and body loading, projected MCP
+leaf tools, and gateway-dispatched hooks. Native skills, MCP registrations,
+plugins, hooks, shell, editor, and browser actions outside the gateway remain
+`native-unmanaged` and are not changed by a transition. Hosts that do not
+confirm a current-session re-list report `reload-required`,
+`refresh-unconfirmed`, or `next-session-only`; the last state leaves the current
+observed exposure callable. Notification alone never proves activation.
+
+Start with read-only definition and proposal inspection:
+
+```bash
+unpin workflow list --json
+unpin workflow validate --id delivery --provider codex --json
+unpin workflow propose --prompt "plan the next change" --provider codex --json
+unpin session status --id SESSION_ID --json
+```
+
+Workflow definition writes are reviewed plan/apply operations. Confirmed launch
+binds the proposal, workflow/profile/catalog revisions, process, workspace, and
+connection into one authenticated lease. Use `unpin session enter-mode` and
+`unpin session cancel-transition` with operation fields from status or the
+controlling gateway. Desktop is the primary workflow workbench; TUI is a compact
+inspection and CLI-handoff surface. See [MCP routing details](docs/MCP.md),
+[desktop workflow guidance](docs/DESKTOP.md), and
+[matrix evidence](docs/local-provider-matrix.md).
+
 ## Five-minute local setup
 
 Run Unpin from the Git repository whose agent configuration you want to

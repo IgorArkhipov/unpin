@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import json
 import os
 import pty
@@ -160,6 +161,10 @@ class McpSession:
             "unpin_plan_toggle_item",
             "unpin_apply_toggle_item",
             "unpin_restore_backup",
+            "unpin_list_workflows",
+            "unpin_validate_workflow",
+            "unpin_propose_session_workflow",
+            "unpin_plan_workflow_session_launch",
         }
         if initialized.get("serverInfo", {}).get("name") != "unpin":
             raise MatrixFailure("MCP initialize returned unexpected server identity")
@@ -590,6 +595,164 @@ def assert_agent_plugin_payload_redacted(payload: Any, surface: str) -> None:
             raise MatrixFailure(f"{surface} Agent Plugin payload leaked {forbidden}")
 
 
+def authenticated_desktop_bridge_request(
+    request: dict[str, Any],
+    binding: dict[str, Any],
+    session_secret: str,
+    sequence: int,
+) -> dict[str, Any]:
+    request = dict(request)
+    params = request.get("params", {})
+    if not isinstance(params, dict):
+        raise MatrixFailure("desktop bridge request params must be an object")
+    request_id = request.get("id")
+    method = request.get("method")
+    if not isinstance(request_id, str) or not isinstance(method, str):
+        raise MatrixFailure("desktop bridge request omitted id or method")
+    operation_id = params.get("operationId") or params.get("proposalId") or request_id
+    fingerprint = (
+        params.get("planFingerprint")
+        or params.get("proposalFingerprint")
+        or params.get("operationFingerprint")
+        or hashlib.sha256(
+            json.dumps(params, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+    )
+    params_digest = hashlib.sha256(
+        json.dumps(params, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    ).hexdigest()
+    material = (
+        "unpin.desktop.bridge.request.v1\0"
+        f"{session_secret}\0{sequence}\0{request_id}\0{method}\0"
+        f"{operation_id}\0{fingerprint}\0{params_digest}"
+    )
+    request["auth"] = {
+        "parentPid": binding.get("parentPid"),
+        "parentStartMarker": binding.get("parentStartMarker"),
+        "childPid": binding.get("childPid"),
+        "childStartMarker": binding.get("childStartMarker"),
+        "projectRoot": binding.get("projectRoot"),
+        "appStateRoot": binding.get("appStateRoot"),
+        "processGeneration": binding.get("processGeneration"),
+        "sequence": sequence,
+        "operationId": operation_id,
+        "fingerprint": fingerprint,
+        "authTag": hashlib.sha256(material.encode("utf-8")).hexdigest(),
+    }
+    return request
+
+
+def _exchange_desktop_bridge_frame(
+    process: subprocess.Popen[str],
+    request: dict[str, Any],
+) -> dict[str, Any]:
+    if process.stdin is None or process.stdout is None:
+        raise MatrixFailure("desktop bridge pipes unavailable")
+    process.stdin.write(json.dumps(request, separators=(",", ":")) + "\n")
+    process.stdin.flush()
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    try:
+        if not selector.select(30):
+            raise MatrixFailure(
+                f"desktop bridge timed out waiting for {request.get('id', 'response')}"
+            )
+        line = process.stdout.readline()
+    finally:
+        selector.close()
+    if not line:
+        raise MatrixFailure(
+            f"desktop bridge stopped before {request.get('id', 'response')}"
+        )
+    try:
+        response = json.loads(line)
+    except json.JSONDecodeError as error:
+        raise MatrixFailure("desktop bridge returned malformed JSON") from error
+    if response.get("id") != request.get("id"):
+        raise MatrixFailure("desktop bridge returned a mismatched response id")
+    if "error" in response:
+        code = response.get("error", {}).get("code", "unknown-error")
+        raise MatrixFailure(f"desktop bridge request failed: {code}")
+    result = response.get("result")
+    if not isinstance(result, dict):
+        raise MatrixFailure("desktop bridge response omitted object result")
+    return result
+
+
+def desktop_bridge_snapshot(
+    binary: Path,
+    fixture_root: Path,
+    project_root: Path,
+    app_state_root: Path,
+) -> dict[str, Any]:
+    process = subprocess.Popen(
+        [
+            str(binary),
+            "desktop",
+            "bridge",
+            "--fixture-root",
+            str(fixture_root),
+            "--home-root",
+            str(fixture_root),
+            "--project-root",
+            str(project_root),
+            "--app-state-root",
+            str(app_state_root),
+        ],
+        cwd=REPO_ROOT,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=fixture_subprocess_environment(),
+    )
+    session_secret = os.urandom(32).hex()
+    handshake_request = {
+        "version": 2,
+        "id": "handshake",
+        "method": "handshake",
+        "params": {
+            "sessionSecret": session_secret,
+            "parentPid": os.getpid(),
+            "parentStartMarker": f"provider-matrix-{os.getpid()}",
+            "childPid": process.pid,
+            "processGeneration": os.urandom(16).hex(),
+            "projectRoot": str(project_root),
+            "appStateRoot": str(app_state_root),
+        },
+    }
+    try:
+        handshake = _exchange_desktop_bridge_frame(process, handshake_request)
+        binding = handshake.get("binding")
+        if not isinstance(binding, dict):
+            raise MatrixFailure("desktop bridge handshake omitted authenticated binding")
+        snapshot_request = authenticated_desktop_bridge_request(
+            {
+                "version": 2,
+                "id": "snapshot",
+                "method": "snapshot",
+                "params": {},
+            },
+            binding,
+            session_secret,
+            1,
+        )
+        return _exchange_desktop_bridge_frame(process, snapshot_request)
+    finally:
+        if process.stdin is not None and not process.stdin.closed:
+            process.stdin.close()
+        try:
+            return_code = process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+            raise MatrixFailure("desktop bridge did not exit after stdin closed")
+        if return_code != 0:
+            stderr = process.stderr.read() if process.stderr is not None else ""
+            raise MatrixFailure(f"desktop bridge exited {return_code}: {stderr[-1000:]}")
+
+
 def run_agent_plugin_surface_parity(
     binary: Path,
     artifact_root: Path,
@@ -679,33 +842,12 @@ def run_agent_plugin_surface_parity(
     except ValueError as error:
         raise MatrixFailure("headless TUI returned invalid Agent Plugin count") from error
 
-    bridge_requests = "\n".join(
-        json.dumps(request)
-        for request in (
-            {"version": 2, "id": "handshake", "method": "handshake"},
-            {"version": 2, "id": "snapshot", "method": "snapshot"},
-        )
-    ) + "\n"
-    bridge = run_command(
-        [
-            binary,
-            "desktop",
-            "bridge",
-            "--fixture-root",
-            fixture_root,
-            "--home-root",
-            fixture_root,
-            "--project-root",
-            project_root,
-            "--app-state-root",
-            app_state_root,
-        ],
-        input_text=bridge_requests,
+    desktop_snapshot = desktop_bridge_snapshot(
+        binary,
+        fixture_root,
+        project_root,
+        app_state_root,
     )
-    bridge_responses = [json.loads(line) for line in bridge.stdout.splitlines()]
-    if len(bridge_responses) != 2 or bridge_responses[0].get("id") != "handshake":
-        raise MatrixFailure("desktop bridge Agent Plugin parity handshake failed")
-    desktop_snapshot = bridge_responses[1].get("result", {})
     assert_agent_plugin_payload_redacted(desktop_snapshot, "desktop bridge")
     desktop_contracts = agent_plugin_surface_contracts(
         desktop_snapshot.get("agentPlugins")

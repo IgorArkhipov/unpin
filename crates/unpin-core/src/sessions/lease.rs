@@ -14,15 +14,19 @@ use crate::{
     providers::ProviderId,
 };
 
-pub const SESSION_LEASE_SCHEMA_VERSION: u32 = 2;
+pub const SESSION_LEASE_STORE_SCHEMA_V2: u32 = 2;
+pub const SESSION_LEASE_STORE_SCHEMA_V3: u32 = 3;
+pub const SESSION_LEASE_SCHEMA_VERSION: u32 = SESSION_LEASE_STORE_SCHEMA_V3;
 pub const BOOTSTRAP_LIFETIME_SECONDS: i64 = 5 * 60;
 pub const MAX_SESSION_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 pub const SESSION_OVERLAY_MARKER: &str = ".unpin-overlay.json";
 const SECRET_BYTES: usize = 32;
 const SESSION_AUTHENTICATION_ALGORITHM: &str = "hmac-sha256";
 const BOOTSTRAP_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-bootstrap-v2\0";
-const LEASE_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-lease-v2\0";
+const LEASE_AUTHENTICATION_PURPOSE_V2: &[u8] = b"unpin-session-lease-v2\0";
+const LEASE_AUTHENTICATION_PURPOSE_V3: &[u8] = b"unpin-session-lease-v3\0";
 const LAUNCH_CONTROL_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-session-launch-control-v1\0";
+const RUNTIME_REGISTRATION_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-runtime-registration-v1\0";
 const INVENTORY_GROUP_AUTHENTICATION_PURPOSE: &[u8] =
     b"unpin-inventory-group-session-authority-v1\0";
 const REACH_AWARE_AUTHENTICATION_PURPOSE: &[u8] = b"unpin-reach-aware-operation-v2\0";
@@ -58,6 +62,16 @@ impl SessionAuthorityKey {
 
     pub fn verify_launch_control(&self, payload: &[u8], tag: &str) -> Result<(), String> {
         self.verify(LAUNCH_CONTROL_AUTHENTICATION_PURPOSE, payload, tag)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn authenticate_runtime_registration(&self, payload: &[u8]) -> Result<String, String> {
+        self.authenticate(RUNTIME_REGISTRATION_AUTHENTICATION_PURPOSE, payload)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn verify_runtime_registration(&self, payload: &[u8], tag: &str) -> Result<(), String> {
+        self.verify(RUNTIME_REGISTRATION_AUTHENTICATION_PURPOSE, payload, tag)
             .map_err(|error| error.to_string())
     }
 
@@ -102,6 +116,13 @@ impl SessionAuthorityKey {
         mac.update(payload);
         mac.verify_slice(&tag)
             .map_err(|_| LeaseValidationError::AuthenticationFailed)
+    }
+
+    pub(crate) fn authenticate_workflow_high_water(
+        &self,
+        payload: &[u8],
+    ) -> Result<String, LeaseValidationError> {
+        self.authenticate(b"unpin-session-workflow-high-water-v1\0", payload)
     }
 }
 
@@ -171,6 +192,57 @@ pub struct PinnedExposure {
     pub profile: PinnedProfile,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capability_locks: Option<Box<CapabilityLockSnapshot>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PinnedWorkflowEnvelope {
+    pub workflow_id: String,
+    pub workflow_revision: String,
+    pub baseline_profile_id: String,
+    pub baseline_profile_digest: String,
+    pub profile_revisions: std::collections::BTreeMap<String, String>,
+    pub active_mode: String,
+    pub active_effective_profile_digest: String,
+    pub maximum_envelope_digest: String,
+    pub capability_lock_digest: String,
+    pub catalog_revision: String,
+    pub proposal_id: String,
+    pub proposal_fingerprint: String,
+    pub state_sequence: u64,
+    pub sealed_generation: u64,
+}
+
+impl PinnedWorkflowEnvelope {
+    pub(crate) fn validate(&self) -> Result<(), LeaseValidationError> {
+        validate_identifier("workflow id", &self.workflow_id)?;
+        validate_identifier("baseline profile id", &self.baseline_profile_id)?;
+        validate_identifier("workflow mode", &self.active_mode)?;
+        validate_identifier("workflow proposal id", &self.proposal_id)?;
+        for (mode, digest) in &self.profile_revisions {
+            validate_identifier("workflow mode", mode)?;
+            validate_digest("workflow profile", digest)?;
+        }
+        for (label, digest) in [
+            ("workflow revision", &self.workflow_revision),
+            ("baseline profile", &self.baseline_profile_digest),
+            ("effective profile", &self.active_effective_profile_digest),
+            ("maximum envelope", &self.maximum_envelope_digest),
+            ("capability lock", &self.capability_lock_digest),
+            ("catalog revision", &self.catalog_revision),
+            ("proposal fingerprint", &self.proposal_fingerprint),
+        ] {
+            validate_digest(label, digest)?;
+        }
+        if self.profile_revisions.is_empty()
+            || !self.profile_revisions.contains_key(&self.active_mode)
+            || self.state_sequence == 0
+            || self.sealed_generation == 0
+        {
+            return Err(LeaseValidationError::InvalidWorkflowEnvelope);
+        }
+        Ok(())
+    }
 }
 
 impl PinnedExposure {
@@ -471,6 +543,8 @@ pub struct SessionLease {
     pub workspace_start_revision: Option<String>,
     pub last_workspace_revision: Option<String>,
     pub workspace_drifted: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<Box<PinnedWorkflowEnvelope>>,
     pub desired_exposure: PinnedExposure,
     pub observed_exposure: PinnedExposure,
     pub live_status: LiveExposureStatus,
@@ -496,21 +570,31 @@ pub struct SessionLease {
 }
 
 impl SessionLease {
+    #[must_use]
+    pub const fn store_schema_version(&self) -> u32 {
+        if self.workflow.is_some() {
+            SESSION_LEASE_STORE_SCHEMA_V3
+        } else {
+            SESSION_LEASE_STORE_SCHEMA_V2
+        }
+    }
+
     pub(crate) fn seal(
         &mut self,
         authority_key: &SessionAuthorityKey,
     ) -> Result<(), LeaseValidationError> {
         self.authentication_algorithm = SESSION_AUTHENTICATION_ALGORITHM.to_string();
         self.authority_key_id = authority_key.key_id();
-        let message = self.authentication_message()?;
+        let message = self.authentication_message_v3()?;
         self.authentication_tag =
-            authority_key.authenticate(LEASE_AUTHENTICATION_PURPOSE, &message)?;
+            authority_key.authenticate(LEASE_AUTHENTICATION_PURPOSE_V3, &message)?;
         Ok(())
     }
 
-    pub(crate) fn verify(
+    pub(crate) fn verify_for_store_schema(
         &self,
         authority_key: &SessionAuthorityKey,
+        store_schema_version: u32,
     ) -> Result<(), LeaseValidationError> {
         self.validate_shape()?;
         if self.authentication_algorithm != SESSION_AUTHENTICATION_ALGORITHM
@@ -518,12 +602,19 @@ impl SessionLease {
         {
             return Err(LeaseValidationError::AuthenticationFailed);
         }
-        let message = self.authentication_message()?;
-        authority_key.verify(
-            LEASE_AUTHENTICATION_PURPOSE,
-            &message,
-            &self.authentication_tag,
-        )
+        match store_schema_version {
+            SESSION_LEASE_STORE_SCHEMA_V2 => authority_key.verify(
+                LEASE_AUTHENTICATION_PURPOSE_V2,
+                &self.authentication_message_v2()?,
+                &self.authentication_tag,
+            ),
+            SESSION_LEASE_STORE_SCHEMA_V3 => authority_key.verify(
+                LEASE_AUTHENTICATION_PURPOSE_V3,
+                &self.authentication_message_v3()?,
+                &self.authentication_tag,
+            ),
+            _ => Err(LeaseValidationError::AuthenticationFailed),
+        }
     }
 
     pub(crate) fn verify_handle(&self, handle: &SessionHandle) -> Result<(), LeaseValidationError> {
@@ -552,6 +643,12 @@ impl SessionLease {
         }
         self.desired_exposure.validate()?;
         self.observed_exposure.validate()?;
+        if let Some(workflow) = &self.workflow {
+            workflow.validate()?;
+            if workflow.active_effective_profile_digest != self.desired_exposure.revision {
+                return Err(LeaseValidationError::InvalidWorkflowEnvelope);
+            }
+        }
         self.process.validate()?;
         self.coverage.validate()?;
         if self.isolation == IsolationLevel::Strict && !self.coverage.supports_strict_isolation() {
@@ -585,7 +682,18 @@ impl SessionLease {
                 LeaseValidationError::InvalidLeaseExpiry,
             )?;
         }
-        if self.lifecycle == LeaseLifecycle::Active && !self.admission_open {
+        if self.lifecycle == LeaseLifecycle::Active
+            && !self.admission_open
+            && !(self.workflow.is_some()
+                && self.desired_exposure != self.observed_exposure
+                && matches!(
+                    self.live_status,
+                    LiveExposureStatus::Configured
+                        | LiveExposureStatus::NotificationSent
+                        | LiveExposureStatus::ReloadRequired
+                ))
+            && !(self.workflow.is_some() && self.live_status == LiveExposureStatus::Unknown)
+        {
             return Err(LeaseValidationError::InvalidLifecycle);
         }
         if matches!(
@@ -600,7 +708,71 @@ impl SessionLease {
         Ok(())
     }
 
-    fn authentication_message(&self) -> Result<Vec<u8>, LeaseValidationError> {
+    fn authentication_message_v3(&self) -> Result<Vec<u8>, LeaseValidationError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct AuthenticationBody<'a> {
+            session_id: &'a str,
+            provider: ProviderId,
+            repository_key: &'a str,
+            workspace_key: &'a str,
+            workspace_start_revision: &'a Option<String>,
+            last_workspace_revision: &'a Option<String>,
+            workspace_drifted: bool,
+            workflow: &'a Option<Box<PinnedWorkflowEnvelope>>,
+            desired_exposure: &'a PinnedExposure,
+            observed_exposure: &'a PinnedExposure,
+            live_status: LiveExposureStatus,
+            process: &'a ProcessEvidence,
+            isolation: IsolationLevel,
+            coverage: &'a CoverageLevel,
+            protected_resources: &'a BTreeSet<String>,
+            lifecycle: LeaseLifecycle,
+            admission_open: bool,
+            in_flight_calls: u32,
+            in_flight_call_ids: &'a BTreeSet<String>,
+            heartbeat_at_unix: i64,
+            lease_expires_at_unix: i64,
+            connection_owner_id: &'a str,
+            closed_reason: &'a Option<String>,
+            connection_scope_digest: &'a str,
+            owner_secret_digest: &'a str,
+            authentication_algorithm: &'a str,
+            authority_key_id: &'a str,
+        }
+        serde_json::to_vec(&AuthenticationBody {
+            session_id: &self.session_id,
+            provider: self.provider,
+            repository_key: &self.repository_key,
+            workspace_key: &self.workspace_key,
+            workspace_start_revision: &self.workspace_start_revision,
+            last_workspace_revision: &self.last_workspace_revision,
+            workspace_drifted: self.workspace_drifted,
+            workflow: &self.workflow,
+            desired_exposure: &self.desired_exposure,
+            observed_exposure: &self.observed_exposure,
+            live_status: self.live_status,
+            process: &self.process,
+            isolation: self.isolation,
+            coverage: &self.coverage,
+            protected_resources: &self.protected_resources,
+            lifecycle: self.lifecycle,
+            admission_open: self.admission_open,
+            in_flight_calls: self.in_flight_calls,
+            in_flight_call_ids: &self.in_flight_call_ids,
+            heartbeat_at_unix: self.heartbeat_at_unix,
+            lease_expires_at_unix: self.lease_expires_at_unix,
+            connection_owner_id: &self.connection_owner_id,
+            closed_reason: &self.closed_reason,
+            connection_scope_digest: &self.connection_scope_digest,
+            owner_secret_digest: &self.owner_secret_digest,
+            authentication_algorithm: &self.authentication_algorithm,
+            authority_key_id: &self.authority_key_id,
+        })
+        .map_err(|error| LeaseValidationError::Serialization(error.to_string()))
+    }
+
+    fn authentication_message_v2(&self) -> Result<Vec<u8>, LeaseValidationError> {
         #[derive(Serialize)]
         #[serde(rename_all = "camelCase")]
         struct AuthenticationBody<'a> {
@@ -795,6 +967,7 @@ impl PendingBootstrap {
             workspace_start_revision: self.workspace_revision.clone(),
             last_workspace_revision: self.workspace_revision,
             workspace_drifted: false,
+            workflow: None,
             desired_exposure: self.exposure.clone(),
             observed_exposure: self.exposure,
             live_status: LiveExposureStatus::ObservedRefresh,
@@ -817,7 +990,7 @@ impl PendingBootstrap {
             authentication_tag: String::new(),
         };
         lease.seal(authority_key)?;
-        lease.verify(authority_key)?;
+        lease.verify_for_store_schema(authority_key, SESSION_LEASE_STORE_SCHEMA_V3)?;
         Ok(lease)
     }
 
@@ -881,13 +1054,33 @@ impl SessionRecord {
         }
     }
 
-    pub(crate) fn verify(
+    pub(crate) fn workflow_counters(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::Established { lease } => lease
+                .workflow
+                .as_ref()
+                .map(|workflow| (workflow.state_sequence, workflow.sealed_generation)),
+            Self::Pending { .. } => None,
+        }
+    }
+
+    pub(crate) fn lease_authentication_tag(&self) -> Result<&str, LeaseValidationError> {
+        match self {
+            Self::Established { lease } => Ok(&lease.authentication_tag),
+            Self::Pending { .. } => Err(LeaseValidationError::InvalidLifecycle),
+        }
+    }
+
+    pub(crate) fn verify_for_store_schema(
         &self,
         authority_key: &SessionAuthorityKey,
+        store_schema_version: u32,
     ) -> Result<(), LeaseValidationError> {
         match self {
             Self::Pending { claim } => claim.verify(authority_key),
-            Self::Established { lease } => lease.verify(authority_key),
+            Self::Established { lease } => {
+                lease.verify_for_store_schema(authority_key, store_schema_version)
+            }
         }
     }
 }
@@ -905,6 +1098,7 @@ pub(crate) enum LeaseValidationError {
     InvalidLeaseExpiry,
     InvalidBootstrapExpiry,
     InvalidLifecycle,
+    InvalidWorkflowEnvelope,
     OwnerAuthenticationFailed,
     AuthenticationFailed,
     Serialization(String),
@@ -928,6 +1122,9 @@ impl fmt::Display for LeaseValidationError {
             Self::InvalidLeaseExpiry => formatter.write_str("invalid session lease expiry"),
             Self::InvalidBootstrapExpiry => formatter.write_str("invalid bootstrap expiry"),
             Self::InvalidLifecycle => formatter.write_str("invalid session lease lifecycle"),
+            Self::InvalidWorkflowEnvelope => {
+                formatter.write_str("invalid pinned workflow envelope")
+            }
             Self::OwnerAuthenticationFailed => {
                 formatter.write_str("session owner authentication failed")
             }
@@ -1142,7 +1339,7 @@ mod tests {
         lease.lease_expires_at_unix = lease.heartbeat_at_unix + MAX_SESSION_LIFETIME_SECONDS + 1;
         lease.seal(&authority_key).unwrap();
         assert_eq!(
-            lease.verify(&authority_key),
+            lease.verify_for_store_schema(&authority_key, SESSION_LEASE_STORE_SCHEMA_V3),
             Err(LeaseValidationError::InvalidLeaseExpiry)
         );
     }

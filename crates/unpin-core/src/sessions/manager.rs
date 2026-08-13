@@ -29,12 +29,13 @@ use crate::{
 
 use super::lease::{
     BootstrapAuthority, BootstrapRequest, ConnectionClaim, LeaseLifecycle, LeaseValidationError,
-    LiveExposureStatus, PendingBootstrap, PinnedExposure, ProcessEvidence,
-    SESSION_LEASE_SCHEMA_VERSION, SESSION_OVERLAY_MARKER, SessionAuthorityKey, SessionHandle,
-    SessionLease, SessionRecord, constant_time_equal, digest_bytes, validate_identifier,
-    validate_workspace_revision,
+    LiveExposureStatus, PendingBootstrap, PinnedExposure, PinnedWorkflowEnvelope, ProcessEvidence,
+    SESSION_LEASE_SCHEMA_VERSION, SESSION_LEASE_STORE_SCHEMA_V2, SESSION_OVERLAY_MARKER,
+    SessionAuthorityKey, SessionHandle, SessionLease, SessionRecord, constant_time_equal,
+    digest_bytes, validate_identifier, validate_workspace_revision,
 };
 use super::mode::{GATEWAY_MODE_SCHEMA_VERSION, GatewayModeState, GatewayModeTarget};
+use super::{WorkflowHighWater, WorkflowHighWaterError, WorkflowHighWaterStore};
 
 pub const DEFAULT_STALE_AFTER_SECONDS: i64 = 30;
 
@@ -251,11 +252,11 @@ impl SessionManager {
         claim.validate().map_err(LeaseError::from)?;
         let store = self.store(authority.session_id());
         let preflight = store
-            .load::<SessionRecord>()?
+            .load_compatible::<SessionRecord>(&[SESSION_LEASE_STORE_SCHEMA_V2])?
             .ok_or(LeaseError::SessionNotFound)?;
         preflight
             .value
-            .verify(authority_key)
+            .verify_for_store_schema(authority_key, preflight.schema_version)
             .map_err(LeaseError::from)?;
         let protected_resources = match preflight.value {
             SessionRecord::Pending { claim } => claim.protected_resources,
@@ -267,11 +268,11 @@ impl SessionManager {
             self.acquire_transition_admission(protected_resources.iter().map(String::as_str))?;
         let _registry = self.registry_lock()?;
         let snapshot = store
-            .load::<SessionRecord>()?
+            .load_compatible::<SessionRecord>(&[SESSION_LEASE_STORE_SCHEMA_V2])?
             .ok_or(LeaseError::SessionNotFound)?;
         snapshot
             .value
-            .verify(authority_key)
+            .verify_for_store_schema(authority_key, snapshot.schema_version)
             .map_err(LeaseError::from)?;
         let pending = match snapshot.value {
             SessionRecord::Pending { claim } => *claim,
@@ -321,13 +322,24 @@ impl SessionManager {
             .generation
             .checked_add(1)
             .ok_or(LeaseError::OwnerGenerationOverflow)?;
-        let revision = match store.compare_and_swap(
-            Some(&snapshot.revision),
-            OwnerGeneration::new(claim.connection_owner_id.clone(), owner_generation)?,
-            &SessionRecord::Established {
-                lease: Box::new(lease.clone()),
-            },
-        ) {
+        let established = SessionRecord::Established {
+            lease: Box::new(lease.clone()),
+        };
+        let claimed = if snapshot.schema_version == SESSION_LEASE_SCHEMA_VERSION {
+            store.compare_and_swap(
+                Some(&snapshot.revision),
+                OwnerGeneration::new(claim.connection_owner_id.clone(), owner_generation)?,
+                &established,
+            )
+        } else {
+            store.compare_and_swap_migrating_schema(
+                &snapshot.revision,
+                snapshot.schema_version,
+                OwnerGeneration::new(claim.connection_owner_id.clone(), owner_generation)?,
+                &established,
+            )
+        };
+        let revision = match claimed {
             Ok(revision) => revision,
             Err(StateError::StaleRevision { .. }) => {
                 return Err(LeaseError::BootstrapAlreadyConsumed);
@@ -345,11 +357,11 @@ impl SessionManager {
         let _registry = self.registry_lock()?;
         let store = self.store(authority.session_id());
         let snapshot = store
-            .load::<SessionRecord>()?
+            .load_compatible::<SessionRecord>(&[SESSION_LEASE_STORE_SCHEMA_V2])?
             .ok_or(LeaseError::SessionNotFound)?;
         snapshot
             .value
-            .verify(authority_key)
+            .verify_for_store_schema(authority_key, snapshot.schema_version)
             .map_err(LeaseError::from)?;
         match snapshot.value {
             SessionRecord::Pending { claim } => {
@@ -359,7 +371,10 @@ impl SessionManager {
                 ) {
                     return Err(LeaseError::BootstrapAuthenticationFailed);
                 }
-                store.remove_if_revision(&snapshot.revision)?;
+                store.remove_if_revision_compatible(
+                    &snapshot.revision,
+                    &[SESSION_LEASE_STORE_SCHEMA_V2],
+                )?;
                 Ok(())
             }
             SessionRecord::Established { .. } => Err(LeaseError::BootstrapAlreadyConsumed),
@@ -367,12 +382,27 @@ impl SessionManager {
     }
 
     pub fn list(&self) -> Result<Vec<LeaseSnapshot>, LeaseError> {
+        self.authority_key()?;
+        let leases_directory = get_session_leases_dir(&self.app_state_root);
+        match fs::symlink_metadata(&leases_directory) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Ok(_) => {}
+            Err(error) => return Err(state_io_error(&leases_directory, error)),
+        }
         let _registry = self.registry_lock()?;
         self.list_unlocked()
     }
 
     pub fn load_for_handle(&self, handle: &SessionHandle) -> Result<LeaseSnapshot, LeaseError> {
-        let snapshot = self.load_established(handle.session_id())?;
+        let _registry = self.registry_lock()?;
+        self.load_for_handle_unlocked(handle)
+    }
+
+    pub(crate) fn load_for_handle_unlocked(
+        &self,
+        handle: &SessionHandle,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        let snapshot = self.load_established_unlocked(handle.session_id())?;
         snapshot
             .lease
             .verify_handle(handle)
@@ -417,6 +447,170 @@ impl SessionManager {
         })
     }
 
+    /// Pins the confirmed workflow to the real established session. Later
+    /// definition edits cannot alter this immutable envelope.
+    pub fn pin_workflow(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        workflow: PinnedWorkflowEnvelope,
+        exposure: PinnedExposure,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        workflow.validate().map_err(LeaseError::from)?;
+        exposure.validate().map_err(LeaseError::from)?;
+        if workflow.active_effective_profile_digest != exposure.revision {
+            return Err(LeaseError::InvalidState(
+                "workflow effective exposure does not match pinned exposure".to_string(),
+            ));
+        }
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            if lease.workflow.is_some() {
+                return Err(LeaseError::WorkflowAlreadyPinned);
+            }
+            lease.workflow = Some(Box::new(workflow));
+            lease.desired_exposure = exposure.clone();
+            lease.observed_exposure = exposure;
+            lease.live_status = LiveExposureStatus::ObservedRefresh;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn update_workflow_mode(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        target_mode: &str,
+        exposure: PinnedExposure,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        validate_identifier("workflow mode", target_mode).map_err(LeaseError::from)?;
+        exposure.validate().map_err(LeaseError::from)?;
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            let workflow = lease
+                .workflow
+                .as_mut()
+                .ok_or(LeaseError::WorkflowNotPinned)?;
+            if workflow.profile_revisions.get(target_mode) != Some(&exposure.revision) {
+                return Err(LeaseError::WorkflowExpansionRequiresReview);
+            }
+            workflow.active_mode = target_mode.to_string();
+            workflow.active_effective_profile_digest = exposure.revision.clone();
+            workflow.state_sequence = workflow
+                .state_sequence
+                .checked_add(1)
+                .ok_or(LeaseError::OwnerGenerationOverflow)?;
+            lease.desired_exposure = exposure;
+            lease.live_status = LiveExposureStatus::Configured;
+            lease.admission_open = false;
+            Ok(())
+        })
+    }
+
+    /// Keep the current observed exposure callable when the host can only
+    /// apply a requested workflow mode to a future session. The transition
+    /// remains journaled and cancellable, but the live lease stays pinned to
+    /// the current mode and exposure.
+    pub(crate) fn defer_workflow_mode_to_next_session(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        observed_mode: &str,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        validate_identifier("workflow mode", observed_mode).map_err(LeaseError::from)?;
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            let workflow = lease
+                .workflow
+                .as_mut()
+                .ok_or(LeaseError::WorkflowNotPinned)?;
+            if workflow.profile_revisions.get(observed_mode)
+                != Some(&lease.observed_exposure.revision)
+            {
+                return Err(LeaseError::InvalidState(
+                    "observed workflow mode does not match current exposure".to_string(),
+                ));
+            }
+            workflow.active_mode = observed_mode.to_string();
+            workflow.active_effective_profile_digest = lease.observed_exposure.revision.clone();
+            workflow.state_sequence = workflow
+                .state_sequence
+                .checked_add(1)
+                .ok_or(LeaseError::OwnerGenerationOverflow)?;
+            lease.desired_exposure = lease.observed_exposure.clone();
+            lease.live_status = LiveExposureStatus::NextSessionOnly;
+            lease.admission_open = true;
+            Ok(())
+        })
+    }
+
+    pub(crate) fn cancel_workflow_transition(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        observed_mode: &str,
+        observed_exposure: PinnedExposure,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            let workflow = lease
+                .workflow
+                .as_mut()
+                .ok_or(LeaseError::WorkflowNotPinned)?;
+            workflow.active_mode = observed_mode.to_string();
+            workflow.active_effective_profile_digest = observed_exposure.revision.clone();
+            workflow.state_sequence = workflow
+                .state_sequence
+                .checked_add(1)
+                .ok_or(LeaseError::OwnerGenerationOverflow)?;
+            lease.observed_exposure = observed_exposure.clone();
+            lease.desired_exposure = observed_exposure;
+            lease.live_status = LiveExposureStatus::ObservedRefresh;
+            lease.admission_open = true;
+            Ok(())
+        })
+    }
+
+    /// Restore the currently observed exposure after cancelling a direct
+    /// gateway refresh. Unlike `request_exposure`, this closes the durable
+    /// transition by reopening admission and recording an observed state.
+    pub(crate) fn restore_observed_exposure(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            lease.desired_exposure = lease.observed_exposure.clone();
+            lease.live_status = LiveExposureStatus::ObservedRefresh;
+            lease.admission_open = true;
+            Ok(())
+        })
+    }
+
+    /// Quarantine a workflow observation whose journal terminalization could
+    /// not be completed or rolled back. Desired and observed exposure remain
+    /// authenticated, but admission is closed and the unknown status forces
+    /// an explicit owner recovery instead of serving a partially reconciled
+    /// projection.
+    pub(crate) fn quarantine_workflow_observation(
+        &self,
+        handle: &SessionHandle,
+        expected: &StateRevision,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, LeaseError> {
+        self.update_owned_lease(handle, expected, now_unix, |lease| {
+            require_active(lease)?;
+            lease.live_status = LiveExposureStatus::Unknown;
+            lease.admission_open = false;
+            Ok(())
+        })
+    }
+
     pub fn observe_exposure(
         &self,
         handle: &SessionHandle,
@@ -438,6 +632,10 @@ impl SessionManager {
             require_active(lease)?;
             if status == LiveExposureStatus::ObservedRefresh {
                 lease.observed_exposure = lease.desired_exposure.clone();
+                lease.admission_open = true;
+            } else if status == LiveExposureStatus::NextSessionOnly {
+                lease.desired_exposure = lease.observed_exposure.clone();
+                lease.admission_open = true;
             }
             lease.live_status = status;
             Ok(())
@@ -469,7 +667,7 @@ impl SessionManager {
         now_unix: i64,
     ) -> Result<LeaseSnapshot, LeaseError> {
         let _registry = self.registry_lock()?;
-        let loaded = self.load_for_handle(handle)?;
+        let loaded = self.load_for_handle_unlocked(handle)?;
         if loaded.lease.lease_expires_at_unix <= now_unix {
             return Err(LeaseError::LeaseExpired);
         }
@@ -594,7 +792,7 @@ impl SessionManager {
     ) -> Result<(), LeaseError> {
         validate_identifier("close reason", reason).map_err(LeaseError::from)?;
         let _registry = self.registry_lock()?;
-        let current = self.load_for_handle(handle)?;
+        let current = self.load_for_handle_unlocked(handle)?;
         if &current.revision != expected {
             return Err(LeaseError::State(StateError::StaleRevision {
                 expected: Some(expected.clone()),
@@ -627,7 +825,7 @@ impl SessionManager {
         validate_identifier("session id", session_id).map_err(LeaseError::from)?;
         validate_identifier("session revoke reason", reason).map_err(LeaseError::from)?;
         let _registry = self.registry_lock()?;
-        let current = self.load_established(session_id)?;
+        let current = self.load_established_unlocked(session_id)?;
         if &current.revision != expected {
             return Err(LeaseError::State(StateError::StaleRevision {
                 expected: Some(expected.clone()),
@@ -662,7 +860,10 @@ impl SessionManager {
             {
                 self.cleanup_overlay(&claim.session_id)?;
                 self.store(&claim.session_id)
-                    .remove_if_revision(&snapshot.revision)?;
+                    .remove_if_revision_compatible(
+                        &snapshot.revision,
+                        &[SESSION_LEASE_STORE_SCHEMA_V2],
+                    )?;
             }
         }
         let mut expired = Vec::new();
@@ -793,7 +994,9 @@ impl SessionManager {
         let mut leases = Vec::new();
         for snapshot in self.scan_records()? {
             if let SessionRecord::Established { lease } = snapshot.value {
-                lease.verify(authority_key).map_err(LeaseError::from)?;
+                lease
+                    .verify_for_store_schema(authority_key, snapshot.schema_version)
+                    .map_err(LeaseError::from)?;
                 leases.push(LeaseSnapshot {
                     revision: snapshot.revision,
                     lease: *lease,
@@ -859,7 +1062,7 @@ impl SessionManager {
         F: FnOnce(&mut SessionLease) -> Result<(), LeaseError>,
     {
         let _registry = self.registry_lock()?;
-        let loaded = self.load_established(handle.session_id())?;
+        let loaded = self.load_established_unlocked(handle.session_id())?;
         loaded
             .lease
             .verify_handle(handle)
@@ -890,11 +1093,11 @@ impl SessionManager {
         validate_identifier("state actor", actor_id).map_err(LeaseError::from)?;
         let store = self.store(session_id);
         let snapshot = store
-            .load::<SessionRecord>()?
+            .load_compatible::<SessionRecord>(&[SESSION_LEASE_STORE_SCHEMA_V2])?
             .ok_or(LeaseError::SessionNotFound)?;
         snapshot
             .value
-            .verify(authority_key)
+            .verify_for_store_schema(authority_key, snapshot.schema_version)
             .map_err(LeaseError::from)?;
         if &snapshot.revision != expected {
             return Err(LeaseError::State(StateError::StaleRevision {
@@ -902,25 +1105,102 @@ impl SessionManager {
                 actual: Some(snapshot.revision),
             }));
         }
+        let source_workflow_counters = snapshot.value.workflow_counters();
+        let source_lease_authentication_tag =
+            snapshot.value.lease_authentication_tag()?.to_string();
         let mut lease = match snapshot.value {
             SessionRecord::Established { lease } => *lease,
             SessionRecord::Pending { .. } => return Err(LeaseError::BootstrapNotConsumed),
         };
         mutation(&mut lease)?;
         lease.seal(authority_key).map_err(LeaseError::from)?;
-        lease.verify(authority_key).map_err(LeaseError::from)?;
+        lease
+            .verify_for_store_schema(authority_key, SESSION_LEASE_SCHEMA_VERSION)
+            .map_err(LeaseError::from)?;
         let generation = snapshot
             .owner
             .generation
             .checked_add(1)
             .ok_or(LeaseError::OwnerGenerationOverflow)?;
-        let revision = store.compare_and_swap(
-            Some(expected),
-            OwnerGeneration::new(actor_id, generation)?,
-            &SessionRecord::Established {
-                lease: Box::new(lease.clone()),
-            },
-        )?;
+        let owner = OwnerGeneration::new(actor_id, generation)?;
+        let record = SessionRecord::Established {
+            lease: Box::new(lease.clone()),
+        };
+        let pending_high_water = if let Some(workflow) = &lease.workflow {
+            let high_water_store = self.high_water_store()?;
+            let current = high_water_store.load(session_id)?;
+            let (expected_high_water_revision, high_water_owner, base) =
+                if let Some(current) = current {
+                    let Some((source_state_sequence, source_sealed_generation)) =
+                        source_workflow_counters
+                    else {
+                        return Err(LeaseError::WorkflowRecoveryRequired);
+                    };
+                    if current.value.pending.is_some()
+                        || snapshot.schema_version != current.value.lease_schema_version
+                        || source_state_sequence != current.value.state_sequence
+                        || source_sealed_generation != current.value.sealed_generation
+                        || !constant_time_equal(
+                            source_lease_authentication_tag.as_bytes(),
+                            current.value.lease_authentication_tag.as_bytes(),
+                        )
+                    {
+                        return Err(LeaseError::WorkflowRecoveryRequired);
+                    }
+                    (Some(current.revision), current.owner, current.value)
+                } else {
+                    if source_workflow_counters.is_some() {
+                        return Err(LeaseError::WorkflowHighWaterMissing);
+                    }
+                    (
+                        None,
+                        owner.clone(),
+                        WorkflowHighWater::new(
+                            session_id,
+                            snapshot.schema_version,
+                            workflow.state_sequence,
+                            workflow.sealed_generation,
+                            &source_lease_authentication_tag,
+                        )?,
+                    )
+                };
+            let pending = base.prepare_transition(
+                snapshot.revision.clone(),
+                source_lease_authentication_tag,
+                SESSION_LEASE_SCHEMA_VERSION,
+                workflow.state_sequence,
+                workflow.sealed_generation,
+                lease.authentication_tag.clone(),
+            )?;
+            let revision = high_water_store.publish(
+                session_id,
+                expected_high_water_revision.as_ref(),
+                high_water_owner,
+                pending.clone(),
+            )?;
+            Some((revision, pending))
+        } else {
+            None
+        };
+        let revision = if snapshot.schema_version == SESSION_LEASE_SCHEMA_VERSION {
+            store.compare_and_swap(Some(expected), owner, &record)?
+        } else {
+            store.compare_and_swap_migrating_schema(
+                expected,
+                snapshot.schema_version,
+                owner,
+                &record,
+            )?
+        };
+        if let Some((pending_revision, pending_high_water)) = pending_high_water {
+            let high_water_store = self.high_water_store()?;
+            high_water_store.publish(
+                session_id,
+                Some(&pending_revision),
+                OwnerGeneration::new(actor_id, generation)?,
+                pending_high_water.finalized_target()?,
+            )?;
+        }
         Ok(LeaseSnapshot { revision, lease })
     }
 
@@ -976,25 +1256,32 @@ impl SessionManager {
         )
     }
 
-    fn load_established(&self, session_id: &str) -> Result<LeaseSnapshot, LeaseError> {
+    fn load_established_unlocked(&self, session_id: &str) -> Result<LeaseSnapshot, LeaseError> {
         let authority_key = self.authority_key()?;
         validate_identifier("session id", session_id).map_err(LeaseError::from)?;
         let snapshot = self
             .store(session_id)
-            .load::<SessionRecord>()?
+            .load_compatible::<SessionRecord>(&[SESSION_LEASE_STORE_SCHEMA_V2])?
             .ok_or(LeaseError::SessionNotFound)?;
         snapshot
             .value
-            .verify(authority_key)
+            .verify_for_store_schema(authority_key, snapshot.schema_version)
             .map_err(LeaseError::from)?;
         if snapshot.value.session_id() != session_id {
             return Err(LeaseError::SessionPathMismatch);
         }
         match snapshot.value {
-            SessionRecord::Established { lease } => Ok(LeaseSnapshot {
-                revision: snapshot.revision,
-                lease: *lease,
-            }),
+            SessionRecord::Established { lease } => {
+                self.reconcile_lease_high_water(
+                    snapshot.schema_version,
+                    &lease,
+                    &snapshot.revision,
+                )?;
+                Ok(LeaseSnapshot {
+                    revision: snapshot.revision,
+                    lease: *lease,
+                })
+            }
             SessionRecord::Pending { .. } => Err(LeaseError::BootstrapNotConsumed),
         }
     }
@@ -1034,12 +1321,19 @@ impl SessionManager {
             };
             let store = AtomicJsonStore::new(entry.path(), SESSION_LEASE_SCHEMA_VERSION);
             let snapshot = store
-                .load::<SessionRecord>()?
+                .load_compatible::<SessionRecord>(&[SESSION_LEASE_STORE_SCHEMA_V2])?
                 .ok_or(LeaseError::SessionNotFound)?;
             snapshot
                 .value
-                .verify(authority_key)
+                .verify_for_store_schema(authority_key, snapshot.schema_version)
                 .map_err(LeaseError::from)?;
+            if let SessionRecord::Established { lease } = &snapshot.value {
+                self.reconcile_lease_high_water(
+                    snapshot.schema_version,
+                    lease,
+                    &snapshot.revision,
+                )?;
+            }
             let expected_name = crate::encode_path_segment(snapshot.value.session_id());
             if expected_name != encoded_id {
                 return Err(LeaseError::SessionPathMismatch);
@@ -1115,6 +1409,119 @@ impl SessionManager {
             get_session_lease_path(&self.app_state_root, session_id),
             SESSION_LEASE_SCHEMA_VERSION,
         )
+    }
+
+    fn high_water_store(&self) -> Result<WorkflowHighWaterStore, LeaseError> {
+        Ok(WorkflowHighWaterStore::with_authority_key(
+            &self.app_state_root,
+            self.authority_key()?.clone(),
+        ))
+    }
+
+    fn reconcile_lease_high_water(
+        &self,
+        store_schema_version: u32,
+        lease: &SessionLease,
+        lease_revision: &StateRevision,
+    ) -> Result<(), LeaseError> {
+        let high_water_store = self.high_water_store()?;
+        let Some(workflow) = &lease.workflow else {
+            loop {
+                let Some(current) = high_water_store.load(&lease.session_id)? else {
+                    return Ok(());
+                };
+                let Some(pending) = current.value.pending.as_deref() else {
+                    return Err(LeaseError::WorkflowReplay);
+                };
+                if pending.source_lease_revision != *lease_revision
+                    || !constant_time_equal(
+                        pending.source_lease_authentication_tag.as_bytes(),
+                        lease.authentication_tag.as_bytes(),
+                    )
+                {
+                    return Err(LeaseError::WorkflowRecoveryRequired);
+                }
+                match high_water_store.remove_if_revision(&lease.session_id, &current.revision) {
+                    Ok(()) => return Ok(()),
+                    Err(WorkflowHighWaterError::State(StateError::StaleRevision { .. })) => {
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+        };
+        loop {
+            let current = high_water_store
+                .load(&lease.session_id)?
+                .ok_or(LeaseError::WorkflowHighWaterMissing)?;
+            if let Some(pending) = current.value.pending.as_deref() {
+                if pending.target_lease_schema_version == store_schema_version
+                    && pending.target_state_sequence == workflow.state_sequence
+                    && pending.target_sealed_generation == workflow.sealed_generation
+                    && constant_time_equal(
+                        pending.target_lease_authentication_tag.as_bytes(),
+                        lease.authentication_tag.as_bytes(),
+                    )
+                {
+                    match high_water_store.publish(
+                        &lease.session_id,
+                        Some(&current.revision),
+                        current.owner,
+                        current.value.finalized_target()?,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(WorkflowHighWaterError::State(StateError::StaleRevision {
+                            ..
+                        })) => {
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                if pending.source_lease_revision == *lease_revision
+                    && constant_time_equal(
+                        pending.source_lease_authentication_tag.as_bytes(),
+                        lease.authentication_tag.as_bytes(),
+                    )
+                    && current.value.lease_schema_version == store_schema_version
+                    && current.value.state_sequence == workflow.state_sequence
+                    && current.value.sealed_generation == workflow.sealed_generation
+                    && constant_time_equal(
+                        current.value.lease_authentication_tag.as_bytes(),
+                        lease.authentication_tag.as_bytes(),
+                    )
+                {
+                    let mut cleared = current.value.clone();
+                    cleared.pending = None;
+                    match high_water_store.publish(
+                        &lease.session_id,
+                        Some(&current.revision),
+                        current.owner,
+                        cleared,
+                    ) {
+                        Ok(_) => return Ok(()),
+                        Err(WorkflowHighWaterError::State(StateError::StaleRevision {
+                            ..
+                        })) => {
+                            continue;
+                        }
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                return Err(LeaseError::WorkflowRecoveryRequired);
+            }
+            if current.value.lease_schema_version == store_schema_version
+                && current.value.state_sequence == workflow.state_sequence
+                && current.value.sealed_generation == workflow.sealed_generation
+                && constant_time_equal(
+                    current.value.lease_authentication_tag.as_bytes(),
+                    lease.authentication_tag.as_bytes(),
+                )
+            {
+                return Ok(());
+            }
+            return Err(LeaseError::WorkflowReplay);
+        }
     }
 
     fn authority_key(&self) -> Result<&SessionAuthorityKey, LeaseError> {
@@ -1247,6 +1654,12 @@ pub enum LeaseError {
     InFlightOverflow,
     SessionDraining,
     OwnerGenerationOverflow,
+    WorkflowAlreadyPinned,
+    WorkflowNotPinned,
+    WorkflowExpansionRequiresReview,
+    WorkflowHighWaterMissing,
+    WorkflowRecoveryRequired,
+    WorkflowReplay,
     SecureRandomUnavailable,
     ProcessInspection(String),
     ProcessNotRunning(u32),
@@ -1270,6 +1683,18 @@ impl From<LeaseValidationError> for LeaseError {
             LeaseValidationError::InvalidProcessEvidence => Self::InvalidProcessEvidence,
             other => Self::InvalidState(other.to_string()),
         }
+    }
+}
+
+impl From<WorkflowHighWaterError> for LeaseError {
+    fn from(error: WorkflowHighWaterError) -> Self {
+        Self::InvalidState(error.to_string())
+    }
+}
+
+impl From<super::WorkflowRouterError> for LeaseError {
+    fn from(error: super::WorkflowRouterError) -> Self {
+        Self::InvalidState(error.to_string())
     }
 }
 
@@ -1323,6 +1748,18 @@ impl fmt::Display for LeaseError {
             Self::InFlightOverflow => formatter.write_str("in-flight call counter overflow"),
             Self::SessionDraining => formatter.write_str("session still has in-flight calls"),
             Self::OwnerGenerationOverflow => formatter.write_str("session owner generation overflow"),
+            Self::WorkflowAlreadyPinned => formatter.write_str("session workflow is already pinned"),
+            Self::WorkflowNotPinned => formatter.write_str("session workflow is not pinned"),
+            Self::WorkflowExpansionRequiresReview => {
+                formatter.write_str("workflow expansion requires operator review")
+            }
+            Self::WorkflowHighWaterMissing => {
+                formatter.write_str("workflow high-water record is missing")
+            }
+            Self::WorkflowRecoveryRequired => {
+                formatter.write_str("workflow transition recovery is required")
+            }
+            Self::WorkflowReplay => formatter.write_str("workflow state replay rejected"),
             Self::SecureRandomUnavailable => formatter.write_str("secure OS randomness unavailable"),
             Self::ProcessInspection(message) => write!(formatter, "process inspection failed: {message}"),
             Self::ProcessNotRunning(pid) => write!(formatter, "process {pid} is not running"),

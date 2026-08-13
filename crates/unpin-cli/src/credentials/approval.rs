@@ -6,6 +6,7 @@ use std::io::Write;
 use std::{
     fs::OpenOptions,
     io::{self, IsTerminal, Read},
+    os::fd::{FromRawFd, RawFd},
 };
 
 use unpin_core::{
@@ -143,6 +144,79 @@ pub(crate) fn authorize_reviewed_control_decision(
         OwnerGeneration::new(actor_id, 1).map_err(|error| error.to_string())?,
     )
     .map_err(|error| error.to_string())
+}
+
+/// Consume a signed operator approval receipt from an already-open descriptor.
+///
+/// The descriptor number is only a handle to a secret supplied out-of-band by
+/// the operator; the receipt itself is never accepted from argv, environment,
+/// stdin, or a path. The core approval nonce ledger provides the durable
+/// single-use/retry boundary after the receipt is verified against the exact
+/// reviewed operation and context.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn authorize_operator_descriptor(
+    fixture_mode: bool,
+    app_state_root: &Path,
+    expectation: &ApprovalExpectation,
+    plan_fingerprint: &str,
+    reviewed_fingerprint: Option<&str>,
+    actor_id: &str,
+    now_unix: i64,
+    descriptor: i32,
+) -> Result<ControlAuthorization, String> {
+    validate_human_approval_request(expectation, plan_fingerprint, reviewed_fingerprint)
+        .map_err(|_| "approval-principal-unverified".to_string())?;
+    let receipt = read_operator_receipt(descriptor)?;
+    let canonical_fixture_root = if fixture_mode {
+        Some(
+            canonical_fixture_scope_path(app_state_root)
+                .map_err(|_| "approval-principal-unverified".to_string())?,
+        )
+    } else {
+        None
+    };
+    let approval_state_root = canonical_fixture_root.as_deref().unwrap_or(app_state_root);
+    let key = resolve_approval_key(fixture_mode, approval_state_root)
+        .map_err(|_| "approval-principal-unverified".to_string())?
+        .ok_or_else(|| "approval-principal-unverified".to_string())?;
+    let verifier = ApprovalVerifier::new(key);
+    authorize_control(
+        approval_state_root,
+        &receipt,
+        &verifier,
+        expectation,
+        now_unix,
+        OwnerGeneration::new(actor_id, 1)
+            .map_err(|_| "approval-principal-unverified".to_string())?,
+    )
+    .map_err(|_| "approval-principal-unverified".to_string())
+}
+
+#[cfg(unix)]
+fn read_operator_receipt(descriptor: i32) -> Result<ApprovalReceipt, String> {
+    const MAX_OPERATOR_RECEIPT_BYTES: usize = 128 * 1024;
+    if descriptor <= 2 {
+        return Err("approval-principal-unverified".to_string());
+    }
+    let raw_fd =
+        RawFd::try_from(descriptor).map_err(|_| "approval-principal-unverified".to_string())?;
+    // SAFETY: ownership is transferred exactly once for this short-lived
+    // credential read; dropping the File closes the supplied descriptor.
+    let mut file = unsafe { std::fs::File::from_raw_fd(raw_fd) };
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take((MAX_OPERATOR_RECEIPT_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| "approval-principal-unverified".to_string())?;
+    if bytes.len() > MAX_OPERATOR_RECEIPT_BYTES {
+        return Err("approval-principal-unverified".to_string());
+    }
+    serde_json::from_slice(&bytes).map_err(|_| "approval-principal-unverified".to_string())
+}
+
+#[cfg(not(unix))]
+fn read_operator_receipt(_descriptor: i32) -> Result<ApprovalReceipt, String> {
+    Err("approval-principal-unverified".to_string())
 }
 
 pub(crate) fn authorize_desktop_control_decision(
@@ -1124,6 +1198,102 @@ mod tests {
         assert_eq!(
             approval.receipt().claims.expires_at_unix - approval.receipt().claims.issued_at_unix,
             300
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn operator_receipt_descriptor_is_external_and_single_use() {
+        use std::{
+            io::{Seek, SeekFrom},
+            os::fd::IntoRawFd,
+        };
+
+        let temp = tempfile::tempdir().expect("operator fixture tempdir");
+        let app_state_root = std::fs::canonicalize(temp.path()).expect("canonical tempdir");
+        let expectation = approval_expectation();
+        let plan_fingerprint = expectation.effect_graph_digest.clone();
+        let operator_key = fixture_approval_key(&app_state_root).expect("fixture approval key");
+        let approval = issue_human_approval_with(
+            &expectation,
+            &plan_fingerprint,
+            Some(&plan_fingerprint),
+            2_000_000_000,
+            &FixtureHumanPresence,
+            || Ok(Some(operator_key.clone())),
+            || Ok("operator-receipt".to_string()),
+        )
+        .expect("operator receipt");
+        let receipt_bytes = serde_json::to_vec(approval.receipt()).expect("receipt JSON");
+
+        let descriptor = || {
+            let mut file = tempfile::tempfile().expect("receipt descriptor");
+            file.write_all(&receipt_bytes).expect("receipt bytes");
+            file.seek(SeekFrom::Start(0)).expect("receipt seek");
+            file.into_raw_fd()
+        };
+
+        assert_eq!(
+            read_operator_receipt(0).expect_err("stdio must be rejected"),
+            "approval-principal-unverified"
+        );
+        assert!(
+            authorize_operator_descriptor(
+                true,
+                &app_state_root,
+                &expectation,
+                &plan_fingerprint,
+                Some(&plan_fingerprint),
+                "operator-descriptor-test",
+                2_000_000_000,
+                descriptor(),
+            )
+            .is_ok()
+        );
+
+        let mut replay_claims = approval.receipt().claims.clone();
+        replay_claims.receipt_id = "operator-replay".to_string();
+        replay_claims.operation_id = "operator-replay-operation".to_string();
+        let replay_receipt = ApprovalIssuer::new(
+            operator_key,
+            unpin_core::approval::CONTROL_APPROVAL_ISSUER,
+            unpin_core::approval::CONTROL_APPROVAL_AUDIENCE,
+        )
+        .expect("replay issuer")
+        .issue(replay_claims)
+        .expect("replay receipt");
+        let mut replay_expectation = expectation.clone();
+        replay_expectation.operation_id = "operator-replay-operation".to_string();
+        let replay_bytes = serde_json::to_vec(&replay_receipt).expect("replay receipt JSON");
+        let mut replay_file = tempfile::tempfile().expect("replay descriptor");
+        replay_file
+            .write_all(&replay_bytes)
+            .expect("replay receipt bytes");
+        replay_file.seek(SeekFrom::Start(0)).expect("replay seek");
+        assert_eq!(
+            authorize_operator_descriptor(
+                true,
+                &app_state_root,
+                &replay_expectation,
+                &plan_fingerprint,
+                Some(&plan_fingerprint),
+                "operator-descriptor-test",
+                2_000_000_000,
+                replay_file.into_raw_fd(),
+            )
+            .expect_err("receipt nonce must not cross operations"),
+            "approval-principal-unverified"
+        );
+
+        let mut oversized = tempfile::tempfile().expect("oversized descriptor");
+        oversized
+            .write_all(&vec![b' '; 128 * 1024 + 1])
+            .expect("oversized receipt bytes");
+        oversized.seek(SeekFrom::Start(0)).expect("oversized seek");
+        assert_eq!(
+            read_operator_receipt(oversized.into_raw_fd())
+                .expect_err("oversized receipts must be rejected"),
+            "approval-principal-unverified"
         );
     }
 

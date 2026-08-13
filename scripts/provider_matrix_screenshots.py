@@ -65,6 +65,7 @@ DASHBOARD_SECTION_IDS = (
     "provider-opencode",
     "provider-zed",
     "mcp-states",
+    "workflow-routing",
 )
 SCREENSHOT_SECTION_IDS = (
     *DASHBOARD_SECTION_IDS,
@@ -203,16 +204,19 @@ def run_xcode_capture(
     runner=subprocess.run,
 ) -> None:
     section_metadata = [section._asdict() for section in SCREENSHOT_SECTIONS]
-    capture_environment = {
-        "UNPIN_PROVIDER_MATRIX_DASHBOARD": str(dashboard_path),
-        "UNPIN_PROVIDER_MATRIX_SCREENSHOTS_DIR": str(output_root),
-        "UNPIN_PROVIDER_MATRIX_SECTIONS": json.dumps(section_metadata),
-    }
-    environment = os.environ.copy()
-    environment.update(capture_environment)
-
     with tempfile.TemporaryDirectory(prefix="unpin-provider-matrix-xcode-") as temporary:
         derived_data = Path(temporary)
+        staged_dashboard_path = derived_data / "dashboard.html"
+        staged_output_root = derived_data / "screenshots"
+        shutil.copyfile(dashboard_path, staged_dashboard_path)
+        staged_output_root.mkdir(mode=0o700)
+        capture_environment = {
+            "UNPIN_PROVIDER_MATRIX_DASHBOARD": str(staged_dashboard_path),
+            "UNPIN_PROVIDER_MATRIX_SCREENSHOTS_DIR": str(staged_output_root),
+            "UNPIN_PROVIDER_MATRIX_SECTIONS": json.dumps(section_metadata),
+        }
+        environment = os.environ.copy()
+        environment.update(capture_environment)
         build_command = [
             "xcodebuild",
             "build-for-testing",
@@ -270,6 +274,8 @@ def run_xcode_capture(
             environment=environment,
             runner=runner,
         )
+        for capture in validate_capture_inventory(staged_output_root):
+            shutil.copyfile(capture, output_root / capture.name)
 
 
 def _png_dimensions(path: Path) -> tuple[int, int]:

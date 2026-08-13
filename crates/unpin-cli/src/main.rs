@@ -275,7 +275,7 @@ enum Commands {
     /// Launch or inspect isolated Unpin sessions.
     Session {
         #[command(subcommand)]
-        command: commands::session::SessionCommands,
+        command: Box<commands::session::SessionCommands>,
     },
     /// Inspect and safely adopt normalized capability catalog entries.
     Catalog {
@@ -301,6 +301,11 @@ enum Commands {
     Hook {
         #[command(subcommand)]
         command: commands::hook::HookCommands,
+    },
+    /// List, validate, propose, and safely mutate reusable workflow definitions.
+    Workflow {
+        #[command(subcommand)]
+        command: commands::workflow::WorkflowCommands,
     },
     /// Run the Unpin local MCP server over stdio.
     Mcp {
@@ -1133,7 +1138,7 @@ fn main() -> ExitCode {
                 }
             }
         }
-        Some(Commands::Session { command }) => commands::session::run(command),
+        Some(Commands::Session { command }) => commands::session::run(*command),
         Some(Commands::Bulk { command }) => commands::toggle::run(command),
         Some(Commands::AgentPlugins { command }) => commands::agent_plugins::run(command),
         Some(Commands::Catalog { command }) => commands::catalog::run(command),
@@ -1141,6 +1146,7 @@ fn main() -> ExitCode {
         Some(Commands::Group { command }) => commands::group::run(command),
         Some(Commands::Gateway { command }) => commands::gateway::run(command),
         Some(Commands::Hook { command }) => commands::hook::run(command),
+        Some(Commands::Workflow { command }) => commands::workflow::run(command),
         Some(Commands::Tui {
             roots,
             app_state_root,

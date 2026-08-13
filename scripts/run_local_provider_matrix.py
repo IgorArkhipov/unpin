@@ -7,6 +7,7 @@ import collections
 import datetime as dt
 import html
 import json
+import math
 import os
 import re
 import stat
@@ -589,6 +590,276 @@ def capture_static_surfaces(binary: Path, artifact_root: Path) -> dict[str, Any]
     return results
 
 
+def validate_workflow_routing_evidence(evidence: dict[str, Any]) -> None:
+    if evidence.get("schemaVersion") != 1 or evidence.get("status") != "passed":
+        raise MatrixFailure("workflow routing witness did not pass")
+
+    workflow = evidence.get("workflow") or {}
+    modes = evidence.get("modes") or {}
+    metrics = evidence.get("metrics") or {}
+    thresholds = metrics.get("thresholds") or {}
+    timeline = evidence.get("transitionTimeline") or []
+    fallbacks = evidence.get("fallbacks") or {}
+    connections = evidence.get("connections") or {}
+    plugin = evidence.get("agentPlugin") or {}
+    safety = evidence.get("safety") or {}
+    surface_coverage = evidence.get("surfaceCoverage") or {}
+
+    if workflow.get("modeOrder") != ["planning", "implementation", "review"]:
+        raise MatrixFailure("workflow routing modes are incomplete or out of order")
+    if set(modes) != {"planning", "implementation", "review"}:
+        raise MatrixFailure("workflow routing per-mode evidence is incomplete")
+    required_mode_fields = {
+        "advertisedToolNames",
+        "gatewayToolsListNames",
+        "expectedToolDescriptors",
+        "observedToolDescriptors",
+        "mcpObservationSource",
+        "skillSearchResults",
+        "loadedSkillBodyBytes",
+        "hookIds",
+        "schemaBytes",
+        "estimatedTokens",
+        "revision",
+    }
+    for mode_name, mode in modes.items():
+        if not required_mode_fields.issubset(mode):
+            raise MatrixFailure(f"workflow routing mode evidence is incomplete: {mode_name}")
+        if (
+            not mode["advertisedToolNames"]
+            or not mode["gatewayToolsListNames"]
+            or not mode["skillSearchResults"]
+        ):
+            raise MatrixFailure(f"workflow routing mode exposure is empty: {mode_name}")
+        if (
+            mode["mcpObservationSource"]
+            != "GatewayMcpServer RMCP tools/list"
+        ):
+            raise MatrixFailure(
+                f"workflow routing MCP evidence is not from gateway tools/list: {mode_name}"
+            )
+        if not set(mode["gatewayToolsListNames"]).issubset(
+            mode["advertisedToolNames"]
+        ):
+            raise MatrixFailure(
+                f"workflow routing advertised tools do not include gateway tools/list: {mode_name}"
+            )
+        if mode["expectedToolDescriptors"] != mode["observedToolDescriptors"]:
+            raise MatrixFailure(
+                f"workflow routing RMCP descriptors do not match production surface: {mode_name}"
+            )
+        expected_descriptor_names = [
+            descriptor.get("name")
+            for descriptor in mode["expectedToolDescriptors"]
+            if isinstance(descriptor, dict)
+        ]
+        observed_descriptor_names = [
+            descriptor.get("name")
+            for descriptor in mode["observedToolDescriptors"]
+            if isinstance(descriptor, dict)
+        ]
+        if (
+            expected_descriptor_names != mode["advertisedToolNames"]
+            or observed_descriptor_names != mode["gatewayToolsListNames"]
+        ):
+            raise MatrixFailure(
+                f"workflow routing RMCP descriptor names are inconsistent: {mode_name}"
+            )
+        observed_schema_bytes = len(
+            json.dumps(
+                mode["observedToolDescriptors"],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if (
+            mode["schemaBytes"] != observed_schema_bytes
+            or mode["estimatedTokens"] != math.ceil(observed_schema_bytes / 4)
+        ):
+            raise MatrixFailure(
+                f"workflow routing RMCP schema metrics are inconsistent: {mode_name}"
+            )
+
+    required_thresholds = {
+        "initialActiveLessThanUnrouted",
+        "activeLessThanFullEnvelope",
+        "activeEstimatedTokensLessThanFullEnvelope",
+        "initialModeExcludesNonBaselineTool",
+    }
+    if not required_thresholds.issubset(thresholds) or not all(
+        thresholds[name] is True for name in required_thresholds
+    ):
+        raise MatrixFailure("workflow routing context-reduction thresholds failed")
+    if not (
+        metrics.get("initialActiveSchemaBytes", 0)
+        < metrics.get("unroutedInstalledCatalogSchemaBytes", 0)
+        and metrics.get("activeSchemaBytes", 0)
+        < metrics.get("fullEnvelopeSchemaBytes", 0)
+        and metrics.get("activeEstimatedTokens", 0)
+        < metrics.get("fullEnvelopeEstimatedTokens", 0)
+    ):
+        raise MatrixFailure("workflow routing metric inequalities failed")
+    if "estimates" not in str(metrics.get("metricDefinition", "")):
+        raise MatrixFailure("workflow routing token metric is not labeled as an estimate")
+
+    expected_events = [
+        "initial-primary-list",
+        "implementation-staged",
+        "tools-list-changed-notification",
+        "same-primary-tools-list",
+        "review-staged",
+        "same-primary-review-tools-list",
+    ]
+    if [event.get("event") for event in timeline] != expected_events:
+        raise MatrixFailure("workflow routing event ordering is invalid")
+    staged, notified, observed = timeline[1:4]
+    if not (
+        staged.get("desiredRevision") == staged.get("pendingRevision")
+        and staged.get("observedRevision") != staged.get("desiredRevision")
+        and notified.get("observedRevision") != notified.get("desiredRevision")
+        and observed.get("observedRevision") == observed.get("desiredRevision")
+        and observed.get("pendingRevision") is None
+    ):
+        raise MatrixFailure("workflow routing notification or observation evidence is invalid")
+
+    required_fallbacks = {
+        "supportedRefresh": "NotificationRequired",
+        "notification": "NotificationSent",
+        "refreshUnconfirmed": "RefreshUnconfirmed",
+        "reloadRequired": "ReloadRequired",
+        "nextSessionOnly": "NextSessionOnly",
+    }
+    if any(fallbacks.get(name) != value for name, value in required_fallbacks.items()):
+        raise MatrixFailure("workflow routing fallback evidence is incomplete")
+    cancel = fallbacks.get("cancel") or {}
+    if cancel.get("pendingRevision") is not None or cancel.get("recoveryRequired") is not False:
+        raise MatrixFailure("workflow routing cancellation did not restore prior exposure")
+    if fallbacks.get("nextSessionCancelObservedRevision") != cancel.get("observedRevision"):
+        raise MatrixFailure("next-session-only fallback changed current observed exposure")
+
+    if not (
+        connections.get("primary", {}).get("role") == "primary"
+        and connections.get("auxiliary", {}).get("role") == "auxiliary"
+        and connections.get("auxiliaryDataDenial") == "connection-control-only"
+        and connections.get("crossSessionClaimDenial") == "connection-claim-invalid"
+        and connections.get("staleDisconnectedPrimaryDenial") == "connection-epoch-stale"
+        and str(connections.get("staleTransitionDenial", "")).startswith("workflow:")
+        and connections.get("primary", {}).get("sessionId")
+        != connections.get("secondSessionPrimary", {}).get("sessionId")
+    ):
+        raise MatrixFailure("workflow routing connection isolation evidence failed")
+    if not (
+        plugin.get("packageTogglePerformed") is False
+        and plugin.get("nativeStateUnchanged") is True
+        and plugin.get("contributedCapabilityIds")
+        and plugin.get("advertisedToolNames")
+        and plugin.get("skillSearchResults")
+        and plugin.get("hookIds")
+    ):
+        raise MatrixFailure("workflow routing Agent Plugin evidence is incomplete")
+    required_safety = {
+        "fixtureMode": True,
+        "strictMaskingCoverage": "verified-masked",
+        "nativeCapabilities": "native-unmanaged",
+        "nativeProviderStateUnchanged": True,
+        "bridgeAuthentication": "process-root-generation-sequence-bound",
+    }
+    if any(safety.get(name) != value for name, value in required_safety.items()):
+        raise MatrixFailure("workflow routing safety evidence failed")
+    if safety.get("nativeProviderStateSha256Before") != safety.get(
+        "nativeProviderStateSha256After"
+    ):
+        raise MatrixFailure("workflow routing changed provider-native state")
+    protected = safety.get("protectedRootEvidence") or {}
+    if protected.get("repositoryConfigMayRedirect") is not False:
+        raise MatrixFailure("workflow routing protected-root evidence failed")
+    canonical_fields = [
+        "workflowId",
+        "activeMode",
+        "desiredExposureRevision",
+        "observedExposureRevision",
+        "liveStatus",
+        "nextAction",
+    ]
+    if surface_coverage.get("canonicalObservedFields") != canonical_fields:
+        raise MatrixFailure("workflow routing canonical surface fields are incomplete")
+    roles = surface_coverage.get("roles") or {}
+    expected_roles = {
+        "gateway": "authoritative-live-runtime",
+        "mcp": "gateway-tools-list-and-read-only-session-planning",
+        "cli": "definition-validation-and-human-launch-handoff",
+        "desktop": "primary-human-workbench",
+        "tui": "projection-and-handoff",
+    }
+    if any(
+        (roles.get(surface) or {}).get("role") != role
+        for surface, role in expected_roles.items()
+    ):
+        raise MatrixFailure("workflow routing surface coverage roles are incomplete")
+    tui = roles.get("tui") or {}
+    if tui.get("editing") is not False or tui.get("liveParityClaimed") is not False:
+        raise MatrixFailure(
+            "workflow routing TUI must remain projection-and-handoff without editing or live parity"
+        )
+    observations = surface_coverage.get("observations") or {}
+    gateway_observation = observations.get("gateway") or {}
+    mcp_observation = observations.get("mcp") or {}
+    if any(
+        field not in gateway_observation or field not in mcp_observation
+        for field in canonical_fields
+    ):
+        raise MatrixFailure("workflow routing canonical surface observation is incomplete")
+    mismatches = [
+        field
+        for field in canonical_fields
+        if gateway_observation[field] != mcp_observation[field]
+    ]
+    if mismatches:
+        raise MatrixFailure(
+            "workflow routing canonical surface observation mismatch: "
+            + ", ".join(mismatches)
+        )
+    if (
+        mcp_observation.get("observationSource")
+        != "GatewayMcpServer RMCP tools/list"
+        or not mcp_observation.get("observedToolNames")
+        or mcp_observation.get("observedToolNames")
+        != modes["review"].get("gatewayToolsListNames")
+    ):
+        raise MatrixFailure(
+            "workflow routing MCP observation is not backed by gateway tools/list"
+        )
+
+
+def capture_workflow_routing_evidence(
+    cargo: Path, artifact_root: Path
+) -> dict[str, Any]:
+    output_path = artifact_root / "raw/workflow-routing.json"
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    process = run_command(
+        [
+            cargo,
+            "run",
+            "-p",
+            "unpin-core",
+            "--example",
+            "workflow_matrix_evidence",
+            "--all-features",
+            "--locked",
+            "--",
+            output_path,
+        ],
+        timeout_seconds=QUALITY_GATE_TIMEOUT_SECONDS,
+    )
+    if process.returncode != 0:
+        raise MatrixFailure("workflow routing witness failed")
+    if not output_path.is_file():
+        raise MatrixFailure("workflow routing witness did not produce evidence")
+    evidence = json.loads(output_path.read_text(encoding="utf-8"))
+    validate_workflow_routing_evidence(evidence)
+    return evidence
+
+
 def state_label(value: bool | None) -> str:
     if value is None:
         return "guarded"
@@ -613,6 +884,8 @@ def render_report(
     tui_results = summary["results"]["tuiCases"]
     mcp_results = summary["results"]["mcpCases"]
     agent_plugin_parity = summary["staticSurfaces"]["agentPlugins"]
+    workflow_routing = summary["workflowRouting"]
+    workflow_metrics = workflow_routing["metrics"]
     live = summary.get("liveInventory")
     matrix = summary["matrix"]
     declared_exceptions = summary["declaredExceptions"]
@@ -695,6 +968,7 @@ def render_report(
             "- TUI cycles drove search, staging, confirmation blocking, two confirmed applies, rediscovery, and backups through a real terminal PTY; CLI restore then proved both backups.",
             f"- MCP cycles kept writes disabled in {mcp_writes_disabled}/{len(matrix)} cases, blocked {mcp_unreviewed_blocked}/{len(matrix)} unreviewed applies, and returned {mcp_handoffs}/{len(matrix)} exact-fingerprint human-action handoffs; CLI completed each reviewed handoff and restore.",
             f"- Shared-source fan-out: {fanout_counts['CLI']} CLI, {fanout_counts['TUI']} TUI, and {fanout_counts['MCP']} MCP-handoff cases proved all provider views disable and return together.",
+            f"- Workflow routing: planning -> implementation -> review passed with {workflow_metrics['initialActiveSchemaBytes']} initial active schema bytes versus {workflow_metrics['unroutedInstalledCatalogSchemaBytes']} unrouted bytes; token values are deterministic estimates.",
             "",
             "| Provider | Layer | Kind | Surface | Live | CLI | TUI | MCP |",
             "| --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -731,6 +1005,7 @@ def render_report(
             "- `raw/results.json`: CLI cycle summaries.",
             "- `raw/tui-results.json`: interactive TUI cycle summaries.",
             "- `raw/mcp-results.json`: MCP plan/review/handoff summaries plus CLI completion evidence.",
+            "- `raw/workflow-routing.json`: exact per-mode skills, tools, hooks, revisions, fallback, isolation, Agent Plugin, and context-reduction evidence.",
             "- `raw/live-inventory-summary.json`: sanitized installed-library counts and dry-run cells.",
             "- Full live inventory is aggregated in memory and is not persisted.",
             "- `cases/`, `tui-cases/`, and `mcp-cases/`: per-step apply/restore captures plus validated backup-manifest and audit-event summaries.",
@@ -806,6 +1081,18 @@ def render_report(
         f"<article class='metric'><span>{name}</span><strong>{value['status']}</strong><small>{value['durationSeconds']}s</small></article>"
         for name, value in verification.items()
     )
+    routing_rows = "".join(
+        "<tr><td>{mode}</td><td>{tools}</td><td>{skills}</td><td>{hooks}</td>"
+        "<td>{schema}</td><td>{tokens}</td></tr>".format(
+            mode=html.escape(mode_name),
+            tools=len(mode["advertisedToolNames"]),
+            skills=len(mode["skillSearchResults"]),
+            hooks=len(mode["hookIds"]),
+            schema=mode["schemaBytes"],
+            tokens=mode["estimatedTokens"],
+        )
+        for mode_name, mode in workflow_routing["modes"].items()
+    )
     live_state = (
         str(live["providerStateUnchanged"]).lower() if live else "skipped"
     )
@@ -842,6 +1129,7 @@ pre{{white-space:pre-wrap;background:#050c15;border:1px solid var(--border);bord
 <section class="panel" id="tui-library"><div class="eyebrow">TUI CONTROL PLANE</div><h2>Headless library plus interactive terminal cycles</h2><p class="callout">All {len(tui_results)} writable cells passed search, stage, blocked-unconfirmed apply, two confirmed applies, rediscovery, and backup through TUI; CLI restore proved both backups.</p><pre>{html.escape(tui_output)}</pre></section>
 {''.join(provider_sections)}
 <section class="panel" id="mcp-states"><div class="eyebrow">MCP CONTROL PLANE</div><h2>Plan, review, and human-action handoff</h2><div class="metrics"><article class="metric"><span>Scenarios</span><strong>{len(mcp_results)}/{len(matrix)}</strong><small>passed</small></article><article class="metric"><span>MCP writes</span><strong>0/{mcp_writes_disabled}</strong><small>CLI/TUI approval required</small></article><article class="metric"><span>Exact handoff</span><strong>{mcp_handoffs}/{len(matrix)}</strong><small>reviewed fingerprints</small></article><article class="metric"><span>Recovery</span><strong>byte-exact</strong><small>all fixture trees</small></article></div><p class="callout">Every persistent MCP session completed initialize, initialized notification, tools/list discovery, no-write safety checks, blocked unreviewed apply, and exact-fingerprint handoff for toggles and restores. CLI completed each reviewed handoff, producing authenticated backups, two apply plus two restore audit events, and byte-exact recovery.</p></section>
+<section class="panel" id="workflow-routing"><div class="eyebrow">WORKFLOW ROUTING</div><h2>Exact mode-scoped gateway exposure</h2><p class="callout">Planning to implementation to review passed. Initial active schema: {workflow_metrics['initialActiveSchemaBytes']} bytes; unrouted catalog: {workflow_metrics['unroutedInstalledCatalogSchemaBytes']} bytes; full envelope: {workflow_metrics['fullEnvelopeSchemaBytes']} bytes. Token values are deterministic estimates, not billing tokens.</p><table><thead><tr><th>Mode</th><th>Tools</th><th>Skills</th><th>Hooks</th><th>Schema bytes</th><th>Estimated tokens</th></tr></thead><tbody>{routing_rows}</tbody></table><p class="muted">Same-primary re-list is the observation boundary. Reload-required and refresh-unconfirmed are cancellable; next-session-only keeps the current exposure callable. Native provider state remained unchanged.</p></section>
 </main></body></html>"""
 
     announcement = f"""Unpin local provider matrix refreshed
@@ -851,6 +1139,7 @@ pre{{white-space:pre-wrap;background:#050c15;border:1px solid var(--border);bord
 - Isolated matrix: {len(cli_results)}/{len(matrix)} CLI, {len(tui_results)}/{len(matrix)} interactive TUI, and {len(mcp_results)}/{len(matrix)} persistent MCP plan/review/handoff cycles passed.
 - Tested workspace build: Git {git_short}, binary SHA-256 {binary_short}…; full source binding is in summary.json.
 - Shared-source fan-out: {fanout_counts['CLI']} CLI, {fanout_counts['TUI']} TUI, and {fanout_counts['MCP']} MCP-handoff cases proved every loading provider toggles together.
+- Workflow routing: planning -> implementation -> review passed with {workflow_metrics['initialActiveSchemaBytes']} initial active schema bytes versus {workflow_metrics['unroutedInstalledCatalogSchemaBytes']} unrouted bytes; token values are estimates.
 - Coverage: Claude Code, Codex, Cursor, Pi, OpenCode, and Zed across every writable global/project skill, plugin, and MCP cell.
 - Zed plugins remain intentionally out of scope; Zed standard Agent Skills and context_servers MCPs are covered globally and per project.
 - Safety: all mutations used copied fixtures, authenticated backups, audit evidence, restore, and byte-exact recovery. No live provider state or .env files were mutated/read.
@@ -872,6 +1161,7 @@ def build_summary(
     mcp_results: list[dict[str, Any]],
     verification: dict[str, Any],
     static_surfaces: dict[str, Any],
+    workflow_routing: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "runId": artifact_root.name,
@@ -896,6 +1186,7 @@ def build_summary(
         },
         "verification": verification,
         "staticSurfaces": static_surfaces,
+        "workflowRouting": workflow_routing,
         "screenshotsExpected": SCREENSHOTS,
     }
 
@@ -1100,6 +1391,7 @@ def main() -> int:
                 agent_plugin_fixture_workspace,
                 canonical_fixture_digest,
             )
+        workflow_routing = capture_workflow_routing_evidence(cargo, artifact_root)
         verification = (
             {}
             if args.skip_quality_gates
@@ -1120,6 +1412,7 @@ def main() -> int:
             mcp_results,
             verification,
             static_surfaces,
+            workflow_routing,
         )
         write_json(artifact_root / "summary.json", summary)
         tui_output = sanitize_path(

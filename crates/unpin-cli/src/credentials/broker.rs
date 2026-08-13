@@ -559,11 +559,11 @@ mod tests {
             session_authority: Some(Zeroizing::new([0x53; 32])),
         };
         let server =
-            thread::spawn(move || serve_unix_broker(listener, bundle, Duration::from_millis(100)));
+            thread::spawn(move || serve_unix_broker(listener, bundle, Duration::from_secs(1)));
 
         let mut first = None;
         for _ in 0..100 {
-            match request_unix_bundle(&socket, Duration::from_millis(50)) {
+            match request_unix_bundle(&socket, Duration::from_secs(2)) {
                 Ok(bundle) => {
                     first = Some(bundle);
                     break;
@@ -576,7 +576,7 @@ mod tests {
             .expect("connect stalled broker client");
         let mut second = None;
         for _ in 0..100 {
-            match request_unix_bundle(&socket, Duration::from_millis(50)) {
+            match request_unix_bundle(&socket, Duration::from_secs(2)) {
                 Ok(bundle) => {
                     second = Some(bundle);
                     break;

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -32,6 +33,7 @@ from run_local_provider_matrix import (
     live_inventory_exclusion_reason,
     live_item_has_cross_provider_shared_source,
     live_plan_state_paths,
+    validate_workflow_routing_evidence,
 )
 
 
@@ -685,10 +687,24 @@ class ProviderMatrixScreenshotCaptureTests(unittest.TestCase):
                     xctestrun = plistlib.load(handle)
                 target = xctestrun["TestConfigurations"][0]["TestTargets"][0]
                 observed_environment.update(target["EnvironmentVariables"])
+                staged_dashboard = Path(
+                    observed_environment["UNPIN_PROVIDER_MATRIX_DASHBOARD"]
+                )
+                self.assertNotEqual(
+                    staged_dashboard.resolve(),
+                    (artifact_root / "dashboard.html").resolve(),
+                )
+                self.assertEqual(
+                    staged_dashboard.read_text(encoding="utf-8"),
+                    self._dashboard_html(),
+                )
                 output_root = Path(
                     observed_environment[
                         "UNPIN_PROVIDER_MATRIX_SCREENSHOTS_DIR"
                     ]
+                )
+                self.assertFalse(
+                    output_root.resolve().is_relative_to(artifact_root.resolve())
                 )
                 output_root.mkdir(parents=True, exist_ok=True)
                 for section in matrix_screenshots.SCREENSHOT_SECTIONS:
@@ -1205,6 +1221,275 @@ class McpFinalizationContractTests(unittest.TestCase):
         )
 
 
+class WorkflowRoutingEvidenceTests(unittest.TestCase):
+    @staticmethod
+    def valid_evidence() -> dict[str, object]:
+        descriptor = {
+            "name": "review__inspect",
+            "title": "Inspect",
+            "description": "Inspect review fixture",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "outputSchema": {
+                "type": "object",
+                "properties": {"result": {"type": "string"}},
+                "additionalProperties": False,
+            },
+            "annotations": {"readOnlyHint": True, "openWorldHint": False},
+            "execution": {"taskSupport": "optional"},
+        }
+        descriptors = [descriptor]
+        schema_bytes = len(
+            json.dumps(descriptors, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8"
+            )
+        )
+        mode = {
+            "advertisedToolNames": ["review__inspect"],
+            "gatewayToolsListNames": ["review__inspect"],
+            "expectedToolDescriptors": descriptors,
+            "observedToolDescriptors": json.loads(json.dumps(descriptors)),
+            "mcpObservationSource": "GatewayMcpServer RMCP tools/list",
+            "skillSearchResults": [{"name": "fixture-skill"}],
+            "loadedSkillBodyBytes": 10,
+            "hookIds": ["fixture-hook"],
+            "schemaBytes": schema_bytes,
+            "estimatedTokens": math.ceil(schema_bytes / 4),
+            "revision": "a" * 64,
+        }
+        return {
+            "schemaVersion": 1,
+            "status": "passed",
+            "workflow": {"modeOrder": ["planning", "implementation", "review"]},
+            "modes": {
+                "planning": json.loads(json.dumps(mode)),
+                "implementation": json.loads(json.dumps(mode)),
+                "review": json.loads(json.dumps(mode)),
+            },
+            "metrics": {
+                "initialActiveSchemaBytes": 20,
+                "unroutedInstalledCatalogSchemaBytes": 40,
+                "activeSchemaBytes": 20,
+                "fullEnvelopeSchemaBytes": 30,
+                "activeEstimatedTokens": 5,
+                "fullEnvelopeEstimatedTokens": 7,
+                "metricDefinition": "deterministic estimates, not billing tokens",
+                "thresholds": {
+                    "initialActiveLessThanUnrouted": True,
+                    "activeLessThanFullEnvelope": True,
+                    "activeEstimatedTokensLessThanFullEnvelope": True,
+                    "initialModeExcludesNonBaselineTool": True,
+                },
+            },
+            "transitionTimeline": [
+                {"event": "initial-primary-list"},
+                {
+                    "event": "implementation-staged",
+                    "desiredRevision": "b",
+                    "pendingRevision": "b",
+                    "observedRevision": "a",
+                },
+                {
+                    "event": "tools-list-changed-notification",
+                    "desiredRevision": "b",
+                    "observedRevision": "a",
+                },
+                {
+                    "event": "same-primary-tools-list",
+                    "desiredRevision": "b",
+                    "observedRevision": "b",
+                    "pendingRevision": None,
+                },
+                {"event": "review-staged"},
+                {"event": "same-primary-review-tools-list"},
+            ],
+            "fallbacks": {
+                "supportedRefresh": "NotificationRequired",
+                "notification": "NotificationSent",
+                "refreshUnconfirmed": "RefreshUnconfirmed",
+                "reloadRequired": "ReloadRequired",
+                "nextSessionOnly": "NextSessionOnly",
+                "cancel": {
+                    "observedRevision": "a",
+                    "pendingRevision": None,
+                    "recoveryRequired": False,
+                },
+                "nextSessionCancelObservedRevision": "a",
+            },
+            "connections": {
+                "primary": {"role": "primary", "sessionId": "session-a"},
+                "auxiliary": {"role": "auxiliary"},
+                "secondSessionPrimary": {"sessionId": "session-b"},
+                "auxiliaryDataDenial": "connection-control-only",
+                "crossSessionClaimDenial": "connection-claim-invalid",
+                "staleDisconnectedPrimaryDenial": "connection-epoch-stale",
+                "staleTransitionDenial": "workflow:stale",
+            },
+            "agentPlugin": {
+                "packageTogglePerformed": False,
+                "nativeStateUnchanged": True,
+                "contributedCapabilityIds": ["plugin-tool"],
+                "advertisedToolNames": ["plugin__tool"],
+                "skillSearchResults": [{"name": "plugin-skill"}],
+                "hookIds": ["plugin-hook"],
+            },
+            "safety": {
+                "fixtureMode": True,
+                "strictMaskingCoverage": "verified-masked",
+                "nativeCapabilities": "native-unmanaged",
+                "nativeProviderStateUnchanged": True,
+                "nativeProviderStateSha256Before": "sha256:same",
+                "nativeProviderStateSha256After": "sha256:same",
+                "bridgeAuthentication": "process-root-generation-sequence-bound",
+                "protectedRootEvidence": {"repositoryConfigMayRedirect": False},
+            },
+            "surfaceCoverage": {
+                "canonicalObservedFields": [
+                    "workflowId",
+                    "activeMode",
+                    "desiredExposureRevision",
+                    "observedExposureRevision",
+                    "liveStatus",
+                    "nextAction",
+                ],
+                "roles": {
+                    "gateway": {"role": "authoritative-live-runtime"},
+                    "mcp": {
+                        "role": "gateway-tools-list-and-read-only-session-planning"
+                    },
+                    "cli": {
+                        "role": "definition-validation-and-human-launch-handoff"
+                    },
+                    "desktop": {"role": "primary-human-workbench"},
+                    "tui": {
+                        "role": "projection-and-handoff",
+                        "editing": False,
+                        "liveParityClaimed": False,
+                    },
+                },
+                "observations": {
+                    "gateway": {
+                        "workflowId": "delivery",
+                        "activeMode": "review",
+                        "desiredExposureRevision": "a" * 64,
+                        "observedExposureRevision": "a" * 64,
+                        "liveStatus": "observed-refresh",
+                        "nextAction": "continue-in-active-mode",
+                    },
+                    "mcp": {
+                        "workflowId": "delivery",
+                        "activeMode": "review",
+                        "desiredExposureRevision": "a" * 64,
+                        "observedExposureRevision": "a" * 64,
+                        "liveStatus": "observed-refresh",
+                        "nextAction": "continue-in-active-mode",
+ "observationSource": "GatewayMcpServer RMCP tools/list",
+                        "observedToolNames": ["review__inspect"],
+                    },
+                },
+            },
+        }
+
+    def test_accepts_complete_workflow_routing_evidence(self) -> None:
+        validate_workflow_routing_evidence(self.valid_evidence())
+
+    def test_rejects_failed_context_reduction_threshold(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["metrics"]["thresholds"]["activeLessThanFullEnvelope"] = False
+        with self.assertRaisesRegex(MatrixFailure, "context-reduction"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_notification_promoted_as_observation(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["transitionTimeline"][2]["observedRevision"] = "b"
+        with self.assertRaisesRegex(MatrixFailure, "notification or observation"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_next_session_observed_revision_drift(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["fallbacks"]["nextSessionCancelObservedRevision"] = "b"
+        with self.assertRaisesRegex(MatrixFailure, "next-session-only"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_mismatched_canonical_surface_observation(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["surfaceCoverage"]["observations"]["mcp"]["activeMode"] = (
+            "implementation"
+        )
+        with self.assertRaisesRegex(MatrixFailure, "canonical surface observation"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_synthetic_mcp_observation_source(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["surfaceCoverage"]["observations"]["mcp"][
+            "observationSource"
+        ] = "hard-coded fixture"
+        with self.assertRaisesRegex(MatrixFailure, "gateway tools/list"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_tui_live_or_editing_parity_claim(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["surfaceCoverage"]["roles"]["tui"]["editing"] = True
+        with self.assertRaisesRegex(MatrixFailure, "TUI.*projection-and-handoff"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_missing_observed_descriptor(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"] = []
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_changed_descriptor_description(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"][0][
+            "description"
+        ] = "Changed"
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_changed_descriptor_input_schema(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"][0]["inputSchema"][
+            "additionalProperties"
+        ] = True
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_changed_descriptor_annotations_and_output_schema(self) -> None:
+        for field, value in (
+            ("annotations", {"readOnlyHint": False}),
+            ("outputSchema", {"type": "string"}),
+        ):
+            with self.subTest(field=field):
+                evidence = self.valid_evidence()
+                evidence["modes"]["planning"]["observedToolDescriptors"][0][field] = (
+                    value
+                )
+                with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+                    validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_same_names_with_mismatched_descriptor_content(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["observedToolDescriptors"][0]["execution"] = {
+            "taskSupport": "forbidden"
+        }
+        self.assertEqual(
+            evidence["modes"]["planning"]["gatewayToolsListNames"],
+            ["review__inspect"],
+        )
+        with self.assertRaisesRegex(MatrixFailure, "descriptors do not match"):
+            validate_workflow_routing_evidence(evidence)
+
+    def test_rejects_schema_bytes_not_measured_from_observed_descriptors(self) -> None:
+        evidence = self.valid_evidence()
+        evidence["modes"]["planning"]["schemaBytes"] += 1
+        with self.assertRaisesRegex(MatrixFailure, "schema metrics"):
+            validate_workflow_routing_evidence(evidence)
+
+
 class LiveInventoryFilterTests(unittest.TestCase):
     def test_live_shared_source_requires_matching_source_and_state_paths(self) -> None:
         target = {
@@ -1385,6 +1670,84 @@ class LiveInventoryFilterTests(unittest.TestCase):
             MatrixFailure, "omitted required matrix tools"
         ):
             session._initialize()
+
+    def test_desktop_snapshot_request_uses_handshake_binding(self) -> None:
+        binding = {
+            "parentPid": 101,
+            "parentStartMarker": "parent-start",
+            "childPid": 202,
+            "childStartMarker": "child-start",
+            "projectRoot": "/test/project",
+            "appStateRoot": "/test/state",
+            "processGeneration": "generation",
+        }
+        session_secret = "11" * 32
+        request = matrix_cases.authenticated_desktop_bridge_request(
+            {
+                "version": 2,
+                "id": "snapshot",
+                "method": "snapshot",
+                "params": {},
+            },
+            binding,
+            session_secret,
+            1,
+        )
+
+        fingerprint = hashlib.sha256(b"{}").hexdigest()
+        material = (
+            "unpin.desktop.bridge.request.v1\0"
+            f"{session_secret}\0{1}\0snapshot\0snapshot\0snapshot\0{fingerprint}\0"
+            f"{hashlib.sha256(b'{}').hexdigest()}"
+        )
+        self.assertEqual(
+            request["auth"],
+            {
+                **binding,
+                "sequence": 1,
+                "operationId": "snapshot",
+                "fingerprint": fingerprint,
+                "authTag": hashlib.sha256(material.encode("utf-8")).hexdigest(),
+            },
+        )
+
+    def test_desktop_bridge_snapshot_authenticates_after_handshake(self) -> None:
+        process = mock.Mock(pid=202)
+        process.stdin.closed = False
+        process.wait.return_value = 0
+        binding = {
+            "parentPid": os.getpid(),
+            "parentStartMarker": "parent-start",
+            "childPid": process.pid,
+            "childStartMarker": "child-start",
+            "projectRoot": "/test/project",
+            "appStateRoot": "/test/state",
+            "processGeneration": "generation",
+        }
+        snapshot = {"agentPlugins": []}
+        with (
+            mock.patch.object(matrix_cases.subprocess, "Popen", return_value=process),
+            mock.patch.object(
+                matrix_cases,
+                "_exchange_desktop_bridge_frame",
+                side_effect=[{"binding": binding}, snapshot],
+            ) as exchange,
+        ):
+            result = matrix_cases.desktop_bridge_snapshot(
+                Path("/test/unpin"),
+                Path("/test/fixtures"),
+                Path("/test/project"),
+                Path("/test/state"),
+            )
+
+        self.assertEqual(result, snapshot)
+        handshake_request = exchange.call_args_list[0].args[1]
+        snapshot_request = exchange.call_args_list[1].args[1]
+        self.assertEqual(handshake_request["params"]["childPid"], process.pid)
+        self.assertEqual(snapshot_request["auth"]["sequence"], 1)
+        for field, value in binding.items():
+            self.assertEqual(snapshot_request["auth"][field], value)
+        self.assertEqual(process.stdin.close.call_count, 1)
 
     def test_agent_plugin_surface_contracts_normalize_provider_shapes(self) -> None:
         base = {

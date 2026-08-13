@@ -71,6 +71,58 @@ fn owner(id: &str, generation: u64) -> OwnerGeneration {
     OwnerGeneration::new(id, generation).expect("valid owner generation")
 }
 
+#[test]
+fn atomic_json_supports_explicit_compatible_read_and_schema_migration() {
+    let temp = TempDir::new().expect("temporary state");
+    let state_path = temp.path().join("state.json");
+    let v2 = AtomicJsonStore::new(&state_path, 2);
+    let revision = v2
+        .compare_and_swap(None, owner("session-owner", 2), &json!({ "value": 2 }))
+        .expect("write v2 state");
+
+    let v3 = AtomicJsonStore::new(&state_path, 3);
+    let compatible = v3
+        .load_compatible::<serde_json::Value>(&[2])
+        .expect("explicit v2-compatible read")
+        .expect("stored state");
+    assert_eq!(compatible.schema_version, 2);
+    assert_eq!(compatible.value, json!({ "value": 2 }));
+
+    let migrated = v3
+        .compare_and_swap_migrating_schema(
+            &revision,
+            2,
+            owner("session-owner", 3),
+            &json!({ "value": 3 }),
+        )
+        .expect("owner-CAS schema migration");
+    assert_eq!(migrated.sequence, 2);
+    assert_eq!(
+        v3.load::<serde_json::Value>()
+            .expect("exact v3 read")
+            .expect("migrated state")
+            .value,
+        json!({ "value": 3 })
+    );
+    assert!(matches!(
+        v2.load::<serde_json::Value>(),
+        Err(StateError::SchemaVersionMismatch {
+            expected: 2,
+            actual: 3
+        })
+    ));
+
+    let removable_path = temp.path().join("removable.json");
+    let old_store = AtomicJsonStore::new(&removable_path, 2);
+    let removable = old_store
+        .compare_and_swap(None, owner("session-owner", 4), &json!({ "value": 4 }))
+        .expect("write removable v2 state");
+    AtomicJsonStore::new(&removable_path, 3)
+        .remove_if_revision_compatible(&removable, &[2])
+        .expect("remove compatible v2 state");
+    assert!(!removable_path.exists());
+}
+
 #[cfg(unix)]
 fn lock_path(store: &AtomicJsonStore) -> PathBuf {
     let resource_id = store.physical_resource_id().expect("physical resource id");

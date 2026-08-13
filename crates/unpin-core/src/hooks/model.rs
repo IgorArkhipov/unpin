@@ -785,6 +785,37 @@ impl HookHandler {
         }
     }
 
+    /// Restores trust carried by a record authenticated with the session
+    /// authority key. Callers must authenticate the containing record first;
+    /// this method revalidates the invocation and profile bindings instead of
+    /// accepting the persisted trust state verbatim.
+    pub(crate) fn restore_authenticated_runtime_trust(
+        mut self,
+        trust: HookTrustState,
+    ) -> Result<Self, HookModelError> {
+        let invocation_fingerprint = self.action.invocation_fingerprint();
+        match &trust {
+            HookTrustState::NeedsReview => {}
+            HookTrustState::Managed {
+                invocation_fingerprint: reviewed,
+            } if self.ownership == HookOwnership::AdministratorManaged
+                && reviewed == &invocation_fingerprint => {}
+            HookTrustState::Reviewed {
+                invocation_fingerprint: reviewed,
+                profile_digest,
+            } if self.ownership != HookOwnership::AdministratorManaged
+                && reviewed == &invocation_fingerprint =>
+            {
+                validate_digest(profile_digest)?;
+            }
+            HookTrustState::Managed { .. } | HookTrustState::Reviewed { .. } => {
+                return Err(HookModelError::TrustRequired);
+            }
+        }
+        self.trust = trust;
+        Ok(self)
+    }
+
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id

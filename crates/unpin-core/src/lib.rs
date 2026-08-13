@@ -24,6 +24,7 @@ pub mod state;
 pub mod transitions;
 pub mod update;
 pub mod update_service;
+pub mod workflows;
 
 mod pi_packages;
 mod toml_syntax;
@@ -36,6 +37,13 @@ pub(crate) fn encode_lower_hex(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
+}
+
+/// Return the lower-case SHA-256 digest for a byte sequence.
+pub fn sha256_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+
+    encode_lower_hex(&sha2::Sha256::digest(bytes))
 }
 
 pub(crate) fn is_lower_hex_digest(value: &str) -> bool {

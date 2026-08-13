@@ -6,7 +6,7 @@ use crate::{
     providers::ProviderId,
     sessions::{
         CallAdmission, LeaseLifecycle, LeaseSnapshot, LiveExposureStatus, PinnedExposure,
-        SessionHandle, SessionManager,
+        SessionHandle, SessionManager, WorkflowTransitionRequest, WorkflowTransitionResult,
     },
 };
 
@@ -34,6 +34,10 @@ pub struct GatewayControlPlane {
 }
 
 impl GatewayControlPlane {
+    pub(crate) fn app_state_root(&self) -> &std::path::Path {
+        self.manager.app_state_root()
+    }
+
     pub fn new(
         manager: SessionManager,
         handle: SessionHandle,
@@ -122,6 +126,37 @@ impl GatewayControlPlane {
             self.manager
                 .observe_exposure(&self.handle, &snapshot.revision, status, now_unix)?;
         *snapshot = updated.clone();
+        if status == LiveExposureStatus::ObservedRefresh
+            && let Some(workflow) = updated.lease.workflow.as_deref()
+        {
+            let terminalized = crate::sessions::WorkflowJournal::new(self.manager.app_state_root())
+                .observe_matching_transition(
+                    self.handle.session_id(),
+                    &workflow.active_mode,
+                    &updated.lease.observed_exposure.revision,
+                    updated.revision.sequence,
+                    self.handle.owner_id(),
+                    now_unix,
+                );
+            if let Err(error) = terminalized {
+                let quarantine = self.manager.quarantine_workflow_observation(
+                    &self.handle,
+                    &updated.revision,
+                    now_unix,
+                );
+                return match quarantine {
+                    Ok(quarantined) => {
+                        *snapshot = quarantined;
+                        Err(GatewayError::Workflow(format!(
+                            "workflow observation quarantined: {error}"
+                        )))
+                    }
+                    Err(quarantine_error) => Err(GatewayError::Workflow(format!(
+                        "workflow observation failed: {error}; quarantine failed: {quarantine_error}"
+                    ))),
+                };
+            }
+        }
         Ok(updated)
     }
 
@@ -164,6 +199,60 @@ impl GatewayControlPlane {
         let updated =
             self.manager
                 .reconcile_stopped_runtime(&self.handle, &snapshot.revision, now_unix)?;
+        *snapshot = updated.clone();
+        Ok(updated)
+    }
+
+    /// Cancel a durable U2 workflow transition using its authenticated
+    /// operation journal. The router owns source-mode recovery and reopens
+    /// admission only after restoring the prior observed exposure.
+    pub(crate) fn cancel_workflow_transition(
+        &self,
+        operation_id: &str,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, GatewayError> {
+        let mut snapshot = self.lock_snapshot()?;
+        let router = crate::sessions::WorkflowRouter::new(self.manager.clone());
+        let updated = router
+            .cancel_transition(&self.handle, &snapshot.revision, operation_id, now_unix)
+            .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        *snapshot = updated.clone();
+        Ok(updated)
+    }
+
+    pub(crate) fn enter_workflow_mode(
+        &self,
+        request: WorkflowTransitionRequest,
+        next_session_only: bool,
+    ) -> Result<WorkflowTransitionResult, GatewayError> {
+        let mut snapshot = self.lock_snapshot()?;
+        let router = crate::sessions::WorkflowRouter::new(self.manager.clone());
+        let result = if next_session_only {
+            router.enter_mode_next_session_only(&self.handle, &snapshot.revision, request)
+        } else {
+            router.enter_mode(&self.handle, &snapshot.revision, request)
+        }
+        .map_err(|error| GatewayError::Workflow(error.to_string()))?;
+        *snapshot = self.manager.load_for_handle(&self.handle)?;
+        Ok(result)
+    }
+
+    pub(crate) fn restore_observed_exposure(
+        &self,
+        now_unix: i64,
+    ) -> Result<LeaseSnapshot, GatewayError> {
+        let mut snapshot = self.lock_snapshot()?;
+        if snapshot.lease.workflow.is_some()
+            && snapshot.lease.desired_exposure != snapshot.lease.observed_exposure
+            && !snapshot.lease.admission_open
+        {
+            return Err(GatewayError::Workflow(
+                "workflow transition cancellation requires its operation id".to_string(),
+            ));
+        }
+        let updated =
+            self.manager
+                .restore_observed_exposure(&self.handle, &snapshot.revision, now_unix)?;
         *snapshot = updated.clone();
         Ok(updated)
     }

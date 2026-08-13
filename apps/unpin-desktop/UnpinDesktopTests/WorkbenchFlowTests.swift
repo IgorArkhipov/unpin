@@ -18,7 +18,9 @@ final class WorkbenchFlowTests: XCTestCase {
         try FileManager.default.createDirectory(at: appStateRoot, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: temporary) }
 
-        let fixtureRoot = try FixtureResources.root()
+        let sourceFixtureRoot = try FixtureResources.root()
+        let fixtureRoot = temporary.appendingPathComponent("fixtures", isDirectory: true)
+        try FileManager.default.copyItem(at: sourceFixtureRoot, to: fixtureRoot)
         let store = WorkspaceStore(bridgeRoots: BridgeLaunchRoots(
             fixtureRoot: fixtureRoot,
             homeRoot: fixtureRoot,
@@ -941,6 +943,86 @@ final class WorkbenchFlowTests: XCTestCase {
         expectedValues.forEach { view.copy($0, statusLabel: $0) }
 
         XCTAssertEqual(copiedValues, expectedValues)
+    }
+
+    func testWorkflowSurfaceGuidanceCoversRouterStates() {
+        let ready = WorkbenchPresentationState.ready
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(presentation: .needsWorkspace)),
+            .empty
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(presentation: .loading)),
+            .loading
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(presentation: .blocked("denied"))),
+            .denied
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
+                reloadLimitation: "reload-required"
+            )),
+            .reloadRequired
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
+                reloadLimitation: "notification-sent"
+            )),
+            .notificationSent
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
+                reloadLimitation: "refresh-unconfirmed"
+            )),
+            .refreshUnconfirmed
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasProposal: true,
+                reloadLimitation: "next-session-only"
+            )),
+            .nextSessionOnly
+        )
+        XCTAssertEqual(
+            classifyWorkflowSurface(WorkflowSurfaceFacts(
+                presentation: ready,
+                hasSession: true,
+                recoveryRequired: true
+            )),
+            .recoveryRequired
+        )
+    }
+
+    func testWorkflowHostCommandEntryProducesDirectArgvWithoutShellExpansion() {
+        XCTAssertEqual(
+            parseWorkflowHostCommand("codex --profile 'delivery mode' --flag=\"safe\""),
+            ["codex", "--profile", "delivery mode", "--flag=safe"]
+        )
+        XCTAssertEqual(
+            parseWorkflowHostCommand("codex --prompt hello\\ world"),
+            ["codex", "--prompt", "hello world"]
+        )
+        XCTAssertTrue(parseWorkflowHostCommand("   ").isEmpty)
+        XCTAssertTrue(parseWorkflowHostCommand("codex 'unterminated").isEmpty)
+        XCTAssertTrue(parseWorkflowHostCommand(#"codex \"#).isEmpty)
+    }
+
+    func testWorkflowTransitionOperationIDsAreUniqueAndInterpolated() {
+        let first = WorkspaceStore.workflowTransitionOperationID()
+        let second = WorkspaceStore.workflowTransitionOperationID()
+
+        XCTAssertTrue(first.hasPrefix("workflow-transition-"))
+        XCTAssertTrue(second.hasPrefix("workflow-transition-"))
+        XCTAssertNotEqual(first, second)
+        XCTAssertFalse(first.contains("UUID().uuidString"))
     }
 
     private func inventoryItem(
