@@ -24,6 +24,48 @@ PROJECTION_VALIDATOR = (
 )
 
 
+def _authenticated_fake_bridge(version: str, snapshot_result: dict[str, object]) -> str:
+    return textwrap.dedent(
+        f"""\
+        #!/usr/bin/env python3
+        import json
+        import sys
+
+        if sys.argv[1:] == ["--version"]:
+            print("unpin {version}")
+            raise SystemExit(0)
+
+        binding = None
+        for line in sys.stdin:
+            request = json.loads(line)
+            request_id = request["id"]
+            if request["method"] == "handshake":
+                params = request["params"]
+                binding = {{
+                    **{{key: value for key, value in params.items() if key != "sessionSecret"}},
+                    "childStartMarker": "fake-child-start-marker",
+                }}
+                result = {{
+                    "protocolVersion": 2,
+                    "binaryVersion": {version!r},
+                    "capabilities": ["snapshot"],
+                    "binding": binding,
+                }}
+            elif request["method"] == "snapshot":
+                assert binding is not None
+                assert "auth" in request
+                result = {snapshot_result!r}
+            else:
+                assert request["method"] == "shutdown"
+                assert "auth" in request
+                result = {{"shutdown": True}}
+            print(json.dumps({{"version": 2, "id": request_id, "result": result}}), flush=True)
+            if request["method"] == "shutdown":
+                break
+        """
+    )
+
+
 class DesktopReleaseScriptTests(unittest.TestCase):
     def test_builder_build_only_does_not_invoke_codesign(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -413,32 +455,32 @@ exit 0
                 macos / "UnpinDesktop",
                 "#!/bin/sh\nexit 0\n",
             )
+            bridge = macos / "unpin"
             self._write_executable(
-                macos / "unpin",
-                f"""\
-                #!/bin/sh
-                set -eu
-                if [ "${{1:-}}" = "--version" ]; then
-                    printf '%s\\n' 'unpin {version}'
-                    exit 0
-                fi
-                while IFS= read -r request; do
-                    case "$request" in
-                        *archive-handshake*)
-                            printf '%s\\n' '{{"version":2,"id":"archive-handshake","result":{{"protocolVersion":2,"binaryVersion":"{version}","capabilities":["snapshot"]}}}}'
-                            ;;
-                        *archive-snapshot*)
-                            printf '%s\\n' '{{"version":2,"id":"archive-snapshot","result":{{"capturedAtUnix":1,"inventory":[{{"provider":true,"kind":"skill","category":"skill","layer":"global","id":"item-id","displayName":"Item","enabled":true,"mutability":"read-write"}}],"warnings":[],"groups":[],"groupWarnings":[]}}}}'
-                            ;;
-                        *archive-shutdown*)
-                            printf '%s\\n' '{{"version":2,"id":"archive-shutdown","result":{{"shutdown":true}}}}'
-                            ;;
-                    esac
-                done
-                """,
+                bridge,
+                _authenticated_fake_bridge(
+                    version,
+                    {
+                        "capturedAtUnix": 1,
+                        "inventory": [
+                            {
+                                "provider": True,
+                                "kind": "skill",
+                                "category": "skill",
+                                "layer": "global",
+                                "id": "item-id",
+                                "displayName": "Item",
+                                "enabled": True,
+                                "mutability": "read-write",
+                            }
+                        ],
+                        "warnings": [],
+                        "groups": [],
+                        "groupWarnings": [],
+                    },
+                ),
             )
             (app / "Contents" / "Info.plist").write_text("{}", encoding="utf-8")
-            bridge = macos / "unpin"
             (resources / "unpin-bridge-manifest.json").write_text(
                 json.dumps(
                     {
