@@ -173,8 +173,11 @@ async fn run_listener(
             _ = &mut shutdown => break,
             completed = connections.join_next(), if !connections.is_empty() => {
                 if let Some(completed) = completed {
-                    completed
-                        .map_err(|_| GatewaySessionError::RuntimePanicked)??;
+                    // A transport or protocol failure belongs to that connection.
+                    // Keep accepting later control connections for the live session;
+                    // only a panicked task is a listener-runtime failure.
+                    let _connection_result =
+                        completed.map_err(|_| GatewaySessionError::RuntimePanicked)?;
                 }
             }
             accepted = listener.accept() => {
@@ -313,7 +316,10 @@ impl std::error::Error for GatewaySessionError {}
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{collections::BTreeSet, os::unix::net::UnixStream, sync::Arc, time::Duration};
+    use std::{
+        collections::BTreeSet, io::Write, net::Shutdown, os::unix::net::UnixStream, sync::Arc,
+        time::Duration,
+    };
 
     use rmcp::ServiceExt;
     use unpin_core::{
@@ -399,7 +405,8 @@ mod tests {
     fn open_client_does_not_block_second_gateway_connection() {
         let temp = tempfile::TempDir::new().unwrap();
         let root = std::fs::canonicalize(temp.path()).unwrap();
-        let runtime = GatewaySessionRuntime::start(gateway(&root), &root).unwrap();
+        let gateway = gateway(&root);
+        let runtime = GatewaySessionRuntime::start(Arc::clone(&gateway), &root).unwrap();
         let _held_open = UnixStream::connect(runtime.socket_path()).unwrap();
         std::thread::sleep(Duration::from_millis(50));
         let socket_path = runtime.socket_path().to_path_buf();
@@ -437,6 +444,66 @@ mod tests {
                 "unpin_workflow_status".to_string(),
             ])
         );
+        runtime.shutdown().unwrap();
+    }
+
+    #[test]
+    fn disconnected_client_does_not_stop_gateway_listener() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = std::fs::canonicalize(temp.path()).unwrap();
+        let service = gateway(&root);
+        let runtime = GatewaySessionRuntime::start(Arc::clone(&service), &root).unwrap();
+        let socket_path = runtime.socket_path().to_path_buf();
+        let client_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        let mut disconnected = UnixStream::connect(&socket_path).unwrap();
+        disconnected
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"disconnect-fixture","version":"1"}}}
+"#,
+            )
+            .unwrap();
+        disconnected.shutdown(Shutdown::Both).unwrap();
+        drop(disconnected);
+        let disconnect_deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while service.primary_connection_claim().unwrap().is_some() {
+            assert!(
+                std::time::Instant::now() < disconnect_deadline,
+                "gateway did not reap disconnected client"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        let names = client_runtime.block_on(async {
+            let stream = tokio::net::UnixStream::connect(&socket_path)
+                .await
+                .expect("gateway listener should survive a disconnected client");
+            let mut client = tokio::time::timeout(Duration::from_secs(2), ().serve(stream))
+                .await
+                .expect("second client initialize timeout")
+                .expect("second client initialize");
+            let tools = tokio::time::timeout(Duration::from_secs(2), client.list_all_tools())
+                .await
+                .expect("second client tools timeout")
+                .expect("second client tools");
+            let names = tools
+                .into_iter()
+                .map(|tool| tool.name.into_owned())
+                .collect::<BTreeSet<_>>();
+            client
+                .close_with_timeout(Duration::from_secs(2))
+                .await
+                .expect("close second client");
+            names
+        });
+
+        assert!(names.contains("unpin_workflow_cancel_transition"));
+        assert!(names.contains("unpin_workflow_enter_mode"));
+        assert!(names.contains("unpin_workflow_modes"));
+        assert!(names.contains("unpin_workflow_status"));
         runtime.shutdown().unwrap();
     }
 

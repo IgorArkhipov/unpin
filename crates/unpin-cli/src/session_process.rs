@@ -1074,9 +1074,7 @@ where
                         }
                         Err(error) => return Err(error.into()),
                     };
-                    if current.lease.lifecycle != LeaseLifecycle::Active
-                        || !current.lease.admission_open
-                    {
+                    if current.lease.lifecycle != LeaseLifecycle::Active {
                         return Err(SessionProcessError::LeaseRevoked);
                     }
                 }

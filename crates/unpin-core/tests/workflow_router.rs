@@ -421,6 +421,69 @@ fn staged_transition_remains_cancellable_after_expected_live_status_publication(
 }
 
 #[test]
+fn staged_transition_remains_cancellable_after_heartbeat_only_revisions() {
+    for (status, label) in [
+        (LiveExposureStatus::Configured, "configured"),
+        (LiveExposureStatus::NotificationSent, "notification-sent"),
+    ] {
+        let (_temp, root) = private_temp();
+        let (manager, claimed) = claimed_session(&root);
+        let pinned = manager
+            .pin_workflow(
+                &claimed.handle,
+                &claimed.lease.revision,
+                workflow(),
+                exposure('b'),
+                1_002,
+            )
+            .expect("pin workflow");
+        let router = WorkflowRouter::new(manager.clone());
+        let operation_id = format!("transition-heartbeat-{label}");
+        router
+            .enter_mode(
+                &claimed.handle,
+                &pinned.revision,
+                transition_request(&operation_id, pinned.revision.sequence),
+            )
+            .expect("stage transition");
+        let staged = manager
+            .load_for_handle(&claimed.handle)
+            .expect("staged lease");
+        let before_heartbeat = if status == LiveExposureStatus::Configured {
+            staged
+        } else {
+            manager
+                .observe_exposure(&claimed.handle, &staged.revision, status, 1_004)
+                .expect("publish live status")
+        };
+        let first_heartbeat = manager
+            .heartbeat(&claimed.handle, &before_heartbeat.revision, 1_005)
+            .expect("first heartbeat");
+        let second_heartbeat = manager
+            .heartbeat(&claimed.handle, &first_heartbeat.revision, 1_006)
+            .expect("second heartbeat");
+
+        let cancelled = router
+            .cancel_transition(
+                &claimed.handle,
+                &second_heartbeat.revision,
+                &operation_id,
+                1_007,
+            )
+            .expect("cancel after heartbeat-only revisions");
+        assert_eq!(
+            cancelled.lease.desired_exposure,
+            cancelled.lease.observed_exposure
+        );
+        assert_eq!(
+            cancelled.lease.workflow.as_ref().unwrap().active_mode,
+            "planning"
+        );
+        assert!(cancelled.lease.admission_open);
+    }
+}
+
+#[test]
 fn unrelated_state_drift_does_not_extend_transition_cancellation_binding() {
     let (_temp, root) = private_temp();
     let (manager, claimed) = claimed_session(&root);

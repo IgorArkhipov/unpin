@@ -1042,17 +1042,36 @@ fn desktop_bridge_workflow_launch_uses_real_session_and_gateway_controls() {
     }
 
     let stop = root_path.join("stop-host");
+    let ready = root_path.join("workflow-host-ready");
+    let gateway_output = root_path.join("workflow-gateway-output.jsonl");
     let host = root_path.join("workflow-host.sh");
     write_text(
         &host,
         r#"#!/bin/sh
 set -eu
 stop="$1"
+ready="$2"
+gateway_output="$3"
+(
+  attempts=0
+  while [ "$attempts" -lt 500 ]; do
+    if grep -q '"id":2' "$gateway_output" 2>/dev/null; then
+      : > "$ready"
+      exit 0
+    fi
+    attempts=$((attempts + 1))
+    sleep 0.01
+  done
+  exit 1
+) &
+ready_watcher=$!
 {
   printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{"tools":{"listChanged":true}},"clientInfo":{"name":"unpin-workflow-fixture","version":"1"}}}'
   printf '%s\n' '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}'
+  printf '%s\n' '{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}'
   while [ ! -e "$stop" ]; do sleep 0.05; done
-} | "$UNPIN_GATEWAY_PROXY_EXECUTABLE" gateway-session-proxy --socket "$UNPIN_GATEWAY_SOCKET" >/dev/null
+} | "$UNPIN_GATEWAY_PROXY_EXECUTABLE" gateway-session-proxy --socket "$UNPIN_GATEWAY_SOCKET" > "$gateway_output"
+wait "$ready_watcher"
 "#,
     );
     fs::set_permissions(&host, fs::Permissions::from_mode(0o700))
@@ -1140,7 +1159,7 @@ stop="$1"
         "params": {
             "proposalId": proposal_id,
             "proposalFingerprint": proposal_fingerprint,
-            "hostCommand": [host, stop],
+            "hostCommand": [host, stop, ready, gateway_output],
         },
     }));
     assert_eq!(
@@ -1163,6 +1182,10 @@ stop="$1"
     let source_sequence = status["result"]["session"]["stateSequence"]
         .as_u64()
         .expect("session state sequence");
+    assert!(
+        wait_for_path(&ready, Duration::from_secs(5)) && ready.is_file(),
+        "workflow host did not complete initial tools/list"
+    );
     let overlay = unpin_core::config::get_session_overlay_root(&app_state_root, &session_id);
     assert!(
         overlay.join("gateway-session.json").is_file(),
@@ -1214,7 +1237,24 @@ stop="$1"
     assert_eq!(cancelled["result"]["session"]["activeMode"], "planning");
 
     fs::write(&stop, b"stop").expect("stop workflow host");
-    thread::sleep(Duration::from_millis(250));
+    let manager =
+        SessionManager::with_authority_key(&app_state_root, session_authority_key(&app_state_root));
+    let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let child_session_exists = manager
+            .list()
+            .expect("workflow sessions while awaiting host exit")
+            .iter()
+            .any(|session| session.lease.session_id == session_id);
+        if !child_session_exists {
+            break;
+        }
+        assert!(
+            Instant::now() < cleanup_deadline,
+            "workflow child session was not cleaned after host exit"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     drop(input);
     let bridge_status = child.wait().expect("wait for bridge");
     assert!(
@@ -1222,8 +1262,6 @@ stop="$1"
         "desktop bridge should stop cleanly"
     );
 
-    let manager =
-        SessionManager::with_authority_key(&app_state_root, session_authority_key(&app_state_root));
     assert!(
         manager
             .list()

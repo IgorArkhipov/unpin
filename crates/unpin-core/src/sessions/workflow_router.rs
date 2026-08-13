@@ -348,18 +348,24 @@ fn transition_binding_matches_current_lease(
     operation: &WorkflowOperationRecord,
     current: &LeaseSnapshot,
 ) -> bool {
-    let sequence_advance = current
-        .revision
-        .sequence
-        .checked_sub(operation.target_state_sequence);
-    match current.lease.live_status {
-        super::LiveExposureStatus::Configured => sequence_advance == Some(0),
-        super::LiveExposureStatus::NotificationSent | super::LiveExposureStatus::ReloadRequired => {
-            sequence_advance == Some(1)
-        }
-        super::LiveExposureStatus::NextSessionOnly => sequence_advance == Some(1),
-        super::LiveExposureStatus::ObservedRefresh | super::LiveExposureStatus::Unknown => false,
-    }
+    let expected_target_revision = current.lease.workflow.as_ref().and_then(|workflow| {
+        operation
+            .target_mode
+            .as_deref()
+            .and_then(|mode| workflow.profile_revisions.get(mode))
+    });
+    current.revision.sequence >= operation.target_state_sequence
+        && current.lease.lifecycle == super::LeaseLifecycle::Active
+        && expected_target_revision == Some(&current.lease.desired_exposure.revision)
+        && current.lease.desired_exposure != current.lease.observed_exposure
+        && current.lease.workspace_start_revision == current.lease.last_workspace_revision
+        && !current.lease.workspace_drifted
+        && matches!(
+            current.lease.live_status,
+            super::LiveExposureStatus::Configured
+                | super::LiveExposureStatus::NotificationSent
+                | super::LiveExposureStatus::ReloadRequired
+        )
 }
 
 pub fn resolved_mode_exposure(
