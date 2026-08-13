@@ -687,10 +687,24 @@ class ProviderMatrixScreenshotCaptureTests(unittest.TestCase):
                     xctestrun = plistlib.load(handle)
                 target = xctestrun["TestConfigurations"][0]["TestTargets"][0]
                 observed_environment.update(target["EnvironmentVariables"])
+                staged_dashboard = Path(
+                    observed_environment["UNPIN_PROVIDER_MATRIX_DASHBOARD"]
+                )
+                self.assertNotEqual(
+                    staged_dashboard.resolve(),
+                    (artifact_root / "dashboard.html").resolve(),
+                )
+                self.assertEqual(
+                    staged_dashboard.read_text(encoding="utf-8"),
+                    self._dashboard_html(),
+                )
                 output_root = Path(
                     observed_environment[
                         "UNPIN_PROVIDER_MATRIX_SCREENSHOTS_DIR"
                     ]
+                )
+                self.assertFalse(
+                    output_root.resolve().is_relative_to(artifact_root.resolve())
                 )
                 output_root.mkdir(parents=True, exist_ok=True)
                 for section in matrix_screenshots.SCREENSHOT_SECTIONS:
