@@ -1677,6 +1677,7 @@ pub fn run_child_wrapper(
     if let Some(bridge_socket) = &control.bridge_socket {
         target.env("UNPIN_BRIDGE_SOCKET", bridge_socket);
     }
+    #[cfg(unix)]
     if let Some(gateway_socket) = &control.gateway_socket {
         let authentication_tag = crate::gateway_session::gateway_transport_authentication_tag(
             authority_key,
