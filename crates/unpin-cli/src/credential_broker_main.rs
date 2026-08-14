@@ -1,11 +1,14 @@
 #[cfg(target_os = "macos")]
 #[path = "credentials/broker_peer_auth.rs"]
 mod broker_peer_auth;
+#[cfg(unix)]
 #[path = "credentials/broker_protocol.rs"]
 mod broker_protocol;
+#[cfg(unix)]
 #[path = "credentials/broker_server.rs"]
 mod broker_server;
 
+#[cfg(unix)]
 fn main() -> std::process::ExitCode {
     let mut arguments = std::env::args_os().skip(1);
     let Some(command) = arguments.next() else {
@@ -42,4 +45,10 @@ fn main() -> std::process::ExitCode {
             std::process::ExitCode::FAILURE
         }
     }
+}
+
+#[cfg(not(unix))]
+fn main() -> std::process::ExitCode {
+    eprintln!("unpin-credential-broker is unsupported on this platform");
+    std::process::ExitCode::FAILURE
 }

@@ -70,6 +70,12 @@ if [[ ! -f "$smoke_driver" || -L "$smoke_driver" ]]; then
   echo "bounded credential broker smoke driver is missing or unsafe" >&2
   exit 1
 fi
+arch_executable="$(command -v arch || true)"
+if [[ -z "$arch_executable" || ! -f "$arch_executable" || ! -x "$arch_executable" || -L "$arch_executable" ]]; then
+  echo "macOS architecture launcher missing or unsafe" >&2
+  exit 1
+fi
+
 broker_version_output_file="$smoke_root/broker-version.out"
 set +e
 env -i \
@@ -81,7 +87,7 @@ env -i \
     --timeout-seconds "$broker_timeout_seconds" \
     --stdout-file "$broker_version_output_file" \
     -- \
-    arch "-$expected_architecture" "$broker" --version
+    "$arch_executable" "-$expected_architecture" "$broker" --version
 broker_status=$?
 set -e
 if [[ "$broker_status" -ne 0 ]]; then

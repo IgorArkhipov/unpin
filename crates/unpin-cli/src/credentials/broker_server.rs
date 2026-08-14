@@ -219,6 +219,7 @@ fn ensure_socket_directory(app_state_root: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(target_os = "macos")]
 fn client_code_requirement(fingerprint: &str) -> Result<String, String> {
     let normalized = fingerprint.to_ascii_lowercase();
     if normalized.len() != 40 || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit()) {
@@ -350,6 +351,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn macos_requirement_pins_cli_and_desktop_bridge_to_one_certificate() {
         let fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567";
