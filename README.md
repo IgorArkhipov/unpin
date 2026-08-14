@@ -36,7 +36,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v1.3.0-TARGET.tar.gz \
+gh attestation verify unpin-v1.4.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -45,7 +45,7 @@ Extract the archive, install both included executables together on your user
 before installing the stable broker under the app-state root:
 
 ```bash
-cd unpin-v1.3.0-TARGET
+cd unpin-v1.4.0-TARGET
 install -d "$HOME/.local/bin"
 install -m 0755 unpin unpin-credential-broker "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
@@ -119,9 +119,9 @@ archive against `SHA256SUMS` and its GitHub attestation before extracting it:
 
 ```bash
 gh attestation verify \
-  unpin-desktop-v1.3.0-TARGET.tar.gz \
+  unpin-desktop-v1.4.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
-tar -xzf unpin-desktop-v1.3.0-TARGET.tar.gz
+tar -xzf unpin-desktop-v1.4.0-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
