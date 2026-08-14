@@ -33,8 +33,9 @@ staging_root="$release_output/.unpin-desktop-v${release_version}-${release_targe
 app="$staging_root/UnpinDesktop.app"
 desktop_binary="$app/Contents/MacOS/UnpinDesktop"
 bridge_binary="$app/Contents/MacOS/unpin"
+broker_binary="$app/Contents/MacOS/unpin-credential-broker"
 manifest="$app/Contents/Resources/unpin-bridge-manifest.json"
-for required in "$desktop_binary" "$bridge_binary" "$manifest"; do
+for required in "$desktop_binary" "$bridge_binary" "$broker_binary" "$manifest"; do
   if [[ ! -f "$required" || -L "$required" ]]; then
     echo "desktop release staging output is missing or unsafe: $required" >&2
     exit 1
@@ -48,13 +49,20 @@ if [[ "$(lipo -archs "$bridge_binary")" != "$xcode_architecture" ]]; then
   echo "bundled bridge architecture does not match $xcode_architecture" >&2
   exit 1
 fi
+if [[ "$(lipo -archs "$broker_binary")" != "$xcode_architecture" ]]; then
+  echo "bundled credential broker architecture does not match $xcode_architecture" >&2
+  exit 1
+fi
 
-# Sign the Keychain-accessing bridge before recording its digest, then sign the
-# outer app last. No build commands run in this script: the caller can expose
-# the signing Keychain only for this isolated operation.
+# Sign the authenticated bridge and its separately pinned Keychain broker, then
+# record the bridge digest and sign the outer app last. No build commands run
+# here: the caller can expose the signing Keychain only for this operation.
 "$repository_root/scripts/sign_macos_artifact.sh" \
   dev.unpin.workbench.bridge \
   "$bridge_binary" >&2
+"$repository_root/scripts/sign_macos_artifact.sh" \
+  dev.unpin.credential-broker \
+  "$broker_binary" >&2
 bridge_digest="$(shasum -a 256 "$bridge_binary" | awk '{print $1}')"
 printf '{"bridgeProtocolVersion":2,"unpinVersion":"%s","sha256":"%s"}\n' \
   "$release_version" "$bridge_digest" > "$manifest"

@@ -25,7 +25,7 @@ mod updater;
 
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use unpin_core::{
-    approval::ControlApprovalContext,
+    approval::{ApprovalKey, ControlApprovalContext},
     capabilities::{CAPABILITY_ROWS, validate_capability_matrix, validate_provider_fixtures},
     config::{
         LoadConfigOptions, UnpinConfig, UnpinConfigOverrides, load_config, normalize_absolute_path,
@@ -137,13 +137,6 @@ impl DiscoveryRootArgs {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
-    /// Internal credential broker process for local MCP and CLI clients.
-    #[command(hide = true)]
-    CredentialBroker {
-        /// Unpin-owned state root that owns the private broker socket.
-        #[arg(long)]
-        app_state_root: PathBuf,
-    },
     /// Manage credentials used by Unpin safety features.
     Auth {
         #[command(subcommand)]
@@ -479,15 +472,6 @@ fn main() -> ExitCode {
     };
 
     match cli.command {
-        Some(Commands::CredentialBroker { app_state_root }) => {
-            match credentials::run_credential_broker(&app_state_root) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(error) => {
-                    eprintln!("credential broker failed: {error}");
-                    ExitCode::FAILURE
-                }
-            }
-        }
         Some(Commands::Auth { command }) => run_auth_command(command),
         Some(Commands::Providers) => {
             println!("{}", render_providers());
@@ -708,15 +692,32 @@ fn main() -> ExitCode {
                                             } else {
                                                 config.app_state_root.clone()
                                             };
-                                            let controller = match credentials::resolve_session_authority_key(fixture_mode, &toggle_state_root) {
-                                                Ok(Some(key)) => NativeToggleController::with_session_authority_key(&toggle_state_root, key),
-                                                Ok(None) if apply => return command_error_exit(
-                                                    json,
-                                                    "blocked",
-                                                    "session authority key missing; run `unpin auth session init`",
-                                                ),
-                                                Ok(None) => NativeToggleController::new(&toggle_state_root),
-                                                Err(error) => return command_error_exit(json, "blocked", &error),
+                                            let controller = if apply {
+                                                match credentials::resolve_session_authority_key(
+                                                    fixture_mode,
+                                                    &toggle_state_root,
+                                                ) {
+                                                    Ok(Some(key)) => {
+                                                        NativeToggleController::with_session_authority_key(
+                                                            &toggle_state_root,
+                                                            key,
+                                                        )
+                                                    }
+                                                    Ok(None) => {
+                                                        return command_error_exit(
+                                                            json,
+                                                            "blocked",
+                                                            "session authority key missing; run `unpin auth session init`",
+                                                        );
+                                                    }
+                                                    Err(error) => {
+                                                        return command_error_exit(
+                                                            json, "blocked", &error,
+                                                        );
+                                                    }
+                                                }
+                                            } else {
+                                                NativeToggleController::new(&toggle_state_root)
                                             };
                                             let reach_input = match reach {
                                                 commands::ProviderReachArg::Selected => {
@@ -1241,10 +1242,8 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let (backup_authentication_key, authentication) =
+            let (backup_authentication_key, session_authority_key, approval_key, authentication) =
                 resolve_mcp_authentication_readiness(fixture_mode, &config.app_state_root);
-            let session_authority_key =
-                resolve_optional_session_authority_key(fixture_mode, &config.app_state_root);
             let app_state_root = if fixture_mode {
                 match std::fs::canonicalize(&config.app_state_root) {
                     Ok(root) => root,
@@ -1270,19 +1269,12 @@ fn main() -> ExitCode {
                     );
                     return ExitCode::FAILURE;
                 };
-                let approval_key = match credentials::resolve_approval_key(
-                    fixture_mode,
-                    &app_state_root,
-                ) {
-                    Ok(Some(key)) => key,
-                    Ok(None) => {
+                let approval_key = match approval_key {
+                    Some(key) => key,
+                    None => {
                         eprintln!(
                             "approved group apply requires approval signing; run `unpin auth approval init`"
                         );
-                        return ExitCode::FAILURE;
-                    }
-                    Err(error) => {
-                        eprintln!("{error}");
                         return ExitCode::FAILURE;
                     }
                 };
@@ -1508,7 +1500,12 @@ fn parse_provider_id(value: &str) -> Option<ProviderId> {
 }
 
 fn run_auth_command(command: AuthCommands) -> ExitCode {
-    let store = credentials::KeychainSecretStore;
+    let machine = auth_command_machine_output(&command);
+    let config = match resolve_config(&DiscoveryRootArgs::default(), None) {
+        Ok(config) => config,
+        Err(error) => return command_error_exit(machine, "failed", &error),
+    };
+    let store = credentials::KeychainSecretStore::new(config.app_state_root);
     match command {
         AuthCommands::Backup {
             command: BackupAuthCommands::Init { json },
@@ -1691,6 +1688,28 @@ fn run_auth_command(command: AuthCommands) -> ExitCode {
     }
 }
 
+fn auth_command_machine_output(command: &AuthCommands) -> bool {
+    match command {
+        AuthCommands::Backup {
+            command: BackupAuthCommands::Init { json } | BackupAuthCommands::Status { json },
+        }
+        | AuthCommands::Approval {
+            command: ApprovalAuthCommands::Init { json } | ApprovalAuthCommands::Status { json },
+        }
+        | AuthCommands::Session {
+            command:
+                SessionAuthorityAuthCommands::Init { json }
+                | SessionAuthorityAuthCommands::Status { json },
+        }
+        | AuthCommands::CursorDashboard {
+            command:
+                CursorDashboardAuthCommands::Store { json }
+                | CursorDashboardAuthCommands::Status { json }
+                | CursorDashboardAuthCommands::Remove { json },
+        } => *json,
+    }
+}
+
 fn store_cursor_dashboard_credential(
     store: &impl credentials::SecretStore,
     json: bool,
@@ -1770,34 +1789,93 @@ fn resolve_optional_session_authority_key(
 fn resolve_mcp_authentication_readiness(
     fixture_mode: bool,
     app_state_root: &Path,
-) -> (Option<BackupAuthenticationKey>, McpAuthenticationReadiness) {
-    let (backup_authentication_key, backup_authentication) =
-        match credentials::resolve_backup_authentication_key(fixture_mode, app_state_root) {
-            Ok(Some(key)) => {
-                let readiness = McpCredentialReadiness::ready(Some(key.key_id()));
-                (Some(key), readiness)
+) -> (
+    Option<BackupAuthenticationKey>,
+    Option<unpin_core::sessions::SessionAuthorityKey>,
+    Option<ApprovalKey>,
+    McpAuthenticationReadiness,
+) {
+    let (
+        backup_authentication_key,
+        session_authority_key,
+        approval_key,
+        backup_authentication,
+        approval_signing,
+    ) = if fixture_mode {
+        let (backup_authentication_key, backup_authentication) =
+            match credentials::resolve_backup_authentication_key(true, app_state_root) {
+                Ok(Some(key)) => {
+                    let readiness = McpCredentialReadiness::ready(Some(key.key_id()));
+                    (Some(key), readiness)
+                }
+                Ok(None) => (None, McpCredentialReadiness::missing()),
+                Err(error) => {
+                    eprintln!("backup authentication unavailable: {error}");
+                    (None, McpCredentialReadiness::unavailable())
+                }
+            };
+        let session_authority_key = resolve_optional_session_authority_key(true, app_state_root);
+        let (approval_key, approval_signing) =
+            match credentials::resolve_approval_key(true, app_state_root) {
+                Ok(Some(key)) => {
+                    let readiness = McpCredentialReadiness::ready(Some(key.key_id()));
+                    (Some(key), readiness)
+                }
+                Ok(None) => (None, McpCredentialReadiness::missing()),
+                Err(error) => {
+                    eprintln!("approval signing unavailable: {error}");
+                    (None, McpCredentialReadiness::unavailable())
+                }
+            };
+        (
+            backup_authentication_key,
+            session_authority_key,
+            approval_key,
+            backup_authentication,
+            approval_signing,
+        )
+    } else {
+        match credentials::resolve_runtime_credentials(app_state_root) {
+            Ok(credentials) => {
+                let backup_authentication = credentials
+                    .backup_authentication_key
+                    .as_ref()
+                    .map_or_else(McpCredentialReadiness::missing, |key| {
+                        McpCredentialReadiness::ready(Some(key.key_id()))
+                    });
+                let approval_signing = credentials
+                    .approval_key
+                    .as_ref()
+                    .map_or_else(McpCredentialReadiness::missing, |key| {
+                        McpCredentialReadiness::ready(Some(key.key_id()))
+                    });
+                (
+                    credentials.backup_authentication_key,
+                    credentials.session_authority_key,
+                    credentials.approval_key,
+                    backup_authentication,
+                    approval_signing,
+                )
             }
-            Ok(None) => (None, McpCredentialReadiness::missing()),
             Err(error) => {
                 eprintln!("backup authentication unavailable: {error}");
-                (None, McpCredentialReadiness::unavailable())
-            }
-        };
-    let approval_signing =
-        match credentials::approval_key_status_for_mode(fixture_mode, app_state_root) {
-            Ok(credentials::ApprovalKeyState::Ready { key_id }) => {
-                McpCredentialReadiness::ready(Some(key_id))
-            }
-            Ok(credentials::ApprovalKeyState::Missing) => McpCredentialReadiness::missing(),
-            Err(error) => {
+                eprintln!("session authority unavailable; session controls disabled: {error}");
                 eprintln!("approval signing unavailable: {error}");
-                McpCredentialReadiness::unavailable()
+                (
+                    None,
+                    None,
+                    None,
+                    McpCredentialReadiness::unavailable(),
+                    McpCredentialReadiness::unavailable(),
+                )
             }
-        };
+        }
+    };
     let cursor_dashboard = if fixture_mode {
         McpCredentialReadiness::missing()
     } else {
-        match credentials::cursor_dashboard_credential_status(&credentials::KeychainSecretStore) {
+        let store = credentials::KeychainSecretStore::new(app_state_root);
+        match credentials::cursor_dashboard_credential_status(&store) {
             Ok(credentials::CursorDashboardCredentialState::Ready) => {
                 McpCredentialReadiness::ready(None)
             }
@@ -1812,6 +1890,8 @@ fn resolve_mcp_authentication_readiness(
     };
     (
         backup_authentication_key,
+        session_authority_key,
+        approval_key,
         McpAuthenticationReadiness {
             backup_authentication,
             approval_signing,

@@ -25,6 +25,8 @@ const CHECKSUM_ASSET_NAME: &str = "SHA256SUMS";
 const DESKTOP_BRIDGE_PROTOCOL_VERSION: u64 = 2;
 #[cfg(target_os = "macos")]
 const CLI_CODE_IDENTIFIER: &str = "dev.unpin.cli";
+#[cfg(any(target_os = "macos", test))]
+const BROKER_CODE_IDENTIFIER: &str = "dev.unpin.credential-broker";
 #[cfg(target_os = "macos")]
 const DESKTOP_CODE_IDENTIFIER: &str = "dev.unpin.workbench";
 #[cfg(target_os = "macos")]
@@ -82,9 +84,21 @@ pub struct ApplyResult {
     pub target: UpdateTarget,
     pub install_path: PathBuf,
     pub backup_path: PathBuf,
-    pub keychain_requirement_preserved: bool,
+    pub credential_broker_preserved: bool,
     pub relaunch_status: RelaunchStatus,
     pub warning: Option<String>,
+}
+
+#[derive(Debug)]
+struct InstallOutcome {
+    primary_backup: PathBuf,
+    companion: Option<CompanionInstallOutcome>,
+}
+
+#[derive(Debug)]
+struct CompanionInstallOutcome {
+    install_path: PathBuf,
+    backup_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,11 +117,6 @@ impl RelaunchStatus {
             Self::Failed => "failed",
         }
     }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CandidateVerification {
-    keychain_requirement_preserved: bool,
 }
 
 #[cfg(target_os = "macos")]
@@ -233,24 +242,76 @@ pub async fn apply_update(request: UpdateRequest) -> Result<ApplyResult, String>
     }
     verify_file_digest(&archive_path, &expected_archive_digest, &plan.archive_name)
         .map_err(|error| error.to_string())?;
-    let candidate = extract_release_archive(&archive_path, &workspace.path.join("unpacked"), &plan)
+    let unpacked = workspace.path.join("unpacked");
+    let candidate = extract_release_archive(&archive_path, &unpacked, &plan)
         .map_err(|error| error.to_string())?;
+    let companion_candidate = plan
+        .companion_relative_path()
+        .map(|relative_path| unpacked.join(relative_path));
     let candidate_fingerprint = fingerprint_path(&candidate)?;
-    let verification = verify_candidate(&install_path, &candidate, &plan)?;
-    let backup_path = install_candidate(
-        &candidate,
+    let companion_candidate_fingerprint = companion_candidate
+        .as_deref()
+        .map(fingerprint_path)
+        .transpose()?;
+    verify_candidate(
         &install_path,
-        &plan.current_version,
-        request.target,
-        &installed_fingerprint,
+        &candidate,
+        companion_candidate.as_deref(),
+        &plan,
+    )?;
+    let installation = match request.target {
+        UpdateTarget::Cli => {
+            let companion_candidate = companion_candidate
+                .as_deref()
+                .ok_or_else(|| "CLI update companion is missing".to_string())?;
+            let companion_candidate_fingerprint = companion_candidate_fingerprint
+                .as_deref()
+                .ok_or_else(|| "CLI update companion fingerprint is missing".to_string())?;
+            let companion_install_path = credential_broker_install_path(&install_path)?;
+            let companion_installed_fingerprint =
+                optional_regular_file_fingerprint(&companion_install_path)?;
+            install_cli_candidates(
+                &candidate,
+                companion_candidate,
+                &install_path,
+                &plan.current_version,
+                CliInstallFingerprints {
+                    primary: InstallFingerprints {
+                        installed: &installed_fingerprint,
+                        candidate: &candidate_fingerprint,
+                    },
+                    companion_installed: companion_installed_fingerprint.as_deref(),
+                    companion_candidate: companion_candidate_fingerprint,
+                },
+                &workspace.path,
+            )?
+        }
+        UpdateTarget::Desktop => InstallOutcome {
+            primary_backup: install_candidate(
+                &candidate,
+                &install_path,
+                &plan.current_version,
+                request.target,
+                &installed_fingerprint,
+                &candidate_fingerprint,
+                &workspace.path,
+            )?,
+            companion: None,
+        },
+    };
+    verify_installation_or_rollback(
+        &install_path,
+        &installation,
         &candidate_fingerprint,
+        companion_candidate_fingerprint.as_deref(),
         &workspace.path,
     )?;
     write_update_audit_or_rollback(
         &install_path,
-        &backup_path,
+        &installation,
         &plan,
         &candidate_fingerprint,
+        companion_candidate_fingerprint.as_deref(),
         &workspace.path,
     )?;
     let (relaunch_status, warning) = if request.relaunch {
@@ -271,8 +332,10 @@ pub async fn apply_update(request: UpdateRequest) -> Result<ApplyResult, String>
         installed_version: plan.latest_version,
         target: request.target,
         install_path,
-        backup_path,
-        keychain_requirement_preserved: verification.keychain_requirement_preserved,
+        backup_path: installation.primary_backup,
+        // The stable app-state broker is intentionally outside both update
+        // targets and is never overwritten by the ordinary updater.
+        credential_broker_preserved: true,
         relaunch_status,
         warning,
     })
@@ -590,11 +653,27 @@ fn parse_cli_version_output(stdout: &[u8]) -> Result<ReleaseVersion, String> {
 fn verify_candidate(
     installed: &Path,
     candidate: &Path,
+    companion_candidate: Option<&Path>,
     plan: &UpdatePlan,
-) -> Result<CandidateVerification, String> {
+) -> Result<(), String> {
     match plan.target {
-        UpdateTarget::Cli => verify_cli_candidate(installed, candidate, &plan.latest_version),
+        UpdateTarget::Cli => {
+            verify_cli_candidate(installed, candidate, &plan.latest_version)?;
+            let companion_candidate =
+                companion_candidate.ok_or_else(|| "CLI update companion is missing".to_string())?;
+            let companion_install_path = credential_broker_install_path(installed)?;
+            let companion_installed = optional_regular_file_exists(&companion_install_path)?
+                .then_some(companion_install_path.as_path());
+            verify_credential_broker_candidate(
+                companion_installed,
+                companion_candidate,
+                &plan.latest_version,
+            )
+        }
         UpdateTarget::Desktop => {
+            if companion_candidate.is_some() {
+                return Err("desktop update has an unexpected companion candidate".to_string());
+            }
             verify_desktop_candidate(installed, candidate, &plan.latest_version)
         }
     }
@@ -604,7 +683,7 @@ fn verify_cli_candidate(
     _installed: &Path,
     candidate: &Path,
     expected_version: &ReleaseVersion,
-) -> Result<CandidateVerification, String> {
+) -> Result<(), String> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
@@ -623,17 +702,60 @@ fn verify_cli_candidate(
         CodeSignatureScope::Executable,
         CLI_CODE_IDENTIFIER,
     )?;
+    #[cfg(target_os = "macos")]
+    verify_pinned_code_requirement(
+        candidate,
+        CodeSignatureScope::Executable,
+        CLI_CODE_IDENTIFIER,
+    )?;
     verify_executable_version(candidate, expected_version)?;
-    Ok(CandidateVerification {
-        keychain_requirement_preserved: cfg!(target_os = "macos"),
-    })
+    Ok(())
+}
+
+fn verify_credential_broker_candidate(
+    installed: Option<&Path>,
+    candidate: &Path,
+    expected_version: &ReleaseVersion,
+) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mode = fs::symlink_metadata(candidate)
+            .map_err(|error| error.to_string())?
+            .permissions()
+            .mode();
+        if mode & 0o111 == 0 {
+            return Err("credential broker candidate is not executable".to_string());
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        verify_pinned_code_requirement(
+            candidate,
+            CodeSignatureScope::Executable,
+            BROKER_CODE_IDENTIFIER,
+        )?;
+        if let Some(installed) = installed {
+            verify_matching_code_requirement(
+                installed,
+                candidate,
+                CodeSignatureScope::Executable,
+                BROKER_CODE_IDENTIFIER,
+            )?;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = installed;
+    verify_credential_broker_version(candidate, expected_version)?;
+    Ok(())
 }
 
 fn verify_desktop_candidate(
     installed: &Path,
     candidate: &Path,
     expected_version: &ReleaseVersion,
-) -> Result<CandidateVerification, String> {
+) -> Result<(), String> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (installed, candidate, expected_version);
@@ -643,6 +765,11 @@ fn verify_desktop_candidate(
     {
         verify_matching_code_requirement(
             installed,
+            candidate,
+            CodeSignatureScope::Bundle,
+            DESKTOP_CODE_IDENTIFIER,
+        )?;
+        verify_pinned_code_requirement(
             candidate,
             CodeSignatureScope::Bundle,
             DESKTOP_CODE_IDENTIFIER,
@@ -662,15 +789,23 @@ fn verify_desktop_candidate(
             CodeSignatureScope::Executable,
             DESKTOP_BRIDGE_CODE_IDENTIFIER,
         )?;
+        verify_pinned_code_requirement(
+            &candidate_bridge,
+            CodeSignatureScope::Executable,
+            DESKTOP_BRIDGE_CODE_IDENTIFIER,
+        )?;
         verify_executable_version(&candidate_bridge, expected_version)?;
         verify_desktop_bridge_manifest(
             &candidate.join("Contents/Resources/unpin-bridge-manifest.json"),
             &candidate_bridge,
             expected_version,
         )?;
-        Ok(CandidateVerification {
-            keychain_requirement_preserved: true,
-        })
+        let installed_broker = installed.join("Contents/MacOS/unpin-credential-broker");
+        let candidate_broker = candidate.join("Contents/MacOS/unpin-credential-broker");
+        let installed_broker =
+            optional_regular_file_exists(&installed_broker)?.then_some(installed_broker.as_path());
+        verify_credential_broker_candidate(installed_broker, &candidate_broker, expected_version)?;
+        Ok(())
     }
 }
 
@@ -731,17 +866,29 @@ fn plist_value(path: &Path, key: &str) -> Result<String, String> {
 }
 
 fn verify_executable_version(path: &Path, expected: &ReleaseVersion) -> Result<(), String> {
+    verify_reported_version(path, &format!("unpin {expected}"), "candidate executable")
+}
+
+fn verify_credential_broker_version(path: &Path, expected: &ReleaseVersion) -> Result<(), String> {
+    verify_reported_version(
+        path,
+        &format!("unpin-credential-broker {expected} protocol 1"),
+        "credential broker candidate",
+    )
+}
+
+fn verify_reported_version(path: &Path, expected: &str, subject: &str) -> Result<(), String> {
     let mut command = Command::new(path);
     command.arg("--version");
-    let (status, stdout) =
-        bounded_stdout(&mut command, MAX_VERSION_OUTPUT_BYTES, "candidate version")?;
+    let description = format!("{subject} version");
+    let (status, stdout) = bounded_stdout(&mut command, MAX_VERSION_OUTPUT_BYTES, &description)?;
     if !status.success() {
-        return Err("candidate executable version smoke failed".to_string());
+        return Err(format!("{subject} version smoke failed"));
     }
     let stdout = String::from_utf8(stdout).map_err(|error| error.to_string())?;
-    if stdout.trim() != format!("unpin {expected}") {
+    if stdout.trim() != expected {
         return Err(format!(
-            "candidate executable reported unexpected version: {}",
+            "{subject} reported unexpected version: {}",
             stdout.trim()
         ));
     }
@@ -948,7 +1095,7 @@ fn verify_matching_code_requirement(
     let candidate_requirement = code_requirement(candidate)?;
     if installed_requirement != candidate_requirement {
         return Err(format!(
-            "candidate designated requirement changed; Keychain Always Allow would not persist ({installed_requirement} != {candidate_requirement})"
+            "candidate designated requirement changed; refusing a different signing identity ({installed_requirement} != {candidate_requirement})"
         ));
     }
     Ok(())
@@ -1002,6 +1149,60 @@ fn verify_codesign(path: &Path, scope: CodeSignatureScope) -> Result<(), String>
 }
 
 #[cfg(target_os = "macos")]
+fn verify_pinned_code_requirement(
+    path: &Path,
+    scope: CodeSignatureScope,
+    expected_identifier: &str,
+) -> Result<(), String> {
+    verify_codesign(path, scope)?;
+    let identifier = code_identifier(path)?;
+    if identifier != expected_identifier {
+        return Err(format!(
+            "code signing identifier changed; expected {expected_identifier}, got {identifier} ({})",
+            path.display()
+        ));
+    }
+    let fingerprint = option_env!("UNPIN_CODESIGN_CERTIFICATE_SHA1")
+        .ok_or_else(|| "Unpin was not built with a signing certificate fingerprint".to_string())?;
+    let requirement = pinned_code_requirement(expected_identifier, fingerprint)?;
+    let mut command = Command::new("/usr/bin/codesign");
+    command.args(["--verify", "--strict", "--verbose=4"]);
+    if matches!(scope, CodeSignatureScope::Bundle) {
+        command.arg("--deep");
+    }
+    command.arg("-R").arg(&requirement).arg(path);
+    let output = bounded_output(
+        &mut command,
+        MAX_CODESIGN_OUTPUT_BYTES,
+        "pinned code signing requirement",
+    )?;
+    if !output.status.success() {
+        return Err(format!(
+            "candidate is not signed by the pinned Unpin certificate: {}",
+            path.display()
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn pinned_code_requirement(identifier: &str, fingerprint: &str) -> Result<String, String> {
+    let normalized = fingerprint.to_ascii_lowercase();
+    if normalized.len() != 40
+        || !normalized.bytes().all(|byte| byte.is_ascii_hexdigit())
+        || identifier.is_empty()
+        || !identifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-'))
+    {
+        return Err("Unpin signing certificate requirement is invalid".to_string());
+    }
+    Ok(format!(
+        "identifier \"{identifier}\" and certificate leaf = H\"{normalized}\""
+    ))
+}
+
+#[cfg(target_os = "macos")]
 fn code_requirement(path: &Path) -> Result<String, String> {
     let mut command = Command::new("/usr/bin/codesign");
     command.args(["-d", "-r-"]).arg(path);
@@ -1030,6 +1231,31 @@ fn code_requirement(path: &Path) -> Result<String, String> {
         .ok_or_else(|| format!("designated requirement is missing: {}", path.display()))
 }
 
+fn credential_broker_install_path(cli_install_path: &Path) -> Result<PathBuf, String> {
+    let parent = cli_install_path
+        .parent()
+        .ok_or_else(|| "CLI install path has no parent".to_string())?;
+    Ok(parent.join("unpin-credential-broker"))
+}
+
+fn optional_regular_file_exists(path: &Path) -> Result<bool, String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_file() => Err(format!(
+            "optional update companion must be a regular file: {}",
+            path.display()
+        )),
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn optional_regular_file_fingerprint(path: &Path) -> Result<Option<String>, String> {
+    optional_regular_file_exists(path)?
+        .then(|| fingerprint_path(path))
+        .transpose()
+}
+
 fn install_candidate(
     candidate: &Path,
     install_path: &Path,
@@ -1053,9 +1279,216 @@ fn install_candidate(
     )
 }
 
+#[derive(Clone, Copy)]
 struct InstallFingerprints<'a> {
     installed: &'a str,
     candidate: &'a str,
+}
+
+#[derive(Clone, Copy)]
+struct CliInstallFingerprints<'a> {
+    primary: InstallFingerprints<'a>,
+    companion_installed: Option<&'a str>,
+    companion_candidate: &'a str,
+}
+
+fn install_cli_candidates(
+    candidate: &Path,
+    companion_candidate: &Path,
+    install_path: &Path,
+    current_version: &ReleaseVersion,
+    fingerprints: CliInstallFingerprints<'_>,
+    workspace: &Path,
+) -> Result<InstallOutcome, String> {
+    install_cli_candidates_with_sync(
+        candidate,
+        companion_candidate,
+        install_path,
+        current_version,
+        fingerprints,
+        workspace,
+        sync_tree,
+    )
+}
+
+fn install_cli_candidates_with_sync<F>(
+    candidate: &Path,
+    companion_candidate: &Path,
+    install_path: &Path,
+    current_version: &ReleaseVersion,
+    fingerprints: CliInstallFingerprints<'_>,
+    workspace: &Path,
+    sync_tree_for_install: F,
+) -> Result<InstallOutcome, String>
+where
+    F: Fn(&Path) -> Result<(), String>,
+{
+    let companion_install_path = credential_broker_install_path(install_path)?;
+    preflight_cli_candidates(
+        candidate,
+        companion_candidate,
+        install_path,
+        &companion_install_path,
+        current_version,
+        fingerprints,
+        &sync_tree_for_install,
+    )?;
+
+    let primary_backup = install_candidate_with_sync(
+        candidate,
+        install_path,
+        current_version,
+        UpdateTarget::Cli,
+        fingerprints.primary,
+        workspace,
+        &sync_tree_for_install,
+    )?;
+    let companion = match install_companion_candidate_with_sync(
+        companion_candidate,
+        &companion_install_path,
+        current_version,
+        fingerprints.companion_installed,
+        fingerprints.companion_candidate,
+        workspace,
+        &sync_tree_for_install,
+    ) {
+        Ok(companion) => companion,
+        Err(error) => {
+            return Err(
+                match restore_backup_as(
+                    install_path,
+                    &primary_backup,
+                    workspace,
+                    "failed-cli-install",
+                ) {
+                    Ok(()) => format!("{error}; previous installation was restored"),
+                    Err(rollback_error) => format!(
+                        "{error}; CLI rollback failed ({rollback_error}); backup is {}",
+                        primary_backup.display()
+                    ),
+                },
+            );
+        }
+    };
+    Ok(InstallOutcome {
+        primary_backup,
+        companion: Some(companion),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn preflight_cli_candidates<F>(
+    candidate: &Path,
+    companion_candidate: &Path,
+    install_path: &Path,
+    companion_install_path: &Path,
+    current_version: &ReleaseVersion,
+    fingerprints: CliInstallFingerprints<'_>,
+    sync_tree_for_install: &F,
+) -> Result<(), String>
+where
+    F: Fn(&Path) -> Result<(), String>,
+{
+    validate_install_target(install_path, UpdateTarget::Cli)?;
+    validate_install_target(candidate, UpdateTarget::Cli)?;
+    validate_install_target(companion_candidate, UpdateTarget::Cli)?;
+    if fingerprint_path(install_path)? != fingerprints.primary.installed {
+        return Err("installed update target changed after the update began".to_string());
+    }
+    if fingerprint_path(candidate)? != fingerprints.primary.candidate
+        || fingerprint_path(companion_candidate)? != fingerprints.companion_candidate
+    {
+        return Err("verified CLI update candidates changed before installation".to_string());
+    }
+    match (
+        fingerprints.companion_installed,
+        optional_regular_file_fingerprint(companion_install_path)?,
+    ) {
+        (Some(expected), Some(actual)) if expected == actual => {}
+        (None, None) => {}
+        _ => return Err("installed credential broker changed after the update began".to_string()),
+    }
+    for path in [candidate, companion_candidate] {
+        sync_tree_for_install(path)?;
+    }
+    if fingerprint_path(candidate)? != fingerprints.primary.candidate
+        || fingerprint_path(companion_candidate)? != fingerprints.companion_candidate
+    {
+        return Err("verified CLI update candidates changed during durability sync".to_string());
+    }
+    for path in [
+        backup_path(install_path, current_version)?,
+        backup_path(companion_install_path, current_version)?,
+    ] {
+        if fs::symlink_metadata(&path).is_ok() {
+            return Err(format!("update backup already exists: {}", path.display()));
+        }
+    }
+    Ok(())
+}
+
+fn install_companion_candidate_with_sync<F>(
+    candidate: &Path,
+    install_path: &Path,
+    current_version: &ReleaseVersion,
+    installed_fingerprint: Option<&str>,
+    candidate_fingerprint: &str,
+    workspace: &Path,
+    sync_tree_for_install: &F,
+) -> Result<CompanionInstallOutcome, String>
+where
+    F: Fn(&Path) -> Result<(), String>,
+{
+    if fingerprint_path(candidate)? != candidate_fingerprint {
+        return Err("verified credential broker changed before installation".to_string());
+    }
+    let backup_path = installed_fingerprint
+        .map(|expected| {
+            validate_install_target(install_path, UpdateTarget::Cli)?;
+            if fingerprint_path(install_path)? != expected {
+                return Err("installed credential broker changed before installation".to_string());
+            }
+            let backup = backup_path(install_path, current_version)?;
+            fs::rename(install_path, &backup).map_err(|error| error.to_string())?;
+            Ok(backup)
+        })
+        .transpose()?;
+    if installed_fingerprint.is_none() && optional_regular_file_exists(install_path)? {
+        return Err("credential broker appeared during installation".to_string());
+    }
+    if let Err(error) = fs::rename(candidate, install_path) {
+        let original = format!("credential broker swap failed: {error}");
+        return Err(match backup_path.as_deref() {
+            Some(backup) => rollback_error(install_path, backup, workspace, original),
+            None => original,
+        });
+    }
+    if let Err(error) = sync_tree_for_install(install_path).and_then(|()| {
+        sync_directory(
+            install_path
+                .parent()
+                .ok_or_else(|| "credential broker install path has no parent".to_string())?,
+        )
+    }) {
+        let original = format!("credential broker durability sync failed: {error}");
+        return Err(match backup_path.as_deref() {
+            Some(backup) => rollback_error(install_path, backup, workspace, original),
+            None => match displace_new_install(
+                install_path,
+                workspace,
+                "failed-credential-broker-install",
+            ) {
+                Ok(()) => format!("{original}; new credential broker was removed"),
+                Err(rollback_error) => {
+                    format!("{original}; broker rollback failed ({rollback_error})")
+                }
+            },
+        });
+    }
+    Ok(CompanionInstallOutcome {
+        install_path: install_path.to_path_buf(),
+        backup_path,
+    })
 }
 
 fn install_candidate_with_sync<F>(
@@ -1085,11 +1518,7 @@ where
     let parent = install_path
         .parent()
         .ok_or_else(|| "install path has no parent".to_string())?;
-    let file_name = install_path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| "install name is invalid".to_string())?;
-    let backup = parent.join(format!(".{file_name}.unpin-backup-{current_version}"));
+    let backup = backup_path(install_path, current_version)?;
     if fs::symlink_metadata(&backup).is_ok() {
         return Err(format!(
             "update backup already exists: {}",
@@ -1117,6 +1546,17 @@ where
     Ok(backup)
 }
 
+fn backup_path(install_path: &Path, current_version: &ReleaseVersion) -> Result<PathBuf, String> {
+    let parent = install_path
+        .parent()
+        .ok_or_else(|| "install path has no parent".to_string())?;
+    let file_name = install_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| "install name is invalid".to_string())?;
+    Ok(parent.join(format!(".{file_name}.unpin-backup-{current_version}")))
+}
+
 fn rollback_error(
     install_path: &Path,
     backup: &Path,
@@ -1133,12 +1573,37 @@ fn rollback_error(
 }
 
 fn restore_backup(install_path: &Path, backup: &Path, workspace: &Path) -> Result<(), String> {
+    restore_backup_as(install_path, backup, workspace, "failed-install")
+}
+
+fn restore_backup_as(
+    install_path: &Path,
+    backup: &Path,
+    workspace: &Path,
+    displaced_name: &str,
+) -> Result<(), String> {
     if fs::symlink_metadata(install_path).is_ok() {
-        let displaced = workspace.join("failed-install");
+        let displaced = workspace.join(displaced_name);
         fs::rename(install_path, &displaced).map_err(|error| error.to_string())?;
     }
     fs::rename(backup, install_path).map_err(|error| error.to_string())?;
     sync_tree(install_path)?;
+    sync_directory(
+        install_path
+            .parent()
+            .ok_or_else(|| "install path has no parent".to_string())?,
+    )
+}
+
+fn displace_new_install(
+    install_path: &Path,
+    workspace: &Path,
+    displaced_name: &str,
+) -> Result<(), String> {
+    if fs::symlink_metadata(install_path).is_ok() {
+        fs::rename(install_path, workspace.join(displaced_name))
+            .map_err(|error| error.to_string())?;
+    }
     sync_directory(
         install_path
             .parent()
@@ -1237,11 +1702,88 @@ fn sync_tree(path: &Path) -> Result<(), String> {
     sync_directory(path)
 }
 
+fn verify_installation_or_rollback(
+    install_path: &Path,
+    installation: &InstallOutcome,
+    candidate_fingerprint: &str,
+    companion_candidate_fingerprint: Option<&str>,
+    workspace: &Path,
+) -> Result<(), String> {
+    let verification = (|| {
+        if fingerprint_path(install_path)? != candidate_fingerprint {
+            return Err(
+                "installed update target does not match the verified candidate".to_string(),
+            );
+        }
+        match (
+            installation.companion.as_ref(),
+            companion_candidate_fingerprint,
+        ) {
+            (Some(companion), Some(expected))
+                if fingerprint_path(&companion.install_path)? == expected => {}
+            (None, None) => {}
+            _ => {
+                return Err(
+                    "installed credential broker does not match the verified candidate".to_string(),
+                );
+            }
+        }
+        Ok(())
+    })();
+    verification
+        .map_err(|error| rollback_installation_error(install_path, installation, workspace, error))
+}
+
+fn rollback_installation_error(
+    install_path: &Path,
+    installation: &InstallOutcome,
+    workspace: &Path,
+    original_error: String,
+) -> String {
+    let mut rollback_errors = Vec::new();
+    if let Some(companion) = &installation.companion {
+        let result = match &companion.backup_path {
+            Some(backup) => restore_backup_as(
+                &companion.install_path,
+                backup,
+                workspace,
+                "failed-credential-broker-install",
+            ),
+            None => displace_new_install(
+                &companion.install_path,
+                workspace,
+                "failed-credential-broker-install",
+            ),
+        };
+        if let Err(error) = result {
+            rollback_errors.push(format!("credential broker: {error}"));
+        }
+    }
+    if let Err(error) = restore_backup_as(
+        install_path,
+        &installation.primary_backup,
+        workspace,
+        "failed-primary-install",
+    ) {
+        rollback_errors.push(format!("primary target: {error}"));
+    }
+    if rollback_errors.is_empty() {
+        format!("{original_error}; previous installation was restored")
+    } else {
+        format!(
+            "{original_error}; rollback failed ({}); primary backup is {}",
+            rollback_errors.join("; "),
+            installation.primary_backup.display()
+        )
+    }
+}
+
 fn write_update_audit(
     install_path: &Path,
-    backup_path: &Path,
+    installation: &InstallOutcome,
     plan: &UpdatePlan,
     candidate_fingerprint: &str,
+    companion_candidate_fingerprint: Option<&str>,
 ) -> Result<(), String> {
     let parent = install_path
         .parent()
@@ -1258,8 +1800,17 @@ fn write_update_audit(
         "previousVersion": plan.current_version.to_string(),
         "installedVersion": plan.latest_version.to_string(),
         "installPath": install_path,
-        "backupPath": backup_path,
+        "backupPath": installation.primary_backup,
         "candidateSha256": candidate_fingerprint,
+        "credentialBrokerInstallPath": installation
+            .companion
+            .as_ref()
+            .map(|companion| &companion.install_path),
+        "credentialBrokerBackupPath": installation
+            .companion
+            .as_ref()
+            .and_then(|companion| companion.backup_path.as_ref()),
+        "credentialBrokerCandidateSha256": companion_candidate_fingerprint,
     }))
     .map_err(|error| error.to_string())?;
     let mut options = OpenOptions::new();
@@ -1280,15 +1831,23 @@ fn write_update_audit(
 
 fn write_update_audit_or_rollback(
     install_path: &Path,
-    backup_path: &Path,
+    installation: &InstallOutcome,
     plan: &UpdatePlan,
     candidate_fingerprint: &str,
+    companion_candidate_fingerprint: Option<&str>,
     workspace: &Path,
 ) -> Result<(), String> {
-    write_update_audit(install_path, backup_path, plan, candidate_fingerprint).map_err(|error| {
-        rollback_error(
+    write_update_audit(
+        install_path,
+        installation,
+        plan,
+        candidate_fingerprint,
+        companion_candidate_fingerprint,
+    )
+    .map_err(|error| {
+        rollback_installation_error(
             install_path,
-            backup_path,
+            installation,
             workspace,
             format!("update audit failed: {error}"),
         )
@@ -1655,22 +2214,34 @@ mod tests {
         let temporary = tempfile::TempDir::new().expect("temporary directory");
         let install_path = temporary.path().join("unpin");
         let candidate = temporary.path().join("candidate");
+        let broker_candidate = temporary.path().join("broker-candidate");
         fs::write(&install_path, b"old").expect("installed binary");
         fs::write(&candidate, b"#!/bin/sh\nprintf 'unpin 1.1.0\\n'\n").expect("candidate binary");
+        fs::write(&broker_candidate, b"new broker").expect("candidate broker");
         fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
             .expect("candidate executable mode");
+        fs::set_permissions(&broker_candidate, fs::Permissions::from_mode(0o755))
+            .expect("candidate broker mode");
 
         let workspace = temporary.path().join("workspace");
         fs::create_dir(&workspace).expect("workspace");
         let installed_fingerprint = fingerprint_path(&install_path).expect("installed fingerprint");
         let candidate_fingerprint = fingerprint_path(&candidate).expect("candidate fingerprint");
-        let backup = install_candidate(
+        let broker_candidate_fingerprint =
+            fingerprint_path(&broker_candidate).expect("broker candidate fingerprint");
+        let installation = install_cli_candidates(
             &candidate,
+            &broker_candidate,
             &install_path,
             &ReleaseVersion::parse("1.0.2").expect("version"),
-            UpdateTarget::Cli,
-            &installed_fingerprint,
-            &candidate_fingerprint,
+            CliInstallFingerprints {
+                primary: InstallFingerprints {
+                    installed: &installed_fingerprint,
+                    candidate: &candidate_fingerprint,
+                },
+                companion_installed: None,
+                companion_candidate: &broker_candidate_fingerprint,
+            },
             &workspace,
         )
         .expect("CLI install");
@@ -1680,7 +2251,275 @@ mod tests {
             fs::read_to_string(&install_path).expect("installed candidate"),
             "#!/bin/sh\nprintf 'unpin 1.1.0\\n'\n"
         );
-        assert_eq!(fs::read(&backup).expect("rollback backup"), b"old");
+        assert_eq!(
+            fs::read(&installation.primary_backup).expect("rollback backup"),
+            b"old"
+        );
+        assert_eq!(
+            fs::read(temporary.path().join("unpin-credential-broker")).expect("installed broker"),
+            b"new broker"
+        );
+        assert!(
+            installation
+                .companion
+                .as_ref()
+                .expect("companion installation")
+                .backup_path
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn committed_cli_update_with_existing_broker_preserves_pair_evidence() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
+        let install_path = temporary.path().join("unpin");
+        let installed_broker = temporary.path().join("unpin-credential-broker");
+        let candidate = temporary.path().join("candidate");
+        let broker_candidate = temporary.path().join("broker-candidate");
+        let workspace = temporary.path().join("workspace");
+        fs::write(&install_path, b"old cli").expect("installed CLI");
+        fs::write(&installed_broker, b"old broker").expect("installed broker");
+        fs::write(&candidate, b"new cli").expect("candidate CLI");
+        fs::write(&broker_candidate, b"new broker").expect("candidate broker");
+        for path in [&candidate, &broker_candidate] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("candidate mode");
+        }
+        fs::create_dir(&workspace).expect("workspace");
+        let installed_fingerprint = fingerprint_path(&install_path).expect("installed fingerprint");
+        let candidate_fingerprint = fingerprint_path(&candidate).expect("candidate fingerprint");
+        let installed_broker_fingerprint =
+            fingerprint_path(&installed_broker).expect("installed broker fingerprint");
+        let broker_candidate_fingerprint =
+            fingerprint_path(&broker_candidate).expect("broker candidate fingerprint");
+        let current_version = ReleaseVersion::parse("1.0.2").expect("current version");
+
+        let installation = install_cli_candidates(
+            &candidate,
+            &broker_candidate,
+            &install_path,
+            &current_version,
+            CliInstallFingerprints {
+                primary: InstallFingerprints {
+                    installed: &installed_fingerprint,
+                    candidate: &candidate_fingerprint,
+                },
+                companion_installed: Some(&installed_broker_fingerprint),
+                companion_candidate: &broker_candidate_fingerprint,
+            },
+            &workspace,
+        )
+        .expect("paired CLI install");
+        verify_installation_or_rollback(
+            &install_path,
+            &installation,
+            &candidate_fingerprint,
+            Some(&broker_candidate_fingerprint),
+            &workspace,
+        )
+        .expect("paired installation verification");
+        let plan = UpdatePlan::new(
+            "1.0.2",
+            "1.1.0",
+            UpdateTarget::Cli,
+            UpdatePlatform::MacOsArm64,
+        )
+        .expect("update plan");
+        write_update_audit(
+            &install_path,
+            &installation,
+            &plan,
+            &candidate_fingerprint,
+            Some(&broker_candidate_fingerprint),
+        )
+        .expect("update audit");
+
+        let companion = installation.companion.as_ref().expect("companion metadata");
+        let expected_cli_backup = temporary.path().join(".unpin.unpin-backup-1.0.2");
+        let expected_broker_backup = temporary
+            .path()
+            .join(".unpin-credential-broker.unpin-backup-1.0.2");
+        assert_eq!(installation.primary_backup, expected_cli_backup);
+        assert_eq!(companion.install_path, installed_broker);
+        assert_eq!(
+            companion.backup_path.as_deref(),
+            Some(expected_broker_backup.as_path())
+        );
+        assert_eq!(fs::read(&install_path).expect("new CLI"), b"new cli");
+        assert_eq!(
+            fs::read(&installed_broker).expect("new broker"),
+            b"new broker"
+        );
+        assert_eq!(
+            fs::read(&expected_cli_backup).expect("old CLI backup"),
+            b"old cli"
+        );
+        assert_eq!(
+            fs::read(&expected_broker_backup).expect("old broker backup"),
+            b"old broker"
+        );
+        assert!(!candidate.exists());
+        assert!(!broker_candidate.exists());
+
+        let audit_path = temporary.path().join(".unpin.unpin-update-audit.jsonl");
+        let audit: serde_json::Value = serde_json::from_str(
+            fs::read_to_string(&audit_path)
+                .expect("audit record")
+                .trim_end(),
+        )
+        .expect("audit JSON");
+        assert_eq!(audit["installPath"], json!(install_path));
+        assert_eq!(audit["backupPath"], json!(expected_cli_backup));
+        assert_eq!(audit["candidateSha256"], candidate_fingerprint);
+        assert_eq!(
+            audit["credentialBrokerInstallPath"],
+            json!(installed_broker)
+        );
+        assert_eq!(
+            audit["credentialBrokerBackupPath"],
+            json!(expected_broker_backup)
+        );
+        assert_eq!(
+            audit["credentialBrokerCandidateSha256"],
+            broker_candidate_fingerprint
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_companion_failure_restores_cli_and_previous_broker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
+        let install_path = temporary.path().join("unpin");
+        let installed_broker = temporary.path().join("unpin-credential-broker");
+        let candidate = temporary.path().join("candidate");
+        let broker_candidate = temporary.path().join("broker-candidate");
+        let workspace = temporary.path().join("workspace");
+        fs::write(&install_path, b"old cli").expect("installed CLI");
+        fs::write(&installed_broker, b"old broker").expect("installed broker");
+        fs::write(&candidate, b"new cli").expect("candidate CLI");
+        fs::write(&broker_candidate, b"new broker").expect("candidate broker");
+        for path in [&candidate, &broker_candidate] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("candidate mode");
+        }
+        fs::create_dir(&workspace).expect("workspace");
+        let installed_fingerprint = fingerprint_path(&install_path).expect("installed fingerprint");
+        let candidate_fingerprint = fingerprint_path(&candidate).expect("candidate fingerprint");
+        let installed_broker_fingerprint =
+            fingerprint_path(&installed_broker).expect("installed broker fingerprint");
+        let broker_candidate_fingerprint =
+            fingerprint_path(&broker_candidate).expect("broker candidate fingerprint");
+
+        let error = install_cli_candidates_with_sync(
+            &candidate,
+            &broker_candidate,
+            &install_path,
+            &ReleaseVersion::parse("1.0.2").expect("version"),
+            CliInstallFingerprints {
+                primary: InstallFingerprints {
+                    installed: &installed_fingerprint,
+                    candidate: &candidate_fingerprint,
+                },
+                companion_installed: Some(&installed_broker_fingerprint),
+                companion_candidate: &broker_candidate_fingerprint,
+            },
+            &workspace,
+            |path| {
+                if path == installed_broker.as_path() {
+                    Err("injected broker durability failure".to_string())
+                } else {
+                    sync_tree(path)
+                }
+            },
+        )
+        .expect_err("broker durability failure must roll back the pair");
+
+        assert!(error.contains("broker durability sync failed"), "{error}");
+        assert!(
+            error.contains("previous installation was restored"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&install_path).expect("restored CLI"), b"old cli");
+        assert_eq!(
+            fs::read(&installed_broker).expect("restored broker"),
+            b"old broker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cli_audit_failure_restores_cli_and_previous_broker() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
+        let install_path = temporary.path().join("unpin");
+        let installed_broker = temporary.path().join("unpin-credential-broker");
+        let candidate = temporary.path().join("candidate");
+        let broker_candidate = temporary.path().join("broker-candidate");
+        let workspace = temporary.path().join("workspace");
+        fs::write(&install_path, b"old cli").expect("installed CLI");
+        fs::write(&installed_broker, b"old broker").expect("installed broker");
+        fs::write(&candidate, b"new cli").expect("candidate CLI");
+        fs::write(&broker_candidate, b"new broker").expect("candidate broker");
+        for path in [&candidate, &broker_candidate] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("candidate mode");
+        }
+        fs::create_dir(&workspace).expect("workspace");
+        let installed_fingerprint = fingerprint_path(&install_path).expect("installed fingerprint");
+        let candidate_fingerprint = fingerprint_path(&candidate).expect("candidate fingerprint");
+        let installed_broker_fingerprint =
+            fingerprint_path(&installed_broker).expect("installed broker fingerprint");
+        let broker_candidate_fingerprint =
+            fingerprint_path(&broker_candidate).expect("broker candidate fingerprint");
+        let installation = install_cli_candidates(
+            &candidate,
+            &broker_candidate,
+            &install_path,
+            &ReleaseVersion::parse("1.0.2").expect("version"),
+            CliInstallFingerprints {
+                primary: InstallFingerprints {
+                    installed: &installed_fingerprint,
+                    candidate: &candidate_fingerprint,
+                },
+                companion_installed: Some(&installed_broker_fingerprint),
+                companion_candidate: &broker_candidate_fingerprint,
+            },
+            &workspace,
+        )
+        .expect("paired installation");
+        fs::create_dir(temporary.path().join(".unpin.unpin-update-audit.jsonl"))
+            .expect("audit path collision");
+        let plan = UpdatePlan::new(
+            "1.0.2",
+            "v1.1.0",
+            UpdateTarget::Cli,
+            UpdatePlatform::MacOsArm64,
+        )
+        .expect("update plan");
+
+        let error = write_update_audit_or_rollback(
+            &install_path,
+            &installation,
+            &plan,
+            &candidate_fingerprint,
+            Some(&broker_candidate_fingerprint),
+            &workspace,
+        )
+        .expect_err("audit failure must roll back the pair");
+
+        assert!(error.contains("update audit failed"), "{error}");
+        assert!(
+            error.contains("previous installation was restored"),
+            "{error}"
+        );
+        assert_eq!(fs::read(&install_path).expect("restored CLI"), b"old cli");
+        assert_eq!(
+            fs::read(&installed_broker).expect("restored broker"),
+            b"old broker"
+        );
     }
 
     #[cfg(unix)]
@@ -1770,11 +2609,16 @@ mod tests {
         )
         .expect("update plan");
 
+        let installation = InstallOutcome {
+            primary_backup: backup,
+            companion: None,
+        };
         let error = write_update_audit_or_rollback(
             &install_path,
-            &backup,
+            &installation,
             &plan,
             &candidate_fingerprint,
+            None,
             &workspace,
         )
         .expect_err("audit failure must roll back");
@@ -1785,9 +2629,9 @@ mod tests {
             "{error}"
         );
         assert_eq!(fs::read(&install_path).expect("restored install"), b"old");
-        assert!(!backup.exists());
+        assert!(!installation.primary_backup.exists());
         assert_eq!(
-            fs::read(workspace.join("failed-install")).expect("displaced candidate"),
+            fs::read(workspace.join("failed-primary-install")).expect("displaced candidate"),
             b"new"
         );
     }
@@ -1811,6 +2655,34 @@ mod tests {
         .expect_err("oversized version output must fail");
 
         assert!(error.contains("output exceeds size limit"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn credential_broker_version_must_match_release() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
+        let candidate = temporary.path().join("unpin-credential-broker");
+        fs::write(
+            &candidate,
+            b"#!/bin/sh\nprintf '%s\\n' 'unpin-credential-broker 1.1.0 protocol 1'\n",
+        )
+        .expect("candidate binary");
+        fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755))
+            .expect("candidate executable mode");
+        let expected = ReleaseVersion::parse("1.1.0").expect("version");
+
+        verify_credential_broker_version(&candidate, &expected).expect("matching broker version");
+
+        fs::write(
+            &candidate,
+            b"#!/bin/sh\nprintf '%s\\n' 'unpin-credential-broker 1.0.0 protocol 1'\n",
+        )
+        .expect("wrong-version candidate");
+        let error = verify_credential_broker_version(&candidate, &expected)
+            .expect_err("wrong broker version must fail");
+        assert!(error.contains("reported unexpected version"), "{error}");
     }
 
     #[cfg(unix)]
@@ -2065,7 +2937,40 @@ mod tests {
             "dev.unpin.cli",
         )
         .expect_err("changed designated requirement must fail");
-        assert!(error.contains("Keychain Always Allow would not persist"));
+        assert!(error.contains("refusing a different signing identity"));
+    }
+
+    #[test]
+    fn pinned_requirement_uses_exact_identifier_and_certificate() {
+        let fingerprint = "0123456789ABCDEF0123456789ABCDEF01234567";
+
+        assert_eq!(
+            pinned_code_requirement(BROKER_CODE_IDENTIFIER, fingerprint).expect("requirement"),
+            "identifier \"dev.unpin.credential-broker\" and certificate leaf = H\"0123456789abcdef0123456789abcdef01234567\""
+        );
+        assert!(pinned_code_requirement(BROKER_CODE_IDENTIFIER, "not-a-fingerprint").is_err());
+        assert!(pinned_code_requirement("unsafe identifier", fingerprint).is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desktop_broker_rejects_missing_or_wrong_identity() {
+        let temporary = tempfile::TempDir::new().expect("temporary directory");
+        let expected = ReleaseVersion::parse("1.1.0").expect("version");
+        let missing = temporary.path().join("missing-broker");
+        assert!(verify_credential_broker_candidate(None, &missing, &expected).is_err());
+
+        let wrong_identity = temporary.path().join("wrong-identity");
+        fs::copy(
+            std::env::current_exe().expect("current test executable"),
+            &wrong_identity,
+        )
+        .expect("copy test executable");
+        sign_ad_hoc(&wrong_identity, "dev.unpin.other");
+
+        let error = verify_credential_broker_candidate(None, &wrong_identity, &expected)
+            .expect_err("wrong broker identity must fail");
+        assert!(error.contains("identifier changed"), "{error}");
     }
 
     #[cfg(target_os = "macos")]

@@ -21,6 +21,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("macos-15", linux_job)
         self.assertNotIn("release-signing", linux_job)
         self.assertNotIn("UNPIN_MACOS_SIGNING_CERTIFICATE", linux_job)
+        self.assertNotIn("UNPIN_CODESIGN_CERTIFICATE_SHA1", linux_job)
         self.assertNotIn("import_macos_signing_identity.sh", linux_job)
         self.assertNotIn("sign_macos_artifact.sh", linux_job)
         self.assertIn("verify_linux_release_artifact.sh", linux_job)
@@ -32,7 +33,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("target: aarch64-apple-darwin", macos_cli_job)
         self.assertIn("target: x86_64-apple-darwin", macos_cli_job)
         self.assertIn(
-            "UNPIN_CODESIGN_EXPECTED_FINGERPRINT: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389",
+            "UNPIN_CODESIGN_EXPECTED_FINGERPRINT: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}",
+            macos_cli_job,
+        )
+        self.assertIn(
+            "UNPIN_CODESIGN_CERTIFICATE_SHA1: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}",
             macos_cli_job,
         )
         self.assertIn('UNPIN_REQUIRE_STABLE_CODESIGN: "1"', macos_cli_job)
@@ -51,6 +56,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("Sign and package desktop workbench", desktop_job)
         self.assertIn("sign_desktop_release.sh", desktop_job)
         self.assertIn("verify_desktop_release_artifact.sh", desktop_job)
+        self.assertIn(
+            "UNPIN_CODESIGN_CERTIFICATE_SHA1: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}",
+            desktop_job,
+        )
         self._assert_signing_secret_boundary(desktop_job)
         self._assert_import_cleanup_order(desktop_job)
 
@@ -70,12 +79,39 @@ class ReleaseWorkflowTests(unittest.TestCase):
         cli_script = (
             REPOSITORY_ROOT / "scripts" / "verify_macos_release_artifact.sh"
         ).read_text(encoding="utf-8")
+        package_script = (
+            REPOSITORY_ROOT / "scripts" / "package_release.sh"
+        ).read_text(encoding="utf-8")
+        desktop_sign_script = (
+            REPOSITORY_ROOT / "scripts" / "sign_desktop_release.sh"
+        ).read_text(encoding="utf-8")
 
         self.assertIn("UNPIN_CODESIGN_EXPECTED_FINGERPRINT", signature_script)
         self.assertIn("--display --extract-certificates=", signature_script)
         self.assertIn("dev.unpin.workbench", desktop_script)
         self.assertIn("dev.unpin.workbench.bridge", desktop_script)
+        self.assertIn("dev.unpin.credential-broker", desktop_script)
         self.assertIn("dev.unpin.cli", cli_script)
+        self.assertIn("dev.unpin.credential-broker", cli_script)
+        self.assertIn("dev.unpin.credential-broker", package_script)
+        self.assertIn("dev.unpin.credential-broker", desktop_sign_script)
+
+    def test_release_configuration_does_not_reference_the_retired_identity(self) -> None:
+        retired_name = "".join(("Code", "Burn Update Signing"))
+        retired_fingerprint = "".join(
+            ("E2AB4267F6B79DF40B87", "76A2EE9309F64CFD2389")
+        )
+        repository_text = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (
+                WORKFLOW,
+                REPOSITORY_ROOT / "docs" / "RELEASING.md",
+                REPOSITORY_ROOT / "scripts" / "test_macos_signing_identity_scripts.py",
+            )
+        )
+
+        self.assertNotIn(retired_name, repository_text)
+        self.assertNotIn(retired_fingerprint, repository_text.upper())
 
     def _job(self, name: str) -> str:
         match = re.search(

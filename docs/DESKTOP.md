@@ -31,20 +31,18 @@ tar -xzf unpin-desktop-v1.3.0-TARGET.tar.gz
 open unpin-desktop-v1.3.0-TARGET
 ```
 
-Starting with `1.0.2`, official releases use a stable self-signed personal
-certificate with Hardened Runtime so Keychain authorization can remain valid
-across updates. The certificate is not Developer ID signing or Apple
-notarization and does not establish Gatekeeper trust. On first launch, macOS can
-report that Apple cannot verify the developer.
+Official releases use a self-signed personal certificate with Hardened Runtime.
+The certificate is not Developer ID signing or Apple notarization and does not
+establish Gatekeeper trust. On first launch, macOS can report that Apple cannot
+verify the developer.
 
-Replacing a `1.0.1`-or-earlier ad-hoc build is a one-time transition: the
-designated requirement changes, so the first `1.0.2` launch may ask for
-Keychain access again. Approve it only after the checksum and attestation above
-succeed. Later updates signed by this same certificate and the same app or
-bridge identifier retain the designated requirement and their **Always Allow**
-grants. A future certificate rotation changes that
-requirement again; follow the release notes and the [release runbook](RELEASING.md#certificate-expiry-and-rotation)
-when it happens.
+Releases through `1.3.0` accessed Keychain from rebuilt executables and could
+prompt again even when the certificate and identifier stayed the same. Current
+archives include a separately signed credential broker. Approve its first
+installation only after the checksum and attestation above succeed. Ordinary
+updates leave the stable broker bytes unchanged. A future certificate rotation
+requires an explicit broker replacement; follow the release notes and the
+[release runbook](RELEASING.md#certificate-expiry-and-rotation) when it happens.
 
 After the checksum and attestation pass, use Finder to Control-click
 `UnpinDesktop.app`, choose **Open**, and confirm **Open**. Alternatively, after
@@ -152,14 +150,17 @@ and requires these designated requirements to be byte-for-byte equal to the
 installed app and bridge requirements:
 
 - `dev.unpin.workbench` for the app;
-- `dev.unpin.workbench.bridge` for the bundled bridge.
+- `dev.unpin.workbench.bridge` for the bundled bridge;
+- `dev.unpin.credential-broker` for the bundled broker companion.
 
 The old app bundle is retained beside the installation as a hidden rollback
 bundle, the candidate is swapped into the same path, and the new app is
 relaunched before the old process exits. Exact designated-requirement equality
-is what preserves an existing Keychain **Always Allow** grant across updates.
-An automatic update refuses a certificate or identifier change instead of
-installing a build that would trigger a new Keychain authorization.
+rejects an unexpected signing identity. It does not claim to preserve Keychain
+authorization. The updater reports `credentialBrokerPreserved: true` only when
+it has left the stable app-state broker untouched. An automatic update refuses
+a certificate or identifier change instead of silently rotating that trust
+boundary.
 
 ## Manual fallback
 

@@ -67,6 +67,20 @@ def _authenticated_fake_bridge(version: str, snapshot_result: dict[str, object])
 
 
 class DesktopReleaseScriptTests(unittest.TestCase):
+    def test_xcode_bundle_phase_declares_credential_broker_output(self) -> None:
+        project = (
+            REPOSITORY_ROOT
+            / "apps"
+            / "unpin-desktop"
+            / "UnpinDesktop.xcodeproj"
+            / "project.pbxproj"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/unpin-credential-broker",
+            project,
+        )
+
     def test_builder_build_only_does_not_invoke_codesign(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -92,6 +106,7 @@ app="$derived_data/Build/Products/Release/UnpinDesktop.app"
 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
 printf '%s' desktop > "$app/Contents/MacOS/UnpinDesktop"
 printf '%s' bridge > "$app/Contents/MacOS/unpin"
+printf '%s' broker > "$app/Contents/MacOS/unpin-credential-broker"
 : > "$app/Contents/Resources/unpin-bridge-manifest.json"
 """,
             )
@@ -157,6 +172,7 @@ printf '%s\\n' arm64
                 mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
                 printf '%s' 'desktop executable' > "$app/Contents/MacOS/UnpinDesktop"
                 printf '%s' 'bridge executable' > "$app/Contents/MacOS/unpin"
+                printf '%s' 'broker executable' > "$app/Contents/MacOS/unpin-credential-broker"
                 : > "$app/Contents/Resources/unpin-bridge-manifest.json"
                 """,
             )
@@ -180,6 +196,7 @@ if [ "${1:-}" = "--display" ]; then
     artifact="$argument"
   done
   case "$artifact" in
+    *unpin-credential-broker) identifier=dev.unpin.credential-broker ;;
     *.app) identifier=dev.unpin.workbench ;;
     *) identifier=dev.unpin.workbench.bridge ;;
   esac
@@ -226,6 +243,7 @@ exit 0
                 root / "target" / "x86_64-apple-darwin" / "release" / "unpin"
             )
             target_binary.parent.mkdir(parents=True)
+            broker_binary = target_binary.with_name("unpin-credential-broker")
             execution_marker = root / "cross-compiled-binary-executed"
             self._write_executable(
                 target_binary,
@@ -237,6 +255,15 @@ exit 0
                 """,
             )
             self._write_executable(
+                broker_binary,
+                f"""\
+                #!/bin/sh
+                # arch: x86_64
+                printf '%s' broker-executed > '{execution_marker}'
+                exit 99
+                """,
+            )
+            self._write_executable(
                 command_bin / "cargo",
                 """\
                 #!/bin/sh
@@ -244,15 +271,16 @@ exit 0
                 case "${1:-}" in
                   build)
                     shift
-                    test "$#" -eq 8
+                    test "$#" -eq 9
                     test "$1" = "--locked"
                     test "$2" = "--manifest-path"
                     test "$3" = "$FAKE_WORKSPACE_ROOT/Cargo.toml"
                     test "$4" = "-p"
                     test "$5" = "unpin-cli"
-                    test "$6" = "--target"
-                    test "$7" = "x86_64-apple-darwin"
-                    test "$8" = "--release"
+                    test "$6" = "--bins"
+                    test "$7" = "--target"
+                    test "$8" = "x86_64-apple-darwin"
+                    test "$9" = "--release"
                     exit 0
                     ;;
                   pkgid)
@@ -336,6 +364,15 @@ exit 0
                 execution_marker.exists(),
                 "bundle script executed the cross-compiled target binary",
             )
+            bundled_broker = (
+                build_root
+                / "UnpinDesktop.app"
+                / "Contents"
+                / "MacOS"
+                / "unpin-credential-broker"
+            )
+            self.assertTrue(bundled_broker.is_file())
+            self.assertEqual(bundled_broker.read_bytes(), broker_binary.read_bytes())
             manifest = json.loads(
                 (
                     build_root
@@ -480,6 +517,10 @@ exit 0
                     },
                 ),
             )
+            self._write_executable(
+                macos / "unpin-credential-broker",
+                f"#!/bin/sh\nprintf '%s\\n' 'unpin-credential-broker {version} protocol 1'\nprintf '%s' executed > '{root / 'broker-version-executed'}'\n",
+            )
             (app / "Contents" / "Info.plist").write_text("{}", encoding="utf-8")
             (resources / "unpin-bridge-manifest.json").write_text(
                 json.dumps(
@@ -507,6 +548,7 @@ if [ "${1:-}" = "--display" ]; then
     artifact=""
     for argument in "$@"; do artifact="$argument"; done
     case "$artifact" in
+        *unpin-credential-broker) identifier=dev.unpin.credential-broker ;;
         *.app) identifier=dev.unpin.workbench ;;
         *) identifier=dev.unpin.workbench.bridge ;;
     esac
@@ -536,6 +578,7 @@ exit 0
 
             self.assertNotEqual(completed.returncode, 0, completed.stdout)
             self.assertIn("desktop archive inventory projection is invalid", completed.stderr)
+            self.assertTrue((root / "broker-version-executed").is_file())
 
     def test_full_verifier_terminates_hung_bridge(self) -> None:
         if sys.platform != "darwin":
@@ -573,6 +616,10 @@ exit 0
                 while :; do sleep 1; done
                 """,
             )
+            self._write_executable(
+                macos / "unpin-credential-broker",
+                f"#!/bin/sh\nprintf '%s\\n' 'unpin-credential-broker {version} protocol 1'\n",
+            )
             (app / "Contents" / "Info.plist").write_text("{}", encoding="utf-8")
             bridge = macos / "unpin"
             (resources / "unpin-bridge-manifest.json").write_text(
@@ -601,6 +648,7 @@ if [ "${1:-}" = "--display" ]; then
     artifact=""
     for argument in "$@"; do artifact="$argument"; done
     case "$artifact" in
+        *unpin-credential-broker) identifier=dev.unpin.credential-broker ;;
         *.app) identifier=dev.unpin.workbench ;;
         *) identifier=dev.unpin.workbench.bridge ;;
     esac

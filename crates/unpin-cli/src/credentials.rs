@@ -2,12 +2,17 @@ mod approval;
 pub(crate) use approval::require_live_apply_terminal;
 mod backup_authentication;
 mod broker;
+#[cfg(unix)]
+mod broker_client_auth;
+#[cfg(target_os = "macos")]
+mod broker_peer_auth;
+mod broker_protocol;
 mod cursor_dashboard;
 mod session_authority;
 
 pub(crate) use approval::{
-    ApprovalKeyInitialization, ApprovalKeyState, approval_key_status, approval_key_status_for_mode,
-    authorize_control_decision, authorize_desktop_control_decision, authorize_operator_descriptor,
+    ApprovalKeyInitialization, ApprovalKeyState, approval_key_status, authorize_control_decision,
+    authorize_desktop_control_decision, authorize_operator_descriptor,
     authorize_reviewed_control_decision, initialize_approval_key, issue_human_approval,
     issue_inventory_group_approval, resolve_approval_key,
 };
@@ -15,7 +20,6 @@ pub(crate) use backup_authentication::{
     BackupAuthenticationInitialization, BackupAuthenticationState, backup_authentication_status,
     initialize_backup_authentication_key, resolve_backup_authentication_key,
 };
-pub(crate) use broker::run as run_credential_broker;
 pub(crate) use cursor_dashboard::{
     CursorDashboardCredentialRemoval, CursorDashboardCredentialState,
     CursorDashboardCredentialUpdate, MAX_CURSOR_DASHBOARD_COOKIE_BYTES,
@@ -36,7 +40,44 @@ pub(crate) trait SecretStore {
     fn delete(&self, service: &str, account: &str) -> Result<bool, String>;
 }
 
-pub(crate) struct KeychainSecretStore;
+pub(crate) struct KeychainSecretStore {
+    #[cfg(unix)]
+    app_state_root: std::path::PathBuf,
+}
+
+pub(crate) struct RuntimeCredentials {
+    pub(crate) approval_key: Option<unpin_core::approval::ApprovalKey>,
+    pub(crate) backup_authentication_key: Option<unpin_core::mutation::BackupAuthenticationKey>,
+    pub(crate) session_authority_key: Option<unpin_core::sessions::SessionAuthorityKey>,
+}
+
+pub(crate) fn resolve_runtime_credentials(
+    app_state_root: &std::path::Path,
+) -> Result<RuntimeCredentials, String> {
+    let bundle = broker::resolve_runtime_bundle(app_state_root)?;
+    Ok(RuntimeCredentials {
+        approval_key: bundle
+            .approval()
+            .map(unpin_core::approval::ApprovalKey::new),
+        backup_authentication_key: bundle
+            .backup_authentication()
+            .map(unpin_core::mutation::BackupAuthenticationKey::new),
+        session_authority_key: bundle
+            .session_authority()
+            .map(unpin_core::sessions::SessionAuthorityKey::new),
+    })
+}
+
+impl KeychainSecretStore {
+    pub(crate) fn new(app_state_root: impl Into<std::path::PathBuf>) -> Self {
+        #[cfg(not(unix))]
+        let _ = app_state_root;
+        Self {
+            #[cfg(unix)]
+            app_state_root: app_state_root.into(),
+        }
+    }
+}
 
 pub(crate) fn resolve_gateway_credential(
     fixture_mode: bool,
@@ -56,7 +97,7 @@ pub(crate) fn resolve_gateway_credential(
             &material,
         ))));
     }
-    resolve_gateway_credential_from_store(&KeychainSecretStore, key_id)
+    resolve_gateway_credential_from_store(&KeychainSecretStore::new(app_state_root), key_id)
 }
 
 fn resolve_gateway_credential_from_store(
@@ -87,31 +128,85 @@ fn validate_gateway_credential_key_id(key_id: &str) -> Result<(), String> {
 
 impl SecretStore for KeychainSecretStore {
     fn get(&self, service: &str, account: &str) -> Result<Option<Vec<u8>>, String> {
-        let entry = keyring::Entry::new(service, account)
-            .map_err(|error| format!("keychain entry could not be opened: {error}"))?;
-        match entry.get_secret() {
-            Ok(secret) => Ok(Some(secret)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(error) => Err(format!("keychain credential could not be read: {error}")),
+        if service != KEYCHAIN_SERVICE {
+            return Err("credential store service is invalid".to_string());
+        }
+        #[cfg(unix)]
+        {
+            if broker::legacy_keyring_fallback_allowed(&self.app_state_root)? {
+                direct_keyring_get(service, account)
+            } else {
+                broker::get(&self.app_state_root, account)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            direct_keyring_get(service, account)
         }
     }
 
     fn set(&self, service: &str, account: &str, secret: &[u8]) -> Result<(), String> {
-        let entry = keyring::Entry::new(service, account)
-            .map_err(|error| format!("keychain entry could not be opened: {error}"))?;
-        entry
-            .set_secret(secret)
-            .map_err(|error| format!("keychain credential could not be stored: {error}"))
+        if service != KEYCHAIN_SERVICE {
+            return Err("credential store service is invalid".to_string());
+        }
+        #[cfg(unix)]
+        {
+            if broker::legacy_keyring_fallback_allowed(&self.app_state_root)? {
+                direct_keyring_set(service, account, secret)
+            } else {
+                broker::set(&self.app_state_root, account, secret)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            direct_keyring_set(service, account, secret)
+        }
     }
 
     fn delete(&self, service: &str, account: &str) -> Result<bool, String> {
-        let entry = keyring::Entry::new(service, account)
-            .map_err(|error| format!("keychain entry could not be opened: {error}"))?;
-        match entry.delete_credential() {
-            Ok(()) => Ok(true),
-            Err(keyring::Error::NoEntry) => Ok(false),
-            Err(error) => Err(format!("keychain credential could not be removed: {error}")),
+        if service != KEYCHAIN_SERVICE {
+            return Err("credential store service is invalid".to_string());
         }
+        #[cfg(unix)]
+        {
+            if broker::legacy_keyring_fallback_allowed(&self.app_state_root)? {
+                direct_keyring_delete(service, account)
+            } else {
+                broker::delete(&self.app_state_root, account)
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            direct_keyring_delete(service, account)
+        }
+    }
+}
+
+fn direct_keyring_get(service: &str, account: &str) -> Result<Option<Vec<u8>>, String> {
+    let entry = keyring::Entry::new(service, account)
+        .map_err(|error| format!("keychain entry could not be opened: {error}"))?;
+    match entry.get_secret() {
+        Ok(secret) => Ok(Some(secret)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(error) => Err(format!("keychain credential could not be read: {error}")),
+    }
+}
+
+fn direct_keyring_set(service: &str, account: &str, secret: &[u8]) -> Result<(), String> {
+    let entry = keyring::Entry::new(service, account)
+        .map_err(|error| format!("keychain entry could not be opened: {error}"))?;
+    entry
+        .set_secret(secret)
+        .map_err(|error| format!("keychain credential could not be stored: {error}"))
+}
+
+fn direct_keyring_delete(service: &str, account: &str) -> Result<bool, String> {
+    let entry = keyring::Entry::new(service, account)
+        .map_err(|error| format!("keychain entry could not be opened: {error}"))?;
+    match entry.delete_credential() {
+        Ok(()) => Ok(true),
+        Err(keyring::Error::NoEntry) => Ok(false),
+        Err(error) => Err(format!("keychain credential could not be removed: {error}")),
     }
 }
 

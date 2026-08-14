@@ -24,10 +24,13 @@ if [[ ! "$release_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; the
 fi
 
 release_binary="target/$release_target/release/unpin"
-if [[ ! -f "$release_binary" || -L "$release_binary" ]]; then
-  echo "release binary is missing or unsafe: $release_binary" >&2
-  exit 1
-fi
+release_broker="target/$release_target/release/unpin-credential-broker"
+for required_binary in "$release_binary" "$release_broker"; do
+  if [[ ! -f "$required_binary" || -L "$required_binary" ]]; then
+    echo "release binary is missing or unsafe: $required_binary" >&2
+    exit 1
+  fi
+done
 
 release_stage="$(mktemp -d)"
 if [[ -z "$release_stage" || ! -d "$release_stage" ]]; then
@@ -41,12 +44,16 @@ release_root="$release_stage/$release_name"
 mkdir -p "$release_root" "$release_output"
 
 install -m 0755 "$release_binary" "$release_root/unpin"
+install -m 0755 "$release_broker" "$release_root/unpin-credential-broker"
 case "$release_target" in
   aarch64-apple-darwin | x86_64-apple-darwin)
     repository_root="$(git rev-parse --show-toplevel)"
     "$repository_root/scripts/sign_macos_artifact.sh" \
       dev.unpin.cli \
       "$release_root/unpin" >&2
+    "$repository_root/scripts/sign_macos_artifact.sh" \
+      dev.unpin.credential-broker \
+      "$release_root/unpin-credential-broker" >&2
     ;;
 esac
 install -m 0644 README.md LICENSE "$release_root/"

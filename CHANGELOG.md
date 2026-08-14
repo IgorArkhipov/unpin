@@ -7,6 +7,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Fixed
+
+- Replaced per-release macOS Keychain access with a create-once, Unpin-specific
+  credential broker stored under the app-state root. Ordinary CLI updates leave
+  its exact signed bytes unchanged, so an approved broker does not prompt again
+  merely because the CLI was rebuilt.
+
+### Security
+
+- Removed the unrelated release-signing identity from active automation. macOS
+  release jobs now require an Unpin-specific self-signed certificate and public
+  fingerprint from the protected `release-signing` Environment, package a
+  separately identified broker, and authenticate broker clients before any
+  Keychain operation.
+- The identity migration requires one verified manual or deliberately staged
+  installation and one new broker authorization. Broker upgrades are explicit
+  and require renewed authorization; ordinary application updates cannot
+  replace the installed broker.
+
 ## [1.3.0] - 2026-08-13
 
 ### Added
@@ -34,9 +53,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Existing provider discovery, plugins, groups, CLI, TUI, desktop, and MCP
   workflows remain supported. The built-in workflow presets add routing
   without changing provider configuration formats.
-- The stable macOS certificate and executable identifiers are unchanged, so a
-  verified update from `1.2.0` preserves Keychain designated requirements and
-  existing **Always Allow** grants.
+- The macOS certificate and executable identifiers are unchanged, so the
+  built-in updater accepts a verified update from `1.2.0`. This is an update
+  trust check, not a guarantee that Keychain access will avoid another prompt.
 
 ## [1.2.0] - 2026-08-11
 
@@ -62,9 +81,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Existing skills, MCP servers, plugins, groups, CLI, TUI, desktop, and MCP
   workflows remain supported. Agent Plugin activation is currently actionable
   for Claude and Codex anchors; other detected combinations are diagnostic.
-- The stable macOS certificate and executable identifiers are unchanged, so a
-  verified update from `1.1.0` preserves Keychain designated requirements and
-  existing **Always Allow** grants.
+- The macOS certificate and executable identifiers are unchanged, so the
+  built-in updater accepts a verified update from `1.1.0`. Rebuilt executable
+  bytes could still trigger another Keychain prompt.
 
 ## [1.1.0] - 2026-08-07
 
@@ -79,24 +98,25 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 ### Security
 
 - Update downloads are HTTPS-host restricted and bounded, archives are checksum-verified and traversal-safe, and candidates must report the expected version before atomic replacement.
-- macOS updates require exact release identifiers and byte-for-byte equality with the installed designated requirements for the standalone CLI, desktop app, and bundled bridge. Certificate or identifier rotation is rejected so existing Keychain **Always Allow** grants are preserved across normal updates.
+- macOS updates require exact release identifiers and byte-for-byte equality with the installed designated requirements for the standalone CLI, desktop app, and bundled bridge. Certificate or identifier rotation is rejected as an update-trust violation; this check does not itself preserve Keychain authorization.
 
 ### Compatibility
 
 - `v1.0.2` does not contain the updater, so moving to `v1.1.0` is a final manual
-  installation. Because both releases use the same certificate and identifiers,
-  that replacement preserves the designated requirements and existing Keychain
-  **Always Allow** grants. Later compatible releases can use the built-in update
-  flow.
+  installation. Both releases use the same certificate and identifiers, so the
+  designated-requirement trust boundary is unchanged. Later compatible releases
+  can use the built-in update flow, but rebuilt binaries may still prompt for
+  Keychain access.
 
 ## [1.0.2] - 2026-08-06
 
 ### Changed
 
-- Official macOS CLI and desktop archives now use the stable self-signed
-  `CodeBurn Update Signing` certificate, preserving each executable's
-  designated requirement across later updates signed with that certificate so
-  Keychain **Always Allow** grants can remain valid.
+- Official macOS CLI and desktop archives began using a consistent self-signed
+  certificate to stabilize each executable's designated requirement across
+  releases. That certificate has since been retired because it was unrelated to
+  Unpin, and a stable requirement alone did not prevent recurring Keychain
+  prompts for rebuilt executables.
 - The release workflow reads the P12 and password from the protected
   `release-signing` Environment after required approval, imports them into an
   ephemeral runner Keychain, rejects a missing or mismatched identity instead of
@@ -108,9 +128,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - CLI, terminal TUI, MCP, and desktop behavior are unchanged from `1.0.1`.
 - Updating from `1.0.1` or earlier changes the designated requirement once from
   the old ad-hoc signature, so macOS may prompt for Keychain access again on the
-  first `1.0.2` launch. Grants made under the stable certificate persist across
-  later updates signed with that certificate and the same identifiers; a future
-  certificate rotation resets the requirement and those **Always Allow** grants.
+  first `1.0.2` launch. Later rebuilt executables may prompt again even when the
+  certificate and identifiers are unchanged; certificate rotation also changes
+  the updater's trust requirement.
 - The personal certificate is not Developer ID signing or notarization and does
   not establish Gatekeeper trust. It uses timestamp mode `none`; secure
   timestamping is not claimed for this personal self-signed certificate. The

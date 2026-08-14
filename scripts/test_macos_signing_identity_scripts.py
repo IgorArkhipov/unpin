@@ -11,7 +11,7 @@ from pathlib import Path
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 IMPORT_SCRIPT = REPOSITORY_ROOT / "scripts" / "import_macos_signing_identity.sh"
 CLEANUP_SCRIPT = REPOSITORY_ROOT / "scripts" / "cleanup_macos_signing_identity.sh"
-EXPECTED_IDENTITY = "E2AB4267F6B79DF40B8776A2EE9309F64CFD2389"
+EXPECTED_IDENTITY = "0123456789ABCDEF0123456789ABCDEF01234567"
 
 
 class MacosSigningIdentityScriptTests(unittest.TestCase):
@@ -231,14 +231,14 @@ class MacosSigningIdentityScriptTests(unittest.TestCase):
                     fi
                     if [ "$valid_only" = 0 ]; then
                       printf '\\nPolicy: Code Signing\\n  Matching identities\\n'
-                      printf '  1) %s "%s"\\n' "$FAKE_CODESIGN_IDENTITY" "${FAKE_CODESIGN_DISPLAY_NAME:-CodeBurn Update Signing}"
+                      printf '  1) %s "%s"\\n' "$FAKE_CODESIGN_IDENTITY" "${FAKE_CODESIGN_DISPLAY_NAME:-Unpin Release Signing}"
                       if [ "$identity_count" = 2 ]; then
                         printf '  2) 1111111111111111111111111111111111111111 "Second Identity"\\n'
                       fi
                       printf '     %s identities found\\n\\n  Valid identities only\\n' "$identity_count"
                     fi
                     if [ "${FAKE_CODESIGN_IDENTITY_UNTRUSTED:-0}" != 1 ]; then
-                      printf '  1) %s "%s"\\n' "$FAKE_CODESIGN_IDENTITY" "${FAKE_CODESIGN_DISPLAY_NAME:-CodeBurn Update Signing}"
+                      printf '  1) %s "%s"\\n' "$FAKE_CODESIGN_IDENTITY" "${FAKE_CODESIGN_DISPLAY_NAME:-Unpin Release Signing}"
                       if [ "$identity_count" = 2 ]; then
                         printf '  2) 1111111111111111111111111111111111111111 "Second Identity"\\n'
                       fi

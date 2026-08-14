@@ -189,7 +189,8 @@ fn render_apply(result: &ApplyResult, machine: bool) -> Result<String, String> {
             "installedVersion": result.installed_version.to_string(),
             "installPath": result.install_path,
             "backupPath": result.backup_path,
-            "keychainRequirementPreserved": result.keychain_requirement_preserved,
+            "credentialBrokerPreserved": result.credential_broker_preserved,
+            "keychainRequirementPreserved": cfg!(target_os = "macos"),
             "relaunchStatus": result.relaunch_status.as_str(),
             "warning": result.warning,
         }))
@@ -276,7 +277,7 @@ mod tests {
             target: UpdateTarget::Desktop,
             install_path: PathBuf::from("/Applications/UnpinDesktop.app"),
             backup_path: PathBuf::from("/Applications/.UnpinDesktop.app.unpin-backup-1.0.2"),
-            keychain_requirement_preserved: true,
+            credential_broker_preserved: true,
             relaunch_status: unpin_core::update_service::RelaunchStatus::NotRequested,
             warning: None,
         };
@@ -292,7 +293,8 @@ mod tests {
                 "installedVersion": "1.1.0",
                 "installPath": "/Applications/UnpinDesktop.app",
                 "backupPath": "/Applications/.UnpinDesktop.app.unpin-backup-1.0.2",
-                "keychainRequirementPreserved": true,
+                "credentialBrokerPreserved": true,
+                "keychainRequirementPreserved": cfg!(target_os = "macos"),
                 "relaunchStatus": "notRequested",
                 "warning": null,
             })
@@ -307,7 +309,7 @@ mod tests {
             target: UpdateTarget::Cli,
             install_path: PathBuf::from("/usr/local/bin/unpin"),
             backup_path: PathBuf::from("/usr/local/bin/.unpin.unpin-backup-1.0.2"),
-            keychain_requirement_preserved: false,
+            credential_broker_preserved: true,
             relaunch_status: unpin_core::update_service::RelaunchStatus::Failed,
             warning: Some("relaunch failed; start Unpin manually".to_string()),
         };
@@ -323,7 +325,8 @@ mod tests {
                 "installedVersion": "1.1.0",
                 "installPath": "/usr/local/bin/unpin",
                 "backupPath": "/usr/local/bin/.unpin.unpin-backup-1.0.2",
-                "keychainRequirementPreserved": false,
+                "credentialBrokerPreserved": true,
+                "keychainRequirementPreserved": cfg!(target_os = "macos"),
                 "relaunchStatus": "failed",
                 "warning": "relaunch failed; start Unpin manually",
             })

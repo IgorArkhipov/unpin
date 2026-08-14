@@ -17,15 +17,14 @@ for Apple Silicon and Intel macOS. Each archive has a CycloneDX SBOM
 attestation and is covered by `SHA256SUMS`. The GNU/Linux CLI is built on
 Ubuntu 22.04 and supports glibc 2.35 or newer, including Debian 12.
 
-The `1.0.0` and `1.0.1` desktop archives are ad-hoc signed. Starting with
-`1.0.2`, official macOS CLI and desktop archives use one stable self-signed
-personal certificate so Keychain authorization can remain valid across updates
-signed by that same certificate and identifiers. Moving from `1.0.1` or earlier
-changes the designated requirement once from the old ad-hoc signature, so the
-first `1.0.2` launch may prompt for Keychain access again; later same-certificate
-updates retain the approved **Always Allow** grants. A future certificate
-rotation resets that requirement and prompts once again. The artifacts are still
-not Developer ID signed or Apple-notarized, so macOS can show an
+The `1.0.0` and `1.0.1` desktop archives are ad-hoc signed. Releases from
+`1.0.2` through `1.3.0` used rebuilt executables signed by a consistent personal
+certificate, but those rebuilt bytes could still cause a new Keychain prompt.
+Current macOS archives instead include a separately signed, create-once Unpin
+credential broker. The first verified broker installation requires one
+authorization; ordinary CLI updates leave its exact installed bytes unchanged.
+The active certificate is Unpin-specific but still not Developer ID signing or
+Apple notarization, so macOS can show an
 unidentified-developer Gatekeeper warning. This is an explicit maintainer-
 approved GA exception, not a trusted-distribution claim. The personal
 certificate is used with timestamp mode `none`; secure timestamping is not
@@ -41,13 +40,14 @@ gh attestation verify unpin-v1.3.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
-Extract the archive, install the included binary on your user `PATH`, and start
-with read-only inspection:
+Extract the archive, install both included executables together on your user
+`PATH`, and start with read-only inspection. The CLI verifies the companion
+before installing the stable broker under the app-state root:
 
 ```bash
 cd unpin-v1.3.0-TARGET
-mkdir -p "$HOME/.local/bin"
-install -m 0755 unpin "$HOME/.local/bin/unpin"
+install -d "$HOME/.local/bin"
+install -m 0755 unpin unpin-credential-broker "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
 
 unpin --help
@@ -131,8 +131,9 @@ check on demand. Before replacement, Unpin verifies the release checksum, app
 and bridge signatures, exact identifiers, versions, and equality with the
 installed designated requirements. It relaunches only after a successful
 atomic bundle swap. Certificate rotation is intentionally rejected by
-automatic update and requires a separately documented manual installation
-because it cannot preserve an existing Keychain **Always Allow** grant.
+automatic update and requires a separately documented manual installation plus
+an explicit broker replacement. Designated-requirement equality is an update
+trust check; the unchanged stable broker is what preserves Keychain approval.
 
 To uninstall the desktop app, quit it and move `UnpinDesktop.app` to Trash.
 This leaves the CLI and shared Unpin state under `~/.config/unpin` untouched;
