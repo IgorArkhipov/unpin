@@ -41,6 +41,7 @@ pub(crate) trait SecretStore {
 }
 
 pub(crate) struct KeychainSecretStore {
+    #[cfg(unix)]
     app_state_root: std::path::PathBuf,
 }
 
@@ -69,7 +70,10 @@ pub(crate) fn resolve_runtime_credentials(
 
 impl KeychainSecretStore {
     pub(crate) fn new(app_state_root: impl Into<std::path::PathBuf>) -> Self {
+        #[cfg(not(unix))]
+        let _ = app_state_root;
         Self {
+            #[cfg(unix)]
             app_state_root: app_state_root.into(),
         }
     }
