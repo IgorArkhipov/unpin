@@ -7,6 +7,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.4.0] - 2026-08-14
+
 ### Fixed
 
 - Replaced per-release macOS Keychain access with a create-once, Unpin-specific
@@ -25,6 +27,17 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   installation and one new broker authorization. Broker upgrades are explicit
   and require renewed authorization; ordinary application updates cannot
   replace the installed broker.
+
+### Compatibility
+
+- Upgrading from `1.3.0` or earlier requires a one-time manual installation of
+  both `unpin` and `unpin-credential-broker` from the same verified `1.4.0`
+  archive. The first credential operation installs and authorizes the new
+  stable broker; the retired unrelated certificate is not carried forward.
+- Later compatible updates preserve the installed broker byte-for-byte, so a
+  rebuilt CLI or desktop application does not by itself trigger another
+  Keychain authorization prompt. Deliberate broker upgrades or signing
+  certificate rotation still require explicit replacement and reauthorization.
 
 ## [1.3.0] - 2026-08-13
 
