@@ -49,6 +49,7 @@ with:
 
 ```bash
 UNPIN_CODESIGN_IDENTITY="Certificate Name or SHA-1" \
+UNPIN_CODESIGN_CERTIFICATE_SHA1="40-character certificate SHA-1" \
 UNPIN_CODESIGN_TIMESTAMP_MODE=none \
 UNPIN_REQUIRE_STABLE_CODESIGN=1 \
 scripts/build_desktop_release.sh TARGET VERSION OUTPUT_DIRECTORY
@@ -60,23 +61,26 @@ without separate verification. Use `UNPIN_CODESIGN_TIMESTAMP_MODE=secure` only
 for a Developer ID certificate after confirming that it can reach Apple's
 timestamp service. The builders verify the resulting signature and exact
 identifiers: `dev.unpin.workbench` for the app,
-`dev.unpin.workbench.bridge` for its bundled credential broker, and
-`dev.unpin.cli` for the standalone CLI. The bridge and CLI may each require one
-new Keychain authorization after switching from ad-hoc signing. In particular,
-the first update from `1.0.1` or earlier can prompt because its designated
-requirement changes once; later builds signed by the same certificate and
-identifier retain that requirement and their **Always Allow** grants.
+`dev.unpin.workbench.bridge` for its bundled CLI bridge,
+`dev.unpin.credential-broker` for the separately pinned Keychain broker, and
+`dev.unpin.cli` for the standalone CLI. Only the stable broker accesses
+persistent Keychain entries. The first credential operation after migrating to
+the broker requires one authorization; ordinary CLI updates then reuse the
+exact installed broker bytes instead of relying on the rebuilt CLI's signing
+requirement.
 
 The GitHub release workflow runs the macOS signing jobs in the protected
 `release-signing` Environment. Its
 `UNPIN_MACOS_SIGNING_CERTIFICATE_P12` and
-`UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD` environment secrets are available
-only after the Environment's required approval. The workflow imports the P12
-into an ephemeral runner Keychain, verifies the exact configured SHA-1 identity,
-and removes the temporary Keychain and P12 after packaging. Never commit, log,
-or expose the signing private key; the protected environment is the only
-approved storage used by release automation. This personal certificate remains
-non-Developer-ID and non-notarized, so it does not establish Gatekeeper trust.
+`UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD` environment secrets and the public
+`UNPIN_CODESIGN_CERTIFICATE_SHA1` Environment variable are available only after
+the Environment's required approval. The workflow imports the Unpin-specific
+P12 into an ephemeral runner Keychain, verifies the exact configured SHA-1
+identity, and removes the temporary Keychain and P12 after packaging. Never
+commit, log, or expose the signing private key; the protected environment is the
+only approved storage used by release automation. This personal certificate
+remains non-Developer-ID and non-notarized, so it does not establish Gatekeeper
+trust.
 
 ### Self-update compatibility gate
 
@@ -87,24 +91,32 @@ following contract for every release that should be installable through
 - publish the exact CLI and desktop archive names derived from version and
   target triple, plus `SHA256SUMS` containing each archive;
 - never replace a published archive or checksum asset;
-- sign the standalone CLI, desktop app, and bundled bridge with the configured
-  release certificate and exact identifiers `dev.unpin.cli`,
-  `dev.unpin.workbench`, and `dev.unpin.workbench.bridge`;
+- package the companion `unpin-credential-broker` beside every standalone or
+  desktop CLI and sign it as `dev.unpin.credential-broker` with the configured
+  release certificate;
+- sign the standalone CLI, desktop app, and bundled bridge with exact
+  identifiers `dev.unpin.cli`, `dev.unpin.workbench`, and
+  `dev.unpin.workbench.bridge`;
 - verify the same expected certificate fingerprint in every macOS signing job;
 - keep each candidate's designated requirement exactly equal to the preceding
   installed release requirement.
 
 The updater independently verifies the checksum, candidate version, signature,
-identifier, and exact designated-requirement equality before replacement. The
-desktop JSON success response includes `keychainRequirementPreserved: true`,
-and the native app refuses to terminate and relaunch unless that proof is
-present. This is the release boundary that lets a Keychain **Always Allow**
-grant survive normal updates.
+identifier, and exact designated-requirement equality before replacement. That
+requirement comparison is an update trust check; it is not a Keychain-persistence
+claim. The JSON success response includes `credentialBrokerPreserved: true`,
+and the native app refuses to terminate and relaunch unless the updater confirms
+that the stable app-state broker was left unchanged.
 
 A certificate or identifier rotation is deliberately not self-updatable. The
 old installed release rejects it because its designated requirement changes.
-Publish explicit manual replacement instructions and explain that one new
-Keychain authorization is expected after the verified rotation.
+For the initial move away from the retired unrelated certificate, publish
+manual instructions to install both `unpin` and `unpin-credential-broker` from
+the same verified archive unless an old-certificate transition release is
+deliberately staged. The first credential operation installs the companion at
+`<app-state>/credential-broker/v1/unpin-credential-broker` and requires one
+authorization. Ordinary updates never overwrite that path. Replacing the
+stable broker is an explicit broker upgrade and requires renewed authorization.
 
 ### Certificate expiry and rotation
 
@@ -112,7 +124,7 @@ Inspect the installed certificate before each release and set a reminder well
 before its `notAfter` date (30 days is a useful minimum):
 
 ```bash
-security find-certificate -a -p -c "CodeBurn Update Signing" \
+security find-certificate -a -p -c "Unpin Release Signing" \
   | openssl x509 -noout -subject -fingerprint -sha1 -dates
 ```
 
@@ -129,21 +141,20 @@ following as one reviewed change:
    `UNPIN_MACOS_SIGNING_CERTIFICATE_P12` and
    `UNPIN_MACOS_SIGNING_CERTIFICATE_PASSWORD` in the protected
    `release-signing` Environment. Keep required approval enabled.
-2. Update the SHA-1 fingerprint in `.github/workflows/release.yml`
-   (`UNPIN_CODESIGN_IDENTITY`),
-   `scripts/test_macos_signing_identity_scripts.py` (`EXPECTED_IDENTITY`),
-   and the versioned release notes (`docs/releases/vVERSION.md`, plus the
-   matching `CHANGELOG.md` entry when applicable).
+2. Update `UNPIN_CODESIGN_CERTIFICATE_SHA1` in the protected
+   `release-signing` Environment, then update the versioned release notes
+   (`docs/releases/vVERSION.md`, plus the matching `CHANGELOG.md` entry when
+   applicable). Do not hardcode the fingerprint in the workflow or tests.
 3. Keep timestamp mode `none` for this personal self-signed certificate; do not
    describe it as secure-timestamped or Gatekeeper-trusted.
 4. Run the signing helper and release-tooling tests, then the approved
    delivery-only or provider-matrix gates. Tag only after the merged commit is
    verified, and complete the post-tag artifact fingerprint and exact-identifier
    checks before publication.
-5. Tell users that certificate rotation resets the designated requirement even
-   when bundle identifiers do not change. The first launch of the rotated
-   release therefore requires new Keychain approval; old **Always Allow** grants
-   do not carry over.
+5. Tell users that certificate rotation is a manual or deliberately staged
+   migration even when bundle identifiers do not change. The stable broker pins
+   the authorized client certificate, so rotating it also requires an explicit
+   broker replacement and renewed Keychain authorization.
 
 Do not wait for the expiry date to discover a stale fingerprint or secret: the
 workflow must fail closed if the imported identity does not match the expected

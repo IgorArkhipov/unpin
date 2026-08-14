@@ -46,21 +46,24 @@ esac
 
 target_directory="$workspace_root/target/$rust_target/$cargo_profile_directory"
 binary="$target_directory/unpin"
+broker_binary="$target_directory/unpin-credential-broker"
 bundle_macos="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/MacOS"
 bundle_resources="$TARGET_BUILD_DIR/$CONTENTS_FOLDER_PATH/Resources"
 
 # shellcheck disable=SC2086
 cargo build --locked --manifest-path "$workspace_root/Cargo.toml" \
-  -p unpin-cli --target "$rust_target" $cargo_profile_args
+  -p unpin-cli --bins --target "$rust_target" $cargo_profile_args
 
-if [ ! -x "$binary" ]; then
-  echo "expected bundled Unpin binary at $binary" >&2
-  exit 1
-fi
-if [ "$(lipo -archs "$binary")" != "$expected_architecture" ]; then
-  echo "bundled Unpin binary architecture does not match $expected_architecture" >&2
-  exit 1
-fi
+for required_binary in "$binary" "$broker_binary"; do
+  if [ ! -x "$required_binary" ]; then
+    echo "expected bundled Unpin binary at $required_binary" >&2
+    exit 1
+  fi
+  if [ "$(lipo -archs "$required_binary")" != "$expected_architecture" ]; then
+    echo "bundled Unpin binary architecture does not match $expected_architecture" >&2
+    exit 1
+  fi
+done
 
 package_id="$(cargo pkgid --manifest-path "$workspace_root/Cargo.toml" -p unpin-cli)"
 case "$package_id" in
@@ -81,5 +84,6 @@ if [ -n "${MARKETING_VERSION:-}" ] && [ "$version" != "$MARKETING_VERSION" ]; th
 fi
 mkdir -p "$bundle_macos" "$bundle_resources"
 ditto "$binary" "$bundle_macos/unpin"
+ditto "$broker_binary" "$bundle_macos/unpin-credential-broker"
 digest="$(shasum -a 256 "$bundle_macos/unpin" | awk '{print $1}')"
 printf '{"bridgeProtocolVersion":2,"unpinVersion":"%s","sha256":"%s"}\n' "$version" "$digest" > "$bundle_resources/unpin-bridge-manifest.json"

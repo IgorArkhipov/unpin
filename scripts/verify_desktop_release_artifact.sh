@@ -46,6 +46,7 @@ if [[ ! -d "$fixture_source" ]]; then
 fi
 
 bridge_timeout_seconds="${UNPIN_DESKTOP_RELEASE_BRIDGE_TIMEOUT_SECONDS:-30}"
+broker_timeout_seconds="${UNPIN_DESKTOP_RELEASE_BROKER_TIMEOUT_SECONDS:-30}"
 python3_binary="$(command -v python3 || true)"
 if [[ -z "$python3_binary" || ! -x "$python3_binary" ]]; then
   echo "python3 is required for bounded desktop bridge verification" >&2
@@ -60,8 +61,9 @@ tar -xzf "$archive" -C "$smoke_root"
 app="$smoke_root/$release_name/UnpinDesktop.app"
 desktop_binary="$app/Contents/MacOS/UnpinDesktop"
 bridge_binary="$app/Contents/MacOS/unpin"
+broker_binary="$app/Contents/MacOS/unpin-credential-broker"
 manifest="$app/Contents/Resources/unpin-bridge-manifest.json"
-for required in "$desktop_binary" "$bridge_binary" "$manifest"; do
+for required in "$desktop_binary" "$bridge_binary" "$broker_binary" "$manifest"; do
   if [[ ! -f "$required" || -L "$required" ]]; then
     echo "desktop release archive is missing required file: $required" >&2
     exit 1
@@ -76,6 +78,10 @@ if [[ "$(lipo -archs "$bridge_binary")" != "$expected_architecture" ]]; then
   echo "desktop archive bridge architecture mismatch" >&2
   exit 1
 fi
+if [[ "$(lipo -archs "$broker_binary")" != "$expected_architecture" ]]; then
+  echo "desktop archive credential broker architecture mismatch" >&2
+  exit 1
+fi
 
 "$repository_root/scripts/verify_macos_artifact_signature.sh" \
   dev.unpin.workbench \
@@ -83,6 +89,9 @@ fi
 "$repository_root/scripts/verify_macos_artifact_signature.sh" \
   dev.unpin.workbench.bridge \
   "$bridge_binary"
+"$repository_root/scripts/verify_macos_artifact_signature.sh" \
+  dev.unpin.credential-broker \
+  "$broker_binary"
 app_version="$(plutil -extract CFBundleShortVersionString raw "$app/Contents/Info.plist")"
 if [[ "$app_version" != "$release_version" ]]; then
   echo "desktop app version $app_version does not match $release_version" >&2
@@ -130,6 +139,32 @@ fi
 version_output="$(<"$version_output_file")"
 if [[ "$version_output" != "unpin $release_version" ]]; then
   echo "desktop archive bridge version mismatch: $version_output" >&2
+  exit 1
+fi
+
+broker_version_output_file="$smoke_root/broker-version.out"
+set +e
+env -i \
+  HOME="$smoke_root" \
+  PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+  TMPDIR="$smoke_root" \
+  LC_ALL=C \
+  "$python3_binary" "$smoke_driver" \
+    --timeout-seconds "$broker_timeout_seconds" \
+    --stdout-file "$broker_version_output_file" \
+    -- \
+    arch "-$expected_architecture" "$broker_binary" --version
+broker_status=$?
+set -e
+if [[ "$broker_status" -ne 0 ]]; then
+  if [[ "$broker_status" -eq 124 ]]; then
+    echo "desktop archive credential broker timed out during version verification" >&2
+  fi
+  exit "$broker_status"
+fi
+broker_version_output="$(<"$broker_version_output_file")"
+if [[ "$broker_version_output" != "unpin-credential-broker $release_version protocol 1" ]]; then
+  echo "desktop archive credential broker version mismatch: $broker_version_output" >&2
   exit 1
 fi
 

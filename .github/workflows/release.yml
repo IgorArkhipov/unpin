@@ -56,14 +56,16 @@ jobs:
           printf 'value=%s\n' "${release_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli --bins
 
       - name: Verify GNU/Linux release artifact compatibility
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         shell: bash
-        run: >
-          scripts/verify_linux_release_artifact.sh
-          target/x86_64-unknown-linux-gnu/release/unpin
+        run: |
+          scripts/verify_linux_release_artifact.sh \
+            target/x86_64-unknown-linux-gnu/release/unpin
+          scripts/verify_linux_release_artifact.sh \
+            target/x86_64-unknown-linux-gnu/release/unpin-credential-broker
 
       - name: Install SBOM generator
         uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
@@ -124,8 +126,9 @@ jobs:
     name: Build macOS CLI ${{ matrix.target }}
     environment: release-signing
     env:
-      UNPIN_CODESIGN_IDENTITY: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
-      UNPIN_CODESIGN_EXPECTED_FINGERPRINT: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
+      UNPIN_CODESIGN_IDENTITY: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}
+      UNPIN_CODESIGN_EXPECTED_FINGERPRINT: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}
+      UNPIN_CODESIGN_CERTIFICATE_SHA1: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}
       UNPIN_CODESIGN_TIMESTAMP_MODE: none
       UNPIN_REQUIRE_STABLE_CODESIGN: "1"
     strategy:
@@ -171,7 +174,7 @@ jobs:
           printf 'value=%s\n' "${release_version}" >> "${GITHUB_OUTPUT}"
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli
+        run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli --bins
 
       - name: Install SBOM generator
         uses: taiki-e/install-action@6a1bd70eaac3c8bdf093356838d7ee09fda951cf # v2
@@ -251,8 +254,9 @@ jobs:
     name: Build desktop ${{ matrix.target }}
     environment: release-signing
     env:
-      UNPIN_CODESIGN_IDENTITY: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
-      UNPIN_CODESIGN_EXPECTED_FINGERPRINT: E2AB4267F6B79DF40B8776A2EE9309F64CFD2389
+      UNPIN_CODESIGN_IDENTITY: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}
+      UNPIN_CODESIGN_EXPECTED_FINGERPRINT: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}
+      UNPIN_CODESIGN_CERTIFICATE_SHA1: ${{ vars.UNPIN_CODESIGN_CERTIFICATE_SHA1 }}
       UNPIN_CODESIGN_TIMESTAMP_MODE: none
       UNPIN_REQUIRE_STABLE_CODESIGN: "1"
     strategy:

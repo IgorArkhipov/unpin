@@ -20,11 +20,16 @@ class PackageDesktopReleaseTests(unittest.TestCase):
         self.app = self.root / "UnpinDesktop.app"
         self.app_binary = self.app / "Contents" / "MacOS" / "UnpinDesktop"
         self.bridge_binary = self.app / "Contents" / "MacOS" / "unpin"
+        self.broker_binary = (
+            self.app / "Contents" / "MacOS" / "unpin-credential-broker"
+        )
         self.app_binary.parent.mkdir(parents=True)
         self.app_binary.write_bytes(b"desktop executable")
         self.bridge_binary.write_bytes(b"bridge executable")
+        self.broker_binary.write_bytes(b"broker executable")
         self.app_binary.chmod(0o755)
         self.bridge_binary.chmod(0o755)
+        self.broker_binary.chmod(0o755)
         self.readme = self.root / "README.md"
         self.license = self.root / "LICENSE"
         self.readme.write_text("read me\n", encoding="utf-8")
@@ -90,6 +95,7 @@ class PackageDesktopReleaseTests(unittest.TestCase):
                     "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS",
                     "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS/UnpinDesktop",
                     "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS/unpin",
+                    "unpin-desktop-v1.0.0-aarch64-apple-darwin/UnpinDesktop.app/Contents/MacOS/unpin-credential-broker",
                 ],
             )
             for member in members:
@@ -110,6 +116,7 @@ class PackageDesktopReleaseTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         os.utime(self.app_binary, (1_800_000_000, 1_800_000_000))
         os.utime(self.bridge_binary, (1_900_000_000, 1_900_000_000))
+        os.utime(self.broker_binary, (2_000_000_000, 2_000_000_000))
         second = self.run_packager(second_output)
         self.assertEqual(second.returncode, 0, second.stderr)
 

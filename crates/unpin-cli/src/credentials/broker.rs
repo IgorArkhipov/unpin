@@ -5,6 +5,11 @@ use std::{fs, path::PathBuf};
 
 use zeroize::Zeroizing;
 
+#[cfg(unix)]
+use super::broker_protocol::{
+    BrokerRequest, BrokerResponse, broker_socket_directory, broker_socket_path,
+    configure_unix_stream, effective_uid, read_response, write_request,
+};
 use super::{KEYCHAIN_SERVICE, KeychainSecretStore, SecretStore};
 use super::{
     approval::APPROVAL_ACCOUNT, backup_authentication::BACKUP_AUTHENTICATION_ACCOUNT,
@@ -13,17 +18,19 @@ use super::{
 
 const CREDENTIAL_BUNDLE_ACCOUNT: &str = "credential-bundle-v1";
 const BUNDLE_VERSION: u8 = 1;
-#[cfg(unix)]
-const REQUEST_BUNDLE: u8 = 1;
 const RESPONSE_BYTES: usize = 100;
 #[cfg(unix)]
 const BROKER_STARTUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 #[cfg(unix)]
 const EXISTING_BROKER_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(100);
 #[cfg(unix)]
-const BROKER_CLIENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const BROKER_OPERATION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 #[cfg(unix)]
-const MAX_ACTIVE_BROKER_CLIENTS: usize = 8;
+const STABLE_BROKER_DIRECTORY: &str = "credential-broker";
+#[cfg(unix)]
+const STABLE_BROKER_PROTOCOL_DIRECTORY: &str = "v1";
+#[cfg(unix)]
+const STABLE_BROKER_EXECUTABLE: &str = "unpin-credential-broker";
 
 #[derive(Debug, Clone, Default)]
 pub(super) struct CredentialBundle {
@@ -53,34 +60,7 @@ impl CredentialBundle {
 }
 
 pub(super) fn resolve_runtime_bundle(app_state_root: &Path) -> Result<CredentialBundle, String> {
-    #[cfg(unix)]
-    {
-        request_or_start_broker(app_state_root)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = app_state_root;
-        load_bundle_from_keychain()
-    }
-}
-
-pub(crate) fn run(app_state_root: &Path) -> Result<(), String> {
-    #[cfg(unix)]
-    {
-        run_unix_broker(app_state_root)
-    }
-
-    #[cfg(not(unix))]
-    {
-        let _ = app_state_root;
-        Err("credential broker is only supported on Unix platforms".to_string())
-    }
-}
-
-fn load_bundle_from_keychain() -> Result<CredentialBundle, String> {
-    let store = KeychainSecretStore;
-    load_bundle_from_store(&store)
+    load_bundle_from_store(&KeychainSecretStore::new(app_state_root))
 }
 
 fn load_bundle_from_store(store: &impl SecretStore) -> Result<CredentialBundle, String> {
@@ -180,150 +160,150 @@ fn decode_bundle(serialized: &[u8]) -> Result<CredentialBundle, String> {
 }
 
 #[cfg(unix)]
-fn run_unix_broker(app_state_root: &Path) -> Result<(), String> {
-    use std::{
-        os::unix::{
-            fs::PermissionsExt,
-            net::{UnixListener, UnixStream},
+pub(super) fn get(app_state_root: &Path, account: &str) -> Result<Option<Vec<u8>>, String> {
+    let mut response = request_or_start_broker(
+        app_state_root,
+        &BrokerRequest::Get {
+            account: account.to_string(),
         },
-        time::Duration,
+    )?;
+    match &mut response {
+        BrokerResponse::Value(value) => Ok(Some(std::mem::take(value))),
+        BrokerResponse::NotFound => Ok(None),
+        BrokerResponse::Error(error) => Err(error.clone()),
+        BrokerResponse::Success => {
+            Err("credential broker returned an invalid response".to_string())
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn set(app_state_root: &Path, account: &str, secret: &[u8]) -> Result<(), String> {
+    let response = request_or_start_broker(
+        app_state_root,
+        &BrokerRequest::Set {
+            account: account.to_string(),
+            secret: secret.to_vec(),
+        },
+    )?;
+    match &response {
+        BrokerResponse::Success => Ok(()),
+        BrokerResponse::Error(error) => Err(error.clone()),
+        BrokerResponse::Value(_) | BrokerResponse::NotFound => {
+            Err("credential broker returned an invalid response".to_string())
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn delete(app_state_root: &Path, account: &str) -> Result<bool, String> {
+    let response = request_or_start_broker(
+        app_state_root,
+        &BrokerRequest::Delete {
+            account: account.to_string(),
+        },
+    )?;
+    match &response {
+        BrokerResponse::Success => Ok(true),
+        BrokerResponse::NotFound => Ok(false),
+        BrokerResponse::Error(error) => Err(error.clone()),
+        BrokerResponse::Value(_) => {
+            Err("credential broker returned an invalid response".to_string())
+        }
+    }
+}
+
+#[cfg(unix)]
+pub(super) fn legacy_keyring_fallback_allowed(app_state_root: &Path) -> Result<bool, String> {
+    let candidate = bundled_broker_executable_path()?;
+    legacy_keyring_fallback_allowed_for_paths(app_state_root, &candidate)
+}
+
+#[cfg(unix)]
+fn legacy_keyring_fallback_allowed_for_paths(
+    app_state_root: &Path,
+    candidate: &Path,
+) -> Result<bool, String> {
+    use std::io;
+
+    validate_existing_broker_installation_directories(app_state_root)?;
+    for path in [
+        stable_broker_executable_path(app_state_root),
+        candidate.to_path_buf(),
+    ] {
+        match fs::symlink_metadata(path) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "credential broker availability could not be checked: {error}"
+                ));
+            }
+        }
+    }
+
+    let socket_directory = broker_socket_directory(app_state_root);
+    match fs::symlink_metadata(&socket_directory) {
+        Ok(_) => {
+            validate_broker_socket_directory_for_client(&socket_directory)?;
+            match fs::symlink_metadata(broker_socket_path(app_state_root)) {
+                Ok(_) => Ok(false),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+                Err(error) => Err(format!(
+                    "credential broker socket availability could not be checked: {error}"
+                )),
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "credential broker directory availability could not be checked: {error}"
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn validate_existing_broker_installation_directories(app_state_root: &Path) -> Result<(), String> {
+    use std::{
+        io,
+        os::unix::fs::{MetadataExt as _, PermissionsExt as _},
     };
 
-    let socket_path = broker_socket_path(app_state_root);
-    ensure_broker_directory(app_state_root)?;
-    let listener = match UnixListener::bind(&socket_path) {
-        Ok(listener) => listener,
-        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
-            if UnixStream::connect(&socket_path).is_ok() {
-                return Ok(());
-            }
-            fs::remove_file(&socket_path).map_err(|error| error.to_string())?;
-            UnixListener::bind(&socket_path).map_err(|error| error.to_string())?
-        }
+    let root_metadata = match fs::symlink_metadata(app_state_root) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error.to_string()),
     };
-    fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
-        .map_err(|error| error.to_string())?;
-    let result = serve_unix_broker(
-        listener,
-        CredentialBundle::default(),
-        Duration::from_secs(600),
-    );
-    let _ = fs::remove_file(socket_path);
-    let _ = fs::remove_dir(broker_socket_directory(app_state_root));
-    result
-}
-
-#[cfg(unix)]
-fn serve_unix_broker(
-    listener: std::os::unix::net::UnixListener,
-    bundle: CredentialBundle,
-    idle_timeout: std::time::Duration,
-) -> Result<(), String> {
-    use std::{
-        sync::{
-            Arc, Mutex,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-        },
-        thread,
-        time::{Duration, Instant},
-    };
-
-    listener
-        .set_nonblocking(true)
-        .map_err(|error| error.to_string())?;
-    let mut last_activity = Instant::now();
-    let active_clients = Arc::new(AtomicUsize::new(0));
-    let bundle = Arc::new(Mutex::new(bundle));
-    let keychain_refresh_active = Arc::new(AtomicBool::new(false));
-    refresh_incomplete_bundle_async(&bundle, &keychain_refresh_active);
-    loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                last_activity = Instant::now();
-                refresh_incomplete_bundle_async(&bundle, &keychain_refresh_active);
-                let active_clients = Arc::clone(&active_clients);
-                if active_clients
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |active| {
-                        (active < MAX_ACTIVE_BROKER_CLIENTS).then_some(active + 1)
-                    })
-                    .is_ok()
-                {
-                    let bundle = bundle
-                        .lock()
-                        .map_err(|_| "credential broker bundle lock poisoned".to_string())?
-                        .clone();
-                    thread::spawn(move || {
-                        let _ = serve_unix_client(stream, &bundle);
-                        active_clients.fetch_sub(1, Ordering::Release);
-                    });
-                }
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                if last_activity.elapsed() >= idle_timeout {
-                    return Ok(());
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-            Err(error) => return Err(error.to_string()),
-        }
-    }
-}
-
-#[cfg(unix)]
-fn refresh_incomplete_bundle_async(
-    bundle: &std::sync::Arc<std::sync::Mutex<CredentialBundle>>,
-    keychain_refresh_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-) {
-    use std::sync::atomic::Ordering;
-
-    let needs_refresh = bundle
-        .lock()
-        .map(|bundle| !bundle.is_complete())
-        .unwrap_or(false);
-    if !needs_refresh
-        || keychain_refresh_active
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != effective_uid()
     {
-        return;
+        return Err("credential broker app state root must be a regular directory".to_string());
     }
 
-    let bundle = std::sync::Arc::clone(bundle);
-    let keychain_refresh_active = std::sync::Arc::clone(keychain_refresh_active);
-    std::thread::spawn(move || {
-        if let Ok(refreshed) = load_bundle_from_keychain()
-            && let Ok(mut bundle) = bundle.lock()
+    let mut directory = app_state_root.to_path_buf();
+    for component in [STABLE_BROKER_DIRECTORY, STABLE_BROKER_PROTOCOL_DIRECTORY] {
+        directory.push(component);
+        let metadata = match fs::symlink_metadata(&directory) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => return Err(error.to_string()),
+        };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != root_metadata.uid()
+            || metadata.permissions().mode() & 0o777 != 0o700
         {
-            *bundle = refreshed;
+            return Err("credential broker installation directory is invalid".to_string());
         }
-        keychain_refresh_active.store(false, Ordering::Release);
-    });
-}
-
-#[cfg(unix)]
-fn serve_unix_client(
-    mut stream: std::os::unix::net::UnixStream,
-    bundle: &CredentialBundle,
-) -> Result<(), String> {
-    use std::io::{Read, Write};
-
-    let mut request = [0; 1];
-    configure_unix_stream(&stream, BROKER_CLIENT_TIMEOUT)?;
-    stream
-        .read_exact(&mut request)
-        .map_err(|error| error.to_string())?;
-    if request[0] != REQUEST_BUNDLE {
-        return Err("credential broker received an invalid request".to_string());
     }
-    let response = encode_bundle(bundle);
-    stream
-        .write_all(&response)
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 #[cfg(unix)]
-fn request_or_start_broker(app_state_root: &Path) -> Result<CredentialBundle, String> {
+fn request_or_start_broker(
+    app_state_root: &Path,
+    request: &BrokerRequest,
+) -> Result<BrokerResponse, String> {
     use std::{
         process::{Command, Stdio},
         thread,
@@ -331,22 +311,17 @@ fn request_or_start_broker(app_state_root: &Path) -> Result<CredentialBundle, St
     };
 
     let socket_path = broker_socket_path(app_state_root);
-    let deadline = Instant::now() + BROKER_STARTUP_TIMEOUT;
-    if let Ok(bundle) = request_unix_bundle(
-        &socket_path,
-        deadline
-            .saturating_duration_since(Instant::now())
-            .min(EXISTING_BROKER_PROBE_TIMEOUT),
-    ) {
-        return Ok(bundle);
-    }
-    if Instant::now() >= deadline {
-        return Err("credential broker did not become ready".to_string());
+    match request_ready_broker(&socket_path, request) {
+        Ok(response) => return Ok(response),
+        Err(ReadyBrokerRequestError::Operation(error)) => return Err(error),
+        Err(ReadyBrokerRequestError::NotReady) => {}
     }
 
-    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let candidate = bundled_broker_executable_path()?;
+    let executable =
+        install_stable_broker_from(&candidate, app_state_root, verify_broker_code_signature)?;
+    let deadline = Instant::now() + BROKER_STARTUP_TIMEOUT;
     let mut child = Command::new(executable)
-        .arg("credential-broker")
         .arg("--app-state-root")
         .arg(app_state_root)
         .stdin(Stdio::null())
@@ -358,13 +333,53 @@ fn request_or_start_broker(app_state_root: &Path) -> Result<CredentialBundle, St
     while Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         thread::sleep(remaining.min(std::time::Duration::from_millis(20)));
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if let Ok(bundle) = request_unix_bundle(&socket_path, remaining) {
-            return Ok(bundle);
+        match request_ready_broker(&socket_path, request) {
+            Ok(response) => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Ok(response);
+            }
+            Err(ReadyBrokerRequestError::Operation(error)) => {
+                thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Err(error);
+            }
+            Err(ReadyBrokerRequestError::NotReady) => {}
         }
     }
     terminate_broker_child(&mut child);
     Err("credential broker did not become ready".to_string())
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+enum ReadyBrokerRequestError {
+    NotReady,
+    Operation(String),
+}
+
+#[cfg(unix)]
+fn request_ready_broker(
+    socket_path: &Path,
+    request: &BrokerRequest,
+) -> Result<BrokerResponse, ReadyBrokerRequestError> {
+    request_ready_broker_with(request, |operation, timeout| {
+        request_unix_operation(socket_path, operation, timeout)
+    })
+}
+
+#[cfg(unix)]
+fn request_ready_broker_with(
+    request: &BrokerRequest,
+    mut perform: impl FnMut(&BrokerRequest, std::time::Duration) -> Result<BrokerResponse, String>,
+) -> Result<BrokerResponse, ReadyBrokerRequestError> {
+    match perform(&BrokerRequest::Ping, EXISTING_BROKER_PROBE_TIMEOUT) {
+        Ok(BrokerResponse::Success) => {}
+        Ok(_) | Err(_) => return Err(ReadyBrokerRequestError::NotReady),
+    }
+    perform(request, BROKER_OPERATION_TIMEOUT).map_err(ReadyBrokerRequestError::Operation)
 }
 
 #[cfg(unix)]
@@ -376,83 +391,227 @@ fn terminate_broker_child(child: &mut std::process::Child) {
 }
 
 #[cfg(unix)]
-fn request_unix_bundle(
+fn request_unix_operation(
     socket_path: &Path,
+    request: &BrokerRequest,
     timeout: std::time::Duration,
-) -> Result<CredentialBundle, String> {
-    use std::{
-        io::{Read, Write},
-        os::unix::net::UnixStream,
-    };
+) -> Result<BrokerResponse, String> {
+    use std::os::unix::net::UnixStream;
 
+    let socket_directory = socket_path
+        .parent()
+        .ok_or_else(|| "credential broker socket directory is unavailable".to_string())?;
+    validate_broker_socket_directory_for_client(socket_directory)?;
     let mut stream = UnixStream::connect(socket_path).map_err(|error| error.to_string())?;
     configure_unix_stream(&stream, timeout)?;
-    stream
-        .write_all(&[REQUEST_BUNDLE])
-        .map_err(|error| error.to_string())?;
-    let mut response = Zeroizing::new([0; RESPONSE_BYTES]);
-    stream
-        .read_exact(&mut *response)
-        .map_err(|error| error.to_string())?;
-    decode_bundle(response.as_slice())
+    super::broker_client_auth::authorize(&stream)?;
+    write_request(&mut stream, request)?;
+    read_response(&mut stream)
 }
 
 #[cfg(unix)]
-fn configure_unix_stream(
-    stream: &std::os::unix::net::UnixStream,
-    timeout: std::time::Duration,
+fn validate_broker_socket_directory_for_client(directory: &Path) -> Result<(), String> {
+    validate_broker_socket_directory_for_client_with_uid(directory, effective_uid())
+}
+
+#[cfg(unix)]
+fn validate_broker_socket_directory_for_client_with_uid(
+    directory: &Path,
+    expected_uid: u32,
 ) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(timeout))
-        .map_err(|error| error.to_string())?;
-    stream
-        .set_write_timeout(Some(timeout))
-        .map_err(|error| error.to_string())
+    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+    let metadata = fs::symlink_metadata(directory)
+        .map_err(|error| format!("credential broker socket directory is unavailable: {error}"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err("credential broker socket directory must be a regular directory".to_string());
+    }
+    if metadata.uid() != expected_uid {
+        return Err("credential broker socket directory owner is invalid".to_string());
+    }
+    if metadata.permissions().mode() & 0o777 != 0o700 {
+        return Err("credential broker socket directory permissions are invalid".to_string());
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn ensure_broker_directory(app_state_root: &Path) -> Result<(), String> {
+fn bundled_broker_executable_path() -> Result<PathBuf, String> {
+    let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+    let parent = executable
+        .parent()
+        .ok_or_else(|| "Unpin executable has no parent directory".to_string())?;
+    Ok(parent.join(STABLE_BROKER_EXECUTABLE))
+}
+
+#[cfg(target_os = "macos")]
+fn verify_broker_code_signature(path: &Path) -> Result<(), String> {
+    use std::process::{Command, Stdio};
+
+    let fingerprint = option_env!("UNPIN_CODESIGN_CERTIFICATE_SHA1")
+        .ok_or_else(|| "Unpin was not built with a broker certificate fingerprint".to_string())?;
+    let fingerprint = fingerprint.to_ascii_lowercase();
+    if fingerprint.len() != 40 || !fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err("Unpin broker certificate fingerprint is invalid".to_string());
+    }
+    let requirement = format!(
+        "identifier \"dev.unpin.credential-broker\" and certificate leaf = H\"{fingerprint}\""
+    );
+    let status = Command::new("/usr/bin/codesign")
+        .args(["--verify", "--strict", &format!("-R={requirement}")])
+        .arg(path)
+        .env_clear()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("credential broker signature could not be checked: {error}"))?;
+    if !status.success() {
+        return Err("credential broker has an invalid Unpin code signature".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn verify_broker_code_signature(_path: &Path) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(unix)]
+fn install_stable_broker_from(
+    candidate: &Path,
+    app_state_root: &Path,
+    verify: impl Fn(&Path) -> Result<(), String>,
+) -> Result<PathBuf, String> {
+    use std::{
+        io,
+        os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    };
+
+    ensure_stable_broker_directory(app_state_root)?;
+    let installed = stable_broker_executable_path(app_state_root);
+    match fs::symlink_metadata(&installed) {
+        Ok(_) => {
+            validate_regular_broker_file(&installed)?;
+            verify(&installed)?;
+            return Ok(installed);
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+
+    match fs::symlink_metadata(candidate) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Err(
+                "credential broker companion is missing; reinstall unpin and unpin-credential-broker together"
+                    .to_string(),
+            );
+        }
+        Err(error) => return Err(error.to_string()),
+        Ok(_) => validate_regular_broker_file(candidate)?,
+    }
+    verify(candidate)?;
+    let directory = installed
+        .parent()
+        .expect("stable broker executable always has a parent");
+    let mut entropy = [0_u8; 8];
+    getrandom::fill(&mut entropy).map_err(|error| error.to_string())?;
+    let suffix = entropy
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    let temporary = directory.join(format!(".broker-install-{suffix}"));
+    let copy_result = (|| {
+        let mut source = fs::File::open(candidate).map_err(|error| error.to_string())?;
+        let mut destination = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o700)
+            .open(&temporary)
+            .map_err(|error| error.to_string())?;
+        io::copy(&mut source, &mut destination).map_err(|error| error.to_string())?;
+        destination.sync_all().map_err(|error| error.to_string())?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+        verify(&temporary)?;
+        match fs::hard_link(&temporary, &installed) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                validate_regular_broker_file(&installed)?;
+                verify(&installed)?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        fs::File::open(directory)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    })();
+    let cleanup_result = fs::remove_file(&temporary);
+    copy_result?;
+    if let Err(error) = cleanup_result
+        && error.kind() != io::ErrorKind::NotFound
+    {
+        return Err(format!(
+            "stable broker temporary file cleanup failed: {error}"
+        ));
+    }
+    let metadata = fs::metadata(&installed).map_err(|error| error.to_string())?;
+    let root_metadata = fs::metadata(app_state_root).map_err(|error| error.to_string())?;
+    if metadata.uid() != root_metadata.uid() {
+        return Err("installed credential broker owner is invalid".to_string());
+    }
+    Ok(installed)
+}
+
+#[cfg(unix)]
+fn validate_regular_broker_file(path: &Path) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| error.to_string())?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err("credential broker must be a regular file".to_string());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn ensure_stable_broker_directory(app_state_root: &Path) -> Result<(), String> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
     fs::create_dir_all(app_state_root).map_err(|error| error.to_string())?;
     let root_metadata = fs::symlink_metadata(app_state_root).map_err(|error| error.to_string())?;
-    if root_metadata.file_type().is_symlink() || !root_metadata.is_dir() {
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != effective_uid()
+    {
         return Err("credential broker app state root must be a regular directory".to_string());
     }
-    let directory = broker_socket_directory(app_state_root);
-    match fs::create_dir(&directory) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(error) => return Err(error.to_string()),
+    let mut current = app_state_root.to_path_buf();
+    for component in [STABLE_BROKER_DIRECTORY, STABLE_BROKER_PROTOCOL_DIRECTORY] {
+        current.push(component);
+        match fs::create_dir(&current) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let metadata = fs::symlink_metadata(&current).map_err(|error| error.to_string())?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != root_metadata.uid()
+        {
+            return Err("credential broker installation directory is invalid".to_string());
+        }
+        fs::set_permissions(&current, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
     }
-    let metadata = fs::symlink_metadata(&directory).map_err(|error| error.to_string())?;
-    if metadata.file_type().is_symlink()
-        || !metadata.is_dir()
-        || metadata.uid() != root_metadata.uid()
-    {
-        return Err("credential broker directory must be a regular directory".to_string());
-    }
-    fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
-        .map_err(|error| error.to_string())
+    Ok(())
 }
 
 #[cfg(unix)]
-fn broker_socket_path(app_state_root: &Path) -> PathBuf {
-    broker_socket_directory(app_state_root).join("broker-v1.sock")
-}
-
-#[cfg(unix)]
-fn broker_socket_directory(app_state_root: &Path) -> PathBuf {
-    use std::os::unix::ffi::OsStrExt;
-
-    let hash = app_state_root
-        .as_os_str()
-        .as_bytes()
-        .iter()
-        .fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
-            (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
-        });
-    PathBuf::from("/tmp").join(format!("unpin-credential-broker-v1-{hash:016x}"))
+fn stable_broker_executable_path(app_state_root: &Path) -> PathBuf {
+    app_state_root
+        .join(STABLE_BROKER_DIRECTORY)
+        .join(STABLE_BROKER_PROTOCOL_DIRECTORY)
+        .join(STABLE_BROKER_EXECUTABLE)
 }
 
 #[cfg(test)]
@@ -542,60 +701,217 @@ mod tests {
 
         assert!(socket.starts_with("/tmp"));
         assert!(socket.as_os_str().as_bytes().len() < 104);
+        let directory = socket.parent().expect("broker socket directory");
+        let directory_name = directory
+            .file_name()
+            .expect("broker socket directory name")
+            .to_string_lossy();
+        assert!(directory_name.starts_with("unpin-stable-credential-broker-v1-"));
+        assert!(!directory_name.starts_with("unpin-credential-broker-v1-"));
     }
 
     #[cfg(unix)]
     #[test]
-    fn unix_broker_serves_multiple_clients_from_one_loaded_bundle() {
-        use std::{os::unix::net::UnixListener, thread, time::Duration};
+    fn ready_broker_receives_ping_then_real_request_once() {
+        let request = BrokerRequest::Delete {
+            account: "cursor-dashboard-cookie-v1".to_string(),
+        };
+        let mut operations = Vec::new();
+
+        let response = request_ready_broker_with(&request, |operation, timeout| match operation {
+            BrokerRequest::Ping => {
+                operations.push("ping");
+                assert_eq!(timeout, EXISTING_BROKER_PROBE_TIMEOUT);
+                Ok(BrokerResponse::Success)
+            }
+            BrokerRequest::Delete { .. } => {
+                operations.push("delete");
+                assert_eq!(timeout, BROKER_OPERATION_TIMEOUT);
+                Ok(BrokerResponse::NotFound)
+            }
+            BrokerRequest::Get { .. } | BrokerRequest::Set { .. } => {
+                panic!("unexpected request")
+            }
+        })
+        .expect("ready broker request");
+
+        assert_eq!(response, BrokerResponse::NotFound);
+        assert_eq!(operations, ["ping", "delete"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_broker_install_is_create_once_across_companion_updates() {
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let first_candidate = root.path().join("first-candidate");
+        let later_candidate = root.path().join("later-candidate");
+        fs::write(&first_candidate, b"stable broker bytes").expect("first candidate");
+        fs::write(&later_candidate, b"updated companion bytes").expect("later candidate");
+
+        let installed = install_stable_broker_from(&first_candidate, root.path(), |_| Ok(()))
+            .expect("first broker install");
+        let reused = install_stable_broker_from(&later_candidate, root.path(), |_| Ok(()))
+            .expect("reuse installed broker");
+
+        assert_eq!(reused, installed);
+        assert_eq!(
+            fs::read(installed).expect("installed broker bytes"),
+            b"stable broker bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_broker_install_reuses_existing_when_companion_is_missing() {
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let first_candidate = root.path().join("first-candidate");
+        let missing_candidate = root.path().join("missing-candidate");
+        fs::write(&first_candidate, b"stable broker bytes").expect("first candidate");
+
+        let installed = install_stable_broker_from(&first_candidate, root.path(), |_| Ok(()))
+            .expect("first broker install");
+        let reused = install_stable_broker_from(&missing_candidate, root.path(), |_| Ok(()))
+            .expect("reuse installed broker without a companion");
+
+        assert_eq!(reused, installed);
+        assert_eq!(
+            fs::read(installed).expect("installed broker bytes"),
+            b"stable broker bytes"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_broker_update_allows_legacy_keyring_only_when_binaries_are_absent() {
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let missing_candidate = root.path().join("missing-candidate");
+
+        assert!(
+            legacy_keyring_fallback_allowed_for_paths(root.path(), &missing_candidate)
+                .expect("missing broker paths")
+        );
+
+        fs::write(&missing_candidate, b"companion broker").expect("companion candidate");
+        assert!(
+            !legacy_keyring_fallback_allowed_for_paths(root.path(), &missing_candidate)
+                .expect("present companion")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn first_broker_update_rejects_symlinked_stable_broker_directory() {
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let missing_candidate = root.path().join("missing-candidate");
+        let redirected = root.path().join("redirected-broker-directory");
+        fs::create_dir(&redirected).expect("redirected broker directory");
+        std::os::unix::fs::symlink(&redirected, root.path().join(STABLE_BROKER_DIRECTORY))
+            .expect("stable broker directory symlink");
+
+        let error = legacy_keyring_fallback_allowed_for_paths(root.path(), &missing_candidate)
+            .expect_err("symlinked stable broker directory must fail");
+
+        assert_eq!(error, "credential broker installation directory is invalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn foreign_owned_predictable_socket_directory_is_rejected() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let root = tempfile::TempDir::new().expect("temporary broker root");
-        ensure_broker_directory(root.path()).expect("private broker directory");
-        let socket = broker_socket_path(root.path());
-        let listener = UnixListener::bind(&socket).expect("bind credential broker");
-        let bundle = CredentialBundle {
-            approval: Some(Zeroizing::new([0x11; 32])),
-            backup_authentication: Some(Zeroizing::new([0x42; 32])),
-            session_authority: Some(Zeroizing::new([0x53; 32])),
-        };
-        let server =
-            thread::spawn(move || serve_unix_broker(listener, bundle, Duration::from_secs(1)));
+        let directory = broker_socket_directory(root.path());
+        fs::create_dir(&directory).expect("socket directory");
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .expect("socket directory mode");
+        let actual_uid = fs::symlink_metadata(&directory)
+            .expect("socket directory metadata")
+            .uid();
+        let foreign_uid = actual_uid.wrapping_add(1);
 
-        let mut first = None;
-        for _ in 0..100 {
-            match request_unix_bundle(&socket, Duration::from_secs(2)) {
-                Ok(bundle) => {
-                    first = Some(bundle);
-                    break;
-                }
-                Err(_) => thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        let first = first.expect("first broker client");
-        let stalled_client = std::os::unix::net::UnixStream::connect(&socket)
-            .expect("connect stalled broker client");
-        let mut second = None;
-        for _ in 0..100 {
-            match request_unix_bundle(&socket, Duration::from_secs(2)) {
-                Ok(bundle) => {
-                    second = Some(bundle);
-                    break;
-                }
-                Err(_) => thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        let second = second.expect("second broker client");
+        let error = validate_broker_socket_directory_for_client_with_uid(&directory, foreign_uid)
+            .expect_err("foreign-owned socket directory must fail");
 
-        assert_eq!(first.approval(), Some([0x11; 32]));
-        assert_eq!(second.backup_authentication(), Some([0x42; 32]));
-        assert_eq!(second.session_authority(), Some([0x53; 32]));
-        drop(stalled_client);
-        server
-            .join()
-            .expect("broker thread")
-            .expect("broker result");
-        fs::remove_file(socket).expect("remove test socket");
-        fs::remove_dir(broker_socket_directory(root.path()))
-            .expect("remove private broker directory");
+        assert_eq!(error, "credential broker socket directory owner is invalid");
+        fs::remove_dir(directory).expect("remove socket directory");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn permissive_or_symlinked_socket_directory_is_rejected() {
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let directory = broker_socket_directory(root.path());
+        fs::create_dir(&directory).expect("socket directory");
+        let uid = fs::symlink_metadata(&directory)
+            .expect("socket directory metadata")
+            .uid();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o755))
+            .expect("permissive socket directory mode");
+        assert_eq!(
+            validate_broker_socket_directory_for_client_with_uid(&directory, uid)
+                .expect_err("permissive socket directory must fail"),
+            "credential broker socket directory permissions are invalid"
+        );
+        fs::remove_dir(&directory).expect("remove socket directory");
+
+        let target = root.path().join("socket-directory-target");
+        fs::create_dir(&target).expect("socket directory target");
+        std::os::unix::fs::symlink(&target, &directory).expect("socket directory symlink");
+        assert_eq!(
+            validate_broker_socket_directory_for_client_with_uid(&directory, uid)
+                .expect_err("symlinked socket directory must fail"),
+            "credential broker socket directory must be a regular directory"
+        );
+        fs::remove_file(directory).expect("remove socket directory symlink");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn missing_companion_has_recovery_diagnostic_when_no_stable_broker_exists() {
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let missing_candidate = root.path().join("missing-candidate");
+
+        let error = install_stable_broker_from(&missing_candidate, root.path(), |_| Ok(()))
+            .expect_err("missing companion must fail");
+
+        assert_eq!(
+            error,
+            "credential broker companion is missing; reinstall unpin and unpin-credential-broker together"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_broker_install_rejects_unverified_candidate_without_partial_state() {
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let candidate = root.path().join("candidate");
+        fs::write(&candidate, b"untrusted broker").expect("candidate");
+
+        let error = install_stable_broker_from(&candidate, root.path(), |_| {
+            Err("signature rejected".to_string())
+        })
+        .expect_err("unverified candidate must fail");
+
+        assert!(error.contains("signature rejected"));
+        assert!(!stable_broker_executable_path(root.path()).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stable_broker_install_rejects_symlink_candidate() {
+        let root = tempfile::TempDir::new().expect("temporary broker root");
+        let target = root.path().join("target");
+        let candidate = root.path().join("candidate");
+        fs::write(&target, b"broker").expect("target");
+        std::os::unix::fs::symlink(&target, &candidate).expect("candidate symlink");
+
+        let error = install_stable_broker_from(&candidate, root.path(), |_| Ok(()))
+            .expect_err("symlink candidate must fail");
+
+        assert_eq!(error, "credential broker must be a regular file");
+        assert!(!error.contains(&candidate.display().to_string()));
+        assert!(!stable_broker_executable_path(root.path()).exists());
     }
 }

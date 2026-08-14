@@ -78,7 +78,7 @@
 /* End PBXProject section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		A60000000000000000000003 /* Bundle Unpin */ = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Bundle Unpin"; outputPaths = ("$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/unpin", "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/unpin-bridge-manifest.json"); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh; shellScript = "/bin/sh \"$SRCROOT/Scripts/bundle-unpin.sh\"\n"; };
+		A60000000000000000000003 /* Bundle Unpin */ = {isa = PBXShellScriptBuildPhase; alwaysOutOfDate = 1; buildActionMask = 2147483647; files = (); inputPaths = (); name = "Bundle Unpin"; outputPaths = ("$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/unpin", "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/unpin-credential-broker", "$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Resources/unpin-bridge-manifest.json"); runOnlyForDeploymentPostprocessing = 0; shellPath = /bin/sh; shellScript = "/bin/sh \"$SRCROOT/Scripts/bundle-unpin.sh\"\n"; };
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXResourcesBuildPhase section */

@@ -175,6 +175,7 @@ pub struct UpdatePlan {
     pub archive_name: String,
     archive_root: String,
     candidate_relative_path: PathBuf,
+    companion_relative_path: Option<PathBuf>,
 }
 
 impl UpdatePlan {
@@ -201,6 +202,10 @@ impl UpdatePlan {
             UpdateTarget::Cli => PathBuf::from(&archive_root).join("unpin"),
             UpdateTarget::Desktop => PathBuf::from(&archive_root).join("UnpinDesktop.app"),
         };
+        let companion_relative_path = match target {
+            UpdateTarget::Cli => Some(PathBuf::from(&archive_root).join("unpin-credential-broker")),
+            UpdateTarget::Desktop => None,
+        };
         Ok(Self {
             current_version,
             latest_version,
@@ -209,7 +214,13 @@ impl UpdatePlan {
             archive_name: format!("{archive_root}.tar.gz"),
             archive_root,
             candidate_relative_path,
+            companion_relative_path,
         })
+    }
+
+    #[must_use]
+    pub(crate) fn companion_relative_path(&self) -> Option<&Path> {
+        self.companion_relative_path.as_deref()
     }
 }
 
@@ -306,6 +317,14 @@ pub(crate) fn extract_release_archive(
     };
     if !valid_type || metadata.file_type().is_symlink() {
         return Err(UpdateError::MissingCandidate(candidate));
+    }
+    if let Some(companion_relative_path) = plan.companion_relative_path() {
+        let companion = destination.join(companion_relative_path);
+        let metadata = fs::symlink_metadata(&companion)
+            .map_err(|_| UpdateError::MissingCandidate(companion.clone()))?;
+        if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
+            return Err(UpdateError::MissingCandidate(companion));
+        }
     }
     Ok(candidate)
 }
@@ -456,6 +475,18 @@ mod tests {
                 bytes.as_slice(),
             )
             .expect("entry");
+        let broker_bytes = b"broker candidate";
+        let mut broker_header = tar::Header::new_gnu();
+        broker_header.set_size(broker_bytes.len() as u64);
+        broker_header.set_mode(0o755);
+        broker_header.set_cksum();
+        builder
+            .append_data(
+                &mut broker_header,
+                "unpin-v1.1.0-aarch64-apple-darwin/unpin-credential-broker",
+                broker_bytes.as_slice(),
+            )
+            .expect("broker entry");
         builder
             .into_inner()
             .expect("encoder")
@@ -472,6 +503,50 @@ mod tests {
         let candidate = extract_release_archive(&archive_path, &temp.path().join("out"), &plan)
             .expect("extract");
         assert_eq!(fs::read(candidate).expect("candidate"), bytes);
+    }
+
+    #[test]
+    fn extractor_rejects_cli_archive_without_broker_companion() {
+        let temp = TempDir::new().expect("temp");
+        let archive_path = temp.path().join("release.tar.gz");
+        let encoder = GzEncoder::new(
+            File::create(&archive_path).expect("archive"),
+            Compression::default(),
+        );
+        let mut builder = tar::Builder::new(encoder);
+        let bytes = b"candidate";
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o755);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "unpin-v1.1.0-aarch64-apple-darwin/unpin",
+                bytes.as_slice(),
+            )
+            .expect("entry");
+        builder
+            .into_inner()
+            .expect("encoder")
+            .finish()
+            .expect("gzip");
+        let plan = UpdatePlan::new(
+            "1.0.2",
+            "v1.1.0",
+            UpdateTarget::Cli,
+            UpdatePlatform::MacOsArm64,
+        )
+        .expect("plan");
+
+        let error = extract_release_archive(&archive_path, &temp.path().join("out"), &plan)
+            .expect_err("broker companion is required");
+
+        assert!(matches!(
+            error,
+            UpdateError::MissingCandidate(path)
+                if path.ends_with("unpin-credential-broker")
+        ));
     }
 
     #[test]

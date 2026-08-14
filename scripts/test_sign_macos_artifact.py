@@ -11,13 +11,15 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 SIGN_SCRIPT = REPOSITORY_ROOT / "scripts" / "sign_macos_artifact.sh"
+TEST_IDENTITY = "Unpin Release Signing"
+TEST_FINGERPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
 
 
 class SignMacosArtifactTests(unittest.TestCase):
     def test_stable_identity_uses_explicit_identifier_and_secure_timestamp(self) -> None:
         completed, log = self._run(
             {
-                "UNPIN_CODESIGN_IDENTITY": "CodeBurn Update Signing",
+                "UNPIN_CODESIGN_IDENTITY": TEST_IDENTITY,
                 "UNPIN_CODESIGN_TIMESTAMP_MODE": "secure",
                 "UNPIN_REQUIRE_STABLE_CODESIGN": "1",
             }
@@ -27,7 +29,7 @@ class SignMacosArtifactTests(unittest.TestCase):
         commands = self._read_log(log)
         sign = commands[0]
         self.assertIn("--force", sign)
-        self.assertEqual(sign[sign.index("--sign") + 1], "CodeBurn Update Signing")
+        self.assertEqual(sign[sign.index("--sign") + 1], TEST_IDENTITY)
         self.assertEqual(
             sign[sign.index("--identifier") + 1],
             "dev.unpin.workbench.bridge",
@@ -71,7 +73,7 @@ class SignMacosArtifactTests(unittest.TestCase):
     def test_ad_hoc_result_is_rejected_in_stable_mode(self) -> None:
         completed, _ = self._run(
             {
-                "UNPIN_CODESIGN_IDENTITY": "CodeBurn Update Signing",
+                "UNPIN_CODESIGN_IDENTITY": TEST_IDENTITY,
                 "UNPIN_REQUIRE_STABLE_CODESIGN": "1",
                 "FAKE_CODESIGN_SIGNATURE": "adhoc",
             }
@@ -81,7 +83,7 @@ class SignMacosArtifactTests(unittest.TestCase):
         self.assertIn("produced an ad-hoc signature", completed.stderr)
 
     def test_expected_certificate_fingerprint_is_verified(self) -> None:
-        fingerprint = "E2AB4267F6B79DF40B8776A2EE9309F64CFD2389"
+        fingerprint = TEST_FINGERPRINT
         completed, log = self._run(
             {
                 "UNPIN_CODESIGN_IDENTITY": fingerprint,
@@ -103,8 +105,40 @@ class SignMacosArtifactTests(unittest.TestCase):
             )
         )
 
+    def test_certificate_fingerprint_is_used_when_identity_is_a_name(self) -> None:
+        completed, log = self._run(
+            {
+                "UNPIN_CODESIGN_IDENTITY": TEST_IDENTITY,
+                "UNPIN_CODESIGN_CERTIFICATE_SHA1": TEST_FINGERPRINT.lower(),
+                "UNPIN_REQUIRE_STABLE_CODESIGN": "1",
+                "FAKE_CODESIGN_FINGERPRINT": TEST_FINGERPRINT,
+            }
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertTrue(
+            any(
+                any(
+                    argument.startswith("--extract-certificates=")
+                    for argument in command
+                )
+                for command in self._read_log(log)
+            )
+        )
+
+    def test_invalid_certificate_fingerprint_is_rejected(self) -> None:
+        completed, _ = self._run(
+            {
+                "UNPIN_CODESIGN_IDENTITY": TEST_IDENTITY,
+                "UNPIN_CODESIGN_CERTIFICATE_SHA1": "not-a-fingerprint",
+            }
+        )
+
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("UNPIN_CODESIGN_CERTIFICATE_SHA1", completed.stderr)
+
     def test_mismatched_certificate_fingerprint_is_rejected(self) -> None:
-        fingerprint = "E2AB4267F6B79DF40B8776A2EE9309F64CFD2389"
+        fingerprint = TEST_FINGERPRINT
         completed, _ = self._run(
             {
                 "UNPIN_CODESIGN_IDENTITY": fingerprint,
@@ -196,7 +230,7 @@ class SignMacosArtifactTests(unittest.TestCase):
         fake_codesign.chmod(0o755)
         fake_openssl = command_bin / "openssl"
         fake_openssl.write_text(
-            "#!/bin/sh\nprintf 'sha1 Fingerprint=%s\\n' \"${FAKE_CODESIGN_FINGERPRINT:-E2AB4267F6B79DF40B8776A2EE9309F64CFD2389}\"\n",
+            f"#!/bin/sh\nprintf 'sha1 Fingerprint=%s\\n' \"${{FAKE_CODESIGN_FINGERPRINT:-{TEST_FINGERPRINT}}}\"\n",
             encoding="utf-8",
         )
         fake_openssl.chmod(0o755)
@@ -213,6 +247,7 @@ class SignMacosArtifactTests(unittest.TestCase):
             "UNPIN_CODESIGN_TIMESTAMP_MODE",
             "UNPIN_REQUIRE_STABLE_CODESIGN",
             "UNPIN_CODESIGN_EXPECTED_FINGERPRINT",
+            "UNPIN_CODESIGN_CERTIFICATE_SHA1",
             "FAKE_CODESIGN_IDENTIFIER",
             "FAKE_CODESIGN_SIGNATURE",
             "FAKE_CODESIGN_FINGERPRINT",

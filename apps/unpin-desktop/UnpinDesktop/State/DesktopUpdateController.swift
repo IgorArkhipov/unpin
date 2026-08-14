@@ -65,7 +65,7 @@ struct DesktopUpdateApplyResult: Decodable, Equatable, Sendable {
     let installedVersion: String
     let installPath: String
     let backupPath: String
-    let keychainRequirementPreserved: Bool
+    let credentialBrokerPreserved: Bool
     let relaunchStatus: DesktopUpdateRelaunchStatus
     let warning: String?
 
@@ -78,7 +78,7 @@ struct DesktopUpdateApplyResult: Decodable, Equatable, Sendable {
               URL(fileURLWithPath: installPath).standardizedFileURL.path
                   == expectedInstallPath.standardizedFileURL.path,
               backupPath.isEmpty == false,
-              keychainRequirementPreserved,
+              credentialBrokerPreserved,
               relaunchStatus == .notRequested,
               warning == nil
         else {

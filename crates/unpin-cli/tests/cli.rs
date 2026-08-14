@@ -56,6 +56,24 @@ use unpin_core::{
 #[cfg(unix)]
 const BRIDGE_TEST_SECRET: &str = "1111111111111111111111111111111111111111111111111111111111111111";
 
+#[test]
+fn credential_broker_help_is_successful() {
+    for argument in ["--help", "-h"] {
+        let output = Command::cargo_bin("unpin-credential-broker")
+            .expect("credential broker binary")
+            .arg(argument)
+            .output()
+            .expect("credential broker help output");
+
+        assert!(output.status.success(), "{argument} should succeed");
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("usage: unpin-credential-broker --app-state-root PATH")
+        );
+        assert!(output.stderr.is_empty());
+    }
+}
+
 #[cfg(unix)]
 fn bridge_handshake_request(
     id: &str,
@@ -5048,6 +5066,68 @@ fn group_operation_show_handles_missing_context_and_redacts_internal_evidence() 
             .to_string()
             .contains(root.to_string_lossy().as_ref()),
         "context mismatch exposed a private path"
+    );
+}
+
+#[test]
+#[cfg(target_os = "macos")]
+fn toggle_dry_run_does_not_require_broker_credentials() {
+    let temp = TempDir::new().expect("temp live roots");
+    let root = fs::canonicalize(temp.path()).expect("canonical temp root");
+    let home_root = root.join("home");
+    let project_root = root.join("project");
+    let cursor_root = root.join("cursor");
+    let app_state_root = root.join("state");
+    write_text(
+        &home_root.join(".claude.json"),
+        &serde_json::json!({
+            "mcpServers": {
+                "unsigned-dry-run": {
+                    "command": "/usr/bin/false"
+                }
+            }
+        })
+        .to_string(),
+    );
+    fs::create_dir_all(&project_root).expect("project root");
+    fs::create_dir_all(&cursor_root).expect("cursor root");
+    fs::create_dir_all(&app_state_root).expect("app state root");
+    run_git(&project_root, &["init"]);
+
+    let output = Command::cargo_bin("unpin")
+        .expect("unpin binary")
+        .arg("toggle")
+        .args(["--home-root"])
+        .arg(&home_root)
+        .args(["--project-root"])
+        .arg(&project_root)
+        .args(["--cursor-root"])
+        .arg(&cursor_root)
+        .args(["--app-state-root"])
+        .arg(&app_state_root)
+        .args([
+            "--provider",
+            "claude",
+            "--kind",
+            "mcp",
+            "--layer",
+            "global",
+            "--id",
+            "claude:global:configured-mcp:unsigned-dry-run",
+            "--json",
+        ])
+        .output()
+        .expect("toggle dry run");
+
+    let plan = assert_success_json(output, "unsigned toggle dry run");
+    assert_eq!(plan["status"], "dry-run");
+    assert_eq!(
+        plan["selection"]["id"],
+        "claude:global:configured-mcp:unsigned-dry-run"
+    );
+    assert!(
+        !app_state_root.join("credential-broker").exists(),
+        "dry-run planning must not install or contact the credential broker"
     );
 }
 

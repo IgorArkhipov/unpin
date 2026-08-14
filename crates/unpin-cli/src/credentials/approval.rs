@@ -45,23 +45,6 @@ pub(crate) fn approval_key_status(store: &impl SecretStore) -> Result<ApprovalKe
     }
 }
 
-pub(crate) fn approval_key_status_for_mode(
-    fixture_mode: bool,
-    app_state_root: &Path,
-) -> Result<ApprovalKeyState, String> {
-    if fixture_mode {
-        return Ok(ApprovalKeyState::Ready {
-            key_id: fixture_approval_key(app_state_root)?.key_id(),
-        });
-    }
-    Ok(broker::resolve_runtime_bundle(app_state_root)?
-        .approval()
-        .map(ApprovalKey::new)
-        .map_or(ApprovalKeyState::Missing, |key| ApprovalKeyState::Ready {
-            key_id: key.key_id(),
-        }))
-}
-
 pub(crate) fn initialize_approval_key(
     store: &impl SecretStore,
 ) -> Result<ApprovalKeyInitialization, String> {
@@ -294,7 +277,7 @@ pub(crate) fn issue_human_approval(
         reviewed_fingerprint,
         now_unix,
         &ControllingTerminalHumanPresence,
-        || load_approval_key(&KeychainSecretStore),
+        || load_approval_key(&KeychainSecretStore::new(app_state_root)),
         random_suffix,
     )
 }
@@ -332,7 +315,7 @@ pub(crate) fn issue_desktop_human_approval(
             reviewed_fingerprint,
             now_unix,
             &MacOsUserPresence,
-            || load_approval_key(&KeychainSecretStore),
+            || load_approval_key(&KeychainSecretStore::new(app_state_root)),
             random_suffix,
         )
     }

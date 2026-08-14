@@ -10,6 +10,7 @@ expected_identifier="$1"
 artifact="$2"
 require_stable_signing="${UNPIN_REQUIRE_STABLE_CODESIGN:-0}"
 expected_fingerprint="${UNPIN_CODESIGN_EXPECTED_FINGERPRINT:-}"
+certificate_fingerprint="${UNPIN_CODESIGN_CERTIFICATE_SHA1:-}"
 
 if [[ ! "$expected_identifier" =~ ^[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; then
   echo "invalid macOS signing identifier: $expected_identifier" >&2
@@ -27,11 +28,23 @@ case "$require_stable_signing" in
     ;;
 esac
 
+if [[ -n "$certificate_fingerprint" ]]; then
+  certificate_fingerprint="$(printf '%s' "$certificate_fingerprint" | tr -d ':' | tr '[:lower:]' '[:upper:]')"
+  if [[ ! "$certificate_fingerprint" =~ ^[[:xdigit:]]{40}$ ]]; then
+    echo "UNPIN_CODESIGN_CERTIFICATE_SHA1 must be a 40-character SHA-1 fingerprint" >&2
+    exit 2
+  fi
+fi
+
 # A SHA-1 identity is also the default codesign identity used by the release
-# workflow. Keep the explicit variable for clarity, while accepting the
-# existing identity variable for local invocations that provide a fingerprint.
-if [[ -z "$expected_fingerprint" && "${UNPIN_CODESIGN_IDENTITY:-}" =~ ^[[:xdigit:]]{40}$ ]]; then
-  expected_fingerprint="${UNPIN_CODESIGN_IDENTITY}"
+# workflow. When a local invocation uses the certificate display name instead,
+# fall back to the separately pinned public fingerprint.
+if [[ -z "$expected_fingerprint" ]]; then
+  if [[ "${UNPIN_CODESIGN_IDENTITY:-}" =~ ^[[:xdigit:]]{40}$ ]]; then
+    expected_fingerprint="${UNPIN_CODESIGN_IDENTITY}"
+  elif [[ -n "$certificate_fingerprint" ]]; then
+    expected_fingerprint="$certificate_fingerprint"
+  fi
 fi
 if [[ -n "$expected_fingerprint" ]]; then
   expected_fingerprint="$(printf '%s' "$expected_fingerprint" | tr -d ':' | tr '[:lower:]' '[:upper:]')"

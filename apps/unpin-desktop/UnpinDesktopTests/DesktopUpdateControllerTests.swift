@@ -306,6 +306,26 @@ final class DesktopUpdateControllerTests: XCTestCase {
         XCTAssertTrue(message.contains("may have been committed"))
     }
 
+    func testApplyContractRequiresCredentialBrokerPreservation() async {
+        let termination = DesktopUpdateTerminationRecorder()
+        let controller = DesktopUpdateController(
+            appBundleURL: app,
+            bridgeExecutableURL: app.appendingPathComponent("Contents/MacOS/unpin"),
+            runCommand: { _ in Self.applyJSON(credentialBrokerPreserved: false) },
+            verifyBridge: { _ in },
+            relaunchApplication: { _ in XCTFail("desktop flow must not relaunch") },
+            terminateApplication: { termination.didTerminate = true }
+        )
+
+        await controller.install(availableStatus())
+
+        XCTAssertFalse(termination.didTerminate)
+        guard case let .failed(message) = controller.phase else {
+            return XCTFail("expected broker preservation contract failure")
+        }
+        XCTAssertTrue(message.contains("may have been committed"))
+    }
+
     func testDesktopUpdateCheckPresentsAvailableRelease() async {
         let controller = DesktopUpdateController(
             runCommand: { _ in Self.checkJSON(status: "available") },
@@ -357,12 +377,13 @@ final class DesktopUpdateControllerTests: XCTestCase {
     }
 
     private nonisolated static func applyJSON(
+        credentialBrokerPreserved: Bool = true,
         relaunchStatus: String = "notRequested",
         warning: String? = nil
     ) -> Data {
         let warningJSON = warning.map { "\"\($0)\"" } ?? "null"
         return Data(
-            "{\"schemaVersion\":1,\"status\":\"updated\",\"target\":\"desktop\",\"previousVersion\":\"1.0.2\",\"installedVersion\":\"1.1.0\",\"installPath\":\"/Applications/UnpinDesktop.app\",\"backupPath\":\"/Applications/.UnpinDesktop.app.unpin-backup-1.0.2\",\"keychainRequirementPreserved\":true,\"relaunchStatus\":\"\(relaunchStatus)\",\"warning\":\(warningJSON)}".utf8
+            "{\"schemaVersion\":1,\"status\":\"updated\",\"target\":\"desktop\",\"previousVersion\":\"1.0.2\",\"installedVersion\":\"1.1.0\",\"installPath\":\"/Applications/UnpinDesktop.app\",\"backupPath\":\"/Applications/.UnpinDesktop.app.unpin-backup-1.0.2\",\"credentialBrokerPreserved\":\(credentialBrokerPreserved),\"relaunchStatus\":\"\(relaunchStatus)\",\"warning\":\(warningJSON)}".utf8
         )
     }
 

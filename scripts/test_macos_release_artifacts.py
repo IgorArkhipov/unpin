@@ -11,7 +11,7 @@ from pathlib import Path
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 CLI_VERIFY_SCRIPT = REPOSITORY_ROOT / "scripts" / "verify_macos_release_artifact.sh"
-FINGERPRINT = "E2AB4267F6B79DF40B8776A2EE9309F64CFD2389"
+FINGERPRINT = "0123456789ABCDEF0123456789ABCDEF01234567"
 
 
 class MacosReleaseArtifactTests(unittest.TestCase):
@@ -40,7 +40,21 @@ class MacosReleaseArtifactTests(unittest.TestCase):
         self.assertNotEqual(completed.returncode, 0)
         self.assertIn("ad-hoc signature", completed.stderr)
 
-    def _run_cli(self, overrides: dict[str, str]) -> subprocess.CompletedProcess[str]:
+    def test_packaged_cli_rejects_credential_broker_version_mismatch(self) -> None:
+        completed = self._run_cli(
+            {"FAKE_CODESIGN_FINGERPRINT": FINGERPRINT},
+            broker_version="9.9.9",
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("credential broker version mismatch", completed.stderr)
+
+    def _run_cli(
+        self,
+        overrides: dict[str, str],
+        *,
+        broker_version: str = "1.0.0",
+    ) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             command_bin = root / "bin"
@@ -53,6 +67,12 @@ class MacosReleaseArtifactTests(unittest.TestCase):
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"synthetic signed cli")
             binary.chmod(0o755)
+            broker = release_root / "unpin-credential-broker"
+            self._write_executable(
+                broker,
+                "#!/bin/sh\n"
+                f"printf '%s\\n' 'unpin-credential-broker {broker_version} protocol 1'\n",
+            )
             archive = root / f"{release_name}.tar.gz"
             with tarfile.open(archive, "w:gz") as bundle:
                 bundle.add(release_root, arcname=release_name)
@@ -60,6 +80,10 @@ class MacosReleaseArtifactTests(unittest.TestCase):
             self._write_executable(
                 command_bin / "lipo",
                 "#!/bin/sh\nprintf '%s\\n' arm64\n",
+            )
+            self._write_executable(
+                command_bin / "arch",
+                "#!/bin/sh\nshift\nexec \"$@\"\n",
             )
             self._write_executable(
                 command_bin / "codesign",
@@ -71,9 +95,13 @@ class MacosReleaseArtifactTests(unittest.TestCase):
                     import sys
 
                     arguments = sys.argv[1:]
-                    expected_artifact_suffix = os.environ[
-                        "FAKE_CODESIGN_ARTIFACT_SUFFIX"
-                    ]
+                    artifact = pathlib.Path(arguments[-1])
+                    identifiers = {
+                        "unpin": "dev.unpin.cli",
+                        "unpin-credential-broker": "dev.unpin.credential-broker",
+                    }
+                    if artifact.name not in identifiers:
+                        sys.exit(2)
                     certificate_prefix = next(
                         (
                             argument.partition("=")[2]
@@ -83,19 +111,14 @@ class MacosReleaseArtifactTests(unittest.TestCase):
                         None,
                     )
                     if "--verify" in arguments:
-                        if not arguments[-1].endswith(expected_artifact_suffix):
-                            sys.exit(2)
+                        pass
                     elif certificate_prefix is not None and "--display" in arguments:
-                        if not arguments[-1].endswith(expected_artifact_suffix):
-                            sys.exit(2)
                         prefix = pathlib.Path(certificate_prefix)
                         prefix.with_name(f"{prefix.name}0").write_bytes(b"certificate")
                     elif "--extract-certificates" in arguments:
                         sys.exit(2)
                     elif "--display" in arguments:
-                        if not arguments[-1].endswith(expected_artifact_suffix):
-                            sys.exit(2)
-                        print("Identifier=dev.unpin.cli", file=sys.stderr)
+                        print(f"Identifier={identifiers[artifact.name]}", file=sys.stderr)
                         print(
                             f"Signature={os.environ.get('FAKE_CODESIGN_SIGNATURE', 'signed')}",
                             file=sys.stderr,
@@ -119,7 +142,6 @@ class MacosReleaseArtifactTests(unittest.TestCase):
                     "UNPIN_CODESIGN_IDENTITY": FINGERPRINT,
                     "UNPIN_CODESIGN_EXPECTED_FINGERPRINT": FINGERPRINT,
                     "UNPIN_REQUIRE_STABLE_CODESIGN": "1",
-                    "FAKE_CODESIGN_ARTIFACT_SUFFIX": f"{release_name}/unpin",
                     "FAKE_CODESIGN_FINGERPRINT": FINGERPRINT,
                 }
             )

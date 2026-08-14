@@ -1,5 +1,6 @@
 [package]
 name = "unpin-cli"
+default-run = "unpin"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,6 +17,10 @@ publish.workspace = true
 [[bin]]
 name = "unpin"
 path = "src/main.rs"
+
+[[bin]]
+name = "unpin-credential-broker"
+path = "src/credential_broker_main.rs"
 
 [dependencies]
 unpin-core.workspace = true
