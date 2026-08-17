@@ -62,32 +62,50 @@ pub use bulk_control::*;
 
 mod backup_authentication;
 
+mod directory;
+mod json_mcp;
+mod path_file;
+mod providers;
+pub(crate) use directory::*;
+pub(crate) use json_mcp::*;
+pub(crate) use path_file::*;
+pub(crate) use providers::*;
+mod toggle_dispatch;
+use toggle_dispatch::plan_toggle_dispatch;
+
 pub use backup_authentication::BackupAuthenticationKey;
 use backup_authentication::{verify_backup_authentication, write_authenticated_backup_manifest};
 
-const CODEX_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "codex:global:configured-mcp:";
-const CODEX_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "codex:project:configured-mcp:";
-const CODEX_GLOBAL_PLUGIN_CONFIG_ID_PREFIX: &str = "codex:global:plugin-config:config:";
-const CURSOR_GLOBAL_LOCAL_PLUGIN_ID_PREFIX: &str = "cursor:global:plugin-manifest:local:";
-const CURSOR_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "cursor:global:configured-mcp:";
-const CURSOR_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "cursor:project:configured-mcp:";
-const ZED_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "zed:global:configured-mcp:";
-const ZED_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "zed:project:configured-mcp:";
-const OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:global:configured-mcp:";
-const OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:project:configured-mcp:";
-const OPENCODE_GLOBAL_PLUGIN_CONFIG_ID_PREFIX: &str = "opencode:global:plugin-config:npm:";
-const OPENCODE_PROJECT_PLUGIN_CONFIG_ID_PREFIX: &str = "opencode:project:plugin-config:npm:";
-const PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:global:plugin-config:package-extensions:";
-const PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:project:plugin-config:package-extensions:";
-const CLAUDE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:global:configured-mcp:";
-const CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:@local/";
-const CLAUDE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:";
-const CLAUDE_ALL_PROJECT_MCP_SERVERS_ID: &str =
+pub(super) const CODEX_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "codex:global:configured-mcp:";
+pub(super) const CODEX_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "codex:project:configured-mcp:";
+pub(super) const CODEX_GLOBAL_PLUGIN_CONFIG_ID_PREFIX: &str = "codex:global:plugin-config:config:";
+pub(super) const CURSOR_GLOBAL_LOCAL_PLUGIN_ID_PREFIX: &str =
+    "cursor:global:plugin-manifest:local:";
+pub(super) const CURSOR_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "cursor:global:configured-mcp:";
+pub(super) const CURSOR_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "cursor:project:configured-mcp:";
+pub(super) const ZED_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "zed:global:configured-mcp:";
+pub(super) const ZED_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "zed:project:configured-mcp:";
+pub(super) const OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:global:configured-mcp:";
+pub(super) const OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str =
+    "opencode:project:configured-mcp:";
+pub(super) const OPENCODE_GLOBAL_PLUGIN_CONFIG_ID_PREFIX: &str =
+    "opencode:global:plugin-config:npm:";
+pub(super) const OPENCODE_PROJECT_PLUGIN_CONFIG_ID_PREFIX: &str =
+    "opencode:project:plugin-config:npm:";
+pub(super) const PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX: &str =
+    "pi:global:plugin-config:package-extensions:";
+pub(super) const PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX: &str =
+    "pi:project:plugin-config:package-extensions:";
+pub(super) const CLAUDE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:global:configured-mcp:";
+pub(super) const CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX: &str =
+    "claude:project:configured-mcp:@local/";
+pub(super) const CLAUDE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:";
+pub(super) const CLAUDE_ALL_PROJECT_MCP_SERVERS_ID: &str =
     "claude:project:configured-mcp:all-project-mcp-servers";
-const CURSOR_WORKSPACE_DISABLED_SERVERS_KEY: &str = "cursor/disabledMcpServers";
-const CURSOR_WORKSPACE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
-const BACKUP_MANIFEST_VERSION: u8 = 3;
-const BACKUP_AUTHENTICATION_ALGORITHM: &str = "hmac-sha256-unpin-backup-v1";
+pub(super) const CURSOR_WORKSPACE_DISABLED_SERVERS_KEY: &str = "cursor/disabledMcpServers";
+pub(super) const CURSOR_WORKSPACE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
+pub(super) const BACKUP_MANIFEST_VERSION: u8 = 3;
+pub(super) const BACKUP_AUTHENTICATION_ALGORITHM: &str = "hmac-sha256-unpin-backup-v1";
 
 pub const CONTROL_PLANE_PROTECTED_REASON: &str = "control-plane-protected";
 
@@ -265,7 +283,7 @@ pub fn is_control_plane_protected_disable(item: &DiscoveryItem, target_enabled: 
     id_name == "unpin" || display_name == "unpin"
 }
 
-fn plan_toggle_inner(input: TogglePlanInput) -> ToggleResult {
+pub(super) fn plan_toggle_inner(input: TogglePlanInput) -> ToggleResult {
     let apply = input.apply;
     if input.item.mutability == DiscoveryMutability::ReadWrite
         && is_live_provider_config_state_path(&input.item)
@@ -282,212 +300,7 @@ fn plan_toggle_inner(input: TogglePlanInput) -> ToggleResult {
     }
 }
 
-fn plan_toggle_dispatch(input: TogglePlanInput) -> ToggleResult {
-    if input.item.mutability != DiscoveryMutability::ReadWrite {
-        return blocked(input.item, "read-only item cannot be planned for toggle");
-    }
-
-    if input.apply && input.backup_authentication_key.is_none() {
-        return blocked(
-            input.item,
-            "backup authentication key is required before apply",
-        );
-    }
-
-    let backup_authentication_key = input.backup_authentication_key.as_ref();
-
-    if input.item.uses_codex_skill_config_state() {
-        if input.apply {
-            return apply_codex_skill_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_codex_skill_toggle(input.item);
-    }
-
-    if is_supported_pi_file_skill(&input.item) || input.item.category == DiscoveryCategory::Agent {
-        if input.apply {
-            return apply_path_file_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_path_file_toggle(input.app_state_root, input.item);
-    }
-
-    if input.item.category == DiscoveryCategory::Skill
-        || is_supported_cursor_local_plugin(&input.item)
-    {
-        if input.apply {
-            return apply_directory_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_directory_toggle(input.app_state_root, input.item);
-    }
-
-    if is_supported_claude_plugin_config(&input.item) {
-        if input.apply {
-            return apply_claude_plugin_config_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_claude_plugin_config_toggle(input.item);
-    }
-
-    if is_supported_claude_all_project_mcp_servers(&input.item) {
-        if input.apply {
-            return apply_claude_all_project_mcp_servers_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_claude_all_project_mcp_servers_toggle(input.item);
-    }
-
-    if is_supported_claude_global_configured_mcp(&input.item) {
-        if input.apply {
-            return apply_json_configured_mcp_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_json_configured_mcp_toggle(input.app_state_root, input.item);
-    }
-
-    if is_supported_claude_local_configured_mcp(&input.item) {
-        if input.apply {
-            return apply_json_configured_mcp_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_json_configured_mcp_toggle(input.app_state_root, input.item);
-    }
-
-    if is_supported_claude_configured_mcp(&input.item) {
-        if input.apply {
-            return apply_claude_configured_mcp_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_claude_configured_mcp_toggle(input.item);
-    }
-
-    if is_supported_codex_configured_mcp(&input.item) {
-        if input.apply {
-            return apply_codex_configured_mcp_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_codex_configured_mcp_toggle(input.app_state_root, input.item);
-    }
-
-    if is_supported_codex_plugin(&input.item) {
-        if input.apply {
-            return apply_codex_plugin_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_codex_plugin_toggle(input.item);
-    }
-
-    if is_supported_pi_package_extension(&input.item) {
-        if input.apply {
-            return apply_pi_package_extension_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_pi_package_extension_toggle(input.app_state_root, input.item);
-    }
-
-    if is_supported_opencode_plugin_config(&input.item) {
-        if input.apply {
-            return apply_opencode_plugin_config_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_opencode_plugin_config_toggle(input.app_state_root, input.item);
-    }
-
-    if is_supported_cursor_configured_mcp(&input.item) {
-        if input.apply {
-            return apply_json_configured_mcp_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_json_configured_mcp_toggle(input.app_state_root, input.item);
-    }
-
-    if is_supported_opencode_configured_mcp(&input.item) {
-        if input.apply {
-            return apply_opencode_configured_mcp_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_opencode_configured_mcp_toggle(input.item);
-    }
-
-    if is_supported_zed_configured_mcp(&input.item) {
-        if input.apply {
-            return apply_zed_configured_mcp_toggle(
-                input.app_state_root,
-                input.item,
-                backup_authentication_key.expect("apply key checked above"),
-            );
-        }
-
-        return plan_zed_configured_mcp_toggle(input.app_state_root, input.item);
-    }
-
-    blocked(
-        input.item.clone(),
-        format!(
-            "unsupported toggle planning for {}",
-            input.item.category.as_str()
-        ),
-    )
-}
-
-fn is_live_provider_config_state_path(item: &DiscoveryItem) -> bool {
+pub(super) fn is_live_provider_config_state_path(item: &DiscoveryItem) -> bool {
     !item.state_path.ends_with("entry.json")
         && !is_cursor_workspace_state_path(item)
         && (matches!(
@@ -496,14 +309,14 @@ fn is_live_provider_config_state_path(item: &DiscoveryItem) -> bool {
         ) || item.uses_codex_skill_config_state())
 }
 
-fn validate_mutation_plan_targets(plan: ToggleResult) -> ToggleResult {
+pub(super) fn validate_mutation_plan_targets(plan: ToggleResult) -> ToggleResult {
     match validate_mutation_plan_target_paths(&plan) {
         Ok(()) => plan,
         Err(reason) => blocked_result_from_plan(plan, reason),
     }
 }
 
-fn validate_mutation_plan_target_paths(plan: &ToggleResult) -> Result<(), String> {
+pub(super) fn validate_mutation_plan_target_paths(plan: &ToggleResult) -> Result<(), String> {
     for operation in &plan.operations {
         match operation.operation_type.as_str() {
             "replaceFile" | "replaceJsonValue" => {
@@ -532,7 +345,7 @@ fn validate_mutation_plan_target_paths(plan: &ToggleResult) -> Result<(), String
     Ok(())
 }
 
-fn ensure_provider_config_target(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_provider_config_target(path: &Path) -> Result<(), String> {
     ensure_target_parent_has_no_symlink_components(path)?;
     match fs::symlink_metadata(path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
@@ -552,7 +365,7 @@ fn ensure_provider_config_target(path: &Path) -> Result<(), String> {
     }
 }
 
-fn ensure_target_parent_has_no_symlink_components(path: &Path) -> Result<(), String> {
+pub(super) fn ensure_target_parent_has_no_symlink_components(path: &Path) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("mutation target has no parent: {}", path.display()))?;
@@ -606,27 +419,27 @@ fn ensure_target_parent_has_no_symlink_components(path: &Path) -> Result<(), Str
 }
 
 #[cfg(target_os = "macos")]
-fn allowed_platform_root_alias(path: &Path) -> bool {
+pub(super) fn allowed_platform_root_alias(path: &Path) -> bool {
     matches!(path.to_str(), Some("/etc" | "/tmp" | "/var"))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn allowed_platform_root_alias(_path: &Path) -> bool {
+pub(super) fn allowed_platform_root_alias(_path: &Path) -> bool {
     false
 }
 
-fn write_provider_config(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
+pub(super) fn write_provider_config(path: &Path, contents: impl AsRef<[u8]>) -> io::Result<()> {
     ensure_provider_config_target(path).map_err(io::Error::other)?;
     fs::write(path, contents)
 }
 
-fn rename_mutation_path(from: &Path, to: &Path) -> io::Result<()> {
+pub(super) fn rename_mutation_path(from: &Path, to: &Path) -> io::Result<()> {
     ensure_target_parent_has_no_symlink_components(from).map_err(io::Error::other)?;
     ensure_target_parent_has_no_symlink_components(to).map_err(io::Error::other)?;
     fs::rename(from, to)
 }
 
-fn apply_authorized_toggle_transaction(
+pub(super) fn apply_authorized_toggle_transaction(
     input: TogglePlanInput,
     transition: &TransitionPlan,
     authorization: &ControlAuthorization,
@@ -659,7 +472,7 @@ pub(crate) fn apply_authorized_toggle_transaction_reach_aware(
     )
 }
 
-fn apply_authorized_toggle_transaction_with_policy(
+pub(super) fn apply_authorized_toggle_transaction_with_policy(
     input: TogglePlanInput,
     transition: &TransitionPlan,
     authorization: &ControlAuthorization,
@@ -1093,7 +906,7 @@ fn apply_authorized_toggle_transaction_with_policy(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn recover_native_toggle_checkpoint_failure(
+pub(super) fn recover_native_toggle_checkpoint_failure(
     store: &TransitionJournalStore,
     transition: &TransitionPlan,
     owner: OwnerGeneration,
@@ -1152,7 +965,7 @@ fn recover_native_toggle_checkpoint_failure(
     }
 }
 
-fn mark_native_toggle_needs_repair(
+pub(super) fn mark_native_toggle_needs_repair(
     store: &TransitionJournalStore,
     handle: &mut JournalHandle,
     mut result: ToggleResult,
@@ -1178,14 +991,14 @@ fn mark_native_toggle_needs_repair(
     native_toggle_recovery_after_possible_write(result, reason)
 }
 
-fn native_toggle_recovery_after_possible_write(
+pub(super) fn native_toggle_recovery_after_possible_write(
     result: ToggleResult,
     reason: impl Into<String>,
 ) -> ToggleResult {
     with_possible_write_disclosure(native_toggle_recovery_required(result, reason))
 }
 
-fn with_possible_write_disclosure(mut result: ToggleResult) -> ToggleResult {
+pub(super) fn with_possible_write_disclosure(mut result: ToggleResult) -> ToggleResult {
     result.writes =
         Some("writes may already have been performed; manual recovery is required".to_string());
     result
@@ -1354,7 +1167,7 @@ mod checkpoint_recovery_tests {
     }
 }
 
-fn cached_native_toggle_result(
+pub(super) fn cached_native_toggle_result(
     app_state_root: &Path,
     backup_authentication_key: &BackupAuthenticationKey,
     journal: &TransitionJournal,
@@ -1414,7 +1227,9 @@ fn cached_native_toggle_result(
     }
 }
 
-fn native_toggle_post_state_fingerprint(manifest: &BackupManifest) -> Result<String, String> {
+pub(super) fn native_toggle_post_state_fingerprint(
+    manifest: &BackupManifest,
+) -> Result<String, String> {
     let mut observed = Vec::with_capacity(manifest.entries.len());
     for entry in &manifest.entries {
         let state = match entry.target.target_type.as_str() {
@@ -1567,7 +1382,7 @@ pub(super) fn consolidate_bulk_backup_bundle(
     Ok(bundle_backup_id.clone())
 }
 
-fn backup_resource_key(target: &MutationTarget) -> String {
+pub(super) fn backup_resource_key(target: &MutationTarget) -> String {
     format!(
         "{}\0{}",
         target.target_type,
@@ -1575,7 +1390,7 @@ fn backup_resource_key(target: &MutationTarget) -> String {
     )
 }
 
-fn copy_backup_payload(source: &Path, destination: &Path) -> Result<(), io::Error> {
+pub(super) fn copy_backup_payload(source: &Path, destination: &Path) -> Result<(), io::Error> {
     let metadata = fs::symlink_metadata(source)?;
     if metadata.file_type().is_symlink() {
         return copy_symlink(source, destination);
@@ -1596,7 +1411,7 @@ fn copy_backup_payload(source: &Path, destination: &Path) -> Result<(), io::Erro
     ))
 }
 
-fn native_toggle_recovery_required(
+pub(super) fn native_toggle_recovery_required(
     mut preview: ToggleResult,
     reason: impl Into<String>,
 ) -> ToggleResult {
@@ -1607,14 +1422,17 @@ fn native_toggle_recovery_required(
     preview
 }
 
-fn blocked_result_from_plan(mut plan: ToggleResult, reason: impl Into<String>) -> ToggleResult {
+pub(super) fn blocked_result_from_plan(
+    mut plan: ToggleResult,
+    reason: impl Into<String>,
+) -> ToggleResult {
     plan.status = ToggleStatus::Blocked;
     plan.reason = Some(reason.into());
     plan.writes = Some("no additional writes were performed".to_string());
     plan
 }
 
-fn canonical_existing_root(path: &Path) -> PathBuf {
+pub(super) fn canonical_existing_root(path: &Path) -> PathBuf {
     if let Ok(canonical) = fs::canonicalize(path) {
         return canonical;
     }
@@ -1636,15 +1454,15 @@ fn canonical_existing_root(path: &Path) -> PathBuf {
     path.to_path_buf()
 }
 
-fn transition_digest(bytes: &[u8]) -> String {
+pub(super) fn transition_digest(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
 
-fn with_transition_backup_id<T>(backup_id: &str, operation: impl FnOnce() -> T) -> T {
-    struct ResetBackupId(Option<String>);
+pub(super) fn with_transition_backup_id<T>(backup_id: &str, operation: impl FnOnce() -> T) -> T {
+    pub(super) struct ResetBackupId(Option<String>);
     impl Drop for ResetBackupId {
         fn drop(&mut self) {
             let previous = self.0.take();
@@ -1660,12 +1478,12 @@ fn with_transition_backup_id<T>(backup_id: &str, operation: impl FnOnce() -> T) 
     operation()
 }
 
-fn with_transition_mutation_lock<T>(
+pub(super) fn with_transition_mutation_lock<T>(
     app_state_root: &Path,
     lock: &MutationLock,
     operation: impl FnOnce() -> T,
 ) -> T {
-    struct ResetMutationLockRoot(Option<PathBuf>);
+    pub(super) struct ResetMutationLockRoot(Option<PathBuf>);
     impl Drop for ResetMutationLockRoot {
         fn drop(&mut self) {
             let previous = self.0.take();
@@ -1684,199 +1502,6 @@ fn with_transition_mutation_lock<T>(
     });
     let _reset = ResetMutationLockRoot(previous);
     operation()
-}
-
-fn plan_codex_skill_toggle(item: DiscoveryItem) -> ToggleResult {
-    if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-        let current_fingerprint = match fs::read_to_string(&item.source_path) {
-            Ok(raw) => source_fingerprint(&raw),
-            Err(error) => {
-                return blocked(
-                    item,
-                    format!("Codex skill source could not be read: {error}"),
-                );
-            }
-        };
-        if current_fingerprint != discovered_fingerprint {
-            return blocked(
-                item.clone(),
-                format!(
-                    "Codex skill source drifted for {}: discovered {discovered_fingerprint}, current {current_fingerprint}",
-                    item.id
-                ),
-            );
-        }
-    }
-
-    let config_path = PathBuf::from(&item.state_path);
-    let raw = match read_optional_string(&config_path) {
-        Ok(Some(raw)) => raw,
-        Ok(None) => String::new(),
-        Err(error) => {
-            return blocked(item, format!("Codex config could not be read: {error}"));
-        }
-    };
-    let current_enabled = match codex_skill_config_enabled(&raw, Path::new(&item.source_path)) {
-        Ok(enabled) => enabled,
-        Err(reason) => return blocked(item, reason),
-    };
-    if current_enabled != item.enabled {
-        let discovered_enabled = item.enabled;
-        return blocked(
-            item,
-            format!(
-                "Codex skill state drifted: discovered {discovered_enabled}, current {current_enabled}"
-            ),
-        );
-    }
-
-    let target_enabled = !item.enabled;
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.state_path.clone()),
-            to_path: None,
-            summary: format!(
-                "Set {} enabled = {target_enabled} in Codex skills.config. Restart Codex to load the change.",
-                item.id
-            ),
-            path: Some(item.state_path.clone()),
-            json_path: None,
-            value: Some(Value::Bool(target_enabled)),
-        }],
-        affected_targets: vec![MutationTarget {
-            target_type: "statePath".to_string(),
-            path: item.state_path.clone(),
-        }],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_codex_skill_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_codex_skill_toggle(item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let config_path = PathBuf::from(&item.state_path);
-    let (config_existed, raw) = match read_optional_string(&config_path) {
-        Ok(Some(raw)) => (true, raw),
-        Ok(None) => (false, String::new()),
-        Err(error) => {
-            drop(lock);
-            return blocked(item, format!("Codex config could not be read: {error}"));
-        }
-    };
-    let rewritten = match set_codex_skill_config_enabled(
-        &raw,
-        Path::new(&item.source_path),
-        plan.target_enabled,
-    ) {
-        Ok(rewritten) => rewritten,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(&backup_root)?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        let payload = if config_existed {
-            fs::create_dir_all(
-                backup_payload
-                    .parent()
-                    .expect("backup payload path has a parent"),
-            )?;
-            fs::copy(&config_path, &backup_payload)?;
-            Some(BackupPayload {
-                storage: "path".to_string(),
-                path: "entries/entry-1/payload".to_string(),
-            })
-        } else {
-            None
-        };
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: plan.target_enabled,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: config_existed,
-                path_kind: config_existed.then(|| "file".to_string()),
-                payload,
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        if let Some(parent) = config_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        write_provider_config(&config_path, rewritten)?;
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: plan.target_enabled,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-        Ok(())
-    })();
-
-    drop(lock);
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
 }
 
 pub fn load_backup_summaries(app_state_root: &Path) -> Vec<BackupSummary> {
@@ -1954,7 +1579,7 @@ pub fn load_backup_index_authenticated(
     };
     let (entries, available, mut unreadable_entry) = entries;
 
-    struct ScannedBackupEntry {
+    pub(super) struct ScannedBackupEntry {
         name: Option<String>,
         path: PathBuf,
         summary_directory: bool,
@@ -2240,7 +1865,10 @@ pub fn delete_backup(
     })
 }
 
-fn read_backup_deletion_manifest(app_state_root: &Path, backup_id: &str) -> Result<String, String> {
+pub(super) fn read_backup_deletion_manifest(
+    app_state_root: &Path,
+    backup_id: &str,
+) -> Result<String, String> {
     if !valid_backup_id(backup_id) {
         return Err(format!("invalid backup id: {backup_id}"));
     }
@@ -2308,7 +1936,7 @@ pub fn authenticate_legacy_backup(
     Ok(())
 }
 
-fn backup_summary_from_manifest(
+pub(super) fn backup_summary_from_manifest(
     backup_dir_name: &str,
     backup_root: &Path,
     manifest: BackupManifest,
@@ -2358,7 +1986,7 @@ fn backup_summary_from_manifest(
     }
 }
 
-fn backup_authentication_status(
+pub(super) fn backup_authentication_status(
     backup_dir_name: &str,
     backup_root: &Path,
     manifest: &BackupManifest,
@@ -2382,7 +2010,7 @@ fn backup_authentication_status(
     }
 }
 
-fn validate_backup_manifest_structure(
+pub(super) fn validate_backup_manifest_structure(
     backup_dir_name: &str,
     manifest: &BackupManifest,
 ) -> Result<(), String> {
@@ -2461,7 +2089,7 @@ fn validate_backup_manifest_structure(
     Ok(())
 }
 
-fn validate_backup_authenticity_structure(
+pub(super) fn validate_backup_authenticity_structure(
     authenticity: &BackupAuthenticity,
     expected_algorithm: &str,
 ) -> Result<(), String> {
@@ -2499,7 +2127,11 @@ fn validate_backup_authenticity_structure(
     Ok(())
 }
 
-fn validate_prefixed_hex(value: &str, hex_length: usize, description: &str) -> Result<(), String> {
+pub(super) fn validate_prefixed_hex(
+    value: &str,
+    hex_length: usize,
+    description: &str,
+) -> Result<(), String> {
     let encoded = value
         .strip_prefix("sha256:")
         .ok_or_else(|| format!("{description} must use sha256"))?;
@@ -2512,7 +2144,7 @@ fn validate_prefixed_hex(value: &str, hex_length: usize, description: &str) -> R
     Ok(())
 }
 
-fn validate_path_backup_entry(entry: &BackupEntry) -> Result<(), String> {
+pub(super) fn validate_path_backup_entry(entry: &BackupEntry) -> Result<(), String> {
     if !entry.existed {
         return validate_absent_backup_entry(entry);
     }
@@ -2530,7 +2162,7 @@ fn validate_path_backup_entry(entry: &BackupEntry) -> Result<(), String> {
     validate_backup_entry_payload(entry)
 }
 
-fn validate_sqlite_backup_entry(entry: &BackupEntry) -> Result<(), String> {
+pub(super) fn validate_sqlite_backup_entry(entry: &BackupEntry) -> Result<(), String> {
     if !entry.existed {
         return validate_absent_backup_entry(entry);
     }
@@ -2544,7 +2176,7 @@ fn validate_sqlite_backup_entry(entry: &BackupEntry) -> Result<(), String> {
     validate_backup_entry_payload(entry)
 }
 
-fn validate_absent_backup_entry(entry: &BackupEntry) -> Result<(), String> {
+pub(super) fn validate_absent_backup_entry(entry: &BackupEntry) -> Result<(), String> {
     if entry.path_kind.is_some() || entry.payload.is_some() {
         return Err(format!(
             "absent backup entry {} must not declare path kind or payload",
@@ -2554,7 +2186,7 @@ fn validate_absent_backup_entry(entry: &BackupEntry) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_backup_entry_payload(entry: &BackupEntry) -> Result<(), String> {
+pub(super) fn validate_backup_entry_payload(entry: &BackupEntry) -> Result<(), String> {
     let payload = entry
         .payload
         .as_ref()
@@ -2577,7 +2209,7 @@ fn validate_backup_entry_payload(entry: &BackupEntry) -> Result<(), String> {
     Ok(())
 }
 
-fn validate_backup_payload_evidence(
+pub(super) fn validate_backup_payload_evidence(
     backup_root: &Path,
     manifest: &BackupManifest,
 ) -> Result<(), String> {
@@ -2617,7 +2249,7 @@ fn validate_backup_payload_evidence(
     Ok(())
 }
 
-fn validate_backup_restore_target_allowlist(
+pub(super) fn validate_backup_restore_target_allowlist(
     backup_root: &Path,
     manifest: &BackupManifest,
 ) -> Result<(), String> {
@@ -2661,7 +2293,7 @@ fn validate_backup_restore_target_allowlist(
     Ok(())
 }
 
-fn validate_directory_backup_payload(
+pub(super) fn validate_directory_backup_payload(
     payload_path: &Path,
     allow_symlinks: bool,
 ) -> Result<(), String> {
@@ -2724,7 +2356,7 @@ fn validate_directory_backup_payload(
     Ok(())
 }
 
-fn ensure_backup_symlink_payload(payload_path: &Path) -> Result<(), String> {
+pub(super) fn ensure_backup_symlink_payload(payload_path: &Path) -> Result<(), String> {
     let metadata = fs::symlink_metadata(payload_path).map_err(|error| {
         format!(
             "backup symlink payload could not be read: {}: {error}",
@@ -2746,7 +2378,7 @@ fn ensure_backup_symlink_payload(payload_path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn valid_backup_entry_id(entry_id: &str) -> bool {
+pub(super) fn valid_backup_entry_id(entry_id: &str) -> bool {
     let mut chars = entry_id.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -2807,4858 +2439,7 @@ pub(crate) fn restore_backup_locked(
     }
 }
 
-fn plan_directory_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> ToggleResult {
-    let target_enabled = !item.enabled;
-    let item_noun = directory_item_noun(&item);
-    let item_title = directory_item_title(&item);
-    let restart_guidance = directory_item_restart_guidance(&item);
-    let shared_source_guidance = directory_item_shared_source_guidance(&item);
-
-    let (from_path, to_path, state_path, vault_path_string, summary) = if item.enabled {
-        if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-            let current_fingerprint = match fs::read_to_string(&item.source_path) {
-                Ok(raw) => source_fingerprint(&raw),
-                Err(error) => {
-                    let reason = format!(
-                        "{item_noun} source could not be read: {}: {error}",
-                        item.source_path
-                    );
-                    return blocked(item, reason);
-                }
-            };
-            if current_fingerprint != discovered_fingerprint {
-                let reason = format!(
-                    "{item_title} source drifted for {}: discovered {discovered_fingerprint}, current {current_fingerprint}",
-                    item.id
-                );
-                return blocked(item, reason);
-            }
-        }
-        if let Err(reason) =
-            validate_cursor_local_plugin_directory(&item, Path::new(&item.state_path))
-        {
-            return blocked(item, reason);
-        }
-
-        let state_path = item.state_path.clone();
-        let vault_path_string = path_string(vault_path(&app_state_root, &item));
-        let summary = format!(
-            "Disable {} by moving its directory into the Unpin vault.{shared_source_guidance}{restart_guidance}",
-            item.id,
-        );
-        (
-            state_path.clone(),
-            vault_path_string.clone(),
-            state_path,
-            vault_path_string,
-            summary,
-        )
-    } else {
-        let vault_entry = match load_directory_vault_entry(&app_state_root, &item) {
-            Ok(vault_entry) => vault_entry,
-            Err(reason) => return blocked(item, reason),
-        };
-        let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-        if !directory_toggle_payload_is_available(
-            &item,
-            &vault_payload,
-            Path::new(&vault_entry.original_path),
-        ) {
-            return blocked(
-                item,
-                format!(
-                    "vaulted {item_noun} directory not found: {}",
-                    vault_payload.display()
-                ),
-            );
-        }
-        if let Err(reason) = validate_cursor_local_plugin_directory(&item, &vault_payload) {
-            return blocked(item, reason);
-        }
-        let restore_target = PathBuf::from(&vault_entry.original_path);
-        if restore_target.exists() {
-            return blocked(
-                item,
-                format!(
-                    "restore target already exists: {}",
-                    restore_target.display()
-                ),
-            );
-        }
-        let state_path = vault_entry.original_path.clone();
-        let vault_path_string = vault_entry.vaulted_path.clone();
-        let summary = format!(
-            "Enable {} by moving its directory out of the Unpin vault.{shared_source_guidance}{restart_guidance}",
-            item.id,
-        );
-        (
-            vault_path_string.clone(),
-            state_path.clone(),
-            state_path,
-            vault_path_string,
-            summary,
-        )
-    };
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item,
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "renamePath".to_string(),
-            from_path: Some(from_path.clone()),
-            to_path: Some(to_path.clone()),
-            summary,
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: state_path,
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: vault_path_string,
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_directory_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    if !item.enabled {
-        return apply_disabled_directory_toggle(app_state_root, item, backup_authentication_key);
-    }
-
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plan = plan_directory_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let source_path = PathBuf::from(&item.state_path);
-    let vault_payload = vault_path(&app_state_root, &item);
-    let vault_root = vault_root_path(&app_state_root, &item);
-
-    if !source_path.is_dir() {
-        let reason = format!(
-            "source {} directory not found: {}",
-            directory_item_noun(&item),
-            item.state_path
-        );
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    if vault_root.exists() {
-        let reason = format!("vault entry already exists: {}", vault_root.display());
-        append_pre_mutation_failed_apply_audit_entry(
-            &app_state_root,
-            &item,
-            false,
-            &plan.affected_targets,
-            &reason,
-            &created_at,
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        let backup_path_kind =
-            backup_directory_toggle_payload(&item, &source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: false,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some(backup_path_kind),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        fs::create_dir_all(&vault_root)?;
-        rename_mutation_path(&source_path, &vault_payload)?;
-
-        let entry = VaultEntry {
-            version: 1,
-            provider: item.provider.as_str().to_string(),
-            kind: item.kind.as_str().to_string(),
-            layer: item.layer.as_str().to_string(),
-            item_id: item.id.clone(),
-            display_name: item.display_name.clone(),
-            original_path: item.state_path.clone(),
-            vaulted_path: path_string(vault_payload),
-            payload_kind: "path".to_string(),
-            jsonc_format: None,
-        };
-        write_json_file(&vault_root.join("entry.json"), &entry)?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: false,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_disabled_directory_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let item_noun = directory_item_noun(&item);
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let vault_entry = match load_directory_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_directory_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        return plan;
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
-    let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let restore_target = PathBuf::from(&vault_entry.original_path);
-    let vault_root = disabled_directory_vault_root(&app_state_root, &item);
-    let vault_entry_path = vault_root.join("entry.json");
-
-    if !directory_toggle_payload_is_available(
-        &item,
-        &vault_payload,
-        Path::new(&vault_entry.original_path),
-    ) {
-        return blocked(
-            item,
-            format!(
-                "vaulted {} directory not found: {}",
-                item_noun,
-                vault_payload.display()
-            ),
-        );
-    }
-
-    if restore_target.exists() {
-        return blocked(
-            item,
-            format!(
-                "restore target already exists: {}",
-                restore_target.display()
-            ),
-        );
-    }
-
-    if backup_root.exists() {
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_vault_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        let backup_vault_path_kind =
-            backup_directory_toggle_payload(&item, &vault_payload, &backup_vault_payload)?;
-        fs::create_dir_all(
-            backup_vault_entry
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_entry_path, &backup_vault_entry)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![
-                BackupEntry {
-                    entry_id: "entry-1".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.original_path.clone(),
-                    },
-                    existed: false,
-                    path_kind: None,
-                    payload: None,
-                },
-                BackupEntry {
-                    entry_id: "entry-2".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.vaulted_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some(backup_vault_path_kind),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-2/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-3".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: path_string(vault_entry_path.clone()),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-3/payload".to_string(),
-                    }),
-                },
-            ],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        if let Some(parent) = restore_target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        rename_mutation_path(&vault_payload, &restore_target)?;
-        if vault_root.exists() {
-            fs::remove_dir_all(&vault_root)?;
-        }
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_path_file_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> ToggleResult {
-    let noun = path_file_item_noun(&item);
-    let title = path_file_item_title(&item);
-    let target_enabled = !item.enabled;
-
-    let (from_path, to_path, state_path, vault_path_string, summary) = if item.enabled {
-        if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-            let current_fingerprint = match fs::read_to_string(&item.source_path) {
-                Ok(raw) => source_fingerprint(&raw),
-                Err(error) => {
-                    let reason = format!(
-                        "{noun} source could not be read: {}: {error}",
-                        item.source_path
-                    );
-                    return blocked(item, reason);
-                }
-            };
-            if current_fingerprint != discovered_fingerprint {
-                let reason = format!(
-                    "{title} source drifted for {}: discovered {discovered_fingerprint}, current {current_fingerprint}",
-                    item.id
-                );
-                return blocked(item, reason);
-            }
-        }
-
-        let state_path = item.state_path.clone();
-        let vault_path_string = path_string(vault_path(&app_state_root, &item));
-        let summary = format!(
-            "Disable {} by moving its {noun} file into the Unpin vault.",
-            item.id
-        );
-        (
-            state_path.clone(),
-            vault_path_string.clone(),
-            state_path,
-            vault_path_string,
-            summary,
-        )
-    } else {
-        let vault_entry = match load_path_file_vault_entry(&app_state_root, &item) {
-            Ok(vault_entry) => vault_entry,
-            Err(reason) => return blocked(item, reason),
-        };
-        let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-        if !vault_payload.is_file() {
-            return blocked(
-                item,
-                format!("vaulted {noun} file not found: {}", vault_payload.display()),
-            );
-        }
-        let restore_target = PathBuf::from(&vault_entry.original_path);
-        if restore_target.exists() {
-            return blocked(
-                item,
-                format!(
-                    "restore target already exists: {}",
-                    restore_target.display()
-                ),
-            );
-        }
-        let state_path = vault_entry.original_path.clone();
-        let vault_path_string = vault_entry.vaulted_path.clone();
-        let summary = format!(
-            "Enable {} by moving its {noun} file out of the Unpin vault.",
-            item.id
-        );
-        (
-            vault_path_string.clone(),
-            state_path.clone(),
-            state_path,
-            vault_path_string,
-            summary,
-        )
-    };
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "renamePath".to_string(),
-            from_path: Some(from_path),
-            to_path: Some(to_path),
-            summary,
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: state_path,
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: vault_path_string,
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root_path(&app_state_root, &item).join("entry.json")),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_path_file_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    if !item.enabled {
-        return apply_disabled_path_file_toggle(app_state_root, item, backup_authentication_key);
-    }
-
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plan = plan_path_file_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let source_path = PathBuf::from(&item.state_path);
-    let vault_payload = vault_path(&app_state_root, &item);
-    let vault_root = vault_root_path(&app_state_root, &item);
-
-    if !source_path.is_file() {
-        let reason = format!(
-            "source {} file not found: {}",
-            path_file_item_noun(&item),
-            item.state_path
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    if vault_root.exists() {
-        let reason = format!("vault entry already exists: {}", vault_root.display());
-        append_pre_mutation_failed_apply_audit_entry(
-            &app_state_root,
-            &item,
-            false,
-            &plan.affected_targets,
-            &reason,
-            &created_at,
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: false,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        fs::create_dir_all(&vault_root)?;
-        rename_mutation_path(&source_path, &vault_payload)?;
-
-        let entry = VaultEntry {
-            version: 1,
-            provider: item.provider.as_str().to_string(),
-            kind: item.kind.as_str().to_string(),
-            layer: item.layer.as_str().to_string(),
-            item_id: item.id.clone(),
-            display_name: item.display_name.clone(),
-            original_path: item.state_path.clone(),
-            vaulted_path: path_string(vault_payload),
-            payload_kind: "path".to_string(),
-            jsonc_format: None,
-        };
-        write_json_file(&vault_root.join("entry.json"), &entry)?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: false,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_disabled_path_file_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let vault_entry = match load_path_file_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_path_file_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        return plan;
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
-    let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let restore_target = PathBuf::from(&vault_entry.original_path);
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_entry_path = vault_root.join("entry.json");
-
-    if !vault_payload.is_file() {
-        let noun = path_file_item_noun(&item);
-        return blocked(
-            item,
-            format!(
-                "vaulted {} file not found: {}",
-                noun,
-                vault_payload.display()
-            ),
-        );
-    }
-
-    if restore_target.exists() {
-        return blocked(
-            item,
-            format!(
-                "restore target already exists: {}",
-                restore_target.display()
-            ),
-        );
-    }
-
-    if backup_root.exists() {
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_vault_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_payload, &backup_vault_payload)?;
-        fs::create_dir_all(
-            backup_vault_entry
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_entry_path, &backup_vault_entry)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![
-                BackupEntry {
-                    entry_id: "entry-1".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.original_path.clone(),
-                    },
-                    existed: false,
-                    path_kind: None,
-                    payload: None,
-                },
-                BackupEntry {
-                    entry_id: "entry-2".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.vaulted_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-2/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-3".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: path_string(vault_entry_path.clone()),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-3/payload".to_string(),
-                    }),
-                },
-            ],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        if let Some(parent) = restore_target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        rename_mutation_path(&vault_payload, &restore_target)?;
-        if vault_root.exists() {
-            fs::remove_dir_all(&vault_root)?;
-        }
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_claude_plugin_config_toggle(item: DiscoveryItem) -> ToggleResult {
-    let plugin_id = match claude_plugin_config_id(&item) {
-        Some(plugin_id) => plugin_id,
-        None => return blocked(item, "invalid Claude plugin config item id"),
-    };
-    let target_enabled = !item.enabled;
-    let state_path = item.state_path.clone();
-    let current_enabled = match read_claude_enabled_plugin(Path::new(&state_path), &plugin_id) {
-        Ok(current_enabled) => current_enabled,
-        Err(reason) => return blocked(item, reason),
-    };
-    if current_enabled != item.enabled {
-        let discovered_enabled = item.enabled;
-        return blocked(
-            item,
-            format!(
-                "Claude plugin state drifted for enabledPlugins.{plugin_id}: discovered {}, current {}",
-                discovered_enabled, current_enabled
-            ),
-        );
-    }
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item,
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "replaceJsonValue".to_string(),
-            from_path: Some(state_path.clone()),
-            to_path: None,
-            summary: format!("Set enabledPlugins.{plugin_id} to {target_enabled}."),
-            path: Some(state_path.clone()),
-            json_path: Some(vec!["enabledPlugins".to_string(), plugin_id.clone()]),
-            value: Some(Value::Bool(target_enabled)),
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: state_path,
-            },
-            MutationTarget {
-                target_type: "jsonPath".to_string(),
-                path: format!("enabledPlugins.{plugin_id}"),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_claude_plugin_config_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plugin_id = match claude_plugin_config_id(&item) {
-        Some(plugin_id) => plugin_id,
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Claude plugin config item id");
-        }
-    };
-    let plan = plan_claude_plugin_config_toggle(item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let source_path = PathBuf::from(&item.state_path);
-    let mut document = match read_json_value(&source_path) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if let Err(reason) = set_claude_enabled_plugin(&mut document, &plugin_id, plan.target_enabled) {
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-
-    if !source_path.is_file() {
-        let reason = format!("Claude settings file not found: {}", item.state_path);
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: plan.target_enabled,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        write_provider_config(&source_path, format!("{rendered}\n"))?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: plan.target_enabled,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_claude_all_project_mcp_servers_toggle(item: DiscoveryItem) -> ToggleResult {
-    let target_enabled = !item.enabled;
-    let state_path = item.state_path.clone();
-    let current_enabled = match read_claude_all_project_mcp_servers(Path::new(&state_path)) {
-        Ok(current_enabled) => current_enabled,
-        Err(reason) => return blocked(item, reason),
-    };
-    if current_enabled != item.enabled {
-        let discovered_enabled = item.enabled;
-        return blocked(
-            item,
-            format!(
-                "Claude all-project MCP state drifted: discovered {}, current {}",
-                discovered_enabled, current_enabled
-            ),
-        );
-    }
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item,
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "replaceJsonValue".to_string(),
-            from_path: Some(state_path.clone()),
-            to_path: None,
-            summary: format!("Set enableAllProjectMcpServers to {target_enabled}."),
-            path: Some(state_path.clone()),
-            json_path: Some(vec!["enableAllProjectMcpServers".to_string()]),
-            value: Some(Value::Bool(target_enabled)),
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: state_path,
-            },
-            MutationTarget {
-                target_type: "jsonPath".to_string(),
-                path: "enableAllProjectMcpServers".to_string(),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_claude_all_project_mcp_servers_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plan = plan_claude_all_project_mcp_servers_toggle(item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let source_path = PathBuf::from(&item.state_path);
-    let mut document = match read_json_value(&source_path) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if let Err(reason) = set_claude_all_project_mcp_servers(&mut document, plan.target_enabled) {
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-
-    if !source_path.is_file() {
-        let reason = format!("Claude settings file not found: {}", item.state_path);
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: plan.target_enabled,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        write_provider_config(&source_path, format!("{rendered}\n"))?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: plan.target_enabled,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_claude_configured_mcp_toggle(item: DiscoveryItem) -> ToggleResult {
-    let server_id = match claude_project_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => return blocked(item, "invalid Claude configured MCP item id"),
-    };
-    let settings_path = item.state_path.clone();
-    let mcp_path = item.source_path.clone();
-    let mcp_document = match read_json_value(Path::new(&mcp_path)) {
-        Ok(document) => document,
-        Err(reason) => return blocked(item, reason),
-    };
-    let payload = match claude_mcp_server_value(&mcp_document, &server_id) {
-        Ok(payload) => payload,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let current_enabled =
-        match read_claude_configured_mcp_enabled(Path::new(&settings_path), &server_id) {
-            Ok(current_enabled) => current_enabled,
-            Err(reason) => return blocked(item, reason),
-        };
-    if current_enabled != item.enabled {
-        let discovered_enabled = item.enabled;
-        return blocked(
-            item,
-            format!(
-                "Claude configured MCP state drifted for {server_id}: discovered {}, current {}",
-                discovered_enabled, current_enabled
-            ),
-        );
-    }
-    if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-        let current_fingerprint = json_value_source_fingerprint(&payload);
-        if current_fingerprint != discovered_fingerprint {
-            return blocked(
-                item,
-                format!(
-                    "Claude configured MCP source drifted for {server_id}: discovered {discovered_fingerprint}, current {current_fingerprint}"
-                ),
-            );
-        }
-    }
-
-    let target_enabled = !item.enabled;
-    let action = if target_enabled { "Enable" } else { "Disable" };
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item,
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(settings_path.clone()),
-            to_path: None,
-            summary: format!(
-                "{action} Claude configured MCP {server_id} by rewriting project approval maps."
-            ),
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: settings_path,
-            },
-            MutationTarget {
-                target_type: "jsonPath".to_string(),
-                path: format!("enabledMcpjsonServers.{server_id}"),
-            },
-            MutationTarget {
-                target_type: "jsonPath".to_string(),
-                path: format!("disabledMcpjsonServers.{server_id}"),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_claude_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let server_id = match claude_project_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Claude configured MCP item id");
-        }
-    };
-    let plan = plan_claude_configured_mcp_toggle(item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let source_path = PathBuf::from(&item.state_path);
-    let mut document = match read_json_value(&source_path) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let mcp_document = match read_json_value(Path::new(&item.source_path)) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let payload = match claude_mcp_server_value(&mcp_document, &server_id) {
-        Ok(payload) => payload,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if let Err(reason) =
-        set_claude_configured_mcp_approval(&mut document, &server_id, payload, plan.target_enabled)
-    {
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-
-    if !source_path.is_file() {
-        let reason = format!("Claude settings file not found: {}", item.state_path);
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: plan.target_enabled,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        write_provider_config(&source_path, format!("{rendered}\n"))?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: plan.target_enabled,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_codex_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> ToggleResult {
-    let server_id = match codex_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => return blocked(item, "invalid Codex configured MCP item id"),
-    };
-
-    if item.state_path.ends_with("entry.json") {
-        return plan_disabled_codex_configured_mcp_toggle(app_state_root, item, &server_id);
-    }
-
-    plan_codex_toml_table_toggle(
-        item,
-        "mcp_servers",
-        &server_id,
-        "configured MCP",
-        "its Codex mcp_servers section",
-        false,
-    )
-}
-
-fn plan_codex_plugin_toggle(item: DiscoveryItem) -> ToggleResult {
-    let plugin_id = match codex_plugin_id(&item) {
-        Some(plugin_id) => plugin_id.to_string(),
-        None => return blocked(item, "invalid Codex plugin item id"),
-    };
-
-    plan_codex_toml_table_toggle(
-        item,
-        "plugins",
-        &plugin_id,
-        "plugin",
-        "its Codex plugins section",
-        true,
-    )
-}
-
-fn plan_codex_toml_table_toggle(
-    item: DiscoveryItem,
-    table_prefix: &str,
-    table_id: &str,
-    item_description: &str,
-    summary_location: &str,
-    restart_required: bool,
-) -> ToggleResult {
-    let config_path = PathBuf::from(&item.state_path);
-    let raw = match fs::read_to_string(&config_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            return blocked(item, format!("Codex config could not be read: {}", error));
-        }
-    };
-    if let Err(reason) = ensure_unique_standard_toml_tables(&raw) {
-        return blocked(item, reason);
-    }
-
-    let section = match find_toml_table_section(&raw, table_prefix, table_id) {
-        Some(section) => section,
-        None => {
-            return blocked(
-                item,
-                format!("Codex {item_description} section not found: [{table_prefix}.{table_id}]"),
-            );
-        }
-    };
-    let current_enabled = match toml_table_bool(section.content, "enabled") {
-        Ok(enabled) => enabled.unwrap_or(true),
-        Err(reason) => return blocked(item, reason),
-    };
-    if current_enabled != item.enabled {
-        let discovered_enabled = item.enabled;
-        return blocked(
-            item,
-            format!(
-                "Codex {item_description} state drifted for {table_id}: discovered {}, current {current_enabled}",
-                discovered_enabled
-            ),
-        );
-    }
-    if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-        let Some(current_content) = toml_table_subtree_content(&raw, table_prefix, table_id) else {
-            return blocked(
-                item,
-                format!("Codex {item_description} table subtree is ambiguous for {table_id}"),
-            );
-        };
-        let current_fingerprint = source_fingerprint(&current_content);
-        if current_fingerprint != discovered_fingerprint {
-            return blocked(
-                item,
-                format!(
-                    "Codex {item_description} source drifted for {table_id}: discovered {discovered_fingerprint}, current {current_fingerprint}"
-                ),
-            );
-        }
-    }
-
-    let target_enabled = !item.enabled;
-
-    let restart_guidance = if restart_required {
-        " Restart Codex to load the change."
-    } else {
-        ""
-    };
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.state_path.clone()),
-            to_path: None,
-            summary: format!(
-                "Set {} enabled = {target_enabled} in {summary_location}.{restart_guidance}",
-                item.id
-            ),
-            path: Some(item.state_path.clone()),
-            json_path: None,
-            value: Some(Value::Bool(target_enabled)),
-        }],
-        affected_targets: vec![MutationTarget {
-            target_type: "statePath".to_string(),
-            path: item.state_path.clone(),
-        }],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn plan_disabled_codex_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    server_id: &str,
-) -> ToggleResult {
-    let vault_entry = match load_codex_configured_mcp_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => return blocked(item, reason),
-    };
-    let config_path = PathBuf::from(&vault_entry.original_path);
-    let raw = match fs::read_to_string(&config_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            return blocked(item, format!("Codex config could not be read: {}", error));
-        }
-    };
-    if let Err(reason) = ensure_unique_standard_toml_tables(&raw) {
-        return blocked(item, reason);
-    }
-    if find_toml_table_section(&raw, "mcp_servers", server_id).is_some() {
-        return blocked(
-            item,
-            format!(
-                "live-section-conflict: {server_id} is already present in {}",
-                config_path.display()
-            ),
-        );
-    }
-
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let payload_raw = match fs::read_to_string(&vault_payload) {
-        Ok(raw) => raw,
-        Err(error) => {
-            return blocked(
-                item,
-                format!(
-                    "vault payload could not be read: {}: {error}",
-                    vault_payload.display()
-                ),
-            );
-        }
-    };
-    if let Err(reason) = ensure_unique_standard_toml_tables(&payload_raw) {
-        return blocked(item, format!("vault payload is ambiguous: {reason}"));
-    }
-    if find_toml_table_section(&payload_raw, "mcp_servers", server_id).is_none() {
-        return blocked(
-            item,
-            format!("vault payload does not contain [mcp_servers.{server_id}]"),
-        );
-    }
-
-    let vault_root = vault_root_path(&app_state_root, &item);
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled: true,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(vault_entry.original_path.clone()),
-            to_path: Some(vault_entry.vaulted_path.clone()),
-            summary: format!(
-                "Enable {} by restoring its vaulted Codex mcp_servers section.",
-                item.id
-            ),
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: vault_entry.original_path,
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: vault_entry.vaulted_path,
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root.join("entry.json")),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_codex_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    if item.state_path.ends_with("entry.json") {
-        return apply_disabled_codex_configured_mcp_toggle(
-            app_state_root,
-            item,
-            backup_authentication_key,
-        );
-    }
-
-    let server_id = match codex_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => return blocked(item, "invalid Codex configured MCP item id"),
-    };
-
-    apply_codex_toml_table_toggle(
-        app_state_root,
-        item,
-        CodexTomlToggleSpec {
-            table_prefix: "mcp_servers",
-            table_id: &server_id,
-            item_description: "configured MCP",
-            summary_location: "its Codex mcp_servers section",
-            restart_required: false,
-        },
-        backup_authentication_key,
-    )
-}
-
-fn apply_codex_plugin_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let plugin_id = match codex_plugin_id(&item) {
-        Some(plugin_id) => plugin_id.to_string(),
-        None => return blocked(item, "invalid Codex plugin item id"),
-    };
-
-    apply_codex_toml_table_toggle(
-        app_state_root,
-        item,
-        CodexTomlToggleSpec {
-            table_prefix: "plugins",
-            table_id: &plugin_id,
-            item_description: "plugin",
-            summary_location: "its Codex plugins section",
-            restart_required: true,
-        },
-        backup_authentication_key,
-    )
-}
-
-struct CodexTomlToggleSpec<'a> {
-    table_prefix: &'a str,
-    table_id: &'a str,
-    item_description: &'a str,
-    summary_location: &'a str,
-    restart_required: bool,
-}
-
-fn apply_codex_toml_table_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    spec: CodexTomlToggleSpec<'_>,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plan = plan_codex_toml_table_toggle(
-        item.clone(),
-        spec.table_prefix,
-        spec.table_id,
-        spec.item_description,
-        spec.summary_location,
-        spec.restart_required,
-    );
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let source_path = PathBuf::from(&item.state_path);
-    let raw = match fs::read_to_string(&source_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            drop(lock);
-            return blocked(item, format!("Codex config could not be read: {}", error));
-        }
-    };
-    let rewritten = match set_toml_table_bool(
-        &raw,
-        spec.table_prefix,
-        spec.table_id,
-        "enabled",
-        plan.target_enabled,
-    ) {
-        Ok(rewritten) => rewritten,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-
-    if !source_path.is_file() {
-        let reason = format!("Codex config file not found: {}", item.state_path);
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: plan.target_enabled,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        write_provider_config(&source_path, rewritten)?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: plan.target_enabled,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_disabled_codex_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let server_id = match codex_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Codex configured MCP item id");
-        }
-    };
-    let plan = plan_codex_configured_mcp_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let vault_entry = match load_codex_configured_mcp_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let source_path = PathBuf::from(&vault_entry.original_path);
-    let raw = match fs::read_to_string(&source_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            drop(lock);
-            return blocked(item, format!("Codex config could not be read: {}", error));
-        }
-    };
-    if let Err(reason) = ensure_unique_standard_toml_tables(&raw) {
-        drop(lock);
-        return blocked(item, reason);
-    }
-    if find_toml_table_section(&raw, "mcp_servers", &server_id).is_some() {
-        drop(lock);
-        return blocked(
-            item,
-            format!(
-                "live-section-conflict: {server_id} is already present in {}",
-                source_path.display()
-            ),
-        );
-    }
-
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let payload_raw = match fs::read_to_string(&vault_payload) {
-        Ok(raw) => raw,
-        Err(error) => {
-            drop(lock);
-            return blocked(
-                item,
-                format!(
-                    "vault payload could not be read: {}: {error}",
-                    vault_payload.display()
-                ),
-            );
-        }
-    };
-    if let Err(reason) = ensure_unique_standard_toml_tables(&payload_raw) {
-        drop(lock);
-        return blocked(item, format!("vault payload is ambiguous: {reason}"));
-    }
-    let section = match find_toml_table_section(&payload_raw, "mcp_servers", &server_id) {
-        Some(section) => section,
-        None => {
-            drop(lock);
-            return blocked(
-                item,
-                format!("vault payload does not contain [mcp_servers.{server_id}]"),
-            );
-        }
-    };
-    let rewritten = append_toml_table_section(&raw, section.content);
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
-    let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_entry_path = vault_root.join("entry.json");
-
-    if !source_path.is_file() {
-        let reason = format!("Codex config file not found: {}", source_path.display());
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-        fs::create_dir_all(
-            backup_vault_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_payload, &backup_vault_payload)?;
-        fs::create_dir_all(
-            backup_vault_entry
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_entry_path, &backup_vault_entry)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![
-                BackupEntry {
-                    entry_id: "entry-1".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.original_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-1/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-2".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.vaulted_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-2/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-3".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: path_string(vault_entry_path.clone()),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-3/payload".to_string(),
-                    }),
-                },
-            ],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        write_provider_config(&source_path, rewritten)?;
-        if vault_root.exists() {
-            fs::remove_dir_all(&vault_root)?;
-        }
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_json_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> ToggleResult {
-    let provider_name = json_mcp_provider_name(item.provider);
-    let server_id = match json_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            return blocked(
-                item,
-                format!("invalid {provider_name} configured MCP item id"),
-            );
-        }
-    };
-
-    if !item.enabled && item.state_path.ends_with("entry.json") {
-        return plan_disabled_json_configured_mcp_vault_toggle(app_state_root, item, &server_id);
-    }
-
-    if !item.enabled && is_cursor_workspace_state_path(&item) {
-        return plan_cursor_workspace_configured_mcp_toggle(item, &server_id);
-    }
-
-    let config_path = PathBuf::from(&item.state_path);
-    let document = match read_json_value(&config_path) {
-        Ok(document) => document,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let server_value = match configured_json_mcp_server_value(&document, &item, &server_id) {
-        Ok(server_value) => server_value,
-        Err(reason) => return blocked(item, reason),
-    };
-    let current_enabled = if item.provider == ProviderId::Cursor {
-        cursor_mcp_server_enabled_from_value(&server_value)
-    } else {
-        true
-    };
-    if current_enabled != item.enabled {
-        let discovered_enabled = item.enabled;
-        return blocked(
-            item,
-            format!(
-                "{provider_name} configured MCP state drifted for {server_id}: discovered {}, current {}",
-                discovered_enabled, current_enabled
-            ),
-        );
-    }
-    if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-        let current_fingerprint = json_value_source_fingerprint(&server_value);
-        if current_fingerprint != discovered_fingerprint {
-            return blocked(
-                item,
-                format!(
-                    "{provider_name} configured MCP source drifted for {server_id}: discovered {discovered_fingerprint}, current {current_fingerprint}"
-                ),
-            );
-        }
-    }
-
-    if !item.enabled {
-        if item.provider != ProviderId::Cursor {
-            return blocked(item, "disabled JSON MCP item is missing its vault entry");
-        }
-        if let Err(reason) = cursor_mcp_server_disabled_flag(&document, &server_id) {
-            return blocked(item, reason);
-        }
-
-        return ToggleResult {
-            status: ToggleStatus::DryRun,
-            selection: item.clone(),
-            target_enabled: true,
-            operations: vec![MutationOperation {
-                operation_type: "replaceFile".to_string(),
-                from_path: Some(item.state_path.clone()),
-                to_path: None,
-                summary: format!(
-                    "Enable {} by removing its Cursor mcpServers disabled flag.",
-                    item.id
-                ),
-                path: None,
-                json_path: None,
-                value: None,
-            }],
-            affected_targets: vec![MutationTarget {
-                target_type: "statePath".to_string(),
-                path: item.state_path.clone(),
-            }],
-            backup_id: None,
-            reason: None,
-            writes: Some("no writes were performed".to_string()),
-            provider_reach: None,
-            coverage: None,
-        };
-    }
-
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = json_configured_mcp_vault_payload_path(&app_state_root, &item);
-    let vault_payload_string = path_string(vault_payload);
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled: false,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.state_path.clone()),
-            to_path: Some(vault_payload_string.clone()),
-            summary: format!(
-                "Disable {} by removing its {provider_name} mcpServers entry and vaulting it.",
-                item.id,
-            ),
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: item.state_path.clone(),
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: vault_payload_string,
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root.join("entry.json")),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn plan_disabled_json_configured_mcp_vault_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    server_id: &str,
-) -> ToggleResult {
-    let provider_name = json_mcp_provider_name(item.provider);
-    let vault_entry = match load_json_configured_mcp_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => return blocked(item, reason),
-    };
-    let config_path = PathBuf::from(&vault_entry.original_path);
-    let document = match read_json_value(&config_path) {
-        Ok(document) => document,
-        Err(reason) => return blocked(item, reason),
-    };
-    match configured_json_mcp_server_present(&document, &item, server_id) {
-        Ok(true) => {
-            return blocked(
-                item,
-                format!(
-                    "live-entry-conflict: {server_id} is already present in {}",
-                    config_path.display()
-                ),
-            );
-        }
-        Ok(false) => {}
-        Err(reason) => return blocked(item, reason),
-    }
-
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let payload = match read_json_value(&vault_payload) {
-        Ok(payload) => payload,
-        Err(reason) => return blocked(item, reason),
-    };
-    if !payload.is_object() {
-        let reason = format!(
-            "invalid-vault-payload: {} must contain a JSON object for {}",
-            vault_payload.display(),
-            item.id
-        );
-        return blocked(item, reason);
-    }
-
-    let vault_root = vault_root_path(&app_state_root, &item);
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled: true,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(vault_entry.original_path.clone()),
-            to_path: Some(vault_entry.vaulted_path.clone()),
-            summary: format!(
-                "Enable {} by restoring its vaulted {provider_name} mcpServers entry.",
-                item.id,
-            ),
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: vault_entry.original_path,
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: vault_entry.vaulted_path,
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root.join("entry.json")),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn plan_cursor_workspace_configured_mcp_toggle(
-    item: DiscoveryItem,
-    server_id: &str,
-) -> ToggleResult {
-    let config_path = PathBuf::from(&item.source_path);
-    let document = match read_json_value(&config_path) {
-        Ok(document) => document,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let server_value = match configured_json_mcp_server_value(&document, &item, server_id) {
-        Ok(server_value) => server_value,
-        Err(reason) => return blocked(item, reason),
-    };
-    let workspace_path = PathBuf::from(&item.state_path);
-    let disabled_server_ids = match read_cursor_workspace_disabled_server_ids(&workspace_path) {
-        Ok(disabled_server_ids) => disabled_server_ids,
-        Err(reason) => return blocked(item, reason),
-    };
-    let workspace_server_id = cursor_workspace_server_id(server_id);
-    let has_workspace_disabled = disabled_server_ids
-        .iter()
-        .any(|server_id| server_id == &workspace_server_id);
-    let has_json_disabled = server_value.get("disabled").and_then(Value::as_bool) == Some(true);
-
-    if !has_workspace_disabled && !has_json_disabled {
-        return blocked(
-            item,
-            format!(
-                "unsupported-live-disabled-entry: {server_id} is not disabled in a writable Cursor state source"
-            ),
-        );
-    }
-
-    let next_disabled_server_ids = disabled_server_ids
-        .into_iter()
-        .filter(|server_id| server_id != &workspace_server_id)
-        .collect::<Vec<_>>();
-    let mut operations = Vec::new();
-    let mut affected_targets = Vec::new();
-
-    if has_json_disabled {
-        operations.push(MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.source_path.clone()),
-            to_path: None,
-            summary: format!(
-                "Enable {} by removing its Cursor mcpServers disabled flag.",
-                item.id
-            ),
-            path: Some(item.source_path.clone()),
-            json_path: None,
-            value: None,
-        });
-        affected_targets.push(MutationTarget {
-            target_type: "statePath".to_string(),
-            path: item.source_path.clone(),
-        });
-    }
-
-    if has_workspace_disabled {
-        operations.push(MutationOperation {
-            operation_type: "replaceSqliteItemTableValue".to_string(),
-            from_path: None,
-            to_path: None,
-            summary: format!(
-                "Enable {} by removing it from Cursor workspace disabled MCP state.",
-                item.id
-            ),
-            path: Some(item.state_path.clone()),
-            json_path: None,
-            value: Some(Value::Array(
-                next_disabled_server_ids
-                    .iter()
-                    .map(|server_id| Value::String(server_id.clone()))
-                    .collect(),
-            )),
-        });
-        affected_targets.push(MutationTarget {
-            target_type: "sqlite-item".to_string(),
-            path: item.state_path.clone(),
-        });
-    }
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item,
-        target_enabled: true,
-        operations,
-        affected_targets,
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_json_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    if !item.enabled {
-        if item.state_path.ends_with("entry.json") {
-            return apply_disabled_json_configured_mcp_vault_toggle(
-                app_state_root,
-                item,
-                backup_authentication_key,
-            );
-        }
-        if is_cursor_workspace_state_path(&item) {
-            return apply_cursor_workspace_configured_mcp_toggle(
-                app_state_root,
-                item,
-                backup_authentication_key,
-            );
-        }
-        if item.provider != ProviderId::Cursor {
-            return blocked(item, "disabled JSON MCP item is missing its vault entry");
-        }
-        return apply_cursor_configured_mcp_disabled_flag_enable(
-            app_state_root,
-            item,
-            backup_authentication_key,
-        );
-    }
-
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plan = plan_json_configured_mcp_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let provider_name = json_mcp_provider_name(item.provider);
-    let server_id = match json_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(
-                item,
-                format!("invalid {provider_name} configured MCP item id"),
-            );
-        }
-    };
-
-    let source_path = PathBuf::from(&item.state_path);
-    let mut document = match read_json_value(&source_path) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let server_value = match remove_configured_json_mcp_server(&mut document, &item, &server_id) {
-        Ok(server_value) => server_value,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = json_configured_mcp_vault_payload_path(&app_state_root, &item);
-
-    if !source_path.is_file() {
-        let reason = format!(
-            "{provider_name} MCP config file not found: {}",
-            item.state_path
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    if vault_root.exists() {
-        let reason = format!("vault entry already exists: {}", vault_root.display());
-        append_pre_mutation_failed_apply_audit_entry(
-            &app_state_root,
-            &item,
-            false,
-            &plan.affected_targets,
-            &reason,
-            &created_at,
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: false,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        fs::create_dir_all(&vault_root)?;
-        write_json_file(&vault_payload, &server_value)?;
-
-        let entry = VaultEntry {
-            version: 1,
-            provider: item.provider.as_str().to_string(),
-            kind: vault_kind_segment(&item).to_string(),
-            layer: item.layer.as_str().to_string(),
-            item_id: item.id.clone(),
-            display_name: item.display_name.clone(),
-            original_path: item.state_path.clone(),
-            vaulted_path: path_string(vault_payload),
-            payload_kind: "json-payload".to_string(),
-            jsonc_format: None,
-        };
-        write_json_file(&vault_root.join("entry.json"), &entry)?;
-
-        let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        write_provider_config(&source_path, format!("{rendered}\n"))?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: false,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_cursor_workspace_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let server_id = match cursor_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Cursor configured MCP item id");
-        }
-    };
-    let plan = plan_json_configured_mcp_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let source_path = PathBuf::from(&item.source_path);
-    let workspace_path = PathBuf::from(&item.state_path);
-    let mut document = match read_json_value(&source_path) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let has_json_disabled = cursor_mcp_server_disabled_flag(&document, &server_id).is_ok();
-    if has_json_disabled
-        && let Err(reason) = remove_cursor_mcp_server_disabled_flag(&mut document, &server_id)
-    {
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let mut workspace_connection = match open_cursor_workspace_database(
-        &workspace_path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        "begin write transaction for",
-    ) {
-        Ok(connection) => connection,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let workspace_transaction = match workspace_connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-    {
-        Ok(transaction) => transaction,
-        Err(error) => {
-            let reason =
-                cursor_workspace_database_error(&workspace_path, "reserve write access to", &error);
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let workspace_raw = match read_cursor_workspace_disabled_server_ids_raw_from_connection(
-        &workspace_transaction,
-        &workspace_path,
-    ) {
-        Ok(Some(workspace_raw)) => workspace_raw,
-        Ok(None) => {
-            drop(workspace_transaction);
-            drop(lock);
-            return blocked(
-                item,
-                format!(
-                    "Cursor workspace state is missing {CURSOR_WORKSPACE_DISABLED_SERVERS_KEY} in {}",
-                    workspace_path.display()
-                ),
-            );
-        }
-        Err(reason) => {
-            drop(workspace_transaction);
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let disabled_server_ids =
-        match parse_cursor_workspace_disabled_server_ids(&workspace_path, &workspace_raw) {
-            Ok(disabled_server_ids) => disabled_server_ids,
-            Err(reason) => {
-                drop(workspace_transaction);
-                drop(lock);
-                return blocked(item, reason);
-            }
-        };
-    let workspace_server_id = cursor_workspace_server_id(&server_id);
-    if !disabled_server_ids
-        .iter()
-        .any(|server_id| server_id == &workspace_server_id)
-    {
-        drop(workspace_transaction);
-        drop(lock);
-        return blocked(
-            item,
-            format!(
-                "Cursor workspace state drifted for {server_id}: {workspace_server_id} is no longer disabled"
-            ),
-        );
-    }
-    let next_disabled_server_ids = disabled_server_ids
-        .into_iter()
-        .filter(|server_id| server_id != &workspace_server_id)
-        .collect::<Vec<_>>();
-    let next_workspace_raw = match serde_json::to_vec(&next_disabled_server_ids) {
-        Ok(raw) => raw,
-        Err(error) => {
-            drop(workspace_transaction);
-            drop(lock);
-            return blocked(item, error.to_string());
-        }
-    };
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => {
-            drop(workspace_transaction);
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-
-    if has_json_disabled && !source_path.is_file() {
-        let reason = format!("Cursor mcp.json file not found: {}", source_path.display());
-        drop(workspace_transaction);
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(workspace_transaction);
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-
-        let mut entries = Vec::new();
-        let mut next_entry_id = 1usize;
-
-        if has_json_disabled {
-            let entry_id = format!("entry-{next_entry_id}");
-            next_entry_id += 1;
-            let backup_payload = backup_root.join("entries").join(&entry_id).join("payload");
-            fs::create_dir_all(
-                backup_payload
-                    .parent()
-                    .expect("backup payload path has a parent"),
-            )?;
-            fs::copy(&source_path, &backup_payload)?;
-            entries.push(BackupEntry {
-                entry_id: entry_id.clone(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.source_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: entry_payload_path(&entry_id),
-                }),
-            });
-        }
-
-        let entry_id = format!("entry-{next_entry_id}");
-        let backup_payload = backup_root.join("entries").join(&entry_id).join("payload");
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::write(&backup_payload, &workspace_raw)?;
-        entries.push(BackupEntry {
-            entry_id: entry_id.clone(),
-            target: MutationTarget {
-                target_type: "sqlite-item".to_string(),
-                path: item.state_path.clone(),
-            },
-            existed: true,
-            path_kind: None,
-            payload: Some(BackupPayload {
-                storage: "path".to_string(),
-                path: entry_payload_path(&entry_id),
-            }),
-        });
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries,
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        if has_json_disabled {
-            let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-            write_provider_config(&source_path, format!("{rendered}\n"))?;
-        }
-        write_cursor_workspace_disabled_server_ids_raw_on_connection(
-            &workspace_transaction,
-            &workspace_path,
-            &next_workspace_raw,
-        )
-        .map_err(io::Error::other)?;
-        workspace_transaction.commit().map_err(|error| {
-            io::Error::other(cursor_workspace_database_error(
-                &workspace_path,
-                "commit write transaction for",
-                &error,
-            ))
-        })?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_disabled_json_configured_mcp_vault_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let provider_name = json_mcp_provider_name(item.provider);
-    let server_id = match json_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(
-                item,
-                format!("invalid {provider_name} configured MCP item id"),
-            );
-        }
-    };
-    let plan = plan_json_configured_mcp_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let vault_entry = match load_json_configured_mcp_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let source_path = PathBuf::from(&vault_entry.original_path);
-    let mut document = match read_json_value(&source_path) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    match configured_json_mcp_server_present(&document, &item, &server_id) {
-        Ok(true) => {
-            drop(lock);
-            return blocked(
-                item,
-                format!(
-                    "live-entry-conflict: {server_id} is already present in {}",
-                    source_path.display()
-                ),
-            );
-        }
-        Ok(false) => {}
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    }
-
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let mut payload = match read_json_value(&vault_payload) {
-        Ok(payload) => payload,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if item.provider == ProviderId::Cursor {
-        if let Err(reason) = prepare_cursor_mcp_payload(&mut payload, &server_id) {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    } else if !payload.is_object() {
-        drop(lock);
-        return blocked(
-            item,
-            format!("mcpServers.{server_id} vaulted payload is not an object"),
-        );
-    }
-    if let Err(reason) =
-        insert_configured_json_mcp_server(&mut document, &item, &server_id, payload)
-    {
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
-    let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_entry_path = vault_root.join("entry.json");
-
-    if !source_path.is_file() {
-        let reason = format!(
-            "{provider_name} MCP config file not found: {}",
-            source_path.display()
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-        fs::create_dir_all(
-            backup_vault_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_payload, &backup_vault_payload)?;
-        fs::create_dir_all(
-            backup_vault_entry
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_entry_path, &backup_vault_entry)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![
-                BackupEntry {
-                    entry_id: "entry-1".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.original_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-1/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-2".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.vaulted_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-2/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-3".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: path_string(vault_entry_path.clone()),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-3/payload".to_string(),
-                    }),
-                },
-            ],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        write_provider_config(&source_path, format!("{rendered}\n"))?;
-        if vault_root.exists() {
-            fs::remove_dir_all(&vault_root)?;
-        }
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_cursor_configured_mcp_disabled_flag_enable(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plan = plan_json_configured_mcp_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let server_id = match cursor_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Cursor configured MCP item id");
-        }
-    };
-
-    let source_path = PathBuf::from(&item.state_path);
-    let mut document = match read_json_value(&source_path) {
-        Ok(document) => document,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if let Err(reason) = remove_cursor_mcp_server_disabled_flag(&mut document, &server_id) {
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-
-    if !source_path.is_file() {
-        let reason = format!("Cursor mcp.json file not found: {}", item.state_path);
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        let rendered = serde_json::to_string_pretty(&document).map_err(io::Error::other)?;
-        write_provider_config(&source_path, format!("{rendered}\n"))?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_opencode_configured_mcp_toggle(item: DiscoveryItem) -> ToggleResult {
-    let server_id = match opencode_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => return blocked(item, "invalid OpenCode configured MCP item id"),
-    };
-    let config_path = PathBuf::from(&item.state_path);
-    let raw = match read_jsonc_raw(&config_path) {
-        Ok(raw) => raw,
-        Err(reason) => return blocked(item, reason),
-    };
-    let server_value = match opencode_mcp_server_value(&raw, &server_id) {
-        Ok(value) => value,
-        Err(reason) => return blocked(item, reason),
-    };
-    let current_enabled = server_value
-        .get("enabled")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    if current_enabled != item.enabled {
-        let discovered_enabled = item.enabled;
-        return blocked(
-            item,
-            format!(
-                "OpenCode configured MCP state drifted for {server_id}: discovered {discovered_enabled}, current {current_enabled}"
-            ),
-        );
-    }
-    if let Some(discovered_fingerprint) = item.source_fingerprint.clone() {
-        let current_fingerprint = json_value_source_fingerprint(&server_value);
-        if current_fingerprint != discovered_fingerprint {
-            return blocked(
-                item,
-                format!(
-                    "OpenCode configured MCP source drifted for {server_id}: discovered {discovered_fingerprint}, current {current_fingerprint}"
-                ),
-            );
-        }
-    }
-
-    let target_enabled = !item.enabled;
-    if let Err(reason) = set_opencode_mcp_enabled_jsonc(&raw, &server_id, target_enabled) {
-        return blocked(item, reason);
-    }
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.state_path.clone()),
-            to_path: None,
-            summary: format!(
-                "Set {} enabled = {target_enabled} in OpenCode mcp config. Restart OpenCode to load the change.",
-                item.id
-            ),
-            path: Some(item.state_path.clone()),
-            json_path: Some(vec!["mcp".to_string(), server_id, "enabled".to_string()]),
-            value: Some(Value::Bool(target_enabled)),
-        }],
-        affected_targets: vec![MutationTarget {
-            target_type: "statePath".to_string(),
-            path: item.state_path.clone(),
-        }],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_opencode_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_opencode_configured_mcp_toggle(item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-    let server_id = match opencode_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid OpenCode configured MCP item id");
-        }
-    };
-    let source_path = PathBuf::from(&item.state_path);
-    let raw = match read_jsonc_raw(&source_path) {
-        Ok(raw) => raw,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let rendered = match set_opencode_mcp_enabled_jsonc(&raw, &server_id, plan.target_enabled) {
-        Ok(rendered) => rendered,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if !source_path.is_file() {
-        drop(lock);
-        return blocked(
-            item,
-            format!("OpenCode config file not found: {}", source_path.display()),
-        );
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: plan.target_enabled,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-        write_provider_config(&source_path, rendered)?;
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: plan.target_enabled,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-        Ok(())
-    })();
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_pi_package_extension_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> ToggleResult {
-    let package_source = match pi_package_extension_source(&item) {
-        Some(source) => source.to_string(),
-        None => return blocked(item, "invalid Pi package extension item id"),
-    };
-    let settings_path = PathBuf::from(&item.state_path);
-    let raw = match fs::read_to_string(&settings_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            return blocked(
-                item,
-                format!(
-                    "Pi settings could not be read: {}: {error}",
-                    settings_path.display()
-                ),
-            );
-        }
-    };
-
-    let vault = if item.enabled {
-        if let Err(reason) =
-            prepare_pi_package_disable(&raw, &package_source, item.source_fingerprint.as_deref())
-        {
-            return blocked(item, reason);
-        }
-        None
-    } else {
-        let vault = match load_optional_pi_package_vault(&app_state_root, &item, &package_source) {
-            Ok(vault) => vault,
-            Err(reason) => return blocked(item, reason),
-        };
-        if let Err(reason) = prepare_pi_package_enable(
-            &raw,
-            &package_source,
-            item.source_fingerprint.as_deref(),
-            vault.as_ref().map(|(_, payload)| payload),
-        ) {
-            return blocked(item, reason);
-        }
-        vault
-    };
-
-    let target_enabled = !item.enabled;
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = vault_root.join("payload.json");
-    let mut affected_targets = vec![MutationTarget {
-        target_type: "statePath".to_string(),
-        path: item.state_path.clone(),
-    }];
-    if item.enabled || vault.is_some() {
-        affected_targets.extend([
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: path_string(vault_payload.clone()),
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root.join("entry.json")),
-            },
-        ]);
-    }
-    let action = if target_enabled { "Enable" } else { "Disable" };
-    let summary = if target_enabled && vault.is_some() {
-        format!(
-            "{action} {} by restoring its Pi package extension filter while keeping the package installed. Restart Pi to load the change.",
-            item.id
-        )
-    } else if target_enabled {
-        format!(
-            "{action} {} by removing its empty Pi package extension filter so all package extensions load while keeping the package installed. Restart Pi to load the change.",
-            item.id
-        )
-    } else {
-        format!(
-            "{action} {} by setting packages[].extensions to an empty array while keeping the package reference and other resources. Restart Pi to load the change.",
-            item.id
-        )
-    };
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.state_path.clone()),
-            to_path: (item.enabled || vault.is_some()).then(|| path_string(vault_payload)),
-            summary,
-            path: Some(item.state_path.clone()),
-            json_path: Some(vec![
-                "packages".to_string(),
-                package_source,
-                "extensions".to_string(),
-            ]),
-            value: (!target_enabled).then(|| Value::Array(Vec::new())),
-        }],
-        affected_targets,
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_pi_package_extension_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    if item.enabled {
-        apply_pi_package_extension_disable(app_state_root, item, backup_authentication_key)
-    } else {
-        apply_pi_package_extension_enable(app_state_root, item, backup_authentication_key)
-    }
-}
-
-fn apply_pi_package_extension_disable(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_pi_package_extension_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-    let package_source = match pi_package_extension_source(&item) {
-        Some(source) => source.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Pi package extension item id");
-        }
-    };
-    let source_path = PathBuf::from(&item.state_path);
-    let raw = match fs::read_to_string(&source_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            drop(lock);
-            return blocked(
-                item,
-                format!(
-                    "Pi settings could not be read: {}: {error}",
-                    source_path.display()
-                ),
-            );
-        }
-    };
-    let rewrite =
-        match prepare_pi_package_disable(&raw, &package_source, item.source_fingerprint.as_deref())
-        {
-            Ok(rewrite) => rewrite,
-            Err(reason) => {
-                drop(lock);
-                return blocked(item, reason);
-            }
-        };
-    let payload = rewrite
-        .payload
-        .expect("Pi disable rewrite includes vault payload");
-    if !source_path.is_file() {
-        drop(lock);
-        return blocked(
-            item,
-            format!("Pi settings file not found: {}", source_path.display()),
-        );
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries/entry-1/payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = vault_root.join("payload.json");
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-    match fs::symlink_metadata(&vault_root) {
-        Ok(_) => {
-            let reason = format!("vault entry already exists: {}", vault_root.display());
-            append_pre_mutation_failed_apply_audit_entry(
-                &app_state_root,
-                &item,
-                false,
-                &plan.affected_targets,
-                &reason,
-                &created_at,
-            );
-            drop(lock);
-            return blocked(item, reason);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => {
-            drop(lock);
-            return blocked(item, error.to_string());
-        }
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: false,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        fs::create_dir_all(&vault_root)?;
-        write_json_file(&vault_payload, &payload)?;
-        write_json_file(
-            &vault_root.join("entry.json"),
-            &VaultEntry {
-                version: 1,
-                provider: item.provider.as_str().to_string(),
-                kind: vault_kind_segment(&item).to_string(),
-                layer: item.layer.as_str().to_string(),
-                item_id: item.id.clone(),
-                display_name: item.display_name.clone(),
-                original_path: item.state_path.clone(),
-                vaulted_path: path_string(vault_payload),
-                payload_kind: "json-payload".to_string(),
-                jsonc_format: None,
-            },
-        )?;
-        write_provider_config(&source_path, rewrite.rendered)?;
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: false,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-        Ok(())
-    })();
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_pi_package_extension_enable(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_pi_package_extension_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-    let package_source = match pi_package_extension_source(&item) {
-        Some(source) => source.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Pi package extension item id");
-        }
-    };
-    let vault = match load_optional_pi_package_vault(&app_state_root, &item, &package_source) {
-        Ok(vault) => vault,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let source_path = PathBuf::from(&item.state_path);
-    let raw = match fs::read_to_string(&source_path) {
-        Ok(raw) => raw,
-        Err(error) => {
-            drop(lock);
-            return blocked(
-                item,
-                format!(
-                    "Pi settings could not be read: {}: {error}",
-                    source_path.display()
-                ),
-            );
-        }
-    };
-    let rewrite = match prepare_pi_package_enable(
-        &raw,
-        &package_source,
-        item.source_fingerprint.as_deref(),
-        vault.as_ref().map(|(_, payload)| payload),
-    ) {
-        Ok(rewrite) => rewrite,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if !source_path.is_file() {
-        drop(lock);
-        return blocked(
-            item,
-            format!("Pi settings file not found: {}", source_path.display()),
-        );
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries/entry-1/payload");
-    let backup_vault_payload = backup_root.join("entries/entry-2/payload");
-    let backup_vault_entry = backup_root.join("entries/entry-3/payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_entry_path = vault_root.join("entry.json");
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut entries = vec![BackupEntry {
-            entry_id: "entry-1".to_string(),
-            target: MutationTarget {
-                target_type: "path".to_string(),
-                path: item.state_path.clone(),
-            },
-            existed: true,
-            path_kind: Some("file".to_string()),
-            payload: Some(BackupPayload {
-                storage: "path".to_string(),
-                path: "entries/entry-1/payload".to_string(),
-            }),
-        }];
-        if let Some((vault_entry, _)) = &vault {
-            fs::create_dir_all(
-                backup_vault_payload
-                    .parent()
-                    .expect("backup payload path has a parent"),
-            )?;
-            fs::copy(&vault_entry.vaulted_path, &backup_vault_payload)?;
-            fs::create_dir_all(
-                backup_vault_entry
-                    .parent()
-                    .expect("backup payload path has a parent"),
-            )?;
-            fs::copy(&vault_entry_path, &backup_vault_entry)?;
-            entries.extend([
-                BackupEntry {
-                    entry_id: "entry-2".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.vaulted_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-2/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-3".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: path_string(vault_entry_path.clone()),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-3/payload".to_string(),
-                    }),
-                },
-            ]);
-        }
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries,
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        write_provider_config(&source_path, rewrite.rendered)?;
-        if vault.is_some() {
-            fs::remove_dir_all(&vault_root)?;
-        }
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-        Ok(())
-    })();
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_opencode_plugin_config_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-) -> ToggleResult {
-    let plugin_id = match opencode_plugin_config_id(&item) {
-        Some(plugin_id) => plugin_id.to_string(),
-        None => return blocked(item, "invalid OpenCode npm plugin item id"),
-    };
-
-    if !item.enabled {
-        let vault_entry = match load_opencode_plugin_config_vault_entry(&app_state_root, &item) {
-            Ok(vault_entry) => vault_entry,
-            Err(reason) => return blocked(item, reason),
-        };
-        let source_path = PathBuf::from(&vault_entry.original_path);
-        let source_raw = match read_jsonc_raw(&source_path) {
-            Ok(raw) => raw,
-            Err(reason) => return blocked(item, reason),
-        };
-        let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-        let payload = match read_opencode_plugin_vault_payload(&vault_payload, &plugin_id) {
-            Ok(payload) => payload,
-            Err(reason) => return blocked(item, reason),
-        };
-        if let Err(reason) = prepare_opencode_plugin_restore(
-            &source_raw,
-            &plugin_id,
-            &payload,
-            vault_entry.jsonc_format.as_ref(),
-        ) {
-            return blocked(item, reason);
-        }
-
-        let vault_root = vault_root_path(&app_state_root, &item);
-        return ToggleResult {
-            status: ToggleStatus::DryRun,
-            selection: item.clone(),
-            target_enabled: true,
-            operations: vec![MutationOperation {
-                operation_type: "replaceFile".to_string(),
-                from_path: Some(vault_entry.original_path.clone()),
-                to_path: Some(vault_entry.vaulted_path.clone()),
-                summary: format!(
-                    "Enable {} by restoring its OpenCode plugin config reference. Restart OpenCode to load the change.",
-                    item.id
-                ),
-                path: Some(vault_entry.original_path.clone()),
-                json_path: Some(vec!["plugin".to_string()]),
-                value: Some(Value::String(plugin_id)),
-            }],
-            affected_targets: vec![
-                MutationTarget {
-                    target_type: "statePath".to_string(),
-                    path: vault_entry.original_path,
-                },
-                MutationTarget {
-                    target_type: "vaultPath".to_string(),
-                    path: vault_entry.vaulted_path,
-                },
-                MutationTarget {
-                    target_type: "vaultEntry".to_string(),
-                    path: path_string(vault_root.join("entry.json")),
-                },
-            ],
-            backup_id: None,
-            reason: None,
-            writes: Some("no writes were performed".to_string()),
-            provider_reach: None,
-            coverage: None,
-        };
-    }
-
-    let source_path = PathBuf::from(&item.state_path);
-    let source_raw = match read_jsonc_raw(&source_path) {
-        Ok(raw) => raw,
-        Err(reason) => return blocked(item, reason),
-    };
-    let original_order =
-        match opencode_plugin_order_with_vaults(&app_state_root, &item, &source_raw) {
-            Ok(original_order) => original_order,
-            Err(reason) => return blocked(item, reason),
-        };
-    if let Err(reason) = prepare_opencode_plugin_removal(
-        &source_raw,
-        &plugin_id,
-        item.source_fingerprint.as_deref(),
-        original_order,
-    ) {
-        return blocked(item, reason);
-    }
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = vault_root.join("payload.json");
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled: false,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.state_path.clone()),
-            to_path: Some(path_string(vault_payload.clone())),
-            summary: format!(
-                "Disable {} by removing its OpenCode plugin config reference while retaining installed cache files. Restart OpenCode to load the change.",
-                item.id
-            ),
-            path: Some(item.state_path.clone()),
-            json_path: Some(vec!["plugin".to_string()]),
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: item.state_path.clone(),
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: path_string(vault_payload),
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root.join("entry.json")),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_opencode_plugin_config_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    if !item.enabled {
-        return apply_disabled_opencode_plugin_config_toggle(
-            app_state_root,
-            item,
-            backup_authentication_key,
-        );
-    }
-
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_opencode_plugin_config_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-    let plugin_id = match opencode_plugin_config_id(&item) {
-        Some(plugin_id) => plugin_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid OpenCode npm plugin item id");
-        }
-    };
-    let source_path = PathBuf::from(&item.state_path);
-    let source_raw = match read_jsonc_raw(&source_path) {
-        Ok(raw) => raw,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let original_order =
-        match opencode_plugin_order_with_vaults(&app_state_root, &item, &source_raw) {
-            Ok(original_order) => original_order,
-            Err(reason) => {
-                drop(lock);
-                return blocked(item, reason);
-            }
-        };
-    let removal = match prepare_opencode_plugin_removal(
-        &source_raw,
-        &plugin_id,
-        item.source_fingerprint.as_deref(),
-        original_order,
-    ) {
-        Ok(removal) => removal,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if !source_path.is_file() {
-        drop(lock);
-        return blocked(
-            item,
-            format!("OpenCode config file not found: {}", source_path.display()),
-        );
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = vault_root.join("payload.json");
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-    if vault_root.exists() {
-        let reason = format!("vault entry already exists: {}", vault_root.display());
-        append_pre_mutation_failed_apply_audit_entry(
-            &app_state_root,
-            &item,
-            false,
-            &plan.affected_targets,
-            &reason,
-            &created_at,
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: false,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        fs::create_dir_all(&vault_root)?;
-        write_json_file(&vault_payload, &removal.payload)?;
-        let entry = VaultEntry {
-            version: 1,
-            provider: item.provider.as_str().to_string(),
-            kind: vault_kind_segment(&item).to_string(),
-            layer: item.layer.as_str().to_string(),
-            item_id: item.id.clone(),
-            display_name: item.display_name.clone(),
-            original_path: item.state_path.clone(),
-            vaulted_path: path_string(vault_payload),
-            payload_kind: "json-payload".to_string(),
-            jsonc_format: removal.jsonc_format,
-        };
-        write_json_file(&vault_root.join("entry.json"), &entry)?;
-        write_provider_config(&source_path, &removal.rendered)?;
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: false,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-        Ok(())
-    })();
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_disabled_opencode_plugin_config_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-    let plan = plan_opencode_plugin_config_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-    let plugin_id = match opencode_plugin_config_id(&item) {
-        Some(plugin_id) => plugin_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid OpenCode npm plugin item id");
-        }
-    };
-    let vault_entry = match load_opencode_plugin_config_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let source_path = PathBuf::from(&vault_entry.original_path);
-    let source_raw = match read_jsonc_raw(&source_path) {
-        Ok(raw) => raw,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let payload = match read_opencode_plugin_vault_payload(&vault_payload, &plugin_id) {
-        Ok(payload) => payload,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let rendered = match prepare_opencode_plugin_restore(
-        &source_raw,
-        &plugin_id,
-        &payload,
-        vault_entry.jsonc_format.as_ref(),
-    ) {
-        Ok(rendered) => rendered,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    if !source_path.is_file() {
-        drop(lock);
-        return blocked(
-            item,
-            format!("OpenCode config file not found: {}", source_path.display()),
-        );
-    }
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
-    let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_entry_path = vault_root.join("entry.json");
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-        fs::create_dir_all(
-            backup_vault_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_payload, &backup_vault_payload)?;
-        fs::create_dir_all(
-            backup_vault_entry
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_entry_path, &backup_vault_entry)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![
-                BackupEntry {
-                    entry_id: "entry-1".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.original_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-1/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-2".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.vaulted_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-2/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-3".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: path_string(vault_entry_path.clone()),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-3/payload".to_string(),
-                    }),
-                },
-            ],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        write_provider_config(&source_path, rendered)?;
-        if vault_root.exists() {
-            fs::remove_dir_all(&vault_root)?;
-        }
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-        Ok(())
-    })();
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn plan_zed_configured_mcp_toggle(app_state_root: PathBuf, item: DiscoveryItem) -> ToggleResult {
-    let server_id = match zed_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => return blocked(item, "invalid Zed configured MCP item id"),
-    };
-
-    if !item.enabled {
-        return plan_disabled_zed_configured_mcp_vault_toggle(app_state_root, item, &server_id);
-    }
-
-    let settings_path = PathBuf::from(&item.state_path);
-    let source_raw = match read_jsonc_raw(&settings_path) {
-        Ok(raw) => raw,
-        Err(reason) => return blocked(item, reason),
-    };
-    if let Err(reason) = prepare_zed_context_server_removal(
-        &source_raw,
-        &server_id,
-        item.source_fingerprint.as_deref(),
-    ) {
-        return blocked(item, reason);
-    }
-
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = zed_configured_mcp_vault_payload_path(&app_state_root, &item);
-    let vault_payload_string = path_string(vault_payload);
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled: false,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(item.state_path.clone()),
-            to_path: Some(vault_payload_string.clone()),
-            summary: format!(
-                "Disable {} by removing its Zed context_servers entry and vaulting it.",
-                item.id
-            ),
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: item.state_path.clone(),
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: vault_payload_string,
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root.join("entry.json")),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn plan_disabled_zed_configured_mcp_vault_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    server_id: &str,
-) -> ToggleResult {
-    let vault_entry = match load_zed_configured_mcp_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => return blocked(item, reason),
-    };
-    let settings_path = PathBuf::from(&vault_entry.original_path);
-    let source_raw = match read_jsonc_raw(&settings_path) {
-        Ok(raw) => raw,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let vault_payload_raw = match read_jsonc_raw(&vault_payload) {
-        Ok(raw) => raw,
-        Err(reason) => return blocked(item, reason),
-    };
-    if let Err(reason) = prepare_zed_context_server_restore(
-        &settings_path,
-        &source_raw,
-        server_id,
-        &vault_payload,
-        &vault_payload_raw,
-        vault_entry.jsonc_format.as_ref(),
-    ) {
-        return blocked(item, reason);
-    }
-
-    let vault_root = vault_root_path(&app_state_root, &item);
-
-    ToggleResult {
-        status: ToggleStatus::DryRun,
-        selection: item.clone(),
-        target_enabled: true,
-        operations: vec![MutationOperation {
-            operation_type: "replaceFile".to_string(),
-            from_path: Some(vault_entry.original_path.clone()),
-            to_path: Some(vault_entry.vaulted_path.clone()),
-            summary: format!(
-                "Enable {} by restoring its vaulted Zed context_servers entry.",
-                item.id
-            ),
-            path: None,
-            json_path: None,
-            value: None,
-        }],
-        affected_targets: vec![
-            MutationTarget {
-                target_type: "statePath".to_string(),
-                path: vault_entry.original_path,
-            },
-            MutationTarget {
-                target_type: "vaultPath".to_string(),
-                path: vault_entry.vaulted_path,
-            },
-            MutationTarget {
-                target_type: "vaultEntry".to_string(),
-                path: path_string(vault_root.join("entry.json")),
-            },
-        ],
-        backup_id: None,
-        reason: None,
-        writes: Some("no writes were performed".to_string()),
-        provider_reach: None,
-        coverage: None,
-    }
-}
-
-fn apply_zed_configured_mcp_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    if !item.enabled {
-        return apply_disabled_zed_configured_mcp_vault_toggle(
-            app_state_root,
-            item,
-            backup_authentication_key,
-        );
-    }
-
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let plan = plan_zed_configured_mcp_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let server_id = match zed_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Zed configured MCP item id");
-        }
-    };
-
-    let source_path = PathBuf::from(&item.state_path);
-    let source_raw = match read_jsonc_raw(&source_path) {
-        Ok(raw) => raw,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let removal = match prepare_zed_context_server_removal(
-        &source_raw,
-        &server_id,
-        item.source_fingerprint.as_deref(),
-    ) {
-        Ok(removal) => removal,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let rendered = removal.rendered;
-    let vaulted_server_raw = removal.value_raw;
-    let jsonc_format = removal.format;
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_payload = zed_configured_mcp_vault_payload_path(&app_state_root, &item);
-
-    if !source_path.is_file() {
-        let reason = format!("Zed settings file not found: {}", item.state_path);
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    if vault_root.exists() {
-        let reason = format!("vault entry already exists: {}", vault_root.display());
-        append_pre_mutation_failed_apply_audit_entry(
-            &app_state_root,
-            &item,
-            false,
-            &plan.affected_targets,
-            &reason,
-            &created_at,
-        );
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: false,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![BackupEntry {
-                entry_id: "entry-1".to_string(),
-                target: MutationTarget {
-                    target_type: "path".to_string(),
-                    path: item.state_path.clone(),
-                },
-                existed: true,
-                path_kind: Some("file".to_string()),
-                payload: Some(BackupPayload {
-                    storage: "path".to_string(),
-                    path: "entries/entry-1/payload".to_string(),
-                }),
-            }],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        fs::create_dir_all(&vault_root)?;
-        fs::write(
-            &vault_payload,
-            format!("{}\n", vaulted_server_raw.trim_end()),
-        )?;
-
-        let entry = VaultEntry {
-            version: 1,
-            provider: item.provider.as_str().to_string(),
-            kind: vault_kind_segment(&item).to_string(),
-            layer: item.layer.as_str().to_string(),
-            item_id: item.id.clone(),
-            display_name: item.display_name.clone(),
-            original_path: item.state_path.clone(),
-            vaulted_path: path_string(vault_payload),
-            payload_kind: "json-payload".to_string(),
-            jsonc_format,
-        };
-        write_json_file(&vault_root.join("entry.json"), &entry)?;
-
-        write_provider_config(&source_path, &rendered)?;
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: false,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn apply_disabled_zed_configured_mcp_vault_toggle(
-    app_state_root: PathBuf,
-    item: DiscoveryItem,
-    backup_authentication_key: &BackupAuthenticationKey,
-) -> ToggleResult {
-    let lock = match acquire_mutation_lock(&app_state_root) {
-        Ok(lock) => lock,
-        Err(reason) => return blocked(item, reason),
-    };
-
-    let server_id = match zed_configured_mcp_server_id(&item) {
-        Some(server_id) => server_id.to_string(),
-        None => {
-            drop(lock);
-            return blocked(item, "invalid Zed configured MCP item id");
-        }
-    };
-    let plan = plan_zed_configured_mcp_toggle(app_state_root.clone(), item.clone());
-    if plan.status == ToggleStatus::Blocked {
-        drop(lock);
-        return plan;
-    }
-
-    let vault_entry = match load_zed_configured_mcp_vault_entry(&app_state_root, &item) {
-        Ok(vault_entry) => vault_entry,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let source_path = PathBuf::from(&vault_entry.original_path);
-    let source_raw = match read_jsonc_raw(&source_path) {
-        Ok(raw) => raw,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-
-    let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
-    let vaulted_server_raw = match read_jsonc_raw(&vault_payload) {
-        Ok(raw) => raw,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-    let rendered = match prepare_zed_context_server_restore(
-        &source_path,
-        &source_raw,
-        &server_id,
-        &vault_payload,
-        &vaulted_server_raw,
-        vault_entry.jsonc_format.as_ref(),
-    ) {
-        Ok(rendered) => rendered,
-        Err(reason) => {
-            drop(lock);
-            return blocked(item, reason);
-        }
-    };
-
-    let (backup_id, created_at) = match current_backup_metadata() {
-        Ok(metadata) => metadata,
-        Err(reason) => return blocked(item, reason),
-    };
-    let backup_root = app_state_root.join("backups").join(&backup_id);
-    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
-    let backup_vault_payload = backup_root.join("entries").join("entry-2").join("payload");
-    let backup_vault_entry = backup_root.join("entries").join("entry-3").join("payload");
-    let vault_root = vault_root_path(&app_state_root, &item);
-    let vault_entry_path = vault_root.join("entry.json");
-
-    if !source_path.is_file() {
-        let reason = format!("Zed settings file not found: {}", source_path.display());
-        drop(lock);
-        return blocked(item, reason);
-    }
-
-    if backup_root.exists() {
-        drop(lock);
-        return blocked(item, format!("backup already exists: {backup_id}"));
-    }
-
-    let apply_result = (|| -> Result<(), io::Error> {
-        fs::create_dir_all(app_state_root.join("backups"))?;
-        fs::create_dir_all(app_state_root.join("audit"))?;
-        fs::create_dir_all(
-            backup_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&source_path, &backup_payload)?;
-        fs::create_dir_all(
-            backup_vault_payload
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_payload, &backup_vault_payload)?;
-        fs::create_dir_all(
-            backup_vault_entry
-                .parent()
-                .expect("backup payload path has a parent"),
-        )?;
-        fs::copy(&vault_entry_path, &backup_vault_entry)?;
-
-        let mut manifest = BackupManifest {
-            version: BACKUP_MANIFEST_VERSION,
-            authenticity: None,
-            backup_id: backup_id.clone(),
-            created_at: created_at.clone(),
-            selection: item.clone(),
-            target_enabled: true,
-            affected_targets: plan.affected_targets.clone(),
-            entries: vec![
-                BackupEntry {
-                    entry_id: "entry-1".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.original_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-1/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-2".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: vault_entry.vaulted_path.clone(),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-2/payload".to_string(),
-                    }),
-                },
-                BackupEntry {
-                    entry_id: "entry-3".to_string(),
-                    target: MutationTarget {
-                        target_type: "path".to_string(),
-                        path: path_string(vault_entry_path.clone()),
-                    },
-                    existed: true,
-                    path_kind: Some("file".to_string()),
-                    payload: Some(BackupPayload {
-                        storage: "path".to_string(),
-                        path: "entries/entry-3/payload".to_string(),
-                    }),
-                },
-            ],
-        };
-        write_authenticated_backup_manifest(
-            &backup_root,
-            &mut manifest,
-            backup_authentication_key,
-        )?;
-
-        write_provider_config(&source_path, &rendered)?;
-        if vault_root.exists() {
-            fs::remove_dir_all(&vault_root)?;
-        }
-
-        append_audit_entry(
-            &app_state_root,
-            &ApplyAuditEntry {
-                version: 1,
-                event: "apply".to_string(),
-                created_at,
-                backup_id: backup_id.clone(),
-                selection: item.clone(),
-                target_enabled: true,
-                affected_targets: plan.affected_targets.clone(),
-            },
-        )?;
-
-        Ok(())
-    })();
-
-    drop(lock);
-
-    if let Err(error) = apply_result {
-        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
-    }
-
-    ToggleResult {
-        status: ToggleStatus::Applied,
-        backup_id: Some(backup_id),
-        writes: Some("writes were performed".to_string()),
-        ..plan
-    }
-}
-
-fn blocked(item: DiscoveryItem, reason: impl Into<String>) -> ToggleResult {
+pub(super) fn blocked(item: DiscoveryItem, reason: impl Into<String>) -> ToggleResult {
     ToggleResult {
         target_enabled: item.enabled,
         selection: item,
@@ -7673,7 +2454,7 @@ fn blocked(item: DiscoveryItem, reason: impl Into<String>) -> ToggleResult {
     }
 }
 
-fn apply_failure_result(
+pub(super) fn apply_failure_result(
     mut plan: ToggleResult,
     backup_id: String,
     backup_root: &Path,
@@ -7698,7 +2479,7 @@ fn apply_failure_result(
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BackupManifest {
+pub(super) struct BackupManifest {
     version: u8,
     backup_id: String,
     created_at: String,
@@ -7712,7 +2493,7 @@ struct BackupManifest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BackupAuthenticity {
+pub(super) struct BackupAuthenticity {
     algorithm: String,
     key_id: String,
     payload_digests: Vec<BackupPayloadDigest>,
@@ -7732,14 +2513,14 @@ struct BackupAuthenticity {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BackupPayloadDigest {
+pub(super) struct BackupPayloadDigest {
     entry_id: String,
     digest: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BackupEntry {
+pub(super) struct BackupEntry {
     entry_id: String,
     target: MutationTarget,
     existed: bool,
@@ -7749,14 +2530,14 @@ struct BackupEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct BackupPayload {
+pub(super) struct BackupPayload {
     storage: String,
     path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct VaultEntry {
+pub(super) struct VaultEntry {
     version: u8,
     provider: String,
     kind: String,
@@ -7772,13 +2553,13 @@ struct VaultEntry {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct JsoncVaultFormat {
+pub(super) struct JsoncVaultFormat {
     marker: String,
     property_prefix: String,
     property_suffix: String,
 }
 
-fn load_path_file_vault_entry(
+pub(super) fn load_path_file_vault_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
 ) -> Result<VaultEntry, String> {
@@ -7792,7 +2573,7 @@ fn load_path_file_vault_entry(
     )
 }
 
-fn load_directory_vault_entry(
+pub(super) fn load_directory_vault_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
 ) -> Result<VaultEntry, String> {
@@ -7848,7 +2629,7 @@ fn load_directory_vault_entry(
     Ok(entry)
 }
 
-fn load_codex_configured_mcp_vault_entry(
+pub(super) fn load_codex_configured_mcp_vault_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
 ) -> Result<VaultEntry, String> {
@@ -7862,7 +2643,7 @@ fn load_codex_configured_mcp_vault_entry(
     )
 }
 
-fn load_json_configured_mcp_vault_entry(
+pub(super) fn load_json_configured_mcp_vault_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
 ) -> Result<VaultEntry, String> {
@@ -7881,7 +2662,7 @@ fn load_json_configured_mcp_vault_entry(
     )
 }
 
-fn load_zed_configured_mcp_vault_entry(
+pub(super) fn load_zed_configured_mcp_vault_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
 ) -> Result<VaultEntry, String> {
@@ -7895,7 +2676,7 @@ fn load_zed_configured_mcp_vault_entry(
     )
 }
 
-fn load_opencode_plugin_config_vault_entry(
+pub(super) fn load_opencode_plugin_config_vault_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
 ) -> Result<VaultEntry, String> {
@@ -7909,7 +2690,7 @@ fn load_opencode_plugin_config_vault_entry(
     )
 }
 
-fn load_file_vault_entry(
+pub(super) fn load_file_vault_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
     expected_kind: &str,
@@ -7965,7 +2746,7 @@ fn load_file_vault_entry(
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct ApplyAuditEntry {
+pub(super) struct ApplyAuditEntry {
     version: u8,
     event: String,
     created_at: String,
@@ -7977,7 +2758,7 @@ struct ApplyAuditEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct RestoreAuditEntry {
+pub(super) struct RestoreAuditEntry {
     version: u8,
     event: String,
     created_at: String,
@@ -7987,7 +2768,7 @@ struct RestoreAuditEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct BackupDeletionAuditEntry {
+pub(super) struct BackupDeletionAuditEntry {
     version: u8,
     event: String,
     created_at: String,
@@ -7997,7 +2778,7 @@ struct BackupDeletionAuditEntry {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct FailedApplyAuditEntry {
+pub(super) struct FailedApplyAuditEntry {
     version: u8,
     event: String,
     created_at: String,
@@ -8054,7 +2835,7 @@ pub(crate) fn acquire_mutation_lock(app_state_root: &Path) -> Result<MutationLoc
     })
 }
 
-fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
+pub(super) fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
     match OpenOptions::new()
         .read(true)
         .write(true)
@@ -8076,7 +2857,10 @@ fn open_mutation_lock_file(lock_path: &Path) -> Result<File, String> {
     }
 }
 
-fn validate_open_mutation_lock_file(lock_path: &Path, file: &File) -> Result<(), String> {
+pub(super) fn validate_open_mutation_lock_file(
+    lock_path: &Path,
+    file: &File,
+) -> Result<(), String> {
     let path_metadata = fs::symlink_metadata(lock_path).map_err(|error| error.to_string())?;
     let file_metadata = file.metadata().map_err(|error| error.to_string())?;
     if !path_metadata.file_type().is_file() || !file_metadata.file_type().is_file() {
@@ -8115,33 +2899,39 @@ mod mutation_lock_file_tests {
     }
 }
 
-fn lock_contention_reason(lock_path: &Path) -> String {
+pub(super) fn lock_contention_reason(lock_path: &Path) -> String {
     parse_lock_pid(lock_path).map_or_else(
         || "lock-contention: mutation lock is already held".to_string(),
         |owner_pid| format!("lock-contention: mutation lock is already held by pid {owner_pid}"),
     )
 }
 
-fn parse_lock_pid(lock_path: &Path) -> Option<u32> {
+pub(super) fn parse_lock_pid(lock_path: &Path) -> Option<u32> {
     let raw = fs::read_to_string(lock_path).ok()?;
     let value: Value = serde_json::from_str(&raw).ok()?;
     let pid = value.get("pid")?.as_u64()?;
     u32::try_from(pid).ok()
 }
 
-fn vault_path(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
+pub(super) fn vault_path(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
     vault_root_path(app_state_root, item).join("payload")
 }
 
-fn json_configured_mcp_vault_payload_path(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
+pub(super) fn json_configured_mcp_vault_payload_path(
+    app_state_root: &Path,
+    item: &DiscoveryItem,
+) -> PathBuf {
     vault_root_path(app_state_root, item).join("payload.json")
 }
 
-fn zed_configured_mcp_vault_payload_path(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
+pub(super) fn zed_configured_mcp_vault_payload_path(
+    app_state_root: &Path,
+    item: &DiscoveryItem,
+) -> PathBuf {
     vault_root_path(app_state_root, item).join("payload.json")
 }
 
-fn vault_root_path(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
+pub(super) fn vault_root_path(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
     app_state_root
         .join("vault")
         .join(item.provider.as_str())
@@ -8150,7 +2940,10 @@ fn vault_root_path(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
         .join(encode_path_segment(&item.id))
 }
 
-fn disabled_directory_vault_root(app_state_root: &Path, item: &DiscoveryItem) -> PathBuf {
+pub(super) fn disabled_directory_vault_root(
+    app_state_root: &Path,
+    item: &DiscoveryItem,
+) -> PathBuf {
     let state_path = Path::new(&item.state_path);
     if state_path.file_name() == Some(std::ffi::OsStr::new("entry.json")) {
         state_path
@@ -8162,7 +2955,7 @@ fn disabled_directory_vault_root(app_state_root: &Path, item: &DiscoveryItem) ->
     }
 }
 
-fn vault_kind_segment(item: &DiscoveryItem) -> &'static str {
+pub(super) fn vault_kind_segment(item: &DiscoveryItem) -> &'static str {
     if item.category == DiscoveryCategory::ConfiguredMcp {
         item.category.as_str()
     } else {
@@ -8170,7 +2963,7 @@ fn vault_kind_segment(item: &DiscoveryItem) -> &'static str {
     }
 }
 
-fn directory_toggle_payload_is_available(
+pub(super) fn directory_toggle_payload_is_available(
     item: &DiscoveryItem,
     payload_path: &Path,
     original_path: &Path,
@@ -8183,7 +2976,7 @@ fn directory_toggle_payload_is_available(
         .is_ok_and(|metadata| !metadata.file_type().is_symlink() && metadata.is_dir())
 }
 
-fn backup_directory_toggle_payload(
+pub(super) fn backup_directory_toggle_payload(
     item: &DiscoveryItem,
     source: &Path,
     destination: &Path,
@@ -8221,7 +3014,7 @@ fn backup_directory_toggle_payload(
     }
 }
 
-fn copy_directory_symlink(source: &Path, destination: &Path) -> Result<(), io::Error> {
+pub(super) fn copy_directory_symlink(source: &Path, destination: &Path) -> Result<(), io::Error> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.file_type().is_symlink() {
         return Err(io::Error::new(
@@ -8235,7 +3028,10 @@ fn copy_directory_symlink(source: &Path, destination: &Path) -> Result<(), io::E
     create_directory_symlink(&fs::read_link(source)?, destination)
 }
 
-fn copy_dir_all_preserving_symlinks(source: &Path, destination: &Path) -> Result<(), io::Error> {
+pub(super) fn copy_dir_all_preserving_symlinks(
+    source: &Path,
+    destination: &Path,
+) -> Result<(), io::Error> {
     let source_metadata = fs::symlink_metadata(source)?;
     if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
         return Err(io::Error::new(
@@ -8272,7 +3068,7 @@ fn copy_dir_all_preserving_symlinks(source: &Path, destination: &Path) -> Result
     Ok(())
 }
 
-fn copy_symlink(source: &Path, destination: &Path) -> Result<(), io::Error> {
+pub(super) fn copy_symlink(source: &Path, destination: &Path) -> Result<(), io::Error> {
     let metadata = fs::symlink_metadata(source)?;
     if !metadata.file_type().is_symlink() {
         return Err(io::Error::new(
@@ -8287,15 +3083,23 @@ fn copy_symlink(source: &Path, destination: &Path) -> Result<(), io::Error> {
 }
 
 #[cfg(unix)]
-fn create_symlink_like(_source: &Path, target: &Path, link: &Path) -> Result<(), io::Error> {
+pub(super) fn create_symlink_like(
+    _source: &Path,
+    target: &Path,
+    link: &Path,
+) -> Result<(), io::Error> {
     std::os::unix::fs::symlink(target, link)
 }
 
 #[cfg(windows)]
-fn create_symlink_like(source: &Path, target: &Path, link: &Path) -> Result<(), io::Error> {
+pub(super) fn create_symlink_like(
+    source: &Path,
+    target: &Path,
+    link: &Path,
+) -> Result<(), io::Error> {
     use std::os::windows::fs::MetadataExt as _;
 
-    const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
+    pub(super) const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x10;
     if fs::symlink_metadata(source)?.file_attributes() & FILE_ATTRIBUTE_DIRECTORY != 0 {
         std::os::windows::fs::symlink_dir(target, link)
     } else {
@@ -8304,7 +3108,11 @@ fn create_symlink_like(source: &Path, target: &Path, link: &Path) -> Result<(), 
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_symlink_like(_source: &Path, _target: &Path, link: &Path) -> Result<(), io::Error> {
+pub(super) fn create_symlink_like(
+    _source: &Path,
+    _target: &Path,
+    link: &Path,
+) -> Result<(), io::Error> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!(
@@ -8315,17 +3123,17 @@ fn create_symlink_like(_source: &Path, _target: &Path, link: &Path) -> Result<()
 }
 
 #[cfg(unix)]
-fn create_directory_symlink(target: &Path, link: &Path) -> Result<(), io::Error> {
+pub(super) fn create_directory_symlink(target: &Path, link: &Path) -> Result<(), io::Error> {
     std::os::unix::fs::symlink(target, link)
 }
 
 #[cfg(windows)]
-fn create_directory_symlink(target: &Path, link: &Path) -> Result<(), io::Error> {
+pub(super) fn create_directory_symlink(target: &Path, link: &Path) -> Result<(), io::Error> {
     std::os::windows::fs::symlink_dir(target, link)
 }
 
 #[cfg(not(any(unix, windows)))]
-fn create_directory_symlink(_target: &Path, link: &Path) -> Result<(), io::Error> {
+pub(super) fn create_directory_symlink(_target: &Path, link: &Path) -> Result<(), io::Error> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         format!(
@@ -8335,7 +3143,7 @@ fn create_directory_symlink(_target: &Path, link: &Path) -> Result<(), io::Error
     ))
 }
 
-fn directory_tree_is_plain(path: &Path) -> Result<bool, io::Error> {
+pub(super) fn directory_tree_is_plain(path: &Path) -> Result<bool, io::Error> {
     let metadata = fs::symlink_metadata(path)?;
     if metadata.file_type().is_symlink() {
         return Ok(false);
@@ -8356,7 +3164,7 @@ fn directory_tree_is_plain(path: &Path) -> Result<bool, io::Error> {
     Ok(true)
 }
 
-fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), io::Error> {
+pub(super) fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), io::Error> {
     let source_metadata = fs::symlink_metadata(source)?;
     if source_metadata.file_type().is_symlink() || !source_metadata.is_dir() {
         return Err(io::Error::new(
@@ -8400,12 +3208,12 @@ fn copy_dir_all(source: &Path, destination: &Path) -> Result<(), io::Error> {
     Ok(())
 }
 
-fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), io::Error> {
+pub(super) fn write_json_file(path: &Path, value: &impl Serialize) -> Result<(), io::Error> {
     let json = serde_json::to_string_pretty(value).map_err(io::Error::other)?;
     fs::write(path, format!("{json}\n"))
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
+pub(super) fn encode_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -8415,7 +3223,7 @@ fn encode_hex(bytes: &[u8]) -> String {
     encoded
 }
 
-fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
+pub(super) fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
     if !encoded.len().is_multiple_of(2) {
         return Err("hex value has an odd length".to_string());
     }
@@ -8430,7 +3238,7 @@ fn decode_hex(encoded: &str) -> Result<Vec<u8>, String> {
         .collect()
 }
 
-fn hex_nibble(byte: u8) -> Result<u8, String> {
+pub(super) fn hex_nibble(byte: u8) -> Result<u8, String> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
         b'a'..=b'f' => Ok(byte - b'a' + 10),
@@ -8438,11 +3246,11 @@ fn hex_nibble(byte: u8) -> Result<u8, String> {
     }
 }
 
-fn entry_payload_path(entry_id: &str) -> String {
+pub(super) fn entry_payload_path(entry_id: &str) -> String {
     format!("entries/{entry_id}/payload")
 }
 
-fn append_audit_entry(path: &Path, entry: &impl Serialize) -> Result<(), io::Error> {
+pub(super) fn append_audit_entry(path: &Path, entry: &impl Serialize) -> Result<(), io::Error> {
     let audit_path = path.join("audit").join("log.jsonl");
     let json = serde_json::to_string(entry).map_err(io::Error::other)?;
     let mut file = OpenOptions::new()
@@ -8452,13 +3260,13 @@ fn append_audit_entry(path: &Path, entry: &impl Serialize) -> Result<(), io::Err
     writeln!(file, "{json}")
 }
 
-fn append_failed_apply_audit_entry(path: &Path, entry: &FailedApplyAuditEntry) {
+pub(super) fn append_failed_apply_audit_entry(path: &Path, entry: &FailedApplyAuditEntry) {
     if fs::create_dir_all(path.join("audit")).is_ok() {
         let _ = append_audit_entry(path, entry);
     }
 }
 
-fn append_pre_mutation_failed_apply_audit_entry(
+pub(super) fn append_pre_mutation_failed_apply_audit_entry(
     app_state_root: &Path,
     item: &DiscoveryItem,
     target_enabled: bool,
@@ -8483,7 +3291,7 @@ fn append_pre_mutation_failed_apply_audit_entry(
     );
 }
 
-fn load_backup_manifest(
+pub(super) fn load_backup_manifest(
     app_state_root: &Path,
     backup_id: &str,
     backup_authentication_key: Option<&BackupAuthenticationKey>,
@@ -8518,7 +3326,7 @@ fn load_backup_manifest(
 /// Resolve a retired native child backup ID through the authenticated bundle
 /// manifest that absorbed it. A valid bundle alias wins over a present child
 /// directory, so interrupted cleanup cannot restore only part of a batch.
-fn resolve_backup_id(
+pub(super) fn resolve_backup_id(
     app_state_root: &Path,
     backup_id: &str,
     backup_authentication_key: Option<&BackupAuthenticationKey>,
@@ -8606,7 +3414,7 @@ pub(crate) fn authenticated_backup_manifest_digest(
         .map_err(|error| error.to_string())
 }
 
-fn restore_manifest_transaction(
+pub(super) fn restore_manifest_transaction(
     app_state_root: &Path,
     manifest: &BackupManifest,
 ) -> Result<Option<String>, String> {
@@ -8691,7 +3499,9 @@ fn restore_manifest_transaction(
     Ok(None)
 }
 
-fn prepare_restore_audit_target(app_state_root: &Path) -> Result<MutationTarget, String> {
+pub(super) fn prepare_restore_audit_target(
+    app_state_root: &Path,
+) -> Result<MutationTarget, String> {
     let audit_root = app_state_root.join("audit");
     match fs::symlink_metadata(&audit_root) {
         Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
@@ -8726,13 +3536,16 @@ fn prepare_restore_audit_target(app_state_root: &Path) -> Result<MutationTarget,
     })
 }
 
-fn push_unique_mutation_target(targets: &mut Vec<MutationTarget>, target: MutationTarget) {
+pub(super) fn push_unique_mutation_target(
+    targets: &mut Vec<MutationTarget>,
+    target: MutationTarget,
+) {
     if !targets.contains(&target) {
         targets.push(target);
     }
 }
 
-fn rollback_restore_failure(
+pub(super) fn rollback_restore_failure(
     reason: String,
     rollback_root: &Path,
     rollback_entries: &[BackupEntry],
@@ -8756,7 +3569,9 @@ fn rollback_restore_failure(
     reason
 }
 
-fn validate_restore_manifest_preconditions(manifest: &BackupManifest) -> Result<(), String> {
+pub(super) fn validate_restore_manifest_preconditions(
+    manifest: &BackupManifest,
+) -> Result<(), String> {
     let selections = backup_manifest_selections(manifest);
     for entry in &manifest.entries {
         if !entry.existed
@@ -8796,7 +3611,7 @@ fn validate_restore_manifest_preconditions(manifest: &BackupManifest) -> Result<
     Ok(())
 }
 
-fn capture_restore_rollback_entries(
+pub(super) fn capture_restore_rollback_entries(
     targets: &[MutationTarget],
     rollback_root: &Path,
 ) -> Result<Vec<BackupEntry>, String> {
@@ -8845,7 +3660,7 @@ fn capture_restore_rollback_entries(
     capture_result
 }
 
-fn capture_path_restore_rollback(
+pub(super) fn capture_path_restore_rollback(
     target: &MutationTarget,
     payload_path: &Path,
     entry_id: &str,
@@ -8896,7 +3711,7 @@ fn capture_path_restore_rollback(
     ))
 }
 
-fn capture_sqlite_restore_rollback(
+pub(super) fn capture_sqlite_restore_rollback(
     target: &MutationTarget,
     payload_path: &Path,
     entry_id: &str,
@@ -8923,7 +3738,7 @@ fn capture_sqlite_restore_rollback(
     ))
 }
 
-fn rollback_attempted_targets(
+pub(super) fn rollback_attempted_targets(
     rollback_root: &Path,
     rollback_entries: &[BackupEntry],
     attempted_targets: &[MutationTarget],
@@ -8949,14 +3764,17 @@ fn rollback_attempted_targets(
     Ok(())
 }
 
-fn restore_rollback_entry(rollback_root: &Path, entry: &BackupEntry) -> Result<(), String> {
+pub(super) fn restore_rollback_entry(
+    rollback_root: &Path,
+    entry: &BackupEntry,
+) -> Result<(), String> {
     if entry.target.target_type == "path" {
         remove_path_if_present(Path::new(&entry.target.path))?;
     }
     restore_backup_entry(rollback_root, entry)
 }
 
-fn restore_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Result<(), String> {
+pub(super) fn restore_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Result<(), String> {
     if entry.target.target_type == "sqlite-item" {
         return restore_sqlite_backup_entry(backup_root, entry);
     }
@@ -9021,7 +3839,7 @@ fn restore_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Result<(), S
     }
 }
 
-fn remove_path_if_present(target_path: &Path) -> Result<(), String> {
+pub(super) fn remove_path_if_present(target_path: &Path) -> Result<(), String> {
     ensure_target_parent_has_no_symlink_components(target_path)?;
     match fs::symlink_metadata(target_path) {
         Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
@@ -9033,7 +3851,7 @@ fn remove_path_if_present(target_path: &Path) -> Result<(), String> {
     }
 }
 
-fn ensure_restore_target_absent(target_path: &Path) -> Result<(), String> {
+pub(super) fn ensure_restore_target_absent(target_path: &Path) -> Result<(), String> {
     ensure_target_parent_has_no_symlink_components(target_path)?;
     match fs::symlink_metadata(target_path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
@@ -9045,7 +3863,7 @@ fn ensure_restore_target_absent(target_path: &Path) -> Result<(), String> {
     }
 }
 
-fn ensure_restore_file_target_is_not_symlink(target_path: &Path) -> Result<(), String> {
+pub(super) fn ensure_restore_file_target_is_not_symlink(target_path: &Path) -> Result<(), String> {
     ensure_target_parent_has_no_symlink_components(target_path)?;
     match fs::symlink_metadata(target_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
@@ -9058,7 +3876,7 @@ fn ensure_restore_file_target_is_not_symlink(target_path: &Path) -> Result<(), S
     }
 }
 
-fn ensure_regular_backup_file_payload(payload_path: &Path) -> Result<(), String> {
+pub(super) fn ensure_regular_backup_file_payload(payload_path: &Path) -> Result<(), String> {
     match fs::symlink_metadata(payload_path) {
         Ok(metadata) if metadata.is_file() && !metadata.file_type().is_symlink() => Ok(()),
         Ok(_) => Err(format!(
@@ -9069,7 +3887,10 @@ fn ensure_regular_backup_file_payload(payload_path: &Path) -> Result<(), String>
     }
 }
 
-fn restore_sqlite_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Result<(), String> {
+pub(super) fn restore_sqlite_backup_entry(
+    backup_root: &Path,
+    entry: &BackupEntry,
+) -> Result<(), String> {
     let target_path = PathBuf::from(&entry.target.path);
     ensure_target_parent_has_no_symlink_components(&target_path)?;
     if !entry.existed {
@@ -9093,13 +3914,19 @@ fn restore_sqlite_backup_entry(backup_root: &Path, entry: &BackupEntry) -> Resul
     write_cursor_workspace_disabled_server_ids_raw(&target_path, &payload)
 }
 
-fn backup_payload_path(backup_root: &Path, payload: &BackupPayload) -> Result<PathBuf, String> {
+pub(super) fn backup_payload_path(
+    backup_root: &Path,
+    payload: &BackupPayload,
+) -> Result<PathBuf, String> {
     let payload_path = backup_root.join(backup_payload_relative_path(&payload.path)?);
     validate_backup_payload_parent(backup_root, &payload_path)?;
     Ok(payload_path)
 }
 
-fn validate_backup_payload_parent(backup_root: &Path, payload_path: &Path) -> Result<(), String> {
+pub(super) fn validate_backup_payload_parent(
+    backup_root: &Path,
+    payload_path: &Path,
+) -> Result<(), String> {
     let backup_root_metadata = fs::symlink_metadata(backup_root).map_err(|error| {
         format!(
             "backup root could not be validated: {}: {error}",
@@ -9148,7 +3975,7 @@ fn validate_backup_payload_parent(backup_root: &Path, payload_path: &Path) -> Re
     Ok(())
 }
 
-fn backup_payload_relative_path(payload_path: &str) -> Result<PathBuf, String> {
+pub(super) fn backup_payload_relative_path(payload_path: &str) -> Result<PathBuf, String> {
     let relative_path = Path::new(payload_path);
     let mut validated = PathBuf::new();
     for component in relative_path.components() {
@@ -9165,7 +3992,10 @@ fn backup_payload_relative_path(payload_path: &str) -> Result<PathBuf, String> {
     Ok(validated)
 }
 
-fn validate_path_has_no_symlink_components(root: &Path, path: &Path) -> Result<(), String> {
+pub(super) fn validate_path_has_no_symlink_components(
+    root: &Path,
+    path: &Path,
+) -> Result<(), String> {
     let relative_path = path
         .strip_prefix(root)
         .map_err(|_| format!("vault path is outside Unpin state root: {}", path.display()))?;
@@ -9192,7 +4022,7 @@ fn validate_path_has_no_symlink_components(root: &Path, path: &Path) -> Result<(
     Ok(())
 }
 
-fn remove_restored_vault_entry(
+pub(super) fn remove_restored_vault_entry(
     app_state_root: &Path,
     selection: &DiscoveryItem,
 ) -> Result<(), String> {
@@ -9204,14 +4034,17 @@ fn remove_restored_vault_entry(
     Ok(())
 }
 
-fn vault_mutation_target(app_state_root: &Path, selection: &DiscoveryItem) -> MutationTarget {
+pub(super) fn vault_mutation_target(
+    app_state_root: &Path,
+    selection: &DiscoveryItem,
+) -> MutationTarget {
     MutationTarget {
         target_type: "path".to_string(),
         path: path_string(vault_root_path(app_state_root, selection)),
     }
 }
 
-fn backup_manifest_selections(manifest: &BackupManifest) -> Vec<&DiscoveryItem> {
+pub(super) fn backup_manifest_selections(manifest: &BackupManifest) -> Vec<&DiscoveryItem> {
     manifest
         .authenticity
         .as_ref()
@@ -9222,7 +4055,7 @@ fn backup_manifest_selections(manifest: &BackupManifest) -> Vec<&DiscoveryItem> 
         )
 }
 
-fn restore_failed(
+pub(super) fn restore_failed(
     backup_id: String,
     affected_targets: Vec<MutationTarget>,
     reason: impl Into<String>,
@@ -9235,7 +4068,7 @@ fn restore_failed(
     }
 }
 
-fn valid_backup_id(backup_id: &str) -> bool {
+pub(super) fn valid_backup_id(backup_id: &str) -> bool {
     let mut chars = backup_id.chars();
     let Some(first) = chars.next() else {
         return false;
@@ -9247,15 +4080,15 @@ fn valid_backup_id(backup_id: &str) -> bool {
         && chars.all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
-fn path_string(path: PathBuf) -> String {
+pub(super) fn path_string(path: PathBuf) -> String {
     path.to_string_lossy().into_owned()
 }
 
-fn is_supported_codex_configured_mcp(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_codex_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Codex && item.category == DiscoveryCategory::ConfiguredMcp
 }
 
-fn is_supported_pi_file_skill(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_pi_file_skill(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Pi
         && item.category == DiscoveryCategory::Skill
         && item.id.starts_with(match item.layer {
@@ -9268,7 +4101,7 @@ fn is_supported_pi_file_skill(item: &DiscoveryItem) -> bool {
             == Some("md")
 }
 
-fn path_file_item_noun(item: &DiscoveryItem) -> &'static str {
+pub(super) fn path_file_item_noun(item: &DiscoveryItem) -> &'static str {
     if is_supported_pi_file_skill(item) {
         "skill"
     } else {
@@ -9276,7 +4109,7 @@ fn path_file_item_noun(item: &DiscoveryItem) -> &'static str {
     }
 }
 
-fn path_file_item_title(item: &DiscoveryItem) -> &'static str {
+pub(super) fn path_file_item_title(item: &DiscoveryItem) -> &'static str {
     if is_supported_pi_file_skill(item) {
         "Skill"
     } else {
@@ -9284,7 +4117,7 @@ fn path_file_item_title(item: &DiscoveryItem) -> &'static str {
     }
 }
 
-fn is_supported_cursor_local_plugin(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_cursor_local_plugin(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Cursor
         && item.layer == DiscoveryLayer::Global
         && item.category == DiscoveryCategory::PluginManifest
@@ -9294,7 +4127,7 @@ fn is_supported_cursor_local_plugin(item: &DiscoveryItem) -> bool {
             .is_some_and(|plugin_id| !plugin_id.is_empty())
 }
 
-fn directory_item_noun(item: &DiscoveryItem) -> &'static str {
+pub(super) fn directory_item_noun(item: &DiscoveryItem) -> &'static str {
     if is_supported_cursor_local_plugin(item) {
         "plugin"
     } else {
@@ -9302,7 +4135,7 @@ fn directory_item_noun(item: &DiscoveryItem) -> &'static str {
     }
 }
 
-fn directory_item_title(item: &DiscoveryItem) -> &'static str {
+pub(super) fn directory_item_title(item: &DiscoveryItem) -> &'static str {
     if is_supported_cursor_local_plugin(item) {
         "Cursor local plugin"
     } else {
@@ -9310,7 +4143,7 @@ fn directory_item_title(item: &DiscoveryItem) -> &'static str {
     }
 }
 
-fn directory_item_original_path(item: &DiscoveryItem) -> Option<PathBuf> {
+pub(super) fn directory_item_original_path(item: &DiscoveryItem) -> Option<PathBuf> {
     let source_path = Path::new(&item.source_path);
     if is_supported_cursor_local_plugin(item) {
         source_path.parent()?.parent().map(Path::to_path_buf)
@@ -9319,7 +4152,7 @@ fn directory_item_original_path(item: &DiscoveryItem) -> Option<PathBuf> {
     }
 }
 
-fn directory_item_restart_guidance(item: &DiscoveryItem) -> &'static str {
+pub(super) fn directory_item_restart_guidance(item: &DiscoveryItem) -> &'static str {
     if is_supported_cursor_local_plugin(item) {
         " Restart Cursor or reload its window to load the change."
     } else {
@@ -9327,7 +4160,7 @@ fn directory_item_restart_guidance(item: &DiscoveryItem) -> &'static str {
     }
 }
 
-fn directory_item_shared_source_guidance(item: &DiscoveryItem) -> &'static str {
+pub(super) fn directory_item_shared_source_guidance(item: &DiscoveryItem) -> &'static str {
     if item.is_shared_skill_source() {
         " This changes every provider loading this source path."
     } else {
@@ -9335,7 +4168,7 @@ fn directory_item_shared_source_guidance(item: &DiscoveryItem) -> &'static str {
     }
 }
 
-fn validate_cursor_local_plugin_directory(
+pub(super) fn validate_cursor_local_plugin_directory(
     item: &DiscoveryItem,
     plugin_path: &Path,
 ) -> Result<(), String> {
@@ -9356,63 +4189,63 @@ fn validate_cursor_local_plugin_directory(
     }
 }
 
-fn is_supported_codex_plugin(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_codex_plugin(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Codex
         && item.layer == DiscoveryLayer::Global
         && item.category == DiscoveryCategory::PluginConfig
         && codex_plugin_id(item).is_some()
 }
 
-fn is_supported_cursor_configured_mcp(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_cursor_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Cursor
         && matches!(item.layer, DiscoveryLayer::Global | DiscoveryLayer::Project)
         && item.category == DiscoveryCategory::ConfiguredMcp
         && cursor_configured_mcp_server_id(item).is_some()
 }
 
-fn is_supported_claude_global_configured_mcp(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_claude_global_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Claude
         && item.layer == DiscoveryLayer::Global
         && item.category == DiscoveryCategory::ConfiguredMcp
         && json_configured_mcp_server_id(item).is_some()
 }
 
-fn is_supported_claude_local_configured_mcp(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_claude_local_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Claude
         && item.layer == DiscoveryLayer::Project
         && item.category == DiscoveryCategory::ConfiguredMcp
         && claude_local_configured_mcp_id_parts(item).is_some()
 }
 
-fn is_supported_zed_configured_mcp(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_zed_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Zed
         && matches!(item.layer, DiscoveryLayer::Global | DiscoveryLayer::Project)
         && item.category == DiscoveryCategory::ConfiguredMcp
         && zed_configured_mcp_server_id(item).is_some()
 }
 
-fn is_supported_opencode_configured_mcp(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_opencode_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::OpenCode
         && matches!(item.layer, DiscoveryLayer::Global | DiscoveryLayer::Project)
         && item.category == DiscoveryCategory::ConfiguredMcp
         && opencode_configured_mcp_server_id(item).is_some()
 }
 
-fn is_supported_opencode_plugin_config(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_opencode_plugin_config(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::OpenCode
         && matches!(item.layer, DiscoveryLayer::Global | DiscoveryLayer::Project)
         && item.category == DiscoveryCategory::PluginConfig
         && opencode_plugin_config_id(item).is_some()
 }
 
-fn is_supported_pi_package_extension(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_pi_package_extension(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Pi
         && matches!(item.layer, DiscoveryLayer::Global | DiscoveryLayer::Project)
         && item.category == DiscoveryCategory::PluginConfig
         && pi_package_extension_source(item).is_some()
 }
 
-fn pi_package_extension_source(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn pi_package_extension_source(item: &DiscoveryItem) -> Option<&str> {
     let prefix = match item.layer {
         DiscoveryLayer::Global => PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX,
         DiscoveryLayer::Project => PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX,
@@ -9422,11 +4255,11 @@ fn pi_package_extension_source(item: &DiscoveryItem) -> Option<&str> {
         .filter(|source| !source.is_empty())
 }
 
-fn opencode_plugin_config_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn opencode_plugin_config_id(item: &DiscoveryItem) -> Option<&str> {
     opencode_plugin_config_id_from_id(&item.id, item.layer)
 }
 
-fn opencode_plugin_config_id_from_id(id: &str, layer: DiscoveryLayer) -> Option<&str> {
+pub(super) fn opencode_plugin_config_id_from_id(id: &str, layer: DiscoveryLayer) -> Option<&str> {
     let prefix = match layer {
         DiscoveryLayer::Global => OPENCODE_GLOBAL_PLUGIN_CONFIG_ID_PREFIX,
         DiscoveryLayer::Project => OPENCODE_PROJECT_PLUGIN_CONFIG_ID_PREFIX,
@@ -9435,7 +4268,7 @@ fn opencode_plugin_config_id_from_id(id: &str, layer: DiscoveryLayer) -> Option<
         .filter(|plugin_id| !plugin_id.is_empty())
 }
 
-fn is_supported_claude_configured_mcp(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_claude_configured_mcp(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Claude
         && item.layer == DiscoveryLayer::Project
         && item.category == DiscoveryCategory::ConfiguredMcp
@@ -9443,18 +4276,18 @@ fn is_supported_claude_configured_mcp(item: &DiscoveryItem) -> bool {
         && claude_project_configured_mcp_server_id(item).is_some()
 }
 
-fn is_supported_claude_all_project_mcp_servers(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_claude_all_project_mcp_servers(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Claude
         && item.layer == DiscoveryLayer::Project
         && item.category == DiscoveryCategory::ConfiguredMcp
         && item.id == CLAUDE_ALL_PROJECT_MCP_SERVERS_ID
 }
 
-fn is_supported_claude_plugin_config(item: &DiscoveryItem) -> bool {
+pub(super) fn is_supported_claude_plugin_config(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Claude && item.category == DiscoveryCategory::PluginConfig
 }
 
-fn claude_project_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn claude_project_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     let server_id = item
         .id
         .strip_prefix(CLAUDE_PROJECT_CONFIGURED_MCP_ID_PREFIX)?;
@@ -9465,7 +4298,7 @@ fn claude_project_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str>
     }
 }
 
-fn claude_plugin_config_id(item: &DiscoveryItem) -> Option<String> {
+pub(super) fn claude_plugin_config_id(item: &DiscoveryItem) -> Option<String> {
     if item.provider != ProviderId::Claude || item.category != DiscoveryCategory::PluginConfig {
         return None;
     }
@@ -9481,7 +4314,7 @@ fn claude_plugin_config_id(item: &DiscoveryItem) -> Option<String> {
     }
 }
 
-fn read_claude_enabled_plugin(path: &Path, plugin_id: &str) -> Result<bool, String> {
+pub(super) fn read_claude_enabled_plugin(path: &Path, plugin_id: &str) -> Result<bool, String> {
     let document = read_json_value(path)?;
     document
         .get("enabledPlugins")
@@ -9491,12 +4324,15 @@ fn read_claude_enabled_plugin(path: &Path, plugin_id: &str) -> Result<bool, Stri
         .ok_or_else(|| format!("enabledPlugins.{plugin_id} is missing or not boolean"))
 }
 
-fn read_claude_configured_mcp_enabled(path: &Path, server_id: &str) -> Result<bool, String> {
+pub(super) fn read_claude_configured_mcp_enabled(
+    path: &Path,
+    server_id: &str,
+) -> Result<bool, String> {
     let document = read_json_value(path)?;
     claude_configured_mcp_enabled(&document, server_id)
 }
 
-fn read_claude_all_project_mcp_servers(path: &Path) -> Result<bool, String> {
+pub(super) fn read_claude_all_project_mcp_servers(path: &Path) -> Result<bool, String> {
     let document = read_json_value(path)?;
     document
         .get("enableAllProjectMcpServers")
@@ -9504,14 +4340,14 @@ fn read_claude_all_project_mcp_servers(path: &Path) -> Result<bool, String> {
         .ok_or_else(|| "enableAllProjectMcpServers is missing or not boolean".to_string())
 }
 
-fn read_json_value(path: &Path) -> Result<Value, String> {
+pub(super) fn read_json_value(path: &Path) -> Result<Value, String> {
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("JSON settings could not be read: {}", error))?;
     serde_json::from_str(&raw)
         .map_err(|error| format!("JSON settings could not be parsed: {error}"))
 }
 
-fn read_jsonc_raw(path: &Path) -> Result<String, String> {
+pub(super) fn read_jsonc_raw(path: &Path) -> Result<String, String> {
     fs::read_to_string(path).map_err(|error| {
         format!(
             "JSONC settings could not be read: {}: {error}",
@@ -9520,17 +4356,21 @@ fn read_jsonc_raw(path: &Path) -> Result<String, String> {
     })
 }
 
-fn parse_jsonc_value(raw: &str) -> Result<Value, String> {
+pub(super) fn parse_jsonc_value(raw: &str) -> Result<Value, String> {
     jsonc_parser::parse_to_serde_value(raw, &Default::default())
         .map_err(|error| format!("JSONC settings could not be parsed: {error}"))
 }
 
-fn read_cursor_workspace_disabled_server_ids(database_path: &Path) -> Result<Vec<String>, String> {
+pub(super) fn read_cursor_workspace_disabled_server_ids(
+    database_path: &Path,
+) -> Result<Vec<String>, String> {
     let raw = read_cursor_workspace_disabled_server_ids_raw(database_path)?;
     parse_cursor_workspace_disabled_server_ids(database_path, &raw)
 }
 
-fn read_cursor_workspace_disabled_server_ids_raw(database_path: &Path) -> Result<Vec<u8>, String> {
+pub(super) fn read_cursor_workspace_disabled_server_ids_raw(
+    database_path: &Path,
+) -> Result<Vec<u8>, String> {
     read_cursor_workspace_disabled_server_ids_raw_optional(database_path)?.ok_or_else(|| {
         format!(
             "Cursor workspace database not found: {}",
@@ -9539,7 +4379,7 @@ fn read_cursor_workspace_disabled_server_ids_raw(database_path: &Path) -> Result
     })
 }
 
-fn read_cursor_workspace_disabled_server_ids_raw_optional(
+pub(super) fn read_cursor_workspace_disabled_server_ids_raw_optional(
     database_path: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
     if !ensure_cursor_workspace_database_target(database_path)? {
@@ -9553,7 +4393,7 @@ fn read_cursor_workspace_disabled_server_ids_raw_optional(
     read_cursor_workspace_disabled_server_ids_raw_from_connection(&connection, database_path)
 }
 
-fn read_cursor_workspace_disabled_server_ids_raw_from_connection(
+pub(super) fn read_cursor_workspace_disabled_server_ids_raw_from_connection(
     connection: &Connection,
     database_path: &Path,
 ) -> Result<Option<Vec<u8>>, String> {
@@ -9579,7 +4419,7 @@ fn read_cursor_workspace_disabled_server_ids_raw_from_connection(
     Ok(Some(raw))
 }
 
-fn parse_cursor_workspace_disabled_server_ids(
+pub(super) fn parse_cursor_workspace_disabled_server_ids(
     database_path: &Path,
     raw: &[u8],
 ) -> Result<Vec<String>, String> {
@@ -9591,7 +4431,7 @@ fn parse_cursor_workspace_disabled_server_ids(
     })
 }
 
-fn write_cursor_workspace_disabled_server_ids_raw(
+pub(super) fn write_cursor_workspace_disabled_server_ids_raw(
     database_path: &Path,
     raw: &[u8],
 ) -> Result<(), String> {
@@ -9609,7 +4449,7 @@ fn write_cursor_workspace_disabled_server_ids_raw(
     write_cursor_workspace_disabled_server_ids_raw_on_connection(&connection, database_path, raw)
 }
 
-fn write_cursor_workspace_disabled_server_ids_raw_on_connection(
+pub(super) fn write_cursor_workspace_disabled_server_ids_raw_on_connection(
     connection: &Connection,
     database_path: &Path,
     raw: &[u8],
@@ -9624,7 +4464,9 @@ fn write_cursor_workspace_disabled_server_ids_raw_on_connection(
     Ok(())
 }
 
-fn delete_cursor_workspace_disabled_server_ids(database_path: &Path) -> Result<(), String> {
+pub(super) fn delete_cursor_workspace_disabled_server_ids(
+    database_path: &Path,
+) -> Result<(), String> {
     if !ensure_cursor_workspace_database_target(database_path)? {
         return Ok(());
     }
@@ -9642,7 +4484,7 @@ fn delete_cursor_workspace_disabled_server_ids(database_path: &Path) -> Result<(
     Ok(())
 }
 
-fn open_cursor_workspace_database(
+pub(super) fn open_cursor_workspace_database(
     database_path: &Path,
     flags: OpenFlags,
     action: &str,
@@ -9661,7 +4503,9 @@ fn open_cursor_workspace_database(
     Ok(connection)
 }
 
-fn ensure_cursor_workspace_database_target(database_path: &Path) -> Result<bool, String> {
+pub(super) fn ensure_cursor_workspace_database_target(
+    database_path: &Path,
+) -> Result<bool, String> {
     ensure_target_parent_has_no_symlink_components(database_path)?;
     match fs::symlink_metadata(database_path) {
         Ok(metadata) if metadata.file_type().is_symlink() => Err(format!(
@@ -9681,7 +4525,7 @@ fn ensure_cursor_workspace_database_target(database_path: &Path) -> Result<bool,
     }
 }
 
-fn cursor_workspace_database_error(
+pub(super) fn cursor_workspace_database_error(
     database_path: &Path,
     action: &str,
     error: &SqliteError,
@@ -9702,7 +4546,7 @@ fn cursor_workspace_database_error(
     )
 }
 
-fn sqlite_value_to_bytes(value: SqliteValue) -> Option<Vec<u8>> {
+pub(super) fn sqlite_value_to_bytes(value: SqliteValue) -> Option<Vec<u8>> {
     match value {
         SqliteValue::Text(value) => Some(value.into_bytes()),
         SqliteValue::Blob(value) => Some(value),
@@ -9710,7 +4554,7 @@ fn sqlite_value_to_bytes(value: SqliteValue) -> Option<Vec<u8>> {
     }
 }
 
-fn set_claude_enabled_plugin(
+pub(super) fn set_claude_enabled_plugin(
     document: &mut Value,
     plugin_id: &str,
     target_enabled: bool,
@@ -9730,7 +4574,7 @@ fn set_claude_enabled_plugin(
     Ok(())
 }
 
-fn set_claude_all_project_mcp_servers(
+pub(super) fn set_claude_all_project_mcp_servers(
     document: &mut Value,
     target_enabled: bool,
 ) -> Result<(), String> {
@@ -9748,7 +4592,7 @@ fn set_claude_all_project_mcp_servers(
     Ok(())
 }
 
-fn claude_mcp_server_value(document: &Value, server_id: &str) -> Result<Value, String> {
+pub(super) fn claude_mcp_server_value(document: &Value, server_id: &str) -> Result<Value, String> {
     let servers = document
         .get("mcpServers")
         .and_then(Value::as_object)
@@ -9763,7 +4607,10 @@ fn claude_mcp_server_value(document: &Value, server_id: &str) -> Result<Value, S
     Ok(value.clone())
 }
 
-fn claude_configured_mcp_enabled(document: &Value, server_id: &str) -> Result<bool, String> {
+pub(super) fn claude_configured_mcp_enabled(
+    document: &Value,
+    server_id: &str,
+) -> Result<bool, String> {
     if let Some(disabled_servers) = optional_json_object(document, "disabledMcpjsonServers")?
         && disabled_servers.contains_key(server_id)
     {
@@ -9779,7 +4626,7 @@ fn claude_configured_mcp_enabled(document: &Value, server_id: &str) -> Result<bo
     Ok(true)
 }
 
-fn set_claude_configured_mcp_approval(
+pub(super) fn set_claude_configured_mcp_approval(
     document: &mut Value,
     server_id: &str,
     payload: Value,
@@ -9805,7 +4652,7 @@ fn set_claude_configured_mcp_approval(
     Ok(())
 }
 
-fn optional_json_object<'a>(
+pub(super) fn optional_json_object<'a>(
     document: &'a Value,
     field: &str,
 ) -> Result<Option<&'a serde_json::Map<String, Value>>, String> {
@@ -9818,7 +4665,7 @@ fn optional_json_object<'a>(
     }
 }
 
-fn ensure_json_object_mut<'a>(
+pub(super) fn ensure_json_object_mut<'a>(
     document: &'a mut Value,
     field: &str,
 ) -> Result<&'a mut serde_json::Map<String, Value>, String> {
@@ -9833,7 +4680,7 @@ fn ensure_json_object_mut<'a>(
         .ok_or_else(|| format!("{field} is not an object"))
 }
 
-fn codex_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn codex_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     let prefix = match item.layer {
         DiscoveryLayer::Global => CODEX_GLOBAL_CONFIGURED_MCP_ID_PREFIX,
         DiscoveryLayer::Project => CODEX_PROJECT_CONFIGURED_MCP_ID_PREFIX,
@@ -9846,7 +4693,7 @@ fn codex_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     }
 }
 
-fn codex_plugin_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn codex_plugin_id(item: &DiscoveryItem) -> Option<&str> {
     item.id.strip_prefix(CODEX_GLOBAL_PLUGIN_CONFIG_ID_PREFIX)?;
     if item.display_name.is_empty() {
         None
@@ -9855,7 +4702,7 @@ fn codex_plugin_id(item: &DiscoveryItem) -> Option<&str> {
     }
 }
 
-fn cursor_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn cursor_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     let server_id = match item.layer {
         DiscoveryLayer::Global => item
             .id
@@ -9871,7 +4718,7 @@ fn cursor_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     }
 }
 
-fn json_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn json_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     match item.provider {
         ProviderId::Claude if item.layer == DiscoveryLayer::Global => {
             let server_id = item
@@ -9887,7 +4734,7 @@ fn json_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     }
 }
 
-fn claude_local_configured_mcp_id_parts(item: &DiscoveryItem) -> Option<(&str, &str)> {
+pub(super) fn claude_local_configured_mcp_id_parts(item: &DiscoveryItem) -> Option<(&str, &str)> {
     let remainder = item
         .id
         .strip_prefix(CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX)?;
@@ -9902,7 +4749,7 @@ fn claude_local_configured_mcp_id_parts(item: &DiscoveryItem) -> Option<(&str, &
     Some((scope_token, server_id))
 }
 
-fn json_mcp_provider_name(provider: ProviderId) -> &'static str {
+pub(super) fn json_mcp_provider_name(provider: ProviderId) -> &'static str {
     match provider {
         ProviderId::Claude => "Claude",
         ProviderId::Codex => "Codex",
@@ -9913,7 +4760,7 @@ fn json_mcp_provider_name(provider: ProviderId) -> &'static str {
     }
 }
 
-fn zed_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn zed_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     let server_id = match item.layer {
         DiscoveryLayer::Global => item.id.strip_prefix(ZED_GLOBAL_CONFIGURED_MCP_ID_PREFIX)?,
         DiscoveryLayer::Project => item.id.strip_prefix(ZED_PROJECT_CONFIGURED_MCP_ID_PREFIX)?,
@@ -9925,7 +4772,7 @@ fn zed_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     }
 }
 
-fn opencode_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
+pub(super) fn opencode_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     let server_id = match item.layer {
         DiscoveryLayer::Global => item
             .id
@@ -9937,7 +4784,7 @@ fn opencode_configured_mcp_server_id(item: &DiscoveryItem) -> Option<&str> {
     (!server_id.is_empty()).then_some(server_id)
 }
 
-fn is_cursor_workspace_state_path(item: &DiscoveryItem) -> bool {
+pub(super) fn is_cursor_workspace_state_path(item: &DiscoveryItem) -> bool {
     item.provider == ProviderId::Cursor
         && item.category == DiscoveryCategory::ConfiguredMcp
         && item.state_path != item.source_path
@@ -9947,7 +4794,7 @@ fn is_cursor_workspace_state_path(item: &DiscoveryItem) -> bool {
             == Some("state.vscdb")
 }
 
-fn cursor_workspace_server_id(server_id: &str) -> String {
+pub(super) fn cursor_workspace_server_id(server_id: &str) -> String {
     if server_id.starts_with("user-") {
         server_id.to_string()
     } else {
@@ -9955,7 +4802,7 @@ fn cursor_workspace_server_id(server_id: &str) -> String {
     }
 }
 
-fn configured_json_mcp_servers<'a>(
+pub(super) fn configured_json_mcp_servers<'a>(
     document: &'a Value,
     item: &DiscoveryItem,
 ) -> Result<&'a serde_json::Map<String, Value>, String> {
@@ -9976,7 +4823,7 @@ fn configured_json_mcp_servers<'a>(
         .ok_or_else(|| "Claude local project mcpServers is missing or not an object".to_string())
 }
 
-fn configured_json_mcp_servers_mut<'a>(
+pub(super) fn configured_json_mcp_servers_mut<'a>(
     document: &'a mut Value,
     item: &DiscoveryItem,
 ) -> Result<&'a mut serde_json::Map<String, Value>, String> {
@@ -9997,7 +4844,10 @@ fn configured_json_mcp_servers_mut<'a>(
         .ok_or_else(|| "Claude local project mcpServers is missing or not an object".to_string())
 }
 
-fn claude_local_project_key(document: &Value, scope_token: &str) -> Result<String, String> {
+pub(super) fn claude_local_project_key(
+    document: &Value,
+    scope_token: &str,
+) -> Result<String, String> {
     let projects = document
         .get("projects")
         .and_then(Value::as_object)
@@ -10017,7 +4867,7 @@ fn claude_local_project_key(document: &Value, scope_token: &str) -> Result<Strin
     Ok(project_key.clone())
 }
 
-fn configured_json_mcp_server_value(
+pub(super) fn configured_json_mcp_server_value(
     document: &Value,
     item: &DiscoveryItem,
     server_id: &str,
@@ -10025,7 +4875,7 @@ fn configured_json_mcp_server_value(
     json_mcp_server_value_from_servers(configured_json_mcp_servers(document, item)?, server_id)
 }
 
-fn configured_json_mcp_server_present(
+pub(super) fn configured_json_mcp_server_present(
     document: &Value,
     item: &DiscoveryItem,
     server_id: &str,
@@ -10040,7 +4890,7 @@ fn configured_json_mcp_server_present(
     Ok(true)
 }
 
-fn json_mcp_server_value(document: &Value, server_id: &str) -> Result<Value, String> {
+pub(super) fn json_mcp_server_value(document: &Value, server_id: &str) -> Result<Value, String> {
     let servers = document
         .get("mcpServers")
         .and_then(Value::as_object)
@@ -10048,7 +4898,7 @@ fn json_mcp_server_value(document: &Value, server_id: &str) -> Result<Value, Str
     json_mcp_server_value_from_servers(servers, server_id)
 }
 
-fn json_mcp_server_value_from_servers(
+pub(super) fn json_mcp_server_value_from_servers(
     servers: &serde_json::Map<String, Value>,
     server_id: &str,
 ) -> Result<Value, String> {
@@ -10062,7 +4912,10 @@ fn json_mcp_server_value_from_servers(
     Ok(value.clone())
 }
 
-fn cursor_mcp_server_disabled_flag(document: &Value, server_id: &str) -> Result<(), String> {
+pub(super) fn cursor_mcp_server_disabled_flag(
+    document: &Value,
+    server_id: &str,
+) -> Result<(), String> {
     let value = json_mcp_server_value(document, server_id)?;
     if value.get("disabled").and_then(Value::as_bool) == Some(true) {
         Ok(())
@@ -10071,11 +4924,11 @@ fn cursor_mcp_server_disabled_flag(document: &Value, server_id: &str) -> Result<
     }
 }
 
-fn cursor_mcp_server_enabled_from_value(value: &Value) -> bool {
+pub(super) fn cursor_mcp_server_enabled_from_value(value: &Value) -> bool {
     value.get("disabled").and_then(Value::as_bool) != Some(true)
 }
 
-fn remove_configured_json_mcp_server(
+pub(super) fn remove_configured_json_mcp_server(
     document: &mut Value,
     item: &DiscoveryItem,
     server_id: &str,
@@ -10093,7 +4946,7 @@ fn remove_configured_json_mcp_server(
         .expect("validated JSON MCP server exists"))
 }
 
-fn remove_cursor_mcp_server_disabled_flag(
+pub(super) fn remove_cursor_mcp_server_disabled_flag(
     document: &mut Value,
     server_id: &str,
 ) -> Result<(), String> {
@@ -10115,7 +4968,10 @@ fn remove_cursor_mcp_server_disabled_flag(
     Ok(())
 }
 
-fn prepare_cursor_mcp_payload(payload: &mut Value, server_id: &str) -> Result<(), String> {
+pub(super) fn prepare_cursor_mcp_payload(
+    payload: &mut Value,
+    server_id: &str,
+) -> Result<(), String> {
     let Some(server) = payload.as_object_mut() else {
         return Err(format!(
             "mcpServers.{server_id} vaulted payload is not an object"
@@ -10125,7 +4981,7 @@ fn prepare_cursor_mcp_payload(payload: &mut Value, server_id: &str) -> Result<()
     Ok(())
 }
 
-fn opencode_mcp_server_value(raw: &str, server_id: &str) -> Result<Value, String> {
+pub(super) fn opencode_mcp_server_value(raw: &str, server_id: &str) -> Result<Value, String> {
     let document = parse_jsonc_value(raw)?;
     let servers = document
         .get("mcp")
@@ -10146,7 +5002,7 @@ fn opencode_mcp_server_value(raw: &str, server_id: &str) -> Result<Value, String
     Ok(server.clone())
 }
 
-fn set_opencode_mcp_enabled_jsonc(
+pub(super) fn set_opencode_mcp_enabled_jsonc(
     raw: &str,
     server_id: &str,
     enabled: bool,
@@ -10181,19 +5037,19 @@ fn set_opencode_mcp_enabled_jsonc(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct PiPackageVaultPayload {
+pub(super) struct PiPackageVaultPayload {
     package_source: String,
     original_entry: Value,
     original_raw: String,
     disabled_entry_fingerprint: String,
 }
 
-struct PiPackageRewrite {
+pub(super) struct PiPackageRewrite {
     rendered: String,
     payload: Option<PiPackageVaultPayload>,
 }
 
-fn pi_package_entries(raw: &str) -> Result<Vec<Value>, String> {
+pub(super) fn pi_package_entries(raw: &str) -> Result<Vec<Value>, String> {
     let document = serde_json::from_str::<Value>(raw)
         .map_err(|error| format!("Pi settings are not valid JSON: {error}"))?;
     let packages = document
@@ -10212,7 +5068,10 @@ fn pi_package_entries(raw: &str) -> Result<Vec<Value>, String> {
     Ok(packages.clone())
 }
 
-fn pi_package_selection(raw: &str, package_source: &str) -> Result<(Vec<Value>, usize), String> {
+pub(super) fn pi_package_selection(
+    raw: &str,
+    package_source: &str,
+) -> Result<(Vec<Value>, usize), String> {
     let entries = pi_package_entries(raw)?;
     let index = entries
         .iter()
@@ -10223,7 +5082,7 @@ fn pi_package_selection(raw: &str, package_source: &str) -> Result<(Vec<Value>, 
     Ok((entries, index))
 }
 
-fn pi_package_element_range(raw: &str, index: usize) -> Result<(usize, usize), String> {
+pub(super) fn pi_package_element_range(raw: &str, index: usize) -> Result<(usize, usize), String> {
     let parsed =
         jsonc_parser::parse_to_ast(raw, &CollectOptions::default(), &ParseOptions::default())
             .map_err(|error| format!("Pi settings JSON could not be parsed: {error}"))?;
@@ -10249,7 +5108,7 @@ fn pi_package_element_range(raw: &str, index: usize) -> Result<(usize, usize), S
         .ok_or_else(|| "Pi package entry index changed during JSON parsing".to_string())
 }
 
-fn replace_pi_package_entry(
+pub(super) fn replace_pi_package_entry(
     raw: &str,
     index: usize,
     replacement_raw: &str,
@@ -10277,7 +5136,7 @@ fn replace_pi_package_entry(
     Ok(rendered)
 }
 
-fn validate_pi_package_vault_payload(
+pub(super) fn validate_pi_package_vault_payload(
     payload: &PiPackageVaultPayload,
     package_source: &str,
 ) -> Result<(), String> {
@@ -10312,7 +5171,7 @@ fn validate_pi_package_vault_payload(
     Ok(())
 }
 
-fn read_pi_package_vault_payload(
+pub(super) fn read_pi_package_vault_payload(
     path: &Path,
     package_source: &str,
 ) -> Result<PiPackageVaultPayload, String> {
@@ -10332,7 +5191,7 @@ fn read_pi_package_vault_payload(
     Ok(payload)
 }
 
-fn load_optional_pi_package_vault(
+pub(super) fn load_optional_pi_package_vault(
     app_state_root: &Path,
     item: &DiscoveryItem,
     package_source: &str,
@@ -10361,7 +5220,7 @@ fn load_optional_pi_package_vault(
     Ok(Some((entry, payload)))
 }
 
-fn prepare_pi_package_disable(
+pub(super) fn prepare_pi_package_disable(
     raw: &str,
     package_source: &str,
     discovered_fingerprint: Option<&str>,
@@ -10404,7 +5263,7 @@ fn prepare_pi_package_disable(
     })
 }
 
-fn prepare_pi_package_enable(
+pub(super) fn prepare_pi_package_enable(
     raw: &str,
     package_source: &str,
     discovered_fingerprint: Option<&str>,
@@ -10458,18 +5317,18 @@ fn prepare_pi_package_enable(
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OpenCodePluginVaultPayload {
+pub(super) struct OpenCodePluginVaultPayload {
     plugin_id: String,
     original_order: Vec<String>,
 }
 
-struct OpenCodePluginRemoval {
+pub(super) struct OpenCodePluginRemoval {
     rendered: String,
     payload: OpenCodePluginVaultPayload,
     jsonc_format: Option<JsoncVaultFormat>,
 }
 
-fn opencode_plugin_ids(raw: &str) -> Result<Vec<String>, String> {
+pub(super) fn opencode_plugin_ids(raw: &str) -> Result<Vec<String>, String> {
     let document = parse_jsonc_value(raw)?;
     let plugins = document
         .get("plugin")
@@ -10491,7 +5350,7 @@ fn opencode_plugin_ids(raw: &str) -> Result<Vec<String>, String> {
     Ok(plugin_ids)
 }
 
-fn validate_opencode_plugin_vault_payload(
+pub(super) fn validate_opencode_plugin_vault_payload(
     payload: &OpenCodePluginVaultPayload,
     plugin_id: &str,
 ) -> Result<(), String> {
@@ -10510,7 +5369,7 @@ fn validate_opencode_plugin_vault_payload(
     Ok(())
 }
 
-fn read_opencode_plugin_vault_payload(
+pub(super) fn read_opencode_plugin_vault_payload(
     path: &Path,
     plugin_id: &str,
 ) -> Result<OpenCodePluginVaultPayload, String> {
@@ -10530,7 +5389,7 @@ fn read_opencode_plugin_vault_payload(
     Ok(payload)
 }
 
-fn merge_opencode_plugin_order(base: &mut Vec<String>, current_ids: &[String]) {
+pub(super) fn merge_opencode_plugin_order(base: &mut Vec<String>, current_ids: &[String]) {
     for (current_index, plugin_id) in current_ids.iter().enumerate() {
         if base.contains(plugin_id) {
             continue;
@@ -10553,7 +5412,7 @@ fn merge_opencode_plugin_order(base: &mut Vec<String>, current_ids: &[String]) {
     }
 }
 
-fn opencode_plugin_order_with_vaults(
+pub(super) fn opencode_plugin_order_with_vaults(
     app_state_root: &Path,
     item: &DiscoveryItem,
     raw: &str,
@@ -10649,7 +5508,7 @@ fn opencode_plugin_order_with_vaults(
     Ok(original_order)
 }
 
-fn prepare_opencode_plugin_removal(
+pub(super) fn prepare_opencode_plugin_removal(
     raw: &str,
     plugin_id: &str,
     discovered_fingerprint: Option<&str>,
@@ -10799,7 +5658,7 @@ fn prepare_opencode_plugin_removal(
     })
 }
 
-fn strict_opencode_plugin_insertion_index(
+pub(super) fn strict_opencode_plugin_insertion_index(
     current_ids: &[String],
     payload: &OpenCodePluginVaultPayload,
 ) -> usize {
@@ -10826,7 +5685,7 @@ fn strict_opencode_plugin_insertion_index(
         .unwrap_or(current_ids.len())
 }
 
-fn prepare_opencode_plugin_restore(
+pub(super) fn prepare_opencode_plugin_restore(
     raw: &str,
     plugin_id: &str,
     payload: &OpenCodePluginVaultPayload,
@@ -10902,7 +5761,7 @@ fn prepare_opencode_plugin_restore(
     Ok(rendered)
 }
 
-fn insert_configured_json_mcp_server(
+pub(super) fn insert_configured_json_mcp_server(
     document: &mut Value,
     item: &DiscoveryItem,
     server_id: &str,
@@ -10922,7 +5781,7 @@ fn insert_configured_json_mcp_server(
     Ok(())
 }
 
-fn zed_context_server_value(document: &Value, server_id: &str) -> Result<Value, String> {
+pub(super) fn zed_context_server_value(document: &Value, server_id: &str) -> Result<Value, String> {
     let servers = document
         .get("context_servers")
         .and_then(Value::as_object)
@@ -10937,13 +5796,13 @@ fn zed_context_server_value(document: &Value, server_id: &str) -> Result<Value, 
     Ok(value.clone())
 }
 
-struct ZedJsoncRemoval {
+pub(super) struct ZedJsoncRemoval {
     rendered: String,
     value_raw: String,
     format: Option<JsoncVaultFormat>,
 }
 
-fn prepare_zed_context_server_removal(
+pub(super) fn prepare_zed_context_server_removal(
     raw: &str,
     server_id: &str,
     discovered_fingerprint: Option<&str>,
@@ -10973,7 +5832,7 @@ fn prepare_zed_context_server_removal(
     Ok(removal)
 }
 
-fn prepare_zed_context_server_restore(
+pub(super) fn prepare_zed_context_server_restore(
     source_path: &Path,
     source_raw: &str,
     server_id: &str,
@@ -11013,7 +5872,10 @@ fn prepare_zed_context_server_restore(
     }
 }
 
-fn remove_zed_context_server_jsonc(raw: &str, server_id: &str) -> Result<ZedJsoncRemoval, String> {
+pub(super) fn remove_zed_context_server_jsonc(
+    raw: &str,
+    server_id: &str,
+) -> Result<ZedJsoncRemoval, String> {
     if serde_json::from_str::<Value>(raw).is_ok() {
         return remove_zed_context_server_strict_json(raw, server_id);
     }
@@ -11094,7 +5956,7 @@ fn remove_zed_context_server_jsonc(raw: &str, server_id: &str) -> Result<ZedJson
     })
 }
 
-fn remove_zed_context_server_strict_json(
+pub(super) fn remove_zed_context_server_strict_json(
     raw: &str,
     server_id: &str,
 ) -> Result<ZedJsoncRemoval, String> {
@@ -11125,7 +5987,7 @@ fn remove_zed_context_server_strict_json(
     })
 }
 
-fn restore_zed_context_server_jsonc(
+pub(super) fn restore_zed_context_server_jsonc(
     raw: &str,
     server_id: &str,
     format: &JsoncVaultFormat,
@@ -11163,7 +6025,7 @@ fn restore_zed_context_server_jsonc(
     Ok(rendered)
 }
 
-fn insert_zed_context_server_jsonc(
+pub(super) fn insert_zed_context_server_jsonc(
     raw: &str,
     server_id: &str,
     value_raw: &str,
@@ -11224,7 +6086,7 @@ fn insert_zed_context_server_jsonc(
     Ok(rendered)
 }
 
-fn set_codex_skill_config_enabled(
+pub(super) fn set_codex_skill_config_enabled(
     raw: &str,
     skill_path: &Path,
     enabled: bool,
@@ -11266,7 +6128,7 @@ fn set_codex_skill_config_enabled(
     Ok(rewritten)
 }
 
-fn toml_table_bool(section: &str, key: &str) -> Result<Option<bool>, String> {
+pub(super) fn toml_table_bool(section: &str, key: &str) -> Result<Option<bool>, String> {
     let Some(assignment) = crate::toml_syntax::top_level_assignment(section, key) else {
         return Ok(None);
     };
@@ -11283,7 +6145,7 @@ fn toml_table_bool(section: &str, key: &str) -> Result<Option<bool>, String> {
     }
 }
 
-fn set_toml_table_bool(
+pub(super) fn set_toml_table_bool(
     raw: &str,
     table_prefix: &str,
     table_id: &str,
@@ -11302,7 +6164,7 @@ fn set_toml_table_bool(
     Ok(rewritten)
 }
 
-fn ensure_unique_standard_toml_tables(raw: &str) -> Result<(), String> {
+pub(super) fn ensure_unique_standard_toml_tables(raw: &str) -> Result<(), String> {
     let malformed_table_headers = malformed_table_header_lines(raw);
     if !malformed_table_headers.is_empty() {
         return Err(format!(
@@ -11334,7 +6196,11 @@ fn ensure_unique_standard_toml_tables(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn set_toml_section_bool(section: &str, key: &str, value: bool) -> Result<String, String> {
+pub(super) fn set_toml_section_bool(
+    section: &str,
+    key: &str,
+    value: bool,
+) -> Result<String, String> {
     let rendered_value = if value { "true" } else { "false" };
     if let Some(assignment) = crate::toml_syntax::top_level_assignment(section, key) {
         let existing_len = if assignment.value.starts_with("true")
@@ -11378,12 +6244,12 @@ fn set_toml_section_bool(section: &str, key: &str, value: bool) -> Result<String
     Ok(rewritten)
 }
 
-fn valid_toml_bool_tail(tail: &str) -> bool {
+pub(super) fn valid_toml_bool_tail(tail: &str) -> bool {
     let tail = tail.trim_start();
     tail.is_empty() || tail.starts_with('#')
 }
 
-fn append_toml_table_section(raw: &str, section: &str) -> String {
+pub(super) fn append_toml_table_section(raw: &str, section: &str) -> String {
     let trailing_start = raw
         .char_indices()
         .rev()
@@ -11409,11 +6275,11 @@ fn append_toml_table_section(raw: &str, section: &str) -> String {
     rewritten
 }
 
-fn current_backup_metadata() -> Result<(String, String), String> {
+pub(super) fn current_backup_metadata() -> Result<(String, String), String> {
     Ok((current_backup_id()?, current_timestamp()?))
 }
 
-fn current_backup_id() -> Result<String, String> {
+pub(super) fn current_backup_id() -> Result<String, String> {
     if let Some(backup_id) = TRANSITION_BACKUP_ID_OVERRIDE.with(|slot| slot.borrow().clone()) {
         return Ok(backup_id);
     }
