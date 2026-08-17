@@ -186,9 +186,12 @@ pub(super) fn apply_agent_plugin(
         .authorization
         .take()
         .ok_or("desktop-approval-required")?;
-    let result = controller
-        .apply_with_reach_aware(&plan, authorization, durable, live_discovery)
-        .map_err(|_| "agent-plugin-recovery-required")?;
+    let result = invalidate_after_discovery_change(
+        &state.context,
+        controller
+            .apply_with_reach_aware(&plan, authorization, durable, live_discovery)
+            .map_err(|_| "agent-plugin-recovery-required"),
+    )?;
     state.reviewed_agent_plugins.remove(operation_id);
     let refreshed = fresh_discovery(&state.context).ok().and_then(|discovery| {
         discovery

@@ -120,11 +120,13 @@ pub(super) fn apply_restore(
         .authorization
         .take()
         .ok_or("desktop-approval-required")?;
-    let result = RestoreController::with_session_authority_key(&app_state_root, session_key)
-        .apply(&plan, authorization, &approval_context, Some(backup_key))
-        .map_err(|_| "restore-apply-blocked")?;
+    let result = invalidate_after_discovery_change(
+        &state.context,
+        RestoreController::with_session_authority_key(&app_state_root, session_key)
+            .apply(&plan, authorization, &approval_context, Some(backup_key))
+            .map_err(|_| "restore-apply-blocked"),
+    )?;
     state.reviewed_restores.remove(operation_id);
-    invalidate_discovery(&state.context);
     Ok(json!({"result": redacted_restore_result(&result)}))
 }
 

@@ -199,6 +199,14 @@ pub(super) fn invalidate_discovery(context: &DesktopBridgeContext) {
     context.discovery_cache.invalidate();
 }
 
+pub(super) fn invalidate_after_discovery_change<T, E>(
+    context: &DesktopBridgeContext,
+    result: Result<T, E>,
+) -> Result<T, E> {
+    invalidate_discovery(context);
+    result
+}
+
 pub(crate) fn run(context: DesktopBridgeContext) -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -1148,6 +1156,19 @@ mod tests {
             },
         };
         DesktopBridgeContext::new(config, DiscoveryRoots::fixture_root(root), true)
+    }
+
+    #[test]
+    fn failed_discovery_change_invalidates_cached_discovery() {
+        let temporary = tempfile::tempdir().expect("temporary bridge root");
+        let context = bridge_test_context(temporary.path());
+        let cached = cached_discovery_arc(&context).expect("initial discovery");
+
+        let result = invalidate_after_discovery_change(&context, Err::<(), _>("apply-failed"));
+
+        assert_eq!(result, Err("apply-failed"));
+        let refreshed = cached_discovery_arc(&context).expect("refreshed discovery");
+        assert!(!std::sync::Arc::ptr_eq(&cached, &refreshed));
     }
 
     fn agent_plugin_fixture_context(root: &std::path::Path) -> DesktopBridgeContext {

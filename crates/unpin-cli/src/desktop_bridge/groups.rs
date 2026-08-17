@@ -100,11 +100,13 @@ pub(super) fn apply_group(
         .ok_or("desktop-approval-required")?;
     let plan = reviewed.plan.clone();
     require_group_write_sandbox(&state.context)?;
-    let result = controller
-        .apply(&plan, authorization)
-        .map_err(|_| "group-apply-blocked")?;
+    let result = invalidate_after_discovery_change(
+        &state.context,
+        controller
+            .apply(&plan, authorization)
+            .map_err(|_| "group-apply-blocked"),
+    )?;
     state.reviewed_groups.remove(operation_id);
-    invalidate_discovery(&state.context);
     Ok(json!({"result": result}))
 }
 
