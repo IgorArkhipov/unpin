@@ -6,6 +6,11 @@ defined below is verified and attached. The release workflow creates a draft
 release; it never publishes directly. Tags with a prerelease suffix create a
 draft prerelease; final version tags create a stable draft release.
 
+If a tag workflow reruns after its release is already published and immutable,
+the workflow verifies that state and succeeds without modifying the release.
+Only a confirmed missing-release response creates a draft; lookup failures
+never fall through to release creation.
+
 ## Release contract
 
 - Canonical repository: `IgorArkhipov/unpin`
@@ -276,6 +281,10 @@ workflow, download every draft asset into a new directory, and repeat evidence
 preparation and upload. If an evidence upload only partially succeeds, do not
 publish; remove the partial evidence asset from the draft and repeat the same
 fresh-download procedure.
+
+After publication, rerunning the tag workflow is a safe no-op: it recognizes
+the immutable release and does not upload, replace, edit, or recreate assets.
+The draft evidence warning above continues to apply until publication.
 
 For a delivery-only artifact exception, skip the ordinary evidence path: the
 draft already contains the generated `SHA256SUMS`. Verify its checksums and the

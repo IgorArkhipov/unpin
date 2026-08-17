@@ -7,6 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-08-17
+
+### Fixed
+
+- Made tag release workflow reruns recognize an already-published immutable
+  release as a non-mutating success while preserving guarded draft refreshes.
+
 ## [1.4.1] - 2026-08-17
 
 ### Changed

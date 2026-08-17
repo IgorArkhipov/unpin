@@ -447,31 +447,81 @@ jobs:
           set -euo pipefail
           notes="docs/releases/${GITHUB_REF_NAME}.md"
           test -f "${notes}"
-          if gh release view "${GITHUB_REF_NAME}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
-            test "$(
+          release_response="$(mktemp)"
+          trap 'rm -f "${release_response}"' EXIT
+          if ! http_status="$(
+            curl --silent --show-error --location \
+              --connect-timeout 10 \
+              --max-time 60 \
+              --retry 3 \
+              --retry-all-errors \
+              --retry-max-time 90 \
+              --output "${release_response}" \
+              --write-out '%{http_code}' \
+              --header 'Accept: application/vnd.github+json' \
+              --header "Authorization: Bearer ${GH_TOKEN}" \
+              --header 'X-GitHub-Api-Version: 2022-11-28' \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/releases/tags/${GITHUB_REF_NAME}"
+          )"; then
+            printf 'release lookup failed for %s\n' "${GITHUB_REF_NAME}" >&2
+            exit 1
+          fi
+
+          case "${http_status}" in
+          200)
+            release_state="$(
+              jq -er '[.draft, .immutable, .tag_name] | @tsv' \
+                "${release_response}"
+            )"
+            IFS=$'\t' read -r is_draft is_immutable tag_name <<< "${release_state}"
+            if [[ "${tag_name}" != "${GITHUB_REF_NAME}" ]]; then
+              printf 'release lookup tag mismatch: expected %s, received %s\n' \
+                "${GITHUB_REF_NAME}" "${tag_name}" >&2
+              exit 1
+            fi
+            if [[ "${is_draft}" == "true" ]]; then
+              if [[ "${is_immutable}" != "false" ]]; then
+                printf 'draft release %s reported isImmutable=%s; refusing mutation\n' \
+                  "${GITHUB_REF_NAME}" "${is_immutable}" >&2
+                exit 1
+              fi
               gh release view "${GITHUB_REF_NAME}" \
                 --repo "${GITHUB_REPOSITORY}" \
-                --json isDraft \
-                --jq '.isDraft'
-            )" = "true"
-            gh release view "${GITHUB_REF_NAME}" \
-              --repo "${GITHUB_REPOSITORY}" \
-              --json assets \
-              --jq '.assets[].name' \
-              | python3 scripts/check_release_assets.py reject-evidence
-            gh release upload "${GITHUB_REF_NAME}" dist/* \
-              --repo "${GITHUB_REPOSITORY}" \
-              --clobber
-          else
-            prerelease_args=()
+                --json assets \
+                --jq '.assets[].name' \
+                | python3 scripts/check_release_assets.py reject-evidence
+              gh release upload "${GITHUB_REF_NAME}" dist/* \
+                --repo "${GITHUB_REPOSITORY}" \
+                --clobber
+            elif [[ "${is_draft}" == "false" ]]; then
+              if [[ "${is_immutable}" != "true" ]]; then
+                printf 'published release %s is not immutable; refusing mutation\n' \
+                  "${GITHUB_REF_NAME}" >&2
+                exit 1
+              fi
+              printf 'published immutable release %s already exists; skipping draft refresh\n' \
+                "${GITHUB_REF_NAME}"
+            else
+              printf 'unexpected release state for %s: isDraft=%s isImmutable=%s\n' \
+                "${GITHUB_REF_NAME}" "${is_draft}" "${is_immutable}" >&2
+              exit 1
+            fi
+            ;;
+          404)
+            release_args=(--draft)
             if [[ "${GITHUB_REF_NAME}" == *-* ]]; then
-              prerelease_args+=(--prerelease)
+              release_args+=(--prerelease)
             fi
             gh release create "${GITHUB_REF_NAME}" dist/* \
               --repo "${GITHUB_REPOSITORY}" \
               --verify-tag \
-              --draft \
-              "${prerelease_args[@]}" \
+              "${release_args[@]}" \
               --title "Unpin ${GITHUB_REF_NAME}" \
               --notes-file "${notes}"
-          fi
+            ;;
+          *)
+            printf 'release lookup for %s returned HTTP %s; refusing mutation\n' \
+              "${GITHUB_REF_NAME}" "${http_status}" >&2
+            exit 1
+            ;;
+          esac
