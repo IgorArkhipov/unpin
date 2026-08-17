@@ -31,6 +31,17 @@ use crate::discovery::{
 };
 use crate::encode_path_segment;
 use crate::fs_support::read_optional_string;
+use crate::ids::{
+    CLAUDE_ALL_PROJECT_MCP_SERVERS_ID, CLAUDE_GLOBAL_CONFIGURED_MCP_ID_PREFIX,
+    CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX, CLAUDE_PROJECT_CONFIGURED_MCP_ID_PREFIX,
+    CODEX_GLOBAL_CONFIGURED_MCP_ID_PREFIX, CODEX_GLOBAL_PLUGIN_CONFIG_ID_PREFIX,
+    CODEX_PROJECT_CONFIGURED_MCP_ID_PREFIX, CURSOR_GLOBAL_CONFIGURED_MCP_ID_PREFIX,
+    CURSOR_GLOBAL_LOCAL_PLUGIN_ID_PREFIX, CURSOR_PROJECT_CONFIGURED_MCP_ID_PREFIX,
+    OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX, OPENCODE_GLOBAL_PLUGIN_CONFIG_ID_PREFIX,
+    OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX, OPENCODE_PROJECT_PLUGIN_CONFIG_ID_PREFIX,
+    PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX, PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX,
+    ZED_GLOBAL_CONFIGURED_MCP_ID_PREFIX, ZED_PROJECT_CONFIGURED_MCP_ID_PREFIX,
+};
 use crate::pi_packages::{pi_disabled_package_entry, pi_package_extension_state};
 use crate::sessions::SessionManager;
 use crate::state::atomic_json::OwnerGeneration;
@@ -65,25 +76,6 @@ mod backup_authentication;
 pub use backup_authentication::BackupAuthenticationKey;
 use backup_authentication::{verify_backup_authentication, write_authenticated_backup_manifest};
 
-const CODEX_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "codex:global:configured-mcp:";
-const CODEX_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "codex:project:configured-mcp:";
-const CODEX_GLOBAL_PLUGIN_CONFIG_ID_PREFIX: &str = "codex:global:plugin-config:config:";
-const CURSOR_GLOBAL_LOCAL_PLUGIN_ID_PREFIX: &str = "cursor:global:plugin-manifest:local:";
-const CURSOR_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "cursor:global:configured-mcp:";
-const CURSOR_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "cursor:project:configured-mcp:";
-const ZED_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "zed:global:configured-mcp:";
-const ZED_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "zed:project:configured-mcp:";
-const OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:global:configured-mcp:";
-const OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:project:configured-mcp:";
-const OPENCODE_GLOBAL_PLUGIN_CONFIG_ID_PREFIX: &str = "opencode:global:plugin-config:npm:";
-const OPENCODE_PROJECT_PLUGIN_CONFIG_ID_PREFIX: &str = "opencode:project:plugin-config:npm:";
-const PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:global:plugin-config:package-extensions:";
-const PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:project:plugin-config:package-extensions:";
-const CLAUDE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:global:configured-mcp:";
-const CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:@local/";
-const CLAUDE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:";
-const CLAUDE_ALL_PROJECT_MCP_SERVERS_ID: &str =
-    "claude:project:configured-mcp:all-project-mcp-servers";
 const CURSOR_WORKSPACE_DISABLED_SERVERS_KEY: &str = "cursor/disabledMcpServers";
 const CURSOR_WORKSPACE_BUSY_TIMEOUT: Duration = Duration::from_secs(1);
 const BACKUP_MANIFEST_VERSION: u8 = 3;

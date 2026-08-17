@@ -34,6 +34,13 @@ use crate::{
 mod project_scopes;
 mod providers;
 
+pub(crate) use crate::ids::{
+    CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX, CURSOR_GLOBAL_SKILL_ID_PREFIX,
+    CURSOR_PROJECT_SKILL_ID_PREFIX, OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX,
+    OPENCODE_GLOBAL_SKILL_ID_PREFIX, OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX,
+    OPENCODE_PROJECT_SKILL_ID_PREFIX, PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX,
+    PI_GLOBAL_SKILL_ID_PREFIX, PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX, PI_PROJECT_SKILL_ID_PREFIX,
+};
 use project_scopes::{
     scan_project_scope_frontier_accumulating_with, scan_project_scope_frontier_with,
 };
@@ -73,9 +80,6 @@ impl std::fmt::Display for DiscoveryCancelled {
 
 impl std::error::Error for DiscoveryCancelled {}
 
-const CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:@local/";
-const CURSOR_GLOBAL_SKILL_ID_PREFIX: &str = "cursor:global:skill:";
-const CURSOR_PROJECT_SKILL_ID_PREFIX: &str = "cursor:project:skill:";
 const CURSOR_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const CURSOR_COMPAT_CLAUDE_SKILL_NAMESPACE: &str = "@compat/claude/";
 const CURSOR_COMPAT_CODEX_SKILL_NAMESPACE: &str = "@compat/codex/";
@@ -84,17 +88,9 @@ const CURSOR_COMPAT_SKILL_NAMESPACES: [&str; 3] = [
     CURSOR_COMPAT_CLAUDE_SKILL_NAMESPACE,
     CURSOR_COMPAT_CODEX_SKILL_NAMESPACE,
 ];
-const PI_GLOBAL_SKILL_ID_PREFIX: &str = "pi:global:skill:";
-const PI_PROJECT_SKILL_ID_PREFIX: &str = "pi:project:skill:";
 const PI_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
-const PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:global:plugin-config:package-extensions:";
-const PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:project:plugin-config:package-extensions:";
-const OPENCODE_GLOBAL_SKILL_ID_PREFIX: &str = "opencode:global:skill:";
-const OPENCODE_PROJECT_SKILL_ID_PREFIX: &str = "opencode:project:skill:";
 const OPENCODE_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const OPENCODE_COMPAT_CLAUDE_SKILL_NAMESPACE: &str = "@compat/claude/";
-const OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:global:configured-mcp:";
-const OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:project:configured-mcp:";
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryRoots {

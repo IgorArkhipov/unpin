@@ -13,6 +13,7 @@ mod fs_support;
 pub mod gateway;
 pub mod groups;
 pub mod hooks;
+mod ids;
 pub mod mcp;
 pub mod mutation;
 pub mod profiles;
