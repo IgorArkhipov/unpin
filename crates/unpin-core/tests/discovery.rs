@@ -28,10 +28,18 @@ fn discovery_reports_provider_progress_and_honors_cancellation() {
     .expect("fixture discovery succeeds");
 
     assert!(!discovery.items.is_empty());
-    assert_eq!(progress.len(), ProviderId::ALL.len() + 1);
+    assert_eq!(progress.len(), ProviderId::ALL.len() + 2);
+    assert_eq!(
+        progress[0],
+        DiscoveryProgress {
+            phase: DiscoveryProgressPhase::ScanningProjectScopes,
+            completed_providers: 0,
+            provider_count: ProviderId::ALL.len(),
+        }
+    );
     for (completed_providers, provider) in ProviderId::ALL.into_iter().enumerate() {
         assert_eq!(
-            progress[completed_providers],
+            progress[completed_providers + 1],
             DiscoveryProgress {
                 phase: DiscoveryProgressPhase::DiscoveringProvider(provider),
                 completed_providers,
@@ -40,7 +48,7 @@ fn discovery_reports_provider_progress_and_honors_cancellation() {
         );
     }
     assert_eq!(
-        progress[ProviderId::ALL.len()],
+        progress[ProviderId::ALL.len() + 1],
         DiscoveryProgress {
             phase: DiscoveryProgressPhase::Finalizing,
             completed_providers: ProviderId::ALL.len(),
@@ -49,7 +57,13 @@ fn discovery_reports_provider_progress_and_honors_cancellation() {
     );
 
     let error = discover_all_with_progress(&roots, |_| false)
-        .expect_err("cancelling before the first provider stops discovery");
+        .expect_err("cancelling before the repository scan stops discovery");
+    assert_eq!(error.to_string(), "discovery cancelled");
+
+    let error = discover_all_with_progress(&roots, |update| {
+        matches!(update.phase, DiscoveryProgressPhase::ScanningProjectScopes)
+    })
+    .expect_err("cancelling before the first provider stops discovery");
     assert_eq!(error.to_string(), "discovery cancelled");
 
     let error = discover_all_with_progress(&roots, |update| {

@@ -36,7 +36,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
   "stream",
   "rustls",
 ] }
-rmcp = { version = "=3.0.1", default-features = false, features = [
+rmcp = { version = "=3.1.2", default-features = false, features = [
   "client",
   "server",
   "transport-streamable-http-client",
