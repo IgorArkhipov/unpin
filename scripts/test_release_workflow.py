@@ -1,6 +1,11 @@
 from __future__ import annotations
 
+import json
+import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -112,6 +117,209 @@ class ReleaseWorkflowTests(unittest.TestCase):
 
         self.assertNotIn(retired_name, repository_text)
         self.assertNotIn(retired_fingerprint, repository_text.upper())
+
+    def test_published_immutable_release_rerun_is_non_mutating(self) -> None:
+        release_job = self._job("draft")
+
+        self.assertIn("--write-out '%{http_code}'", release_job)
+        self.assertIn("--retry-all-errors", release_job)
+        self.assertIn("case \"${http_status}\" in", release_job)
+        tag_check = release_job.index(
+            'if [[ "${tag_name}" != "${GITHUB_REF_NAME}" ]]'
+        )
+
+        draft_start = release_job.index('if [[ "${is_draft}" == "true" ]]')
+        published_start = release_job.index(
+            'elif [[ "${is_draft}" == "false" ]]'
+        )
+        unexpected_state = release_job.index("unexpected release state")
+        not_found_branch = release_job.index("404)")
+        create_release = release_job.index("gh release create")
+        refused_status = release_job.index("returned HTTP %s; refusing mutation")
+        self.assertLess(tag_check, draft_start)
+        self.assertLess(draft_start, published_start)
+        self.assertLess(published_start, unexpected_state)
+        self.assertLess(unexpected_state, not_found_branch)
+        self.assertLess(not_found_branch, create_release)
+        self.assertLess(create_release, refused_status)
+
+        draft_branch = release_job[draft_start:published_start]
+        published_branch = release_job[published_start:unexpected_state]
+        missing_release_branch = release_job[not_found_branch:refused_status]
+
+        self.assertIn("reported isImmutable=%s", draft_branch)
+        self.assertIn("check_release_assets.py reject-evidence", draft_branch)
+        self.assertIn("gh release upload", draft_branch)
+
+        self.assertIn("is not immutable; refusing mutation", published_branch)
+        self.assertIn("skipping draft refresh", published_branch)
+        self.assertNotIn("gh release upload", published_branch)
+        self.assertNotIn("gh release create", published_branch)
+        self.assertNotIn("gh release edit", published_branch)
+
+        self.assertIn("gh release create", missing_release_branch)
+        self.assertIn("--draft", missing_release_branch)
+        self.assertEqual(release_job.count("gh release upload"), 1)
+        self.assertEqual(release_job.count("gh release create"), 1)
+
+    def test_release_lookup_creates_only_after_confirmed_not_found(self) -> None:
+        missing, missing_calls = self._run_release_step(
+            404,
+            {"message": "Not Found"},
+        )
+        self.assertEqual(missing.returncode, 0, missing.stderr)
+        self.assertTrue(
+            any(call.startswith("release create ") for call in missing_calls),
+            missing_calls,
+        )
+
+        for status in (401, 503):
+            with self.subTest(status=status):
+                failed, failed_calls = self._run_release_step(
+                    status,
+                    {"message": "lookup failed"},
+                )
+                self.assertNotEqual(failed.returncode, 0)
+                self.assertEqual(failed_calls, [])
+                self.assertIn(f"HTTP {status}", failed.stderr)
+
+        network, network_calls = self._run_release_step(
+            0,
+            {},
+            curl_exit=7,
+        )
+        self.assertNotEqual(network.returncode, 0)
+        self.assertEqual(network_calls, [])
+        self.assertIn("release lookup failed", network.stderr)
+
+    def test_release_lookup_preserves_draft_and_published_boundaries(self) -> None:
+        published, published_calls = self._run_release_step(
+            200,
+            {"draft": False, "immutable": True, "tag_name": "v1.4.2"},
+        )
+        self.assertEqual(published.returncode, 0, published.stderr)
+        self.assertEqual(published_calls, [])
+        self.assertIn("skipping draft refresh", published.stdout)
+
+        mutable, mutable_calls = self._run_release_step(
+            200,
+            {"draft": False, "immutable": False, "tag_name": "v1.4.2"},
+        )
+        self.assertNotEqual(mutable.returncode, 0)
+        self.assertEqual(mutable_calls, [])
+
+        draft, draft_calls = self._run_release_step(
+            200,
+            {"draft": True, "immutable": False, "tag_name": "v1.4.2"},
+        )
+        self.assertEqual(draft.returncode, 0, draft.stderr)
+        self.assertTrue(
+            any(call.startswith("release view ") for call in draft_calls),
+            draft_calls,
+        )
+        self.assertTrue(
+            any(call.startswith("release upload ") for call in draft_calls),
+            draft_calls,
+        )
+
+        evidence, evidence_calls = self._run_release_step(
+            200,
+            {"draft": True, "immutable": False, "tag_name": "v1.4.2"},
+            release_assets="unpin-v1.4.2-provider-matrix-evidence.tar.gz\n",
+        )
+        self.assertNotEqual(evidence.returncode, 0)
+        self.assertTrue(
+            any(call.startswith("release view ") for call in evidence_calls),
+            evidence_calls,
+        )
+        self.assertFalse(
+            any(call.startswith("release upload ") for call in evidence_calls),
+            evidence_calls,
+        )
+
+    def _run_release_step(
+        self,
+        http_status: int,
+        release_payload: dict[str, object],
+        *,
+        curl_exit: int = 0,
+        release_assets: str = "",
+    ) -> tuple[subprocess.CompletedProcess[str], list[str]]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fake_bin = Path(temp_dir)
+            gh_log = fake_bin / "gh.log"
+            self._write_executable(
+                fake_bin / "curl",
+                """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+output_path = Path(args[args.index("--output") + 1])
+output_path.write_text(os.environ["FAKE_RELEASE_JSON"], encoding="utf-8")
+print(os.environ["FAKE_HTTP_STATUS"], end="")
+raise SystemExit(int(os.environ["FAKE_CURL_EXIT"]))
+""",
+            )
+            self._write_executable(
+                fake_bin / "gh",
+                """#!/usr/bin/env python3
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+with Path(os.environ["FAKE_GH_LOG"]).open("a", encoding="utf-8") as log:
+    log.write(" ".join(args) + "\\n")
+if args[:2] == ["release", "view"]:
+    print(os.environ.get("FAKE_RELEASE_ASSETS", ""), end="")
+""",
+            )
+
+            env = os.environ.copy()
+            env.update(
+                {
+                    "PATH": f"{fake_bin}{os.pathsep}{env['PATH']}",
+                    "GH_TOKEN": "test-token",
+                    "GITHUB_API_URL": "https://api.github.test",
+                    "GITHUB_REF_NAME": "v1.4.2",
+                    "GITHUB_REPOSITORY": "IgorArkhipov/unpin",
+                    "FAKE_RELEASE_JSON": json.dumps(release_payload),
+                    "FAKE_HTTP_STATUS": str(http_status),
+                    "FAKE_CURL_EXIT": str(curl_exit),
+                    "FAKE_GH_LOG": str(gh_log),
+                    "FAKE_RELEASE_ASSETS": release_assets,
+                }
+            )
+            result = subprocess.run(
+                ["bash", "-c", self._release_script()],
+                cwd=REPOSITORY_ROOT,
+                env=env,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            calls = (
+                gh_log.read_text(encoding="utf-8").splitlines()
+                if gh_log.exists()
+                else []
+            )
+            return result, calls
+
+    def _release_script(self) -> str:
+        draft_job = self._job("draft")
+        step = draft_job.split(
+            "      - name: Create or refresh draft\n",
+            maxsplit=1,
+        )[1]
+        script = step.split("        run: |\n", maxsplit=1)[1]
+        return textwrap.dedent(script)
+
+    @staticmethod
+    def _write_executable(path: Path, content: str) -> None:
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o755)
 
     def _job(self, name: str) -> str:
         match = re.search(
