@@ -2669,6 +2669,10 @@ fn try_take_startup(
 fn loading_status(state: &LoadingState) -> String {
     match state.progress {
         Some(DiscoveryProgress {
+            phase: DiscoveryProgressPhase::ScanningProjectScopes,
+            ..
+        }) => "Scanning project skill scopes…".to_string(),
+        Some(DiscoveryProgress {
             phase: DiscoveryProgressPhase::DiscoveringProvider(provider),
             completed_providers,
             provider_count,
@@ -3671,6 +3675,17 @@ mod tests {
 
     #[test]
     fn loading_view_reports_provider_progress() {
+        assert_eq!(
+            loading_status(&LoadingState {
+                progress: Some(DiscoveryProgress {
+                    phase: DiscoveryProgressPhase::ScanningProjectScopes,
+                    completed_providers: 0,
+                    provider_count: ProviderId::ALL.len(),
+                }),
+            }),
+            "Scanning project skill scopes…"
+        );
+
         let state = LoadingState {
             progress: Some(DiscoveryProgress {
                 phase: DiscoveryProgressPhase::DiscoveringProvider(ProviderId::Codex),
@@ -3887,10 +3902,18 @@ mod tests {
         .collect::<Vec<_>>();
         assert_eq!(inventory, expected);
         assert_eq!(startup.discovery.warnings, Vec::new());
-        assert_eq!(progress.len(), ProviderId::ALL.len() + 1);
+        assert_eq!(progress.len(), ProviderId::ALL.len() + 2);
+        assert_eq!(
+            progress[0],
+            DiscoveryProgress {
+                phase: DiscoveryProgressPhase::ScanningProjectScopes,
+                completed_providers: 0,
+                provider_count: ProviderId::ALL.len(),
+            }
+        );
         for (completed_providers, provider) in ProviderId::ALL.into_iter().enumerate() {
             assert_eq!(
-                progress[completed_providers],
+                progress[completed_providers + 1],
                 DiscoveryProgress {
                     phase: DiscoveryProgressPhase::DiscoveringProvider(provider),
                     completed_providers,
@@ -3899,7 +3922,7 @@ mod tests {
             );
         }
         assert_eq!(
-            progress[ProviderId::ALL.len()],
+            progress[ProviderId::ALL.len() + 1],
             DiscoveryProgress {
                 phase: DiscoveryProgressPhase::Finalizing,
                 completed_providers: ProviderId::ALL.len(),

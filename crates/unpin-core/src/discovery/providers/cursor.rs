@@ -21,7 +21,7 @@ pub(crate) fn discover_cursor(
         items,
         warnings,
     )?;
-    prepopulate_cursor_repository_scopes(roots, project_scope_cache)?;
+    prepopulate_discovered_project_scopes(roots, project_scope_cache)?;
     let project_skills = discover_project_skill_dirs(
         &roots.cursor_project,
         Path::new(".cursor/skills"),
