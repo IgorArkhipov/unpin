@@ -15,7 +15,7 @@ directory, then verify the selected archive's GitHub build provenance:
 ```bash
 shasum -a 256 -c SHA256SUMS
 gh attestation verify \
-  unpin-desktop-v1.4.0-TARGET.tar.gz \
+  unpin-desktop-v1.4.1-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -27,8 +27,8 @@ Extract the archive and move `UnpinDesktop.app` to `/Applications` or
 `~/Applications`:
 
 ```bash
-tar -xzf unpin-desktop-v1.4.0-TARGET.tar.gz
-open unpin-desktop-v1.4.0-TARGET
+tar -xzf unpin-desktop-v1.4.1-TARGET.tar.gz
+open unpin-desktop-v1.4.1-TARGET
 ```
 
 Official releases use a self-signed personal certificate with Hardened Runtime.

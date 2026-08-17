@@ -7,6 +7,26 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-08-17
+
+### Changed
+
+- Reused one repository walk across supported project skill scopes instead of
+  scanning the same tree independently for each provider.
+- Reused desktop discovery projections for up to 60 seconds within one bridge
+  process. **Reload** starts a replacement bridge and reads external provider
+  changes immediately.
+- Split the mutation, MCP, terminal UI, and desktop bridge implementations into
+  focused modules, shared discovery-item ID prefixes, and extracted toggle
+  dispatch without changing their public contracts.
+- Updated the pinned GitHub Actions and compatible Rust dependencies.
+
+### Fixed
+
+- Invalidated the desktop discovery cache after group, restore, and Agent
+  Plugin mutation attempts, including failed applies, so a later refresh does
+  not reuse a projection from before the attempted change.
+
 ## [1.4.0] - 2026-08-14
 
 ### Fixed

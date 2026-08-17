@@ -3119,7 +3119,7 @@ checksum = "b4ac048d71ede7ee76d585517add45da530660ef4390e49b098733c6e897f254"
 
 [[package]]
 name = "unpin-cli"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "assert_cmd",
  "clap",
@@ -3142,7 +3142,7 @@ dependencies = [
 
 [[package]]
 name = "unpin-core"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "flate2",
  "futures",
