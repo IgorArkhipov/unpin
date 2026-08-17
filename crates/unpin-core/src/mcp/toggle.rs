@@ -525,14 +525,7 @@ pub(super) fn bulk_mcp_root_binding(
 }
 
 pub(super) fn mcp_provider_root(roots: &DiscoveryRoots, provider: ProviderId) -> PathBuf {
-    match provider {
-        ProviderId::Claude => roots.claude_global.clone(),
-        ProviderId::Codex => roots.codex_global.clone(),
-        ProviderId::Cursor => roots.cursor_config.clone(),
-        ProviderId::Pi => roots.pi_global.clone(),
-        ProviderId::OpenCode => roots.opencode_global.clone(),
-        ProviderId::Zed => roots.zed_global.clone(),
-    }
+    roots.provider_global_root(provider).to_path_buf()
 }
 
 /// Coarse selector accepted across the public MCP boundary. Exact identities

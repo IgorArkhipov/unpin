@@ -1,7 +1,7 @@
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet, btree_map::Entry},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     fmt::Write as _,
     fs,
     path::{Path, PathBuf},
@@ -34,6 +34,13 @@ use crate::{
 mod project_scopes;
 mod providers;
 
+pub(crate) use crate::ids::{
+    CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX, CURSOR_GLOBAL_SKILL_ID_PREFIX,
+    CURSOR_PROJECT_SKILL_ID_PREFIX, OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX,
+    OPENCODE_GLOBAL_SKILL_ID_PREFIX, OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX,
+    OPENCODE_PROJECT_SKILL_ID_PREFIX, PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX,
+    PI_GLOBAL_SKILL_ID_PREFIX, PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX, PI_PROJECT_SKILL_ID_PREFIX,
+};
 use project_scopes::{
     scan_project_scope_frontier_accumulating_with, scan_project_scope_frontier_with,
 };
@@ -50,6 +57,7 @@ pub type DiscoveryError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiscoveryProgressPhase {
+    ScanningProjectScopes,
     DiscoveringProvider(ProviderId),
     Finalizing,
 }
@@ -72,9 +80,6 @@ impl std::fmt::Display for DiscoveryCancelled {
 
 impl std::error::Error for DiscoveryCancelled {}
 
-const CLAUDE_LOCAL_CONFIGURED_MCP_ID_PREFIX: &str = "claude:project:configured-mcp:@local/";
-const CURSOR_GLOBAL_SKILL_ID_PREFIX: &str = "cursor:global:skill:";
-const CURSOR_PROJECT_SKILL_ID_PREFIX: &str = "cursor:project:skill:";
 const CURSOR_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const CURSOR_COMPAT_CLAUDE_SKILL_NAMESPACE: &str = "@compat/claude/";
 const CURSOR_COMPAT_CODEX_SKILL_NAMESPACE: &str = "@compat/codex/";
@@ -83,17 +88,9 @@ const CURSOR_COMPAT_SKILL_NAMESPACES: [&str; 3] = [
     CURSOR_COMPAT_CLAUDE_SKILL_NAMESPACE,
     CURSOR_COMPAT_CODEX_SKILL_NAMESPACE,
 ];
-const PI_GLOBAL_SKILL_ID_PREFIX: &str = "pi:global:skill:";
-const PI_PROJECT_SKILL_ID_PREFIX: &str = "pi:project:skill:";
 const PI_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
-const PI_GLOBAL_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:global:plugin-config:package-extensions:";
-const PI_PROJECT_PACKAGE_EXTENSION_ID_PREFIX: &str = "pi:project:plugin-config:package-extensions:";
-const OPENCODE_GLOBAL_SKILL_ID_PREFIX: &str = "opencode:global:skill:";
-const OPENCODE_PROJECT_SKILL_ID_PREFIX: &str = "opencode:project:skill:";
 const OPENCODE_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const OPENCODE_COMPAT_CLAUDE_SKILL_NAMESPACE: &str = "@compat/claude/";
-const OPENCODE_GLOBAL_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:global:configured-mcp:";
-const OPENCODE_PROJECT_CONFIGURED_MCP_ID_PREFIX: &str = "opencode:project:configured-mcp:";
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryRoots {
@@ -182,6 +179,30 @@ impl DiscoveryRoots {
         self.app_state_root =
             Some(fs::canonicalize(app_state_root).unwrap_or_else(|_| app_state_root.to_path_buf()));
         self
+    }
+
+    #[must_use]
+    pub fn provider_global_root(&self, provider: ProviderId) -> &Path {
+        match provider {
+            ProviderId::Claude => &self.claude_global,
+            ProviderId::Codex => &self.codex_global,
+            ProviderId::Cursor => &self.cursor_config,
+            ProviderId::Pi => &self.pi_global,
+            ProviderId::OpenCode => &self.opencode_global,
+            ProviderId::Zed => &self.zed_global,
+        }
+    }
+
+    #[must_use]
+    pub fn provider_project_root(&self, provider: ProviderId) -> &Path {
+        match provider {
+            ProviderId::Claude => &self.claude_project,
+            ProviderId::Codex => &self.codex_project,
+            ProviderId::Cursor => &self.cursor_project,
+            ProviderId::Pi => &self.pi_project,
+            ProviderId::OpenCode => &self.opencode_project,
+            ProviderId::Zed => &self.zed_project,
+        }
     }
 }
 
@@ -489,6 +510,14 @@ pub fn discover_all_with_progress(
 ) -> Result<DiscoveryOutput, DiscoveryError> {
     let mut state = DiscoveryState::default();
     let descriptors = provider_registry();
+    if !report_progress(DiscoveryProgress {
+        phase: DiscoveryProgressPhase::ScanningProjectScopes,
+        completed_providers: 0,
+        provider_count: descriptors.len(),
+    }) {
+        return Err(DiscoveryCancelled.into());
+    }
+    prepopulate_discovered_project_scopes(roots, &mut state.project_scope_cache)?;
 
     for (completed_providers, descriptor) in descriptors.iter().enumerate() {
         if !report_progress(DiscoveryProgress {
@@ -733,7 +762,7 @@ impl ProjectScopeCache {
     }
 }
 
-fn prepopulate_cursor_repository_scopes(
+fn prepopulate_discovered_project_scopes(
     roots: &DiscoveryRoots,
     project_scope_cache: &mut ProjectScopeCache,
 ) -> Result<(), DiscoveryError> {
@@ -742,6 +771,11 @@ fn prepopulate_cursor_repository_scopes(
         (roots.shared_project.as_path(), Path::new(".agents/skills")),
         (roots.claude_project.as_path(), Path::new(".claude/skills")),
         (roots.codex_project.as_path(), Path::new(".codex/skills")),
+        (
+            roots.opencode_project.as_path(),
+            Path::new(".opencode/skills"),
+        ),
+        (roots.pi_project.as_path(), Path::new(".pi/skills")),
     ];
     prepopulate_repository_project_scopes(project_scope_cache, &requests, roots.scan_project_scopes)
 }
@@ -764,37 +798,173 @@ fn prepopulate_repository_project_scopes(
         return Ok(());
     }
 
-    let relative_skill_roots = requests
+    let uncached_requests = requests
         .iter()
-        .map(|(_, relative_skill_root)| (*relative_skill_root).to_path_buf())
-        .collect::<BTreeSet<_>>()
-        .into_iter()
+        .copied()
+        .filter(|(project_root, relative_skill_root)| {
+            !project_scope_cache
+                .scopes
+                .contains_key(&ProjectScopeCacheKey {
+                    project_root: (*project_root).to_path_buf(),
+                    repository_root: repository_root.clone(),
+                    relative_skill_root: (*relative_skill_root).to_path_buf(),
+                    traversal: ProjectSkillTraversal::Repository,
+                    scan_project_scopes: true,
+                })
+        })
         .collect::<Vec<_>>();
-    let scope_roots = project_repository_scope_roots(&repository_root, &relative_skill_roots)?
-        .into_iter()
-        .map(|(relative_skill_root, scope_roots)| (relative_skill_root, Arc::new(scope_roots)))
-        .collect::<BTreeMap<_, _>>();
+    if !uncached_requests.is_empty() {
+        let relative_skill_roots = uncached_requests
+            .iter()
+            .map(|(_, relative_skill_root)| (*relative_skill_root).to_path_buf())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let scope_roots = project_repository_scope_roots(&repository_root, &relative_skill_roots)?
+            .into_iter()
+            .map(|(relative_skill_root, scope_roots)| (relative_skill_root, Arc::new(scope_roots)))
+            .collect::<BTreeMap<_, _>>();
 
+        for (project_root, relative_skill_root) in uncached_requests {
+            let key = ProjectScopeCacheKey {
+                project_root: project_root.to_path_buf(),
+                repository_root: repository_root.clone(),
+                relative_skill_root: relative_skill_root.to_path_buf(),
+                traversal: ProjectSkillTraversal::Repository,
+                scan_project_scopes: true,
+            };
+            let scope_roots = Arc::clone(
+                scope_roots
+                    .get(relative_skill_root)
+                    .expect("every requested relative skill root is scanned"),
+            );
+            project_scope_cache.scopes.insert(key, scope_roots);
+        }
+    }
+
+    derive_cached_project_scope_traversals(project_scope_cache, requests, &repository_root);
+    Ok(())
+}
+
+fn derive_cached_project_scope_traversals(
+    project_scope_cache: &mut ProjectScopeCache,
+    requests: &[(&Path, &Path)],
+    repository_root: &Path,
+) {
     for (project_root, relative_skill_root) in requests {
-        let key = ProjectScopeCacheKey {
-            project_root: (*project_root).to_path_buf(),
-            repository_root: repository_root.clone(),
-            relative_skill_root: (*relative_skill_root).to_path_buf(),
+        let project_root: &Path = project_root;
+        let relative_skill_root: &Path = relative_skill_root;
+        let repository_key = ProjectScopeCacheKey {
+            project_root: project_root.to_path_buf(),
+            repository_root: repository_root.to_path_buf(),
+            relative_skill_root: relative_skill_root.to_path_buf(),
             traversal: ProjectSkillTraversal::Repository,
             scan_project_scopes: true,
         };
-        if project_scope_cache.scopes.contains_key(&key) {
+        let Some(repository_scopes) = project_scope_cache.scopes.get(&repository_key).cloned()
+        else {
+            continue;
+        };
+
+        insert_derived_project_scope(
+            project_scope_cache,
+            project_root,
+            repository_root,
+            relative_skill_root,
+            ProjectSkillTraversal::Selected,
+            ProjectSkillScopeRoots {
+                roots: BTreeSet::from([project_root.to_path_buf()]),
+                skipped_directories: 0,
+            },
+        );
+
+        let mut ancestor_roots = BTreeSet::new();
+        add_project_ancestors(project_root, repository_root, &mut ancestor_roots);
+        insert_derived_project_scope(
+            project_scope_cache,
+            project_root,
+            repository_root,
+            relative_skill_root,
+            ProjectSkillTraversal::Ancestors,
+            ProjectSkillScopeRoots {
+                roots: ancestor_roots.clone(),
+                skipped_directories: 0,
+            },
+        );
+
+        if !project_scope_path_is_visible_to_repository_scan(project_root, repository_root)
+            || (project_root != repository_root && repository_scopes.skipped_directories > 0)
+        {
             continue;
         }
-        let scope_roots = Arc::clone(
-            scope_roots
-                .get(*relative_skill_root)
-                .expect("every requested relative skill root is scanned"),
-        );
-        project_scope_cache.scopes.insert(key, scope_roots);
-    }
 
-    Ok(())
+        let mut ancestor_and_descendant_roots = ancestor_roots;
+        ancestor_and_descendant_roots.extend(
+            repository_scopes
+                .roots
+                .iter()
+                .filter(|scope_root| scope_root.starts_with(project_root))
+                .cloned(),
+        );
+        insert_derived_project_scope(
+            project_scope_cache,
+            project_root,
+            repository_root,
+            relative_skill_root,
+            ProjectSkillTraversal::AncestorsAndDescendants,
+            ProjectSkillScopeRoots {
+                roots: ancestor_and_descendant_roots,
+                skipped_directories: if project_root == repository_root {
+                    repository_scopes.skipped_directories
+                } else {
+                    0
+                },
+            },
+        );
+    }
+}
+
+fn insert_derived_project_scope(
+    project_scope_cache: &mut ProjectScopeCache,
+    project_root: &Path,
+    repository_root: &Path,
+    relative_skill_root: &Path,
+    traversal: ProjectSkillTraversal,
+    scope_roots: ProjectSkillScopeRoots,
+) {
+    let key = ProjectScopeCacheKey {
+        project_root: project_root.to_path_buf(),
+        repository_root: repository_root.to_path_buf(),
+        relative_skill_root: relative_skill_root.to_path_buf(),
+        traversal,
+        scan_project_scopes: true,
+    };
+    project_scope_cache
+        .scopes
+        .entry(key)
+        .or_insert_with(|| Arc::new(scope_roots));
+}
+
+fn project_scope_path_is_visible_to_repository_scan(
+    project_root: &Path,
+    repository_root: &Path,
+) -> bool {
+    if project_root == repository_root {
+        return true;
+    }
+    let Ok(relative) = project_root.strip_prefix(repository_root) else {
+        return false;
+    };
+    let mut current = repository_root.to_path_buf();
+    for component in relative.components() {
+        current.push(component.as_os_str());
+        if should_skip_project_scope_dir(component.as_os_str())
+            || is_repository_tmp_dir(repository_root, &current)
+        {
+            return false;
+        }
+    }
+    true
 }
 
 fn skill_path_mutability(
@@ -995,6 +1165,7 @@ fn add_project_ancestors(
 }
 
 const MAX_PROJECT_SCOPE_SCAN_WORKERS: usize = 8;
+const PROJECT_SCOPE_FRONTIER_SEED_MULTIPLIER: usize = 4;
 
 #[derive(Default)]
 struct ProjectScopeScan {
@@ -1010,6 +1181,7 @@ struct ProjectScopeMultiScan {
 
 struct ProjectScopeDirectoryScan {
     scope_root: Option<PathBuf>,
+    matched_additional_skill_roots: Vec<PathBuf>,
     child_directories: Vec<PathBuf>,
     skipped_directories: usize,
 }
@@ -1043,7 +1215,7 @@ fn add_descendant_skill_scopes_with_worker_limit(
     let worker_limit = worker_limit.max(1);
     let mut scan = ProjectScopeScan::default();
     let mut frontier = vec![search_root.to_path_buf()];
-    while frontier.len() < worker_limit {
+    while frontier.len() < worker_limit.saturating_mul(PROJECT_SCOPE_FRONTIER_SEED_MULTIPLIER) {
         let Some(directory) = frontier.pop() else {
             break;
         };
@@ -1052,6 +1224,7 @@ fn add_descendant_skill_scopes_with_worker_limit(
             search_root,
             repository_root,
             relative_skill_root,
+            &[],
         )?;
         extend_project_scope_scan(&mut scan, &directory_scan);
         frontier.extend(directory_scan.child_directories);
@@ -1097,8 +1270,9 @@ fn project_repository_scope_roots(
     }
 
     let worker_limit = project_scope_scan_worker_limit();
+    let additional_relative_skill_roots = &relative_skill_roots[1..];
     let mut frontier = vec![repository_root.to_path_buf()];
-    while frontier.len() < worker_limit {
+    while frontier.len() < worker_limit.saturating_mul(PROJECT_SCOPE_FRONTIER_SEED_MULTIPLIER) {
         let Some(directory) = frontier.pop() else {
             break;
         };
@@ -1107,6 +1281,7 @@ fn project_repository_scope_roots(
             repository_root,
             repository_root,
             primary_relative_skill_root,
+            additional_relative_skill_roots,
         )?;
         extend_project_scope_multi_scan(
             &mut scan,
@@ -1172,6 +1347,7 @@ fn scan_project_scope_multi_subtree(
             repository_root,
             repository_root,
             primary_relative_skill_root,
+            relative_skill_roots.get(1..).unwrap_or(&[]),
         )?;
         extend_project_scope_multi_scan(
             &mut scan,
@@ -1190,9 +1366,7 @@ fn extend_project_scope_multi_scan(
     relative_skill_roots: &[PathBuf],
     directory_scan: &ProjectScopeDirectoryScan,
 ) {
-    let Some((primary_relative_skill_root, additional_relative_skill_roots)) =
-        relative_skill_roots.split_first()
-    else {
+    let Some((primary_relative_skill_root, _)) = relative_skill_roots.split_first() else {
         return;
     };
     if directory_scan.scope_root.is_some() {
@@ -1201,13 +1375,11 @@ fn extend_project_scope_multi_scan(
             .or_default()
             .insert(directory.to_path_buf());
     }
-    for relative_skill_root in additional_relative_skill_roots {
-        if directory.join(relative_skill_root).is_dir() {
-            scan.scope_roots
-                .entry(relative_skill_root.clone())
-                .or_default()
-                .insert(directory.to_path_buf());
-        }
+    for relative_skill_root in &directory_scan.matched_additional_skill_roots {
+        scan.scope_roots
+            .entry(relative_skill_root.clone())
+            .or_default()
+            .insert(directory.to_path_buf());
     }
     scan.skipped_directories += directory_scan.skipped_directories;
 }
@@ -1256,6 +1428,7 @@ fn scan_project_scope_subtree(
             search_root,
             repository_root,
             relative_skill_root,
+            &[],
         )?;
         extend_project_scope_scan(&mut scan, &directory_scan);
         pending.extend(directory_scan.child_directories);
@@ -1278,44 +1451,53 @@ fn scan_project_scope_directory(
     search_root: &Path,
     repository_root: &Path,
     relative_skill_root: &Path,
+    additional_relative_skill_roots: &[PathBuf],
 ) -> Result<ProjectScopeDirectoryScan, DiscoveryError> {
-    if is_inactive_repository_root(repository_root, directory) {
-        return Ok(ProjectScopeDirectoryScan {
-            scope_root: None,
-            child_directories: Vec::new(),
-            skipped_directories: 0,
-        });
-    }
-    let scope_root = directory
-        .join(relative_skill_root)
-        .is_dir()
-        .then(|| directory.to_path_buf());
     let read_dir = match fs::read_dir(directory) {
         Ok(read_dir) => read_dir,
         Err(error) if directory != search_root && recoverable_project_scope_scan_error(&error) => {
-            return Ok(ProjectScopeDirectoryScan {
-                scope_root,
-                child_directories: Vec::new(),
-                skipped_directories: 1,
-            });
+            return Ok(unreadable_project_scope_directory_scan(
+                directory,
+                repository_root,
+                relative_skill_root,
+                additional_relative_skill_roots,
+            ));
         }
         Err(error) => return Err(error.into()),
     };
+
     let mut skipped_directories = 0;
-    let mut entries = Vec::new();
-    for entry in read_dir {
-        match entry {
-            Ok(entry) => entries.push(entry),
-            Err(error) if recoverable_project_scope_scan_error(&error) => {
-                skipped_directories += 1;
-            }
-            Err(error) => return Err(error.into()),
+    let mut listing_incomplete = false;
+    let mut nested_repository = false;
+    let mut child_directories = Vec::new();
+    let mut skill_root_markers = BTreeSet::new();
+    if let Some(first) = relative_skill_root_marker(relative_skill_root) {
+        skill_root_markers.insert(first.to_os_string());
+    }
+    for additional_relative_skill_root in additional_relative_skill_roots {
+        if let Some(first) = relative_skill_root_marker(additional_relative_skill_root) {
+            skill_root_markers.insert(first.to_os_string());
         }
     }
-    entries.sort_by_key(|entry| entry.file_name());
+    let mut present_markers = BTreeSet::new();
 
-    let mut child_directories = Vec::new();
-    for entry in entries.into_iter().rev() {
+    for entry in read_dir {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if recoverable_project_scope_scan_error(&error) => {
+                skipped_directories += 1;
+                listing_incomplete = true;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let name = entry.file_name();
+        if name == OsStr::new(".git") {
+            nested_repository = true;
+        }
+        if skill_root_markers.contains(&name) {
+            present_markers.insert(name.clone());
+        }
         let file_type = match entry.file_type() {
             Ok(file_type) => file_type,
             Err(error) if recoverable_project_scope_scan_error(&error) => {
@@ -1325,7 +1507,7 @@ fn scan_project_scope_directory(
             Err(error) => return Err(error.into()),
         };
         if !file_type.is_dir()
-            || should_skip_project_scope_dir(&entry.file_name())
+            || should_skip_project_scope_dir(&name)
             || is_repository_tmp_dir(repository_root, &entry.path())
         {
             continue;
@@ -1333,11 +1515,100 @@ fn scan_project_scope_directory(
         child_directories.push(entry.path());
     }
 
+    if directory != repository_root && nested_repository {
+        return Ok(ProjectScopeDirectoryScan {
+            scope_root: None,
+            matched_additional_skill_roots: Vec::new(),
+            child_directories: Vec::new(),
+            skipped_directories: 0,
+        });
+    }
+
+    let scope_root = directory_matches_relative_skill_root(
+        directory,
+        relative_skill_root,
+        &present_markers,
+        listing_incomplete,
+    )
+    .then(|| directory.to_path_buf());
+    let matched_additional_skill_roots = additional_relative_skill_roots
+        .iter()
+        .filter(|relative_skill_root| {
+            directory_matches_relative_skill_root(
+                directory,
+                relative_skill_root,
+                &present_markers,
+                listing_incomplete,
+            )
+        })
+        .cloned()
+        .collect();
+
     Ok(ProjectScopeDirectoryScan {
         scope_root,
+        matched_additional_skill_roots,
         child_directories,
         skipped_directories,
     })
+}
+
+fn unreadable_project_scope_directory_scan(
+    directory: &Path,
+    repository_root: &Path,
+    relative_skill_root: &Path,
+    additional_relative_skill_roots: &[PathBuf],
+) -> ProjectScopeDirectoryScan {
+    if directory != repository_root && directory.join(".git").exists() {
+        return ProjectScopeDirectoryScan {
+            scope_root: None,
+            matched_additional_skill_roots: Vec::new(),
+            child_directories: Vec::new(),
+            skipped_directories: 0,
+        };
+    }
+    ProjectScopeDirectoryScan {
+        scope_root: directory
+            .join(relative_skill_root)
+            .is_dir()
+            .then(|| directory.to_path_buf()),
+        matched_additional_skill_roots: additional_relative_skill_roots
+            .iter()
+            .filter(|skill_root| directory.join(skill_root).is_dir())
+            .cloned()
+            .collect(),
+        child_directories: Vec::new(),
+        skipped_directories: 1,
+    }
+}
+
+fn relative_skill_root_marker(relative_skill_root: &Path) -> Option<&OsStr> {
+    relative_skill_root
+        .components()
+        .next()
+        .map(|component| component.as_os_str())
+}
+
+fn directory_matches_relative_skill_root(
+    directory: &Path,
+    relative_skill_root: &Path,
+    present_markers: &BTreeSet<OsString>,
+    listing_incomplete: bool,
+) -> bool {
+    if listing_incomplete {
+        return directory.join(relative_skill_root).is_dir();
+    }
+    directory_has_relative_skill_root(directory, relative_skill_root, present_markers)
+}
+
+fn directory_has_relative_skill_root(
+    directory: &Path,
+    relative_skill_root: &Path,
+    present_markers: &BTreeSet<OsString>,
+) -> bool {
+    let Some(marker) = relative_skill_root_marker(relative_skill_root) else {
+        return false;
+    };
+    present_markers.contains(marker) && directory.join(relative_skill_root).is_dir()
 }
 
 fn recoverable_project_scope_scan_error(error: &std::io::Error) -> bool {
@@ -1354,26 +1625,41 @@ fn should_skip_project_scope_dir(name: &OsStr) -> bool {
         name.to_str(),
         Some(
             ".agents"
+                | ".cache"
                 | ".claude"
+                | ".codex"
                 | ".cursor"
                 | ".git"
+                | ".gradle"
                 | ".hg"
+                | ".mypy_cache"
+                | ".next"
+                | ".nuxt"
                 | ".opencode"
+                | ".output"
                 | ".pi"
+                | ".pytest_cache"
+                | ".svelte-kit"
                 | ".svn"
+                | ".terraform"
+                | ".tox"
+                | ".turbo"
+                | ".venv"
                 | ".worktrees"
+                | ".zed"
+                | "__pycache__"
+                | "coverage"
+                | "dist"
                 | "fixture"
                 | "fixtures"
                 | "node_modules"
                 | "target"
                 | "test"
                 | "tests"
+                | "vendor"
+                | "venv"
         )
     )
-}
-
-fn is_inactive_repository_root(active_repository_root: &Path, directory: &Path) -> bool {
-    directory != active_repository_root && directory.join(".git").exists()
 }
 
 fn is_repository_tmp_dir(repository_root: &Path, directory: &Path) -> bool {
@@ -3704,11 +3990,26 @@ mod tests {
         let mut state = DiscoveryState::default();
         discover_cursor(&roots, &mut state).expect("Cursor discovery");
 
-        assert_eq!(
-            state.project_scope_cache.scopes.len(),
-            4,
-            "Cursor should consume the four scopes prepopulated for its repository traversal"
-        );
+        for relative_skill_root in [
+            ".cursor/skills",
+            ".agents/skills",
+            ".claude/skills",
+            ".codex/skills",
+        ] {
+            assert!(
+                state
+                    .project_scope_cache
+                    .scopes
+                    .contains_key(&ProjectScopeCacheKey {
+                        project_root: project_root.clone(),
+                        repository_root: repository_root.clone(),
+                        relative_skill_root: PathBuf::from(relative_skill_root),
+                        traversal: ProjectSkillTraversal::Repository,
+                        scan_project_scopes: true,
+                    }),
+                "missing prepopulated repository scope for {relative_skill_root}"
+            );
+        }
         for skill_file in skill_files {
             assert!(
                 state
@@ -4108,6 +4409,279 @@ mod tests {
         .expect_err("cancelled accumulating project scope scan must return an error");
 
         assert_eq!(error.to_string(), "project scope scan cancelled");
+    }
+
+    #[test]
+    fn repository_prepopulation_derives_claude_ancestor_and_descendant_scopes() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path().join("repository");
+        let project_root = repository_root.join("workspace").join("app");
+        write_test_file(&repository_root.join(".git"));
+        write_test_file(
+            &repository_root
+                .join("outside")
+                .join(".claude/skills/outside/SKILL.md"),
+        );
+        write_test_file(
+            &project_root
+                .join("inside")
+                .join(".claude/skills/inside/SKILL.md"),
+        );
+        let requests = [(project_root.as_path(), Path::new(".claude/skills"))];
+        let mut cache = ProjectScopeCache::default();
+
+        prepopulate_repository_project_scopes(&mut cache, &requests, true)
+            .expect("scope prepopulation");
+
+        let derived = cache
+            .get_or_discover(
+                &project_root,
+                &repository_root,
+                Path::new(".claude/skills"),
+                ProjectSkillTraversal::AncestorsAndDescendants,
+                true,
+                || -> Result<ProjectSkillScopeRoots, DiscoveryError> {
+                    panic!("derived ancestor-and-descendant scopes should be cached")
+                },
+            )
+            .expect("derived cached scopes");
+        assert!(derived.roots.contains(&project_root));
+        assert!(derived.roots.contains(&project_root.join("inside")));
+        assert!(!derived.roots.contains(&repository_root.join("outside")));
+        assert_eq!(
+            derived.skipped_directories, 0,
+            "nested derived scopes must not inherit repository-wide skip counts"
+        );
+    }
+
+    #[test]
+    fn derived_same_root_scopes_keep_repository_skip_counts() {
+        let repository_root = PathBuf::from("/repo");
+        let nested_project = repository_root.join("app");
+        let relative_skill_root = Path::new(".claude/skills");
+        let mut cache = ProjectScopeCache::default();
+        let repository_scopes = Arc::new(ProjectSkillScopeRoots {
+            roots: BTreeSet::from([
+                repository_root.clone(),
+                nested_project.clone(),
+                repository_root.join("other"),
+            ]),
+            skipped_directories: 4,
+        });
+        cache.scopes.insert(
+            ProjectScopeCacheKey {
+                project_root: nested_project.clone(),
+                repository_root: repository_root.clone(),
+                relative_skill_root: relative_skill_root.to_path_buf(),
+                traversal: ProjectSkillTraversal::Repository,
+                scan_project_scopes: true,
+            },
+            Arc::clone(&repository_scopes),
+        );
+        cache.scopes.insert(
+            ProjectScopeCacheKey {
+                project_root: repository_root.clone(),
+                repository_root: repository_root.clone(),
+                relative_skill_root: relative_skill_root.to_path_buf(),
+                traversal: ProjectSkillTraversal::Repository,
+                scan_project_scopes: true,
+            },
+            repository_scopes,
+        );
+
+        derive_cached_project_scope_traversals(
+            &mut cache,
+            &[
+                (nested_project.as_path(), relative_skill_root),
+                (repository_root.as_path(), relative_skill_root),
+            ],
+            &repository_root,
+        );
+
+        let nested = cache.scopes.get(&ProjectScopeCacheKey {
+            project_root: nested_project,
+            repository_root: repository_root.clone(),
+            relative_skill_root: relative_skill_root.to_path_buf(),
+            traversal: ProjectSkillTraversal::AncestorsAndDescendants,
+            scan_project_scopes: true,
+        });
+        assert!(
+            nested.is_none(),
+            "nested derived descendant scopes must fall back when the repository walk skipped directories"
+        );
+
+        let same_root = cache
+            .scopes
+            .get(&ProjectScopeCacheKey {
+                project_root: repository_root.clone(),
+                repository_root,
+                relative_skill_root: relative_skill_root.to_path_buf(),
+                traversal: ProjectSkillTraversal::AncestorsAndDescendants,
+                scan_project_scopes: true,
+            })
+            .expect("same-root derived scope");
+        assert_eq!(same_root.skipped_directories, 4);
+    }
+
+    #[test]
+    fn ancestor_and_descendant_scopes_are_not_derived_when_project_is_under_a_skipped_directory() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path().join("repository");
+        let project_root = repository_root.join("tests").join("app");
+        write_test_file(&repository_root.join(".git"));
+        write_test_file(
+            &project_root
+                .join("nested")
+                .join(".claude/skills/inside/SKILL.md"),
+        );
+        let requests = [(project_root.as_path(), Path::new(".claude/skills"))];
+        let mut cache = ProjectScopeCache::default();
+        prepopulate_repository_project_scopes(&mut cache, &requests, true)
+            .expect("scope prepopulation");
+
+        let mut discover_called = false;
+        let derived = cache
+            .get_or_discover(
+                &project_root,
+                &repository_root,
+                Path::new(".claude/skills"),
+                ProjectSkillTraversal::AncestorsAndDescendants,
+                true,
+                || {
+                    discover_called = true;
+                    project_skill_scope_roots(
+                        &project_root,
+                        &repository_root,
+                        Path::new(".claude/skills"),
+                        ProjectSkillTraversal::AncestorsAndDescendants,
+                        true,
+                    )
+                },
+            )
+            .expect("fallback descendant scan");
+        assert!(
+            discover_called,
+            "projects under skipped directories must not reuse the repository descendant cache"
+        );
+        assert!(derived.roots.contains(&project_root));
+        assert!(derived.roots.contains(&project_root.join("nested")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_project_scope_directory_still_reports_existing_skill_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let search_root = temporary_root.path();
+        let directory = search_root.join("opaque");
+        write_test_file(&directory.join(".claude/skills/hidden/SKILL.md"));
+        let original = fs::metadata(&directory)
+            .expect("opaque directory metadata")
+            .permissions();
+        let mut listing_denied = original.clone();
+        listing_denied.set_mode(0o111);
+        fs::set_permissions(&directory, listing_denied).expect("deny directory listing");
+        let scan = scan_project_scope_directory(
+            &directory,
+            search_root,
+            search_root,
+            Path::new(".claude/skills"),
+            &[PathBuf::from(".agents/skills")],
+        );
+        fs::set_permissions(&directory, original).expect("restore directory permissions");
+        let scan = scan.expect("recoverable unreadable directory");
+        assert_eq!(scan.scope_root.as_deref(), Some(directory.as_path()));
+        assert!(scan.matched_additional_skill_roots.is_empty());
+        assert!(scan.child_directories.is_empty());
+        assert_eq!(scan.skipped_directories, 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_nested_repository_is_not_reported_as_a_scope_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path();
+        let nested_repository = repository_root.join("nested");
+        write_test_file(&nested_repository.join(".git"));
+        write_test_file(&nested_repository.join(".claude/skills/hidden/SKILL.md"));
+        let original = fs::metadata(&nested_repository)
+            .expect("nested repository metadata")
+            .permissions();
+        let mut listing_denied = original.clone();
+        listing_denied.set_mode(0o111);
+        fs::set_permissions(&nested_repository, listing_denied).expect("deny directory listing");
+        let scan = scan_project_scope_directory(
+            &nested_repository,
+            repository_root,
+            repository_root,
+            Path::new(".claude/skills"),
+            &[],
+        );
+        fs::set_permissions(&nested_repository, original).expect("restore directory permissions");
+        let scan = scan.expect("recoverable unreadable nested repository");
+        assert_eq!(scan.scope_root, None);
+        assert!(scan.matched_additional_skill_roots.is_empty());
+        assert!(scan.child_directories.is_empty());
+        assert_eq!(scan.skipped_directories, 0);
+    }
+
+    #[test]
+    fn project_scope_scan_skips_generated_dependency_directories() {
+        let temporary_root = tempfile::TempDir::new().expect("temporary repository root");
+        let repository_root = temporary_root.path();
+        write_test_file(
+            &repository_root
+                .join(".next")
+                .join(".claude/skills/hidden/SKILL.md"),
+        );
+        write_test_file(
+            &repository_root
+                .join(".venv")
+                .join(".agents/skills/hidden/SKILL.md"),
+        );
+        write_test_file(
+            &repository_root
+                .join("vendor")
+                .join(".cursor/skills/hidden/SKILL.md"),
+        );
+        write_test_file(
+            &repository_root
+                .join("packages")
+                .join("app")
+                .join(".claude/skills/visible/SKILL.md"),
+        );
+
+        let scope_roots = project_repository_scope_roots(
+            repository_root,
+            &[
+                PathBuf::from(".claude/skills"),
+                PathBuf::from(".agents/skills"),
+                PathBuf::from(".cursor/skills"),
+            ],
+        )
+        .expect("generated-directory skip scan");
+
+        assert_eq!(
+            scope_roots
+                .get(Path::new(".claude/skills"))
+                .map(|scopes| &scopes.roots),
+            Some(&BTreeSet::from([repository_root
+                .join("packages")
+                .join("app")]))
+        );
+        assert!(
+            scope_roots
+                .get(Path::new(".agents/skills"))
+                .is_some_and(|scopes| scopes.roots.is_empty())
+        );
+        assert!(
+            scope_roots
+                .get(Path::new(".cursor/skills"))
+                .is_some_and(|scopes| scopes.roots.is_empty())
+        );
     }
 
     fn write_test_file(path: &Path) {
