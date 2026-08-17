@@ -20,7 +20,7 @@ use super::{
     plan_pi_package_extension_toggle, plan_zed_configured_mcp_toggle,
 };
 
-pub(super) fn plan_toggle_dispatch(input: TogglePlanInput) -> ToggleResult {
+pub(crate) fn plan_toggle_dispatch(input: TogglePlanInput) -> ToggleResult {
     if input.item.mutability != DiscoveryMutability::ReadWrite {
         return blocked(input.item, "read-only item cannot be planned for toggle");
     }

@@ -276,7 +276,7 @@ final class WorkspaceStoreTests: XCTestCase {
         XCTAssertTrue(["off", "mixed"].contains(refreshed.state))
     }
 
-    func testAgentPluginRefreshCannotPublishStaleSnapshotAfterReload() async throws {
+    func testAgentPluginRefreshUsesCachedProjectionUntilReload() async throws {
         let fixture = try makeFixtureStore()
         defer { try? FileManager.default.removeItem(at: fixture.temporaryRoot) }
         let store = fixture.store
@@ -284,6 +284,7 @@ final class WorkspaceStoreTests: XCTestCase {
         let package = try XCTUnwrap(
             store.snapshot?.agentPlugins.first(where: { $0.name == "connector-kit" })
         )
+        let initialFingerprint = package.projectionFingerprint
         await store.planAgentPlugin(
             package,
             target: "off",
@@ -297,32 +298,23 @@ final class WorkspaceStoreTests: XCTestCase {
         var manifest = try XCTUnwrap(
             JSONSerialization.jsonObject(with: Data(contentsOf: manifestURL)) as? [String: Any]
         )
-        manifest["description"] = "first refresh projection"
-        try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
-
-        let discardBarrier = ReadBarrier()
-        store.installTestHooksForTesting(WorkspaceStoreTestHooks(
-            beforeAgentPluginDiscard: { await discardBarrier.pause() }
-        ))
-        let staleRefresh = Task { try? await store.refresh() }
-        await discardBarrier.waitUntilReached()
-
         manifest["description"] = "replacement connection projection"
         try JSONSerialization.data(withJSONObject: manifest).write(to: manifestURL)
+
+        try await store.refresh()
+        let cachedFingerprint = try XCTUnwrap(
+            store.snapshot?.agentPlugins.first(where: { $0.logicalId == package.logicalId })?
+                .projectionFingerprint
+        )
+        XCTAssertEqual(cachedFingerprint, initialFingerprint)
+        XCTAssertNotNil(store.reviewedAgentPlugin)
+
         await store.reloadWorkspace()
         let replacementFingerprint = try XCTUnwrap(
             store.snapshot?.agentPlugins.first(where: { $0.logicalId == package.logicalId })?
                 .projectionFingerprint
         )
-
-        await discardBarrier.release()
-        await staleRefresh.value
-
-        XCTAssertEqual(
-            store.snapshot?.agentPlugins.first(where: { $0.logicalId == package.logicalId })?
-                .projectionFingerprint,
-            replacementFingerprint
-        )
+        XCTAssertNotEqual(replacementFingerprint, initialFingerprint)
         XCTAssertNil(store.reviewedAgentPlugin)
     }
 

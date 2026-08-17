@@ -25,12 +25,9 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
-use serde_json::json;
 use unpin_core::approval::ControlApprovalContext;
-use unpin_core::control::{ControlOperationStatus, ControlStatus, build_control_status};
-use unpin_core::control_operation::{
-    ControlHumanAction, ControlOperationEnvelope, ControlOperationLifecycle, DurableControlError,
-};
+use unpin_core::control::{ControlStatus, build_control_status};
+use unpin_core::control_operation::ControlOperationEnvelope;
 use unpin_core::discovery::{
     DiscoveryCategory, DiscoveryError, DiscoveryItem, DiscoveryLayer, DiscoveryMutability,
     DiscoveryOutput, DiscoveryProgress, DiscoveryProgressPhase, DiscoveryRoots, DiscoveryWarning,
@@ -38,10 +35,9 @@ use unpin_core::discovery::{
 };
 use unpin_core::groups::{GroupAccessContext, GroupMemberIdentity, GroupOperationLifecycle};
 use unpin_core::mutation::{
-    BackupAuthenticationKey, BackupAuthenticationStatus, BackupDeletionPlan, BackupSummary,
-    NativeToggleController, NativeTogglePlan, RestoreControlError, RestoreControlPlan,
-    RestoreController, RestoreStatus, TogglePlanRequest, ToggleResult, ToggleStatus, delete_backup,
-    load_backup_summaries_authenticated, plan_backup_deletion, plan_toggle,
+    BackupAuthenticationKey, BackupAuthenticationStatus, BackupSummary, NativeToggleController,
+    NativeTogglePlan, TogglePlanRequest, ToggleResult, ToggleStatus,
+    load_backup_summaries_authenticated, plan_toggle,
 };
 use unpin_core::sessions::SessionAuthorityKey;
 
@@ -57,10 +53,14 @@ mod agent_plugins;
 mod gateway;
 mod groups;
 mod hooks;
+mod inventory;
 mod profiles;
+mod restore;
 mod sessions;
 mod startup;
 
+use inventory::inventory_header_lines;
+use restore::RestoreWorkflow;
 use startup::{StartupCredentials, finish_after_terminal_run, resolve_startup_credentials};
 
 type TuiResult<T> = Result<T, Box<dyn Error>>;
@@ -93,7 +93,7 @@ impl WorkflowPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TuiView {
+pub(super) enum TuiView {
     Inventory,
     Packages,
     Groups,
@@ -144,24 +144,24 @@ impl TuiView {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ProviderFilter {
+pub(super) enum ProviderFilter {
     All,
     Provider(ProviderId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LayerFilter {
+pub(super) enum LayerFilter {
     All,
     Layer(DiscoveryLayer),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CategoryFilter {
+pub(super) enum CategoryFilter {
     All,
     Category(DiscoveryCategory),
 }
 
-struct TuiState {
+pub(super) struct TuiState {
     discovery: DiscoveryOutput,
     backups: Vec<BackupSummary>,
     app_state_root: PathBuf,
@@ -183,7 +183,7 @@ struct TuiState {
     gateway_workflow: gateway::GatewayWorkflow,
     session_workflow: sessions::SessionWorkflow,
     hook_workflow: hooks::HookWorkflow,
-    restore_workflow: RestoreWorkflow,
+    restore_workflow: restore::RestoreWorkflow,
     last_control_envelope: Option<ControlOperationEnvelope>,
     staged: BTreeMap<GroupMemberIdentity, StagedToggle>,
     pending_confirmation: bool,
@@ -200,7 +200,7 @@ struct TuiState {
 }
 
 #[derive(Debug, Clone)]
-struct StagedToggle {
+pub(super) struct StagedToggle {
     item: DiscoveryItem,
     plan: Option<NativeTogglePlan>,
     blocked_reason: Option<String>,
@@ -215,313 +215,6 @@ fn inventory_item_key(item: &DiscoveryItem) -> GroupMemberIdentity {
 enum TuiActionStatus {
     Success(String),
     Error(String),
-}
-
-#[derive(Debug, Clone)]
-struct ReviewedRestorePlan {
-    plan: RestoreControlPlan,
-    envelope: ControlOperationEnvelope,
-}
-
-#[derive(Debug, Clone)]
-struct RestoreWorkflow {
-    backups: Vec<BackupSummary>,
-    operations: Vec<ControlOperationStatus>,
-    selected: usize,
-    reviewed: Option<ReviewedRestorePlan>,
-    deletion: Option<BackupDeletionPlan>,
-    phase: WorkflowPhase,
-    last_envelope: Option<ControlOperationEnvelope>,
-    last_error: Option<String>,
-}
-
-impl RestoreWorkflow {
-    fn new(backups: Vec<BackupSummary>, operations: Vec<ControlOperationStatus>) -> Self {
-        Self {
-            backups,
-            operations,
-            selected: 0,
-            reviewed: None,
-            deletion: None,
-            phase: WorkflowPhase::Browsing,
-            last_envelope: None,
-            last_error: None,
-        }
-    }
-
-    fn select_next(&mut self) {
-        if !self.backups.is_empty() {
-            self.selected = (self.selected + 1) % self.backups.len();
-            self.reset_review();
-        }
-    }
-
-    fn select_previous(&mut self) {
-        if !self.backups.is_empty() {
-            self.selected = if self.selected == 0 {
-                self.backups.len() - 1
-            } else {
-                self.selected - 1
-            };
-            self.reset_review();
-        }
-    }
-
-    fn rows(&self) -> Vec<String> {
-        self.backups
-            .iter()
-            .enumerate()
-            .map(|(index, backup)| {
-                format!(
-                    "{} {} entries={} restorable={} auth={}",
-                    if index == self.selected { ">" } else { " " },
-                    backup_display_label(backup),
-                    backup.item_count,
-                    backup.restorable,
-                    backup_authentication_label(backup.authentication)
-                )
-            })
-            .collect()
-    }
-
-    fn details(&self) -> Vec<String> {
-        let recovery_count = self
-            .operations
-            .iter()
-            .filter(|operation| operation.recovery_required)
-            .count();
-        let mut details = vec![format!(
-            "Restore: backups={} operations={} recovery={} phase={}",
-            self.backups.len(),
-            self.operations.len(),
-            recovery_count,
-            self.phase.label()
-        )];
-        if let Some(backup) = self.backups.get(self.selected) {
-            details.push(format!("selected: {}", backup.backup_id));
-            details.push(format!("target: {}", backup_display_label(backup)));
-            details.push(format!("created: {}", backup.created_at));
-            details.push(format!("targets: {}", backup.paths.len()));
-        } else {
-            details.push("selected: none".to_string());
-        }
-        for operation in &self.operations {
-            details.push(format!(
-                "operation: {} {} {:?} recovery={}",
-                operation.operation_id,
-                operation.operation_kind,
-                operation.lifecycle,
-                operation.recovery_required
-            ));
-        }
-        if let Some(reviewed) = &self.reviewed {
-            details.push(format!("plan: {}", reviewed.plan.plan_fingerprint));
-            details.push(format!(
-                "resources: {}",
-                reviewed.plan.affected_resources.len()
-            ));
-        }
-        if let Some(deletion) = &self.deletion {
-            details.push(format!("delete backup: {}", deletion.backup_id));
-        }
-        if let Some(envelope) = &self.last_envelope {
-            details.push(format!(
-                "result: {:?} {}",
-                envelope.lifecycle, envelope.operation_id
-            ));
-        }
-        if let Some(error) = &self.last_error {
-            details.push(format!("error: {error}"));
-        }
-        details
-    }
-
-    fn plan(
-        &mut self,
-        app_state_root: &Path,
-        context: &ControlApprovalContext,
-        backup_key: Option<&BackupAuthenticationKey>,
-    ) -> Result<&ControlOperationEnvelope, String> {
-        let backup = self
-            .backups
-            .get(self.selected)
-            .ok_or_else(|| "no backup selected".to_string())?;
-        let plan = RestoreController::new(app_state_root)
-            .plan(&backup.backup_id, context, backup_key)
-            .map_err(|error| error.to_string())?;
-        let expectation = plan
-            .approval_expectation(context)
-            .map_err(|error| error.to_string())?;
-        let envelope = ControlOperationEnvelope::from_expectation(
-            &expectation,
-            &plan.plan_fingerprint,
-            plan.activation,
-            ControlOperationLifecycle::AwaitingHumanAction,
-            Some(ControlHumanAction {
-                code: "confirm-and-apply".to_string(),
-                guidance: "Review authenticated backup and every affected target before restore."
-                    .to_string(),
-            }),
-            false,
-            plan.providers.clone(),
-            json!({"plan": plan}),
-        );
-        self.reviewed = Some(ReviewedRestorePlan { plan, envelope });
-        self.deletion = None;
-        self.phase = WorkflowPhase::Planned;
-        self.last_error = None;
-        Ok(&self.reviewed.as_ref().expect("reviewed plan set").envelope)
-    }
-
-    fn confirm(&mut self) -> bool {
-        if self.reviewed.is_none() && self.deletion.is_none() {
-            return false;
-        }
-        self.phase = WorkflowPhase::Confirmed;
-        true
-    }
-
-    fn plan_deletion(&mut self, app_state_root: &Path) -> Result<(), String> {
-        let backup = self
-            .backups
-            .get(self.selected)
-            .ok_or_else(|| "no backup selected".to_string())?;
-        self.deletion = Some(plan_backup_deletion(app_state_root, &backup.backup_id)?);
-        self.reviewed = None;
-        self.phase = WorkflowPhase::Planned;
-        self.last_error = None;
-        Ok(())
-    }
-
-    fn has_pending_deletion(&self) -> bool {
-        self.deletion.is_some()
-    }
-
-    fn deletion_is_confirmed(&self) -> bool {
-        self.deletion.is_some() && self.phase == WorkflowPhase::Confirmed
-    }
-
-    fn apply_deletion(
-        &mut self,
-        app_state_root: &Path,
-    ) -> Result<unpin_core::mutation::BackupDeletionResult, String> {
-        if self.phase != WorkflowPhase::Confirmed {
-            return Err("backup deletion must be confirmed before apply".to_string());
-        }
-        let plan = self
-            .deletion
-            .as_ref()
-            .ok_or_else(|| "backup deletion plan is missing".to_string())?;
-        let result = delete_backup(app_state_root, plan)?;
-        self.deletion = None;
-        self.phase = WorkflowPhase::Applied;
-        self.last_error = None;
-        Ok(result)
-    }
-
-    fn replace_backups(&mut self, backups: Vec<BackupSummary>) {
-        self.backups = backups;
-        self.selected = self.selected.min(self.backups.len().saturating_sub(1));
-        self.reset_review();
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn apply(
-        &mut self,
-        app_state_root: &Path,
-        project_root: &Path,
-        context: &ControlApprovalContext,
-        authority_key: &SessionAuthorityKey,
-        backup_key: &BackupAuthenticationKey,
-        fixture_mode: bool,
-    ) -> Result<&ControlOperationEnvelope, String> {
-        if self.phase != WorkflowPhase::Confirmed {
-            return Err("restore plan must be confirmed before apply".to_string());
-        }
-        let reviewed = self
-            .reviewed
-            .as_ref()
-            .ok_or_else(|| "restore plan is missing".to_string())?;
-        let mut fixture_paths = vec![app_state_root, project_root];
-        fixture_paths.extend(
-            reviewed
-                .plan
-                .affected_resources
-                .iter()
-                .map(|resource| Path::new(resource.path.as_str())),
-        );
-        unpin_core::fixture::require_fixture_write_sandbox(fixture_mode, fixture_paths)?;
-        let expectation = reviewed
-            .plan
-            .approval_expectation(context)
-            .map_err(|error| error.to_string())?;
-        let authorization = credentials::authorize_reviewed_control_decision(
-            fixture_mode,
-            app_state_root,
-            &expectation,
-            &reviewed.plan.plan_fingerprint,
-            Some(&reviewed.plan.plan_fingerprint),
-            "unpin-tui-restore-approval",
-            unix_now(),
-        )?;
-        let result = match RestoreController::with_session_authority_key(
-            app_state_root,
-            authority_key.clone(),
-        )
-        .apply(
-            &reviewed.plan,
-            authorization,
-            context,
-            Some(backup_key.clone()),
-        ) {
-            Ok(result) => result,
-            Err(error) => {
-                if matches!(
-                    &error,
-                    RestoreControlError::Durable(DurableControlError::RecoveryRequired(_))
-                ) {
-                    self.phase = WorkflowPhase::RecoveryRequired;
-                }
-                return Err(error.to_string());
-            }
-        };
-        let lifecycle = if result.status == RestoreStatus::Restored {
-            ControlOperationLifecycle::Applied
-        } else {
-            ControlOperationLifecycle::RecoveryRequired
-        };
-        self.last_envelope = Some(ControlOperationEnvelope::from_expectation(
-            &expectation,
-            &reviewed.plan.plan_fingerprint,
-            reviewed.plan.activation,
-            lifecycle,
-            None,
-            lifecycle == ControlOperationLifecycle::RecoveryRequired,
-            reviewed.plan.providers.clone(),
-            json!({"result": result}),
-        ));
-        self.phase = if lifecycle == ControlOperationLifecycle::RecoveryRequired {
-            WorkflowPhase::RecoveryRequired
-        } else {
-            WorkflowPhase::Applied
-        };
-        self.last_error = None;
-        Ok(self.last_envelope.as_ref().expect("result envelope set"))
-    }
-
-    fn record_error(&mut self, error: String) {
-        self.last_error = Some(error);
-        if self.phase != WorkflowPhase::RecoveryRequired {
-            self.phase = WorkflowPhase::Blocked;
-        }
-    }
-
-    fn reset_review(&mut self) {
-        self.reviewed = None;
-        self.deletion = None;
-        self.phase = WorkflowPhase::Browsing;
-        self.last_error = None;
-    }
 }
 
 impl TuiState {
@@ -1951,295 +1644,6 @@ impl TuiState {
         self.refresh_discovery(&discovery);
         Ok(discovery)
     }
-
-    fn clear_staged(&mut self) {
-        self.staged.clear();
-        self.pending_confirmation = false;
-    }
-
-    fn search_query(&self) -> &str {
-        &self.search_query
-    }
-
-    fn search_editing(&self) -> bool {
-        self.search_editing
-    }
-
-    fn start_search_editing(&mut self) {
-        self.search_editing = true;
-    }
-
-    fn finish_search_editing(&mut self) {
-        self.search_editing = false;
-        self.clamp_selected();
-    }
-
-    #[cfg(test)]
-    fn set_search_query(&mut self, query: impl Into<String>) {
-        self.search_query = query.into();
-        self.clamp_selected();
-    }
-
-    fn clear_search_query(&mut self) {
-        self.search_query.clear();
-        self.search_editing = false;
-        self.clamp_selected();
-    }
-
-    fn push_search_char(&mut self, ch: char) {
-        if ch.is_control() {
-            return;
-        }
-        self.search_query.push(ch);
-        self.clamp_selected();
-    }
-
-    fn pop_search_char(&mut self) {
-        self.search_query.pop();
-        self.clamp_selected();
-    }
-
-    fn refresh_discovery(&mut self, discovery: &DiscoveryOutput) {
-        self.discovery.clone_from(discovery);
-        self.package_workflow.refresh(discovery);
-        self.backups = load_backup_summaries_authenticated(
-            &self.app_state_root,
-            self.backup_authentication_key.as_ref(),
-        );
-        self.selected = 0;
-        self.clear_staged();
-        self.clamp_selected();
-    }
-
-    fn staged_count(&self) -> usize {
-        self.staged.len()
-    }
-
-    fn pending_confirmation(&self) -> bool {
-        self.pending_confirmation
-    }
-
-    fn staged_summary_strings(&self) -> Vec<String> {
-        self.staged.values().map(staged_toggle_label).collect()
-    }
-
-    fn move_next(&mut self) {
-        match self.view {
-            TuiView::Packages => return self.package_workflow.select_next(),
-            TuiView::Groups => {
-                let visible_count = self.visible_count();
-                return self.group_workflow.select_next(visible_count);
-            }
-            TuiView::Profiles => return self.profile_workflow.select_next(),
-            TuiView::Gateways => return self.gateway_workflow.select_next(),
-            TuiView::Sessions => return self.session_workflow.select_next(),
-            TuiView::Hooks => return self.hook_workflow.select_next(),
-            TuiView::RestoreOperations => return self.restore_workflow.select_next(),
-            TuiView::Inventory => {}
-        }
-        let visible_count = self.visible_count();
-        if visible_count == 0 {
-            return;
-        }
-
-        self.selected = (self.selected + 1) % visible_count;
-    }
-
-    fn move_previous(&mut self) {
-        match self.view {
-            TuiView::Packages => return self.package_workflow.select_previous(),
-            TuiView::Groups => {
-                let visible_count = self.visible_count();
-                return self.group_workflow.select_previous(visible_count);
-            }
-            TuiView::Profiles => return self.profile_workflow.select_previous(),
-            TuiView::Gateways => return self.gateway_workflow.select_previous(),
-            TuiView::Sessions => return self.session_workflow.select_previous(),
-            TuiView::Hooks => return self.hook_workflow.select_previous(),
-            TuiView::RestoreOperations => return self.restore_workflow.select_previous(),
-            TuiView::Inventory => {}
-        }
-        let visible_count = self.visible_count();
-        if visible_count == 0 {
-            return;
-        }
-
-        self.selected = if self.selected == 0 {
-            visible_count - 1
-        } else {
-            self.selected - 1
-        };
-    }
-
-    fn inventory_filters_available(&self) -> bool {
-        self.view == TuiView::Inventory
-            || (self.view == TuiView::Groups && self.group_workflow.uses_inventory_rows())
-    }
-
-    fn scope_control_available(&self) -> bool {
-        self.view == TuiView::Profiles
-            || (self.view == TuiView::Groups && self.group_workflow.can_cycle_draft_scope())
-    }
-
-    fn group_mcp_export_available(&self) -> bool {
-        self.view == TuiView::Groups && self.mcp_approval_handoff.is_some()
-    }
-
-    fn cycle_provider_filter(&mut self) {
-        if !self.inventory_filters_available() {
-            return;
-        }
-        let choices = self.provider_choices();
-        self.provider_filter = next_choice(self.provider_filter, &choices);
-        self.clamp_selected();
-    }
-
-    fn cycle_layer_filter(&mut self) {
-        if !self.inventory_filters_available() {
-            return;
-        }
-        let choices = self.layer_choices();
-        self.layer_filter = next_choice(self.layer_filter, &choices);
-        self.clamp_selected();
-    }
-
-    fn cycle_category_filter(&mut self) {
-        if !self.inventory_filters_available() {
-            return;
-        }
-        let choices = self.category_choices();
-        self.category_filter = next_choice(self.category_filter, &choices);
-        self.clamp_selected();
-    }
-
-    fn visible_items(&self) -> Vec<&DiscoveryItem> {
-        self.visible_indices()
-            .into_iter()
-            .filter_map(|index| self.discovery.items.get(index))
-            .collect()
-    }
-
-    fn visible_count(&self) -> usize {
-        self.discovery
-            .items
-            .iter()
-            .filter(|item| self.matches_filters(item))
-            .count()
-    }
-
-    fn selected_position(&self) -> Option<(usize, usize)> {
-        let visible_count = self.visible_count();
-        if visible_count == 0 {
-            None
-        } else {
-            Some((self.selected + 1, visible_count))
-        }
-    }
-
-    fn filter_summary(&self) -> String {
-        format!(
-            "provider={} layer={} category={}",
-            self.provider_filter.label(),
-            self.layer_filter.label(),
-            self.category_filter.label()
-        )
-    }
-
-    fn visible_indices(&self) -> Vec<usize> {
-        self.discovery
-            .items
-            .iter()
-            .enumerate()
-            .filter_map(|(index, item)| self.matches_filters(item).then_some(index))
-            .collect()
-    }
-
-    fn matches_filters(&self, item: &DiscoveryItem) -> bool {
-        self.provider_filter.matches(item)
-            && self.layer_filter.matches(item)
-            && self.category_filter.matches(item)
-            && self.matches_search(item)
-    }
-
-    fn matches_search(&self, item: &DiscoveryItem) -> bool {
-        let query = self.search_query.trim();
-        if query.is_empty() {
-            return true;
-        }
-
-        let query = query.to_lowercase();
-        [
-            item.id.as_str(),
-            item.display_name.as_str(),
-            item.provider.as_str(),
-            item.layer.as_str(),
-            item.category.as_str(),
-            item.kind.as_str(),
-            item.source_path.as_str(),
-            item.state_path.as_str(),
-        ]
-        .iter()
-        .any(|field| field.to_lowercase().contains(&query))
-    }
-
-    fn clamp_selected(&mut self) {
-        let visible_count = self.visible_count();
-        if visible_count == 0 {
-            self.selected = 0;
-        } else if self.selected >= visible_count {
-            self.selected = visible_count - 1;
-        }
-        self.group_workflow.clamp_member_selection(visible_count);
-    }
-
-    fn provider_choices(&self) -> Vec<ProviderFilter> {
-        let mut choices = vec![ProviderFilter::All];
-        for provider in ProviderId::ALL {
-            if self
-                .discovery
-                .items
-                .iter()
-                .any(|item| item.provider == provider)
-            {
-                choices.push(ProviderFilter::Provider(provider));
-            }
-        }
-        choices
-    }
-
-    fn layer_choices(&self) -> Vec<LayerFilter> {
-        let mut choices = vec![LayerFilter::All];
-        for layer in [DiscoveryLayer::Global, DiscoveryLayer::Project] {
-            if self.discovery.items.iter().any(|item| item.layer == layer) {
-                choices.push(LayerFilter::Layer(layer));
-            }
-        }
-        choices
-    }
-
-    fn category_choices(&self) -> Vec<CategoryFilter> {
-        let mut choices = vec![CategoryFilter::All];
-        for category in [
-            DiscoveryCategory::Skill,
-            DiscoveryCategory::ConfiguredMcp,
-            DiscoveryCategory::Tool,
-            DiscoveryCategory::Agent,
-            DiscoveryCategory::Hook,
-            DiscoveryCategory::ProviderSetting,
-            DiscoveryCategory::PluginConfig,
-            DiscoveryCategory::PluginManifest,
-        ] {
-            if self
-                .discovery
-                .items
-                .iter()
-                .any(|item| item.category == category)
-            {
-                choices.push(CategoryFilter::Category(category));
-            }
-        }
-        choices
-    }
 }
 
 #[cfg(test)]
@@ -2300,7 +1704,7 @@ impl CategoryFilter {
     }
 }
 
-fn next_choice<T: Copy + Eq>(current: T, choices: &[T]) -> T {
+pub(super) fn next_choice<T: Copy + Eq>(current: T, choices: &[T]) -> T {
     let Some(current_index) = choices.iter().position(|choice| *choice == current) else {
         return choices.first().copied().unwrap_or(current);
     };
@@ -3119,65 +2523,6 @@ fn command_footer_height(command_legend: &[Line<'_>], available_width: u16) -> u
     wrapped_line_height(command_legend, available_width).saturating_add(2)
 }
 
-fn inventory_header_lines(state: &TuiState, content_height: u16) -> Vec<Line<'static>> {
-    let full = vec![
-        Line::from(vec![Span::styled(
-            "Unpin",
-            Style::default().add_modifier(Modifier::BOLD),
-        )]),
-        Line::from(format!("Items: {}", state.discovery.items.len())),
-        Line::from(format!("Packages: {}", state.package_workflow.len())),
-        Line::from(format!("Showing: {}", state.visible_count())),
-        Line::from(format!("Warnings: {}", state.discovery.warnings.len())),
-        Line::from(format!(
-            "Backups: {} | Backup authentication: {}",
-            state.backups.len(),
-            backup_authentication_readiness_label(state)
-        )),
-        Line::from(format!("Staged: {}", state.staged_count())),
-        Line::from(format!("Last action: {}", last_action_label(state))),
-        Line::from(format!("Last control: {}", last_control_label(state))),
-        Line::from(format!("View: {}", state.view.title())),
-        Line::from(provider_summary(&state.discovery.items)),
-        Line::from(format!("Filters: {}", state.filter_summary())),
-        Line::from(format!("Search: {}", search_summary(state))),
-    ];
-    if usize::from(content_height) >= full.len() {
-        return full;
-    }
-
-    vec![
-        Line::from(vec![
-            Span::styled("Unpin", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!(" | View: {}", state.view.title())),
-        ]),
-        Line::from(format!(
-            "Items: {} | Packages: {} | Showing: {} | Warnings: {} | Staged: {}",
-            state.discovery.items.len(),
-            state.package_workflow.len(),
-            state.visible_count(),
-            state.discovery.warnings.len(),
-            state.staged_count(),
-        )),
-        Line::from(format!(
-            "Filters: {} | Search: {}",
-            state.filter_summary(),
-            search_summary(state)
-        )),
-        Line::from(format!("Last action: {}", last_action_label(state))),
-        Line::from(format!("Last control: {}", last_control_label(state))),
-        Line::from(format!(
-            "Backups: {} | Backup authentication: {}",
-            state.backups.len(),
-            backup_authentication_readiness_label(state)
-        )),
-        Line::from(provider_summary(&state.discovery.items)),
-    ]
-    .into_iter()
-    .take(usize::from(content_height))
-    .collect()
-}
-
 fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     const MIN_BODY_HEIGHT: u16 = 6;
     const MIN_HEADER_HEIGHT: u16 = 3;
@@ -3499,7 +2844,7 @@ fn backup_label(backup: &BackupSummary) -> String {
     )
 }
 
-fn backup_display_label(backup: &BackupSummary) -> String {
+pub(super) fn backup_display_label(backup: &BackupSummary) -> String {
     format!(
         "{} {} {} → {}",
         backup.providers.join(","),
@@ -3513,7 +2858,9 @@ fn backup_display_label(backup: &BackupSummary) -> String {
     )
 }
 
-fn backup_authentication_label(authentication: BackupAuthenticationStatus) -> &'static str {
+pub(super) fn backup_authentication_label(
+    authentication: BackupAuthenticationStatus,
+) -> &'static str {
     match authentication {
         BackupAuthenticationStatus::Verified => "verified",
         BackupAuthenticationStatus::LegacyUnauthenticated => "legacy-unauthenticated",
@@ -3522,7 +2869,7 @@ fn backup_authentication_label(authentication: BackupAuthenticationStatus) -> &'
     }
 }
 
-fn backup_authentication_readiness_label(state: &TuiState) -> &'static str {
+pub(super) fn backup_authentication_readiness_label(state: &TuiState) -> &'static str {
     if state.backup_authentication_key.is_some() {
         "ready"
     } else {
@@ -3530,7 +2877,7 @@ fn backup_authentication_readiness_label(state: &TuiState) -> &'static str {
     }
 }
 
-fn staged_toggle_label(staged: &StagedToggle) -> String {
+pub(super) fn staged_toggle_label(staged: &StagedToggle) -> String {
     format!(
         "- {} -> {}",
         staged.item.id,
@@ -3550,7 +2897,7 @@ fn staged_change_label(count: usize) -> &'static str {
     }
 }
 
-fn last_action_label(state: &TuiState) -> String {
+pub(super) fn last_action_label(state: &TuiState) -> String {
     match &state.last_action {
         Some(TuiActionStatus::Success(message)) => format!("success: {message}"),
         Some(TuiActionStatus::Error(message)) => format!("error: {message}"),
@@ -3558,7 +2905,7 @@ fn last_action_label(state: &TuiState) -> String {
     }
 }
 
-fn last_control_label(state: &TuiState) -> String {
+pub(super) fn last_control_label(state: &TuiState) -> String {
     state.last_control_envelope.as_ref().map_or_else(
         || "none".to_string(),
         |envelope| {
@@ -3570,7 +2917,7 @@ fn last_control_label(state: &TuiState) -> String {
     )
 }
 
-fn search_summary(state: &TuiState) -> String {
+pub(super) fn search_summary(state: &TuiState) -> String {
     let query = state.search_query();
     if query.is_empty() {
         if state.search_editing() {
@@ -3585,7 +2932,7 @@ fn search_summary(state: &TuiState) -> String {
     }
 }
 
-fn provider_summary(items: &[DiscoveryItem]) -> String {
+pub(super) fn provider_summary(items: &[DiscoveryItem]) -> String {
     let counts = ProviderId::ALL
         .into_iter()
         .map(|provider| format!("{}={}", provider.as_str(), count_provider(items, provider)))
@@ -3607,6 +2954,7 @@ mod tests {
     use ratatui::backend::TestBackend;
     use std::{fs, path::Path, process::Command as StdCommand};
     use tempfile::TempDir;
+    use unpin_core::control_operation::ControlOperationLifecycle;
     use unpin_core::discovery::{
         DiscoveryCategory, DiscoveryKind, DiscoveryLayer, DiscoveryMutability, DiscoveryRoots,
         discover_all,
