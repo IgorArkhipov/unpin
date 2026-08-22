@@ -89,8 +89,8 @@ and cross-platform desktop support remain deferred.
 
 ## First safe run from source
 
-Unpin requires Rust 1.96 or newer. The repository's development and CI
-toolchain is pinned to Rust 1.97.1.
+Unpin requires Rust 1.98 or newer. The repository's development, CI, and
+release toolchain is pinned to Rust 1.98.0.
 
 Release users do not need a source checkout or Rust toolchain; use the
 [release installation and local setup](../README.md#distribution-status-and-quick-start)

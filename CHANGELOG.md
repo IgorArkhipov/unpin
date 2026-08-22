@@ -7,6 +7,10 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Changed
+
+- Raised the minimum supported and default Rust toolchain to 1.98.0.
+
 ## [1.4.2] - 2026-08-17
 
 ### Fixed

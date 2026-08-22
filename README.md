@@ -73,7 +73,7 @@ designated requirement.
 Add `$HOME/.local/bin` to your shell's startup configuration if it is not
 already on `PATH`.
 
-To build from source, use Rust 1.96 or newer:
+To build from source, use Rust 1.98 or newer:
 
 ```bash
 cargo build --release --locked
@@ -747,4 +747,4 @@ cargo deny check
 cargo machete
 ```
 
-CI also checks the declared Rust 1.96 MSRV separately from the pinned Rust 1.97.1 development toolchain.
+CI and release builds use the pinned Rust 1.98.0 toolchain, which is also the declared MSRV.
