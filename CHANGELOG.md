@@ -7,9 +7,13 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.4.3] - 2026-08-22
+
 ### Changed
 
 - Raised the minimum supported and default Rust toolchain to 1.98.0.
+- Aligned development, CI, release, and Trunk Rust pins and added a CI consistency check for those version surfaces.
+- Updated a small set of Rust expressions for Rust 1.98 Clippy without changing public behavior.
 
 ## [1.4.2] - 2026-08-17
 
