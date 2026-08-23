@@ -36,7 +36,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v1.4.2-TARGET.tar.gz \
+gh attestation verify unpin-v1.4.3-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -45,7 +45,7 @@ Extract the archive, install both included executables together on your user
 before installing the stable broker under the app-state root:
 
 ```bash
-cd unpin-v1.4.2-TARGET
+cd unpin-v1.4.3-TARGET
 install -d "$HOME/.local/bin"
 install -m 0755 unpin unpin-credential-broker "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
@@ -73,7 +73,7 @@ designated requirement.
 Add `$HOME/.local/bin` to your shell's startup configuration if it is not
 already on `PATH`.
 
-To build from source, use Rust 1.96 or newer:
+To build from source, use Rust 1.98 or newer:
 
 ```bash
 cargo build --release --locked
@@ -119,9 +119,9 @@ archive against `SHA256SUMS` and its GitHub attestation before extracting it:
 
 ```bash
 gh attestation verify \
-  unpin-desktop-v1.4.2-TARGET.tar.gz \
+  unpin-desktop-v1.4.3-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
-tar -xzf unpin-desktop-v1.4.2-TARGET.tar.gz
+tar -xzf unpin-desktop-v1.4.3-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
@@ -747,4 +747,4 @@ cargo deny check
 cargo machete
 ```
 
-CI also checks the declared Rust 1.96 MSRV separately from the pinned Rust 1.97.1 development toolchain.
+CI and release builds use the pinned Rust 1.98.0 toolchain, which is also the declared MSRV.

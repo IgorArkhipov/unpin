@@ -42,7 +42,7 @@ cargo deny check
 cargo machete
 ```
 
-CI also verifies the declared Rust 1.96 MSRV separately from the pinned Rust 1.97.1 development toolchain.
+CI and release builds use the pinned Rust 1.98.0 toolchain, which is also the declared MSRV.
 
 Before distribution or after broad provider, mutation, backup/restore, TUI, or
 MCP changes, run the full fixture-isolated matrix:

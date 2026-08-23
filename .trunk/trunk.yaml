@@ -33,10 +33,10 @@ lint:
         - crates/unpin-core/tests/fixtures/**
   enabled:
     - actionlint@1.7.12
-    - clippy@1.97.0
+    - clippy@1.98.0
     - git-diff-check
     - markdownlint-cli2@0.23.1
-    - rustfmt@1.97.0
+    - rustfmt@1.98.0
     - taplo@0.10.0
     - trufflehog@3.95.6
     - yamllint@1.38.0

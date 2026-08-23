@@ -47,7 +47,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           targets: x86_64-unknown-linux-gnu
 
@@ -88,7 +88,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           components: clippy, rustfmt
 
@@ -105,6 +105,10 @@ jobs:
       - name: Test
         if: matrix.platform != 'Windows'
         run: cargo test --workspace --all-features --locked
+
+      - name: Build Windows test targets
+        if: matrix.platform == 'Windows'
+        run: cargo test --workspace --all-targets --all-features --locked --no-run
 
       - name: Test Windows platform boundary
         if: matrix.platform == 'Windows'
@@ -124,7 +128,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
         with:
           targets: aarch64-apple-darwin
 
@@ -154,44 +158,6 @@ jobs:
           python3 -m unittest
           scripts.test_desktop_release_scripts.DesktopReleaseScriptTests.test_full_verifier_rejects_boolean_inventory_identity
 
-  msrv:
-    name: Rust 1.96.1 MSRV
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.96.1
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-        with:
-          shared-key: msrv
-
-      - name: Test minimum supported Rust version
-        run: |
-          cargo +1.96.1 test --workspace --all-targets --all-features --locked
-          cargo +1.96.1 test --workspace --doc --all-features --locked
-
-  msrv-windows:
-    name: Rust 1.96.1 MSRV (Windows)
-    runs-on: windows-2025
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.96.1
-
-      - name: Cache cargo
-        uses: Swatinem/rust-cache@258712b0b7b1ddf8bddc9fc3b0faca682b2736c3 # v2
-        with:
-          shared-key: msrv-windows
-
-      - name: Check minimum supported Rust version
-        run: cargo +1.96.1 test --workspace --all-targets --all-features --locked --no-run
-
   dependency-policy:
     name: Dependency policy
     runs-on: ubuntu-latest
@@ -200,7 +166,27 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+        uses: dtolnay/rust-toolchain@f8be11a05b1d4f3fcebe6410cc16743212b999b0 # 1.98.0
+
+      - name: Check Rust toolchain consistency
+        run: |
+          set -euo pipefail
+          rust_version="$(sed -nE 's/^[[:space:]]*rust-version[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' Cargo.toml | head -n 1)"
+          channel="$(sed -nE 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*/\1/p' rust-toolchain.toml | head -n 1)"
+
+          case "$rust_version" in
+            *.*.*) expected_channel="$rust_version" ;;
+            *.*) expected_channel="${rust_version}.0" ;;
+            *)
+              echo "Unable to parse workspace rust-version from Cargo.toml: '$rust_version'" >&2
+              exit 1
+              ;;
+          esac
+
+          if [[ "$channel" != "$expected_channel" ]]; then
+            echo "Rust toolchain mismatch: Cargo.toml rust-version '$rust_version' requires rust-toolchain.toml channel '$expected_channel' (found '$channel')" >&2
+            exit 1
+          fi
 
       - name: Install dependency checks
         uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2

@@ -805,8 +805,7 @@ impl GatewayWorkflowController {
 
         let mode_policy = (|| -> Result<_, GatewayWorkflowError> {
             let mode;
-            let policy;
-            match reviewed.mode.action {
+            let policy = match reviewed.mode.action {
                 GatewayModeAction::Install | GatewayModeAction::Activate => {
                     mode = self
                         .mode
@@ -817,7 +816,7 @@ impl GatewayWorkflowController {
                                 phase: "lifecycle-changed-checkpoint-failed",
                                 reason,
                             })?;
-                    policy = match reviewed.policy.as_ref() {
+                    match reviewed.policy.as_ref() {
                         Some(plan) => {
                             let policy_before_apply = match self.policy_snapshot(&plan.target) {
                                 Ok(checkpoint) => checkpoint,
@@ -855,7 +854,7 @@ impl GatewayWorkflowController {
                             }
                         }
                         None => None,
-                    };
+                    }
                 }
                 GatewayModeAction::Off | GatewayModeAction::Detach => {
                     mode = match self.mode.apply_reviewed(&reviewed.mode, actor_id, now_unix) {
@@ -881,7 +880,7 @@ impl GatewayWorkflowController {
                             reason: "gateway routing has not reached off state".to_string(),
                         });
                     }
-                    policy = match reviewed.policy.as_ref() {
+                    match reviewed.policy.as_ref() {
                         Some(plan) => {
                             let policy_before_apply = self.policy_snapshot(&plan.target)?;
                             match self.policy.apply_reviewed(plan, actor_id) {
@@ -907,9 +906,9 @@ impl GatewayWorkflowController {
                             }
                         }
                         None => None,
-                    };
+                    }
                 }
-            }
+            };
             Ok((mode, policy))
         })();
         let (mode, policy) = match mode_policy {
