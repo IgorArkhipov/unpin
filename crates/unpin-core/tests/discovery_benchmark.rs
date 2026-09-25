@@ -7,6 +7,9 @@ use std::{
 
 use unpin_core::discovery::{DiscoveryOutput, DiscoveryRoots, ProviderId, discover_all};
 
+#[path = "support/counting_allocations.rs"]
+mod counting_allocations;
+
 const CI_DIRECTORY_COUNT: usize = 192;
 const BENCHMARK_DIRECTORY_COUNTS: [usize; 3] = [256, 2_048, 8_192];
 const SKILL_INTERVAL: usize = 16;
@@ -104,23 +107,30 @@ fn benchmark_project_scope_discovery(directory_count: usize) {
 
     let (selected, selected_duration) = timed_discovery(&selected_roots);
     let (_, scope_enumeration_duration) = timed_discovery(&scope_only_fixture.roots);
+    let before = counting_allocations::snapshot();
     let (first_full, first_full_duration) = timed_discovery(&fixture.roots);
+    let first_allocations = counting_allocations::snapshot().0 - before.0;
     let mut warm_durations = Vec::with_capacity(WARM_RUNS);
+    let mut warm_allocations = Vec::with_capacity(WARM_RUNS);
 
     for _ in 0..WARM_RUNS {
+        let before = counting_allocations::snapshot();
         let (discovery, duration) = timed_discovery(&fixture.roots);
+        warm_allocations.push(counting_allocations::snapshot().0 - before.0);
         assert_discovery_matches(&first_full, &discovery);
         warm_durations.push(duration);
     }
 
     warm_durations.sort();
+    warm_allocations.sort_unstable();
     let warm_median = warm_durations[warm_durations.len() / 2];
     let scope_enumeration_estimate = scope_enumeration_duration.saturating_sub(selected_duration);
     let skill_root_walk_estimate = first_full_duration.saturating_sub(scope_enumeration_duration);
     eprintln!(
-        "discovery benchmark directories={directory_count} skills={} items={} selected_provider_baseline={selected_duration:?} scope_enumeration_estimate={scope_enumeration_estimate:?} skill_root_walk_estimate={skill_root_walk_estimate:?} first_full={first_full_duration:?} warm_median={warm_median:?}",
+        "discovery benchmark directories={directory_count} skills={} items={} selected_provider_baseline={selected_duration:?} scope_enumeration_estimate={scope_enumeration_estimate:?} skill_root_walk_estimate={skill_root_walk_estimate:?} first_full={first_full_duration:?} warm_median={warm_median:?} first_allocations={first_allocations} warm_median_allocations={}",
         fixture.skill_names.len(),
         first_full.items.len(),
+        warm_allocations[warm_allocations.len() / 2],
     );
     assert!(
         selected.items.len() <= first_full.items.len(),

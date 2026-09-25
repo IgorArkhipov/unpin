@@ -13,6 +13,14 @@ use super::{
     provider_summary, search_summary, staged_toggle_label,
 };
 
+#[derive(Default)]
+pub(super) struct InventoryRenderCache {
+    rows: Vec<String>,
+    search_text: Vec<String>,
+    visible_indices: Vec<usize>,
+    visible_valid: bool,
+}
+
 impl TuiState {
     pub(super) fn clear_staged(&mut self) {
         self.staged.clear();
@@ -39,12 +47,14 @@ impl TuiState {
     #[cfg(test)]
     pub(super) fn set_search_query(&mut self, query: impl Into<String>) {
         self.search_query = query.into();
+        self.invalidate_visible_inventory();
         self.clamp_selected();
     }
 
     pub(super) fn clear_search_query(&mut self) {
         self.search_query.clear();
         self.search_editing = false;
+        self.invalidate_visible_inventory();
         self.clamp_selected();
     }
 
@@ -53,16 +63,20 @@ impl TuiState {
             return;
         }
         self.search_query.push(ch);
+        self.invalidate_visible_inventory();
         self.clamp_selected();
     }
 
     pub(super) fn pop_search_char(&mut self) {
         self.search_query.pop();
+        self.invalidate_visible_inventory();
         self.clamp_selected();
     }
 
     pub(super) fn refresh_discovery(&mut self, discovery: &DiscoveryOutput) {
         self.discovery.clone_from(discovery);
+        *self.inventory_cache.borrow_mut() = InventoryRenderCache::default();
+        self.preview_cache.borrow_mut().take();
         self.package_workflow.refresh(discovery);
         self.backups = load_backup_summaries_authenticated(
             &self.app_state_root,
@@ -153,6 +167,7 @@ impl TuiState {
         }
         let choices = self.provider_choices();
         self.provider_filter = next_choice(self.provider_filter, &choices);
+        self.invalidate_visible_inventory();
         self.clamp_selected();
     }
 
@@ -162,6 +177,7 @@ impl TuiState {
         }
         let choices = self.layer_choices();
         self.layer_filter = next_choice(self.layer_filter, &choices);
+        self.invalidate_visible_inventory();
         self.clamp_selected();
     }
 
@@ -171,6 +187,7 @@ impl TuiState {
         }
         let choices = self.category_choices();
         self.category_filter = next_choice(self.category_filter, &choices);
+        self.invalidate_visible_inventory();
         self.clamp_selected();
     }
 
@@ -182,11 +199,8 @@ impl TuiState {
     }
 
     pub(super) fn visible_count(&self) -> usize {
-        self.discovery
-            .items
-            .iter()
-            .filter(|item| self.matches_filters(item))
-            .count()
+        self.prepare_visible_inventory();
+        self.inventory_cache.borrow().visible_indices.len()
     }
 
     pub(super) fn selected_position(&self) -> Option<(usize, usize)> {
@@ -208,40 +222,89 @@ impl TuiState {
     }
 
     pub(super) fn visible_indices(&self) -> Vec<usize> {
-        self.discovery
-            .items
+        self.prepare_visible_inventory();
+        self.inventory_cache.borrow().visible_indices.clone()
+    }
+
+    pub(super) fn visible_index(&self, position: usize) -> Option<usize> {
+        self.prepare_visible_inventory();
+        self.inventory_cache
+            .borrow()
+            .visible_indices
+            .get(position)
+            .copied()
+    }
+
+    pub(super) fn prepared_inventory_rows(&self) -> Vec<String> {
+        self.prepare_visible_inventory();
+        let cache = self.inventory_cache.borrow();
+        cache
+            .visible_indices
             .iter()
-            .enumerate()
-            .filter_map(|(index, item)| self.matches_filters(item).then_some(index))
+            .map(|index| cache.rows[*index].clone())
             .collect()
     }
 
-    pub(super) fn matches_filters(&self, item: &DiscoveryItem) -> bool {
-        self.provider_filter.matches(item)
-            && self.layer_filter.matches(item)
-            && self.category_filter.matches(item)
-            && self.matches_search(item)
+    fn invalidate_visible_inventory(&self) {
+        self.inventory_cache.borrow_mut().visible_valid = false;
     }
 
-    pub(super) fn matches_search(&self, item: &DiscoveryItem) -> bool {
-        let query = self.search_query.trim();
-        if query.is_empty() {
-            return true;
+    fn prepare_visible_inventory(&self) {
+        let mut cache = self.inventory_cache.borrow_mut();
+        if cache.rows.len() != self.discovery.items.len() {
+            cache.rows = self
+                .discovery
+                .items
+                .iter()
+                .map(|item| {
+                    format!(
+                        "{} {} {} [{}] {}",
+                        item.provider.as_str(),
+                        item.layer.as_str(),
+                        item.category.as_str(),
+                        super::enabled_label(item.enabled),
+                        item.display_name
+                    )
+                })
+                .collect();
+            cache.search_text = self
+                .discovery
+                .items
+                .iter()
+                .map(|item| {
+                    [
+                        item.id.as_str(),
+                        item.display_name.as_str(),
+                        item.provider.as_str(),
+                        item.layer.as_str(),
+                        item.category.as_str(),
+                        item.kind.as_str(),
+                        item.source_path.as_str(),
+                        item.state_path.as_str(),
+                    ]
+                    .join("\0")
+                    .to_lowercase()
+                })
+                .collect();
+            cache.visible_valid = false;
         }
-
-        let query = query.to_lowercase();
-        [
-            item.id.as_str(),
-            item.display_name.as_str(),
-            item.provider.as_str(),
-            item.layer.as_str(),
-            item.category.as_str(),
-            item.kind.as_str(),
-            item.source_path.as_str(),
-            item.state_path.as_str(),
-        ]
-        .iter()
-        .any(|field| field.to_lowercase().contains(&query))
+        if !cache.visible_valid {
+            let query = self.search_query.trim().to_lowercase();
+            cache.visible_indices = self
+                .discovery
+                .items
+                .iter()
+                .enumerate()
+                .filter_map(|(index, item)| {
+                    (self.provider_filter.matches(item)
+                        && self.layer_filter.matches(item)
+                        && self.category_filter.matches(item)
+                        && (query.is_empty() || cache.search_text[index].contains(&query)))
+                    .then_some(index)
+                })
+                .collect();
+            cache.visible_valid = true;
+        }
     }
 
     pub(super) fn clamp_selected(&mut self) {
