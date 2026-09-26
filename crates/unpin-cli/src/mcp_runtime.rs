@@ -15,7 +15,7 @@ use rmcp::{
     model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorCode,
         Implementation, JsonObject, ListToolsResult, PaginatedRequestParams, ServerCapabilities,
-        ServerInfo, Tool, ToolAnnotations,
+        ServerConfig, Tool, ToolAnnotations,
     },
     service::{
         Peer, RequestContext, RoleServer, RunningService, RxJsonRpcMessage, ServiceRole,
@@ -2029,7 +2029,7 @@ fn value_matches_type(value: &Value, kind: &str) -> bool {
 }
 
 impl ServerHandler for GatewayMcpServer {
-    fn get_info(&self) -> ServerInfo {
+    fn get_info(&self) -> ServerConfig {
         let mut capabilities = ServerCapabilities::builder().enable_tools();
         if self.claim.is_none()
             || (self
@@ -2040,7 +2040,7 @@ impl ServerHandler for GatewayMcpServer {
         {
             capabilities = capabilities.enable_tool_list_changed();
         }
-        ServerInfo::new(
+        ServerConfig::new(
             capabilities.build(),
         )
         .with_server_info(Implementation::new("unpin-gateway", env!("CARGO_PKG_VERSION")))
