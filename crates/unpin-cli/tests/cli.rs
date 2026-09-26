@@ -3521,7 +3521,7 @@ fn list_renders_provider_warnings_from_malformed_json() {
         &fixture_copy
             .path()
             .join("cursor")
-            .join("global")
+            .join("home")
             .join("hooks.json"),
         "{ invalid json",
     );
@@ -3591,7 +3591,7 @@ fn doctor_fails_when_provider_warnings_are_detected() {
         &fixture_copy
             .path()
             .join("cursor")
-            .join("global")
+            .join("home")
             .join("hooks.json"),
         "{ invalid json",
     );
@@ -4081,7 +4081,7 @@ fn tui_headless_renders_provider_warnings() {
         &fixture_copy
             .path()
             .join("cursor")
-            .join("global")
+            .join("home")
             .join("hooks.json"),
         "{ invalid json",
     );

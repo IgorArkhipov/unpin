@@ -4823,6 +4823,79 @@ fn applies_cursor_local_plugin_disable_rediscovers_disabled_and_reenables_from_v
 }
 
 #[test]
+fn portable_cursor_plugin_toggle_and_restore_preserve_manifest() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let plugin_root = fixture_copy
+        .path()
+        .join("cursor/home/plugins/local/portable");
+    fs::create_dir_all(&plugin_root).expect("portable plugin root");
+    let manifest_path = plugin_root.join("plugin.json");
+    let manifest = r#"{"$schema":"https://agent-plugins.org/schemas/1.0.0/plugin.schema.json","name":"portable"}"#;
+    fs::write(&manifest_path, manifest).expect("portable manifest");
+
+    let roots =
+        DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(app_state.path());
+    let item = discover_all(&roots)
+        .expect("discover portable plugin")
+        .items
+        .into_iter()
+        .find(|item| item.id == "cursor:global:plugin-manifest:local:portable")
+        .expect("portable plugin row");
+    assert_eq!(item.mutability, DiscoveryMutability::ReadWrite);
+
+    let disable = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(disable.status, ToggleStatus::Applied);
+    assert!(!plugin_root.exists());
+
+    let disabled = discover_all(&roots)
+        .expect("discover disabled portable plugin")
+        .items
+        .into_iter()
+        .find(|item| item.id == "cursor:global:plugin-manifest:local:portable")
+        .expect("disabled portable plugin row");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.source_path, manifest_path.to_string_lossy());
+
+    let enable = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: disabled,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(enable.status, ToggleStatus::Applied, "{enable:?}");
+    assert_eq!(
+        fs::read_to_string(&manifest_path).expect("manifest restored"),
+        manifest
+    );
+
+    let restore_enable = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: enable.backup_id.expect("enable backup"),
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(restore_enable.status, RestoreStatus::Restored);
+    assert!(!plugin_root.exists());
+
+    let restore_disable = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: disable.backup_id.expect("disable backup"),
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(restore_disable.status, RestoreStatus::Restored);
+    assert_eq!(
+        fs::read_to_string(manifest_path).expect("manifest recovered"),
+        manifest
+    );
+}
+
+#[test]
 fn blocks_cursor_local_plugin_disable_when_manifest_drifted_after_discovery() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
@@ -7331,6 +7404,7 @@ fn opencode_project_plugin_toggle_restores_strict_json_and_backup() {
     "example-opencode-project-connector"
   ]
 }
+
 "#;
     fs::write(&config_path, original).expect("write OpenCode JSON fixture");
     let roots =
@@ -7404,6 +7478,147 @@ fn opencode_project_plugin_toggle_restores_strict_json_and_backup() {
         fs::read_to_string(&config_path).expect("re-enabled OpenCode config"),
         original
     );
+}
+
+#[test]
+fn opencode_plugin_options_tuple_preserves_options_plan_backup_and_restore() {
+    for (file_name, original) in [
+        (
+            "opencode.json",
+            r#"{
+  "mcp": {},
+  "plugin": [["tuple-plugin", {"token": "fixture-only", "nested": {"count": 2}}], "keep-plugin"]
+}
+"#,
+        ),
+        (
+            "opencode.jsonc",
+            r#"{
+  // Keep this comment and the tuple's original formatting.
+  "mcp": {},
+  "plugin": [
+    ["tuple-plugin", {"token": "fixture-only", "nested": {"count": 2}}],
+    "keep-plugin",
+  ],
+}
+"#,
+        ),
+    ] {
+        let fixture_copy = TempDir::new().expect("temp fixture copy");
+        let app_state = TempDir::new().expect("temp app state");
+        copy_dir_all(&fixtures_root(), fixture_copy.path());
+        let project_root = fixture_copy.path().join("opencode/project");
+        let other_name = if file_name == "opencode.json" {
+            "opencode.jsonc"
+        } else {
+            "opencode.json"
+        };
+        fs::remove_file(project_root.join(other_name)).ok();
+        let config_path = project_root.join(file_name);
+        fs::write(&config_path, original).expect("write plugin tuple fixture");
+        let roots =
+            DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(app_state.path());
+        let item_id = "opencode:project:plugin-config:npm:tuple-plugin";
+        let find_item = || {
+            discover_all(&roots)
+                .expect("OpenCode discovery")
+                .items
+                .into_iter()
+                .find(|item| item.id == item_id)
+                .expect("tuple plugin item")
+        };
+        let item = find_item();
+        assert_eq!(item.mutability, DiscoveryMutability::ReadWrite);
+        let tuple = serde_json::json!([
+            "tuple-plugin",
+            {"token": "fixture-only", "nested": {"count": 2}}
+        ]);
+        let preview = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item: item.clone(),
+            apply: false,
+            backup_authentication_key: None,
+        });
+        assert_eq!(preview.status, ToggleStatus::DryRun);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("unmodified config"),
+            original
+        );
+
+        let drifted = original.replace("fixture-only", "changed-before-apply");
+        fs::write(&config_path, drifted).expect("drift fixture");
+        let blocked = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item: item.clone(),
+            apply: false,
+            backup_authentication_key: None,
+        });
+        assert_eq!(blocked.status, ToggleStatus::Blocked);
+        fs::write(&config_path, original).expect("restore fixture before apply");
+
+        let disabled = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item,
+            apply: true,
+            backup_authentication_key: Some(backup_authentication_key()),
+        });
+        assert_eq!(disabled.status, ToggleStatus::Applied);
+        let disabled_raw = fs::read_to_string(&config_path).expect("disabled config");
+        assert!(!disabled_raw.contains("fixture-only"));
+        assert!(disabled_raw.contains("keep-plugin"));
+        if file_name == "opencode.jsonc" {
+            assert!(disabled_raw.contains("// Keep this comment"));
+        }
+
+        let backup_id = disabled.backup_id.expect("disable backup");
+        let restored = restore_backup(RestoreBackupInput {
+            app_state_root: app_state.path().to_path_buf(),
+            backup_id,
+            backup_authentication_key: Some(backup_authentication_key()),
+        });
+        assert_eq!(restored.status, RestoreStatus::Restored);
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("restored backup"),
+            original
+        );
+
+        let disabled = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item: find_item(),
+            apply: true,
+            backup_authentication_key: Some(backup_authentication_key()),
+        });
+        assert_eq!(disabled.status, ToggleStatus::Applied);
+        let disabled_item = find_item();
+        assert!(!disabled_item.enabled);
+        let enable_plan = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item: disabled_item.clone(),
+            apply: false,
+            backup_authentication_key: None,
+        });
+        assert_eq!(enable_plan.status, ToggleStatus::DryRun);
+        assert_eq!(
+            enable_plan.operations[0].value,
+            Some(serde_json::json!("tuple-plugin")),
+            "planning must not expose plugin option values"
+        );
+        let enabled = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item: disabled_item,
+            apply: true,
+            backup_authentication_key: Some(backup_authentication_key()),
+        });
+        assert_eq!(enabled.status, ToggleStatus::Applied);
+        let enabled_raw = fs::read_to_string(&config_path).expect("enabled config");
+        if file_name == "opencode.jsonc" {
+            assert_eq!(enabled_raw, original);
+        } else {
+            let enabled_document: serde_json::Value =
+                serde_json::from_str(&enabled_raw).expect("valid enabled JSON config");
+            assert_eq!(enabled_document["plugin"][0], tuple);
+        }
+    }
 }
 
 #[test]
