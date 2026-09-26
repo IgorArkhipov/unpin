@@ -325,6 +325,8 @@ fn reports_provider_fixture_validation_issues() {
         "[plugins]\n[mcp_servers.]\n",
     )
     .expect("write invalid codex config");
+    fs::create_dir_all(invalid.path().join("cursor").join("global"))
+        .expect("create legacy Cursor app-support fixture directory");
     fs::write(
         invalid
             .path()
@@ -550,6 +552,8 @@ fn fixture_validation_does_not_require_legacy_cursor_app_support_mcp_json() {
 #[test]
 fn fixture_validation_ignores_invalid_legacy_cursor_app_support_mcp_json() {
     let temp = fixture_copy();
+    fs::create_dir_all(temp.path().join("cursor").join("global"))
+        .expect("create legacy Cursor app-support fixture directory");
     fs::write(
         temp.path().join("cursor").join("global").join("mcp.json"),
         r#"{"mcpServers":[]}"#,
