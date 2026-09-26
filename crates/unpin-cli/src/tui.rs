@@ -1396,14 +1396,8 @@ impl TuiState {
         let mut results = Vec::new();
         for staged in &staged {
             let result = self.apply_staged_toggle(staged);
-            if result.status == ToggleStatus::Applied
-                && let Some(item) = self
-                    .discovery
-                    .items
-                    .iter_mut()
-                    .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
-            {
-                item.enabled = staged.target_enabled;
+            if result.status == ToggleStatus::Applied {
+                self.record_applied_toggle(staged);
             }
             results.push(result);
         }
@@ -1536,6 +1530,18 @@ impl TuiState {
             TuiActionStatus::Error(format!("{summary}; {}", failures.join("; ")))
         });
         results
+    }
+
+    fn record_applied_toggle(&mut self, staged: &StagedToggle) {
+        if let Some(item) = self
+            .discovery
+            .items
+            .iter_mut()
+            .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
+        {
+            item.enabled = staged.target_enabled;
+            *self.inventory_cache.borrow_mut() = inventory::InventoryRenderCache::default();
+        }
     }
 
     fn apply_staged_toggle(&self, staged: &StagedToggle) -> ToggleResult {
@@ -4971,6 +4977,7 @@ mod tests {
             project_root.clone(),
             roots,
         );
+        assert!(state.active_rows()[0].contains("[on]"));
 
         assert!(state.stage_selected_toggle());
         assert!(state.confirm_staged());
@@ -4979,6 +4986,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, ToggleStatus::Applied);
         assert!(!live_skill.exists());
+        assert!(state.active_rows()[0].contains("[off]"));
         let output = render_headless_state(&state);
         assert!(output.contains("Last action: error: Applied 1/1 staged change"));
         assert!(output.contains("refresh failed:"));
