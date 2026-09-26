@@ -7,6 +7,28 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-09-25
+
+### Compatibility
+
+- Updated Claude Code discovery for skill overrides, bundled plugin skills and
+  hooks, and global hook-disable state; corrected Codex matcher reset behavior
+  and Cursor's current global configuration and portable plugin locations.
+- Added Pi configured skill paths and optional package resources, and OpenCode
+  layered JSON/JSONC configuration, configured skills, and tuple plugin
+  references. Existing Zed skill and `context_servers` support remains in place.
+- Confined project-owned Pi and OpenCode configured skill paths to the selected
+  project, including symlink targets. User-level external paths remain read-only
+  inventory. Configured scans are bounded, and unreadable optional entries no
+  longer hide other items or disclose private paths in warnings.
+
+### Fixed
+
+- Bounded desktop bridge requests when a child stalls, and reduced repeated
+  TUI and MCP inventory work without changing mutation approval rules.
+- Replaced vulnerable or yanked lockfile dependencies and refreshed compatible
+  Cargo dependencies and pinned CI actions.
+
 ## [1.4.3] - 2026-08-22
 
 ### Changed
