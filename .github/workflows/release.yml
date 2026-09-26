@@ -68,7 +68,7 @@ jobs:
             target/x86_64-unknown-linux-gnu/release/unpin-credential-broker
 
       - name: Install SBOM generator
-        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
         with:
           tool: cargo-cyclonedx@0.5.9
 
@@ -177,7 +177,7 @@ jobs:
         run: cargo build --release --locked --target ${{ matrix.target }} -p unpin-cli --bins
 
       - name: Install SBOM generator
-        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
         with:
           tool: cargo-cyclonedx@0.5.9
 
@@ -367,7 +367,7 @@ jobs:
             "${{ steps.version.outputs.value }}"
 
       - name: Install SBOM generator
-        uses: taiki-e/install-action@dfae9bf3d6f6c6f20ef4ebb3486c01a51341ff12 # v2
+        uses: taiki-e/install-action@9983c65e42da123ff25d1f78505eb6de315aa172 # v2
         with:
           tool: cargo-cyclonedx@0.5.9
 
