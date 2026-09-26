@@ -17,6 +17,7 @@ publish.workspace = true
 flate2.workspace = true
 futures.workspace = true
 getrandom.workspace = true
+globset.workspace = true
 hmac.workspace = true
 jsonc-parser.workspace = true
 rusqlite.workspace = true

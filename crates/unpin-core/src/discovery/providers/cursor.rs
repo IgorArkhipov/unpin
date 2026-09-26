@@ -236,17 +236,17 @@ pub(crate) fn discover_cursor(
         DiscoveryLayer::Global,
         &[
             (
-                roots.cursor_global.join("permissions.json"),
+                roots.cursor_config.join("permissions.json"),
                 "cursor:global:setting:permissions-json",
                 "permissions.json",
             ),
             (
-                roots.cursor_global.join("sandbox.json"),
+                roots.cursor_config.join("sandbox.json"),
                 "cursor:global:setting:sandbox-json",
                 "sandbox.json",
             ),
             (
-                roots.cursor_global.join("cli-config.json"),
+                roots.cursor_config.join("cli-config.json"),
                 "cursor:global:setting:cli-config-json",
                 "cli-config.json",
             ),

@@ -10,7 +10,7 @@ fn write_file(path: &Path, contents: &str) {
 }
 
 #[test]
-fn cursor_uses_config_root_for_global_agents_and_hooks() {
+fn cursor_uses_config_root_for_global_agents_hooks_and_settings() {
     let fixture = tempfile::TempDir::new().expect("fixture");
     let roots = DiscoveryRoots::fixture_root(fixture.path());
     write_file(
@@ -29,6 +29,10 @@ fn cursor_uses_config_root_for_global_agents_and_hooks() {
         &roots.cursor_global.join("hooks.json"),
         r#"{"hooks":{"AfterFileEdit":[{"command":"/usr/bin/false"}]}}"#,
     );
+    for name in ["permissions.json", "sandbox.json", "cli-config.json"] {
+        write_file(&roots.cursor_config.join(name), "{}\n");
+        write_file(&roots.cursor_global.join(name), "{}\n");
+    }
 
     let result = discover_all(&roots).expect("discover fixture");
     let cursor = result
@@ -54,6 +58,17 @@ fn cursor_uses_config_root_for_global_agents_and_hooks() {
         item.category != DiscoveryCategory::Hook
             || item.source_path != roots.cursor_global.join("hooks.json").to_string_lossy()
     }));
+    for name in ["permissions.json", "sandbox.json", "cli-config.json"] {
+        assert!(cursor.iter().any(|item| {
+            item.category == DiscoveryCategory::ProviderSetting
+                && item.source_path == roots.cursor_config.join(name).to_string_lossy()
+        }));
+        assert!(
+            cursor.iter().all(|item| {
+                item.source_path != roots.cursor_global.join(name).to_string_lossy()
+            })
+        );
+    }
 }
 
 #[test]

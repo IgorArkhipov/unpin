@@ -93,6 +93,7 @@ const PI_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const OPENCODE_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const OPENCODE_COMPAT_CLAUDE_SKILL_NAMESPACE: &str = "@compat/claude/";
 const MAX_CONFIGURED_SKILL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CONFIGURED_SKILL_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryRoots {
@@ -1712,23 +1713,51 @@ fn skill_id_path(path: &Path) -> String {
 
 fn discover_direct_skill_markdown_files(
     root: &Path,
-    provider: ProviderId,
-    layer: DiscoveryLayer,
-    id_prefix: &str,
-    mutability: DiscoveryMutability,
+    spec: SkillItemDiscoverySpec<'_>,
     items: &mut Vec<DiscoveryItem>,
+    warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<BTreeSet<String>, DiscoveryError> {
+    let SkillItemDiscoverySpec {
+        provider,
+        layer,
+        id_prefix,
+        mutability,
+        max_fingerprint_bytes,
+        scan_scope,
+    } = spec;
     let mut live_ids = BTreeSet::new();
     if !root.exists() {
         return Ok(live_ids);
     }
 
-    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    let mut limited = false;
+    for entry in fs::read_dir(root)? {
+        if entries.len() == MAX_CONFIGURED_SKILL_ENTRIES {
+            limited = true;
+            break;
+        }
+        entries.push(entry?);
+    }
     entries.sort_by_key(|entry| entry.file_name());
+    let mut remaining_bytes = max_fingerprint_bytes.unwrap_or(MAX_CONFIGURED_SKILL_BYTES);
+    let mut outside_scope = false;
+    let mut incomplete = false;
+    let canonical_scope = match scan_scope.map(fs::canonicalize).transpose() {
+        Ok(scope) => scope,
+        Err(_) => {
+            warnings.push(DiscoveryWarning {
+                provider,
+                layer: Some(layer),
+                code: "scope-scan-incomplete".to_string(),
+                message: "Pi Markdown skill scan could not verify the project boundary".to_string(),
+            });
+            return Ok(live_ids);
+        }
+    };
     for entry in entries {
         let path = entry.path();
-        if !path.is_file()
-            || path.extension().and_then(OsStr::to_str) != Some("md")
+        if path.extension().and_then(OsStr::to_str) != Some("md")
             || path.file_name() == Some(OsStr::new("SKILL.md"))
         {
             continue;
@@ -1739,11 +1768,31 @@ fn discover_direct_skill_markdown_files(
         if stem.is_empty() {
             continue;
         }
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if canonical_scope
+            .as_deref()
+            .is_some_and(|scope| !path_within_canonical_scope(&path, scope))
+        {
+            outside_scope = true;
+            continue;
+        }
+        if metadata.len() > remaining_bytes {
+            limited = true;
+            continue;
+        }
+        remaining_bytes -= metadata.len();
         let id = format!("{id_prefix}{}", skill_id_path(Path::new(stem)));
         live_ids.insert(id.clone());
-        let source_fingerprint = fs::read_to_string(&path)
-            .ok()
-            .map(|raw| source_fingerprint(&raw));
+        let source_fingerprint = skill_file_fingerprint(&path, Some(metadata.len()));
         items.push(DiscoveryItem {
             provider,
             kind: DiscoveryKind::Skill,
@@ -1757,6 +1806,37 @@ fn discover_direct_skill_markdown_files(
             state_path: path_string(&path),
             source_fingerprint,
             hook: None,
+        });
+    }
+
+    if limited {
+        warnings.push(DiscoveryWarning {
+            provider,
+            layer: Some(layer),
+            code: "scope-scan-limited".to_string(),
+            message: format!(
+                "{} Markdown skill scan reached its entry or byte limit",
+                provider.as_str()
+            ),
+        });
+    }
+    if outside_scope {
+        warnings.push(DiscoveryWarning {
+            provider,
+            layer: Some(layer),
+            code: "scope-outside-project".to_string(),
+            message: format!(
+                "{} Markdown skill file is outside the selected project",
+                provider.as_str()
+            ),
+        });
+    }
+    if incomplete {
+        warnings.push(DiscoveryWarning {
+            provider,
+            layer: Some(layer),
+            code: "scope-scan-incomplete".to_string(),
+            message: format!("{} Markdown skill scan was incomplete", provider.as_str()),
         });
     }
 
@@ -1901,7 +1981,6 @@ fn discover_configured_skill_dirs(
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<BTreeSet<String>, DiscoveryError> {
     const MAX_DIRECTORIES: usize = 512;
-    const MAX_ENTRIES: usize = 4096;
     const MAX_DEPTH: usize = 32;
 
     fn add_skill(
@@ -1998,7 +2077,7 @@ fn discover_configured_skill_dirs(
         };
         let mut entries = Vec::new();
         for entry in read_dir {
-            if visited_entries == MAX_ENTRIES {
+            if visited_entries == MAX_CONFIGURED_SKILL_ENTRIES {
                 limited = true;
                 break;
             }
@@ -2057,7 +2136,7 @@ fn discover_configured_skill_dirs(
                 )?;
             }
         }
-        if visited_entries == MAX_ENTRIES {
+        if visited_entries == MAX_CONFIGURED_SKILL_ENTRIES {
             limited = true;
             break;
         }
@@ -3341,7 +3420,10 @@ fn parsed_hook_items(
             code: issue.code.to_string(),
             message: format!(
                 "ignored invalid hook definition in {}",
-                source_path.display()
+                source_path
+                    .file_name()
+                    .unwrap_or(OsStr::new("hook file"))
+                    .to_string_lossy()
             ),
         });
     }

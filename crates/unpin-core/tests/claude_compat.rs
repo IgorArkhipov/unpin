@@ -224,6 +224,33 @@ fn claude_skill_directory_plugins_have_read_only_identity_and_bundled_hooks() {
     assert_eq!(default_hook.mutability, DiscoveryMutability::ReadOnly);
 }
 
+#[test]
+fn invalid_plugin_hook_warning_does_not_expose_absolute_source_path() {
+    let fixture = tempfile::TempDir::new().expect("fixture");
+    let roots = DiscoveryRoots::fixture_root(fixture.path());
+    let plugin_root = roots.claude_global.join("skills/invalid-hook-bundle");
+    write_file(&plugin_root.join("SKILL.md"), "# Invalid hook bundle\n");
+    write_file(
+        &plugin_root.join(".claude-plugin/plugin.json"),
+        r#"{"name":"invalid-hook-bundle","hooks":{"PreToolUse":123}}"#,
+    );
+
+    let result = discover_all(&roots).expect("discover fixture");
+    let warning = result
+        .warnings
+        .iter()
+        .find(|warning| {
+            warning.provider == ProviderId::Claude && warning.code.starts_with("invalid-hook-")
+        })
+        .expect("invalid bundled hook warning");
+    assert!(warning.message.contains("plugin.json"));
+    assert!(
+        !warning
+            .message
+            .contains(&fixture.path().to_string_lossy().to_string())
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn claude_skill_directory_plugin_detection_follows_skill_root_symlinks() {

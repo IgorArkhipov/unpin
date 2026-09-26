@@ -24,11 +24,16 @@ pub(crate) fn discover_pi(
     )?;
     let global_file_skill_ids = discover_direct_skill_markdown_files(
         &native_global_root,
-        ProviderId::Pi,
-        DiscoveryLayer::Global,
-        &format!("{PI_GLOBAL_SKILL_ID_PREFIX}@file/"),
-        DiscoveryMutability::ReadWrite,
+        SkillItemDiscoverySpec {
+            provider: ProviderId::Pi,
+            layer: DiscoveryLayer::Global,
+            id_prefix: &format!("{PI_GLOBAL_SKILL_ID_PREFIX}@file/"),
+            mutability: DiscoveryMutability::ReadWrite,
+            max_fingerprint_bytes: Some(MAX_CONFIGURED_SKILL_BYTES),
+            scan_scope: None,
+        },
         items,
+        warnings,
     )?;
     global_live_ids.extend(global_file_skill_ids);
     let shared_global_id_prefix =
@@ -135,11 +140,16 @@ pub(crate) fn discover_pi(
     let native_project_skill_root = roots.pi_project.join(".pi").join("skills");
     project_live_ids.extend(discover_direct_skill_markdown_files(
         &native_project_skill_root,
-        ProviderId::Pi,
-        DiscoveryLayer::Project,
-        &format!("{PI_PROJECT_SKILL_ID_PREFIX}@file/"),
-        DiscoveryMutability::ReadWrite,
+        SkillItemDiscoverySpec {
+            provider: ProviderId::Pi,
+            layer: DiscoveryLayer::Project,
+            id_prefix: &format!("{PI_PROJECT_SKILL_ID_PREFIX}@file/"),
+            mutability: DiscoveryMutability::ReadWrite,
+            max_fingerprint_bytes: Some(MAX_CONFIGURED_SKILL_BYTES),
+            scan_scope: Some(&roots.pi_project),
+        },
         items,
+        warnings,
     )?);
     let mut project_settings_target = PiSettingsTarget {
         live_skill_ids: &mut project_live_ids,
@@ -186,6 +196,114 @@ struct PiSettingsTarget<'a> {
     skill_roots: &'a mut Vec<PathBuf>,
     items: &'a mut Vec<DiscoveryItem>,
     warnings: &'a mut Vec<DiscoveryWarning>,
+}
+
+const MAX_PI_SKILL_RULES: usize = 512;
+const MAX_PI_SKILL_RULE_BYTES: usize = 64 * 1024;
+
+#[derive(Default)]
+struct PiSkillRules {
+    includes: Vec<globset::GlobMatcher>,
+    excludes: Vec<globset::GlobMatcher>,
+    force_includes: Vec<String>,
+    force_excludes: Vec<String>,
+    accepted_count: usize,
+    accepted_bytes: usize,
+}
+
+impl PiSkillRules {
+    fn add(&mut self, raw: &str) -> Result<bool, globset::Error> {
+        if self.accepted_count == MAX_PI_SKILL_RULES
+            || raw.len() > MAX_PI_SKILL_RULE_BYTES.saturating_sub(self.accepted_bytes)
+        {
+            return Ok(false);
+        }
+        self.accepted_count += 1;
+        self.accepted_bytes += raw.len();
+        let normalized = raw.replace('\\', "/");
+        let (prefix, pattern) = normalized
+            .chars()
+            .next()
+            .filter(|prefix| matches!(prefix, '!' | '+' | '-'))
+            .map_or((None, normalized.as_str()), |prefix| {
+                (Some(prefix), &normalized[1..])
+            });
+        let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+        match prefix {
+            Some('+') => self.force_includes.push(pattern.to_string()),
+            Some('-') => self.force_excludes.push(pattern.to_string()),
+            Some('!') => self.excludes.push(pi_skill_glob(pattern)?),
+            _ => self.includes.push(pi_skill_glob(pattern)?),
+        }
+        Ok(true)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.includes.is_empty()
+            && self.excludes.is_empty()
+            && self.force_includes.is_empty()
+            && self.force_excludes.is_empty()
+    }
+
+    fn enabled(&self, path: &Path, settings_root: &Path) -> bool {
+        let mut candidates = vec![
+            path.strip_prefix(settings_root)
+                .unwrap_or(path)
+                .to_string_lossy()
+                .replace('\\', "/"),
+            path.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned(),
+            path.to_string_lossy().replace('\\', "/"),
+        ];
+        let mut exact_candidates = vec![candidates[0].clone(), candidates[2].clone()];
+        if path.file_name() == Some(OsStr::new("SKILL.md")) {
+            let parent = path.parent().unwrap_or(path);
+            let relative_parent = parent
+                .strip_prefix(settings_root)
+                .unwrap_or(parent)
+                .to_string_lossy()
+                .replace('\\', "/");
+            let absolute_parent = parent.to_string_lossy().replace('\\', "/");
+            candidates.extend([
+                relative_parent.clone(),
+                parent
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned(),
+                absolute_parent.clone(),
+            ]);
+            exact_candidates.extend([relative_parent, absolute_parent]);
+        }
+
+        let matches_glob = |rules: &[globset::GlobMatcher]| {
+            rules
+                .iter()
+                .any(|rule| candidates.iter().any(|candidate| rule.is_match(candidate)))
+        };
+        let matches_exact =
+            |rules: &[String]| rules.iter().any(|rule| exact_candidates.contains(rule));
+        let mut enabled = self.includes.is_empty() || matches_glob(&self.includes);
+        if matches_glob(&self.excludes) {
+            enabled = false;
+        }
+        if matches_exact(&self.force_includes) {
+            enabled = true;
+        }
+        if matches_exact(&self.force_excludes) {
+            enabled = false;
+        }
+        enabled
+    }
+}
+
+fn pi_skill_glob(pattern: &str) -> Result<globset::GlobMatcher, globset::Error> {
+    Ok(globset::GlobBuilder::new(pattern)
+        .literal_separator(true)
+        .build()?
+        .compile_matcher())
 }
 
 fn discover_pi_settings(
@@ -334,6 +452,9 @@ fn discover_pi_configured_skills(
     };
 
     let settings_root = settings_path.parent().unwrap_or(settings_path);
+    let mut rules = PiSkillRules::default();
+    let mut rules_limited = false;
+    let mut configured_roots = Vec::new();
     for (index, skill) in skills.iter().enumerate() {
         let Some(raw_path) = skill.as_str() else {
             warnings.push(DiscoveryWarning {
@@ -351,6 +472,21 @@ fn discover_pi_configured_skills(
                 code: "invalid-shape".to_string(),
                 message: format!("{settings_name} skills[{index}] must be a non-empty string"),
             });
+            continue;
+        }
+        if raw_path.starts_with(['!', '+', '-']) || raw_path.contains(['*', '?']) {
+            match rules.add(raw_path) {
+                Ok(true) => {}
+                Ok(false) => rules_limited = true,
+                Err(_) => {
+                    warnings.push(DiscoveryWarning {
+                        provider: ProviderId::Pi,
+                        layer: Some(layer),
+                        code: "invalid-shape".to_string(),
+                        message: format!("{settings_name} skills[{index}] has an invalid pattern"),
+                    });
+                }
+            }
             continue;
         }
 
@@ -378,6 +514,38 @@ fn discover_pi_configured_skills(
             items,
             warnings,
         )?;
+        configured_roots.push((resolved_root, mutability, configured_ids));
+    }
+
+    if rules_limited {
+        warnings.push(DiscoveryWarning {
+            provider: ProviderId::Pi,
+            layer: Some(layer),
+            code: "pi-skill-rules-limited".to_string(),
+            message: format!("{settings_name} skill rules exceeded the safe scan limit"),
+        });
+    }
+
+    if !rules.is_empty() || rules_limited {
+        for item in items.iter_mut() {
+            if item.provider == ProviderId::Pi
+                && item.layer == layer
+                && item.category == DiscoveryCategory::Skill
+                && configured_roots
+                    .iter()
+                    .any(|(root, _, _)| Path::new(&item.source_path).starts_with(root))
+            {
+                item.enabled = rules.enabled(Path::new(&item.source_path), settings_root);
+                if !item.enabled || rules_limited {
+                    item.mutability = DiscoveryMutability::ReadOnly;
+                }
+            }
+        }
+    }
+
+    for (resolved_root, mutability, configured_ids) in configured_roots {
+        // Physical items must shadow stale vault entries even when Pi rules disable them.
+        live_skill_ids.extend(configured_ids.iter().cloned());
         let writable_ids = configured_ids
             .into_iter()
             .filter(|id| {
@@ -385,11 +553,11 @@ fn discover_pi_configured_skills(
                     item.provider == ProviderId::Pi
                         && item.layer == layer
                         && item.id == *id
+                        && item.enabled
                         && item.mutability == DiscoveryMutability::ReadWrite
                 })
             })
             .collect::<BTreeSet<_>>();
-        live_skill_ids.extend(writable_ids.iter().cloned());
         if !writable_ids.is_empty()
             && mutability == DiscoveryMutability::ReadWrite
             && resolved_root.is_dir()
@@ -483,11 +651,16 @@ fn discover_pi_configured_skill_path(
         )?;
         discover_direct_skill_markdown_files(
             root,
-            ProviderId::Pi,
-            layer,
-            &format!("{id_prefix}@file/"),
-            DiscoveryMutability::ReadOnly,
+            SkillItemDiscoverySpec {
+                provider: ProviderId::Pi,
+                layer,
+                id_prefix: &format!("{id_prefix}@file/"),
+                mutability: DiscoveryMutability::ReadOnly,
+                max_fingerprint_bytes: Some(MAX_CONFIGURED_SKILL_BYTES),
+                scan_scope: project_boundary,
+            },
             items,
+            warnings,
         )?;
     } else if root.is_file() && root.extension().and_then(OsStr::to_str) == Some("md") {
         if fs::metadata(root).is_ok_and(|metadata| metadata.len() > MAX_CONFIGURED_SKILL_BYTES) {

@@ -17,10 +17,14 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Added Pi configured skill paths and optional package resources, and OpenCode
   layered JSON/JSONC configuration, configured skills, and tuple plugin
   references. Existing Zed skill and `context_servers` support remains in place.
+- Matched Pi's current skill-pattern precedence (`!` exclude, `+` exact include,
+  `-` exact exclude) and read Cursor's global permissions, sandbox, and CLI
+  settings from `~/.cursor`.
 - Confined project-owned Pi and OpenCode configured skill paths to the selected
   project, including symlink targets. User-level external paths remain read-only
-  inventory. Configured scans are bounded, and unreadable optional entries no
-  longer hide other items or disclose private paths in warnings.
+  inventory. Configured scans and Pi pattern rules are bounded; malformed
+  optional entries no longer hide other items or disclose private paths in
+  warnings. Pattern-disabled skills cannot duplicate stale vault identities.
 
 ### Fixed
 

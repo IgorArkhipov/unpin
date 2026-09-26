@@ -24,6 +24,7 @@ crossterm = "0.29.0"
 flate2 = "1.1.2"
 futures = "0.3.33"
 getrandom = "0.4.3"
+globset = "0.4.20"
 hmac = "0.13.0"
 http = "1.5.0"
 jsonc-parser = { version = "0.33.1", features = ["cst", "serde"] }
