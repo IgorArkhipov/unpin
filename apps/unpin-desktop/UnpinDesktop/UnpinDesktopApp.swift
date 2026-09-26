@@ -76,6 +76,27 @@ struct WorkbenchPalette {
     }
 }
 
+extension View {
+    @ViewBuilder
+    func workbenchTabPickerStyle() -> some View {
+        if #available(macOS 27, *) {
+            pickerStyle(.tabs)
+        } else {
+            pickerStyle(.segmented)
+        }
+    }
+
+    @ViewBuilder
+    func workbenchRoundedTextFieldStyle() -> some View {
+        if #available(macOS 27, *) {
+            textFieldStyle(.bordered)
+                .textInputBorderShape(.roundedRectangle)
+        } else {
+            textFieldStyle(.roundedBorder)
+        }
+    }
+}
+
 @main
 struct UnpinDesktopApp: App {
     @StateObject private var workspace = WorkspaceStore()
@@ -230,7 +251,7 @@ struct WorkbenchView: View {
                             Text(area.title).tag(area)
                         }
                     }
-                    .pickerStyle(.segmented)
+                    .workbenchTabPickerStyle()
                     .disabled(!presentation.allowsNavigation)
                 }
                 .padding(.horizontal, 18)

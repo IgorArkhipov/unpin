@@ -477,7 +477,7 @@ struct DiscoverOrganizeView: View {
                     Text(mode.rawValue).tag(mode)
                 }
             }
-            .pickerStyle(.segmented)
+            .workbenchTabPickerStyle()
             .frame(maxWidth: 320)
             .padding(.top)
 

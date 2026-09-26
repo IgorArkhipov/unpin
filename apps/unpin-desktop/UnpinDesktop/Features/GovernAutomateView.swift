@@ -431,7 +431,7 @@ struct GovernAutomateView: View {
                 Text("Review \(proposal.workflowId) → \(proposal.entryMode)")
                     .font(.callout.bold())
                 TextField("Child host command (executable and arguments)", text: $workflowHostCommandText)
-                    .textFieldStyle(.roundedBorder)
+                    .workbenchRoundedTextFieldStyle()
                     .accessibilityLabel("Child host command")
                     .accessibilityIdentifier("govern-workflow-host-command")
                 Text("Arguments are passed directly to the child host; no shell is invoked.")
