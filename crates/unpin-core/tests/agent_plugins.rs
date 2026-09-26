@@ -482,6 +482,58 @@ fn symlinked_plugin_cache_entry_marks_inventory_incomplete() {
 }
 
 #[test]
+fn codex_remote_install_metadata_does_not_make_package_cache_incomplete() {
+    let fixture = tempfile::TempDir::new().expect("temporary Agent Plugins fixture");
+    let plugin_root = fixture
+        .path()
+        .join("codex/global/plugins/cache/acme/connector-kit");
+    write_package(&plugin_root.join("1.0.0"), "connector-kit", &["review"]);
+    write(&plugin_root.join(".codex-remote-plugin-install.json"), "{}");
+
+    let discovery = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("Codex discovery survives install metadata");
+
+    assert_eq!(discovery.agent_plugins().len(), 1);
+    assert!(discovery.agent_plugin_inventory_complete());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_latest_version_alias_does_not_make_package_cache_incomplete() {
+    let fixture = tempfile::TempDir::new().expect("temporary Agent Plugins fixture");
+    let plugin_root = fixture
+        .path()
+        .join("codex/global/plugins/cache/acme/connector-kit");
+    write_package(&plugin_root.join("1.0.0"), "connector-kit", &["review"]);
+    std::os::unix::fs::symlink("1.0.0", plugin_root.join("latest")).expect("version alias symlink");
+
+    let discovery = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("Codex discovery survives a version alias");
+
+    assert_eq!(discovery.agent_plugins().len(), 1);
+    assert!(discovery.agent_plugin_inventory_complete());
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_latest_alias_outside_the_cache_keeps_inventory_incomplete() {
+    let fixture = tempfile::TempDir::new().expect("temporary Agent Plugins fixture");
+    let plugin_root = fixture
+        .path()
+        .join("codex/global/plugins/cache/acme/connector-kit");
+    write_package(&plugin_root.join("1.0.0"), "connector-kit", &["review"]);
+    let outside = fixture.path().join("outside-cache-entry");
+    fs::create_dir_all(&outside).expect("outside cache directory");
+    std::os::unix::fs::symlink(&outside, plugin_root.join("latest"))
+        .expect("escaping version alias");
+
+    let discovery = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("Codex discovery survives an escaping alias");
+
+    assert!(!discovery.agent_plugin_inventory_complete());
+}
+
+#[test]
 fn fresh_exact_selection_rejects_new_diagnostics_only_activation_anchor() {
     let fixture = tempfile::TempDir::new().expect("temporary Agent Plugins fixture");
     write(
@@ -726,6 +778,40 @@ fn invalid_manifest_isolated_to_package_and_does_not_synthesize_inventory_rows()
             .message
             .contains(&fixture.path().to_string_lossy().into_owned())
     );
+}
+
+#[test]
+fn schema_less_codex_compatibility_manifest_is_not_an_invalid_portable_package() {
+    let fixture = tempfile::TempDir::new().expect("temporary Agent Plugins fixture");
+    write(
+        &fixture.path().join("codex/global/config.toml"),
+        "[plugins.\"legacy-kit@acme\"]\nenabled = true\n",
+    );
+    let package_root = fixture
+        .path()
+        .join("codex/global/plugins/cache/acme/legacy-kit/1.0.0");
+    write(
+        &package_root.join("plugin.json"),
+        r#"{"name":"legacy-kit","version":"1.0.0","skills":"./skills/"}"#,
+    );
+    write(
+        &package_root.join(".codex-plugin/plugin.json"),
+        r#"{"name":"legacy-kit","version":"1.0.0","skills":"./skills/"}"#,
+    );
+
+    let discovery = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("Codex discovery survives a legacy plugin");
+
+    assert!(discovery.agent_plugins().is_empty());
+    assert!(discovery.agent_plugin_inventory_complete());
+    assert!(discovery.items.iter().any(|item| {
+        item.provider == ProviderId::Codex
+            && item.category == DiscoveryCategory::PluginConfig
+            && item.display_name == "legacy-kit@acme"
+    }));
+    assert!(!discovery.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Codex && warning.code == "agent-plugin-invalid"
+    }));
 }
 
 #[test]

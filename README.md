@@ -343,6 +343,8 @@ OpenCode is the supported harness in this provider family. OpenRouter is a model
 
 Unpin recognizes the [Agent Plugins 1.0.0](https://agent-plugins.org/specification) package layout already installed by a supported host. A root `plugin.json` provides safe package metadata, immediate `skills/*/SKILL.md` entries and root `mcp.json` describe component coverage, and the host's native activation setting remains the only writable authority. Unpin does not install, update, import, delete, or persist desired state for packages, and it never creates missing Skill or MCP inventory rows.
 
+Schema-less Codex compatibility manifests are outside this portable package projection; Unpin does not label them invalid Agent Plugins. Known Codex cache metadata and a `latest` alias to a cached version do not make package inventory incomplete, but unexpected or escaping cache symlinks still do.
+
 Packages are a derived workbench projection. Each scan groups matching existing inventory under one logical package, reports `on`, `off`, `mixed`, or `unknown` state, and distinguishes actionable, diagnostics-only, and unsupported instances. A toggle expands to the exact existing native activation identities, requires explicit selected-provider or all-provider reach, and reuses Unpin's review, fingerprint, drift, backup, audit, recovery, and restore boundaries. Visibility filters never grant mutation reach.
 
 Current package-root support is explicit:
