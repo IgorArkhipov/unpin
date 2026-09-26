@@ -196,6 +196,14 @@ fn build_discovery_snapshot(
 }
 
 pub fn build_inventory_summary(discovery: &DiscoveryOutput) -> DiscoveryInventorySummary {
+    build_inventory_summary_filtered(discovery, |_| true, |_| true)
+}
+
+pub(crate) fn build_inventory_summary_filtered(
+    discovery: &DiscoveryOutput,
+    include_item: impl Fn(&DiscoveryItem) -> bool,
+    include_warning: impl Fn(&DiscoveryWarning) -> bool,
+) -> DiscoveryInventorySummary {
     let mut provider_items = BTreeMap::<&'static str, ProviderInventorySummary>::new();
 
     for provider in ProviderId::ALL {
@@ -208,7 +216,7 @@ pub fn build_inventory_summary(discovery: &DiscoveryOutput) -> DiscoveryInventor
                 warning_count: discovery
                     .warnings
                     .iter()
-                    .filter(|warning| warning.provider == provider)
+                    .filter(|warning| warning.provider == provider && include_warning(warning))
                     .count(),
                 kinds: empty_kind_summary(),
                 categories: empty_category_summary(),
@@ -218,6 +226,9 @@ pub fn build_inventory_summary(discovery: &DiscoveryOutput) -> DiscoveryInventor
     }
 
     for item in &discovery.items {
+        if !include_item(item) {
+            continue;
+        }
         let summary = provider_items
             .get_mut(item.provider.as_str())
             .expect("provider summary exists");

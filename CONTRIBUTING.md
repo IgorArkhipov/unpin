@@ -54,6 +54,9 @@ python3 scripts/run_local_provider_matrix.py
 Follow [the matrix guide](docs/local-provider-matrix.md) to capture, visually
 review, and finalize the publishable evidence set.
 
+For performance-sensitive changes, rerun the release-mode workloads and compare
+them with the [performance baselines](docs/PERFORMANCE_BASELINES.md).
+
 ## Code Guidelines
 
 - Keep `unpin-core` headless. It should own discovery, planning, mutation, snapshots, backups, restore, and MCP-safe logic.

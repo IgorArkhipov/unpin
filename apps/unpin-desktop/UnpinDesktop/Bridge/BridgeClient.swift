@@ -211,6 +211,14 @@ actor BridgeClient {
         child.standardInput = standardInput
         child.standardOutput = standardOutput
         child.standardError = FileHandle.nullDevice
+        let inputFD = standardInput.fileHandleForWriting.fileDescriptor
+        let outputFD = standardOutput.fileHandleForReading.fileDescriptor
+        guard fcntl(inputFD, F_SETNOSIGPIPE, 1) == 0,
+              Self.setNonblocking(inputFD),
+              Self.setNonblocking(outputFD)
+        else {
+            throw BridgeClientError.childStopped
+        }
         try child.run()
         process = child
         input = standardInput.fileHandleForWriting
@@ -552,9 +560,15 @@ actor BridgeClient {
         }
         do {
             try Task.checkCancellation()
-            input.write(encoded)
-            input.write(Data([0x0A]))
-            let responseData = try await readFrame(from: output, kind: kind)
+            let timeoutMilliseconds = kind == .readOnly
+                ? Self.readOnlyRequestTimeoutMilliseconds
+                : controlRequestTimeoutMilliseconds
+            let deadline = DispatchTime.now().uptimeNanoseconds
+                + UInt64(timeoutMilliseconds) * 1_000_000
+            var frame = encoded
+            frame.append(0x0A)
+            try writeFrame(frame, to: input, deadline: deadline)
+            let responseData = try await readFrame(from: output, deadline: deadline)
             let response = try JSONDecoder().decode(BridgeResponse<Response>.self, from: responseData)
             guard response.version == Self.protocolVersion, response.id == request.id else {
                 throw BridgeClientError.malformedResponse
@@ -579,6 +593,9 @@ actor BridgeClient {
             }
             await forceStop()
             if case .requestTimedOut = error {
+                throw BridgeClientError.controlRequestUncertain
+            }
+            if case .childStopped = error {
                 throw BridgeClientError.controlRequestUncertain
             }
             throw error
@@ -695,11 +712,46 @@ actor BridgeClient {
         }
     }
 
-    private func readFrame(from output: FileHandle, kind: BridgeRequestKind) async throws -> Data {
-        let timeoutMilliseconds = kind == .readOnly
-            ? Self.readOnlyRequestTimeoutMilliseconds
-            : controlRequestTimeoutMilliseconds
-        let deadline = Date().timeIntervalSinceReferenceDate + Double(timeoutMilliseconds) / 1_000
+    private static func setNonblocking(_ fd: Int32) -> Bool {
+        let flags = fcntl(fd, F_GETFL)
+        return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0
+    }
+
+    private func waitForIO(fd: Int32, events: Int16, deadline: UInt64) throws {
+        while true {
+            try Task.checkCancellation()
+            let now = DispatchTime.now().uptimeNanoseconds
+            let remaining = deadline > now ? deadline - now : 0
+            guard remaining > 0 else { throw BridgeClientError.requestTimedOut }
+            let timeout = Int32(min(100, max(1, (remaining + 999_999) / 1_000_000)))
+            var descriptor = pollfd(fd: fd, events: events, revents: 0)
+            let readiness = poll(&descriptor, 1, timeout)
+            if readiness < 0 {
+                if errno == EINTR { continue }
+                throw BridgeClientError.childStopped
+            }
+            if readiness > 0 { return }
+        }
+    }
+
+    private func writeFrame(_ frame: Data, to input: FileHandle, deadline: UInt64) throws {
+        let fd = input.fileDescriptor
+        var offset = 0
+        while offset < frame.count {
+            try waitForIO(fd: fd, events: Int16(POLLOUT), deadline: deadline)
+            let written = frame.withUnsafeBytes { bytes in
+                Darwin.write(fd, bytes.baseAddress!.advanced(by: offset), bytes.count - offset)
+            }
+            if written < 0 {
+                if errno == EAGAIN || errno == EINTR { continue }
+                throw BridgeClientError.childStopped
+            }
+            guard written > 0 else { throw BridgeClientError.childStopped }
+            offset += written
+        }
+    }
+
+    private func readFrame(from output: FileHandle, deadline: UInt64) async throws -> Data {
         while true {
             try Task.checkCancellation()
             if let newline = outputBuffer.firstIndex(of: 0x0A) {
@@ -708,19 +760,17 @@ actor BridgeClient {
                 guard frame.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
                 return Data(frame)
             }
-            if Date().timeIntervalSinceReferenceDate >= deadline {
-                throw BridgeClientError.requestTimedOut
+            try waitForIO(fd: output.fileDescriptor, events: Int16(POLLIN), deadline: deadline)
+            var chunk = [UInt8](repeating: 0, count: 8_192)
+            let count = chunk.withUnsafeMutableBytes { bytes in
+                Darwin.read(output.fileDescriptor, bytes.baseAddress!, bytes.count)
             }
-            var descriptor = pollfd(fd: output.fileDescriptor, events: Int16(POLLIN), revents: 0)
-            let readiness = poll(&descriptor, 1, 100)
-            if readiness < 0 {
-                if errno == EINTR { continue }
+            if count < 0 {
+                if errno == EAGAIN || errno == EINTR { continue }
                 throw BridgeClientError.childStopped
             }
-            guard readiness > 0 else { continue }
-            let chunk = output.availableData
-            guard chunk.isEmpty == false else { throw BridgeClientError.childStopped }
-            outputBuffer.append(chunk)
+            guard count > 0 else { throw BridgeClientError.childStopped }
+            outputBuffer.append(contentsOf: chunk.prefix(count))
             guard outputBuffer.count <= Self.maximumFrameBytes else { throw BridgeClientError.malformedResponse }
         }
     }

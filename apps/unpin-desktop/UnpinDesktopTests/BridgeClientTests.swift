@@ -225,6 +225,107 @@ final class BridgeClientTests: XCTestCase {
         XCTAssertTrue(stopped)
     }
 
+    func testLargeControlRequestTimesOutWhenChildStopsReading() async throws {
+        let script = fakeHandshakeScript(tail: "exec sleep 30")
+        let temporary = try temporaryExecutable(script: script)
+        defer { try? FileManager.default.removeItem(at: temporary.root) }
+        let digest = SHA256.hash(data: try Data(contentsOf: temporary.executable))
+            .map { String(format: "%02x", $0) }.joined()
+        let bridge = BridgeClient(
+            executableURL: temporary.executable,
+            projectRoot: temporary.root,
+            manifest: BundledBridgeManifest(
+                bridgeProtocolVersion: BridgeClient.protocolVersion,
+                unpinVersion: "1.0.0",
+                sha256: digest
+            ),
+            controlRequestTimeoutMilliseconds: 50
+        )
+
+        try await bridge.start()
+        _ = try await bridge.handshake()
+        let started = Date()
+        do {
+            _ = try await bridge.approveGroup(
+                operationID: String(repeating: "x", count: 100_000),
+                fingerprint: "fingerprint"
+            )
+            XCTFail("a child that does not read the request must not complete")
+        } catch BridgeClientError.controlRequestUncertain {
+            XCTAssertLessThan(Date().timeIntervalSince(started), 2)
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        let stopped = await bridge.stop()
+        XCTAssertTrue(stopped)
+    }
+
+    func testDelayedReadOnlyResponseCompletes() async throws {
+        let script = fakeHandshakeScript(tail: """
+        IFS= read -r request
+        id=$(printf '%s' "$request" | sed -n 's/.*"id":"\\([^"]*\\)".*/\\1/p')
+        sleep 0.1
+        printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"capturedAtUnix":0,"inventory":[],"warnings":[],"agentPluginInventoryComplete":true,"agentPlugins":[],"groups":[],"groupWarnings":[]}}'
+        """)
+        let temporary = try temporaryExecutable(script: script)
+        defer { try? FileManager.default.removeItem(at: temporary.root) }
+        let digest = SHA256.hash(data: try Data(contentsOf: temporary.executable))
+            .map { String(format: "%02x", $0) }.joined()
+        let bridge = BridgeClient(
+            executableURL: temporary.executable,
+            projectRoot: temporary.root,
+            manifest: BundledBridgeManifest(
+                bridgeProtocolVersion: BridgeClient.protocolVersion,
+                unpinVersion: "1.0.0",
+                sha256: digest
+            )
+        )
+
+        try await bridge.start()
+        _ = try await bridge.handshake()
+        let snapshot = try await bridge.snapshot()
+        XCTAssertEqual(snapshot.capturedAtUnix, 0)
+        let stopped = await bridge.stop()
+        XCTAssertTrue(stopped)
+    }
+
+    func testCancelledLargeControlWriteHasUncertainOutcome() async throws {
+        let temporary = try temporaryExecutable(script: fakeHandshakeScript(tail: "exec sleep 30"))
+        defer { try? FileManager.default.removeItem(at: temporary.root) }
+        let digest = SHA256.hash(data: try Data(contentsOf: temporary.executable))
+            .map { String(format: "%02x", $0) }.joined()
+        let bridge = BridgeClient(
+            executableURL: temporary.executable,
+            projectRoot: temporary.root,
+            manifest: BundledBridgeManifest(
+                bridgeProtocolVersion: BridgeClient.protocolVersion,
+                unpinVersion: "1.0.0",
+                sha256: digest
+            )
+        )
+
+        try await bridge.start()
+        _ = try await bridge.handshake()
+        let pending = Task {
+            try await bridge.approveGroup(
+                operationID: String(repeating: "x", count: 100_000),
+                fingerprint: "fingerprint"
+            )
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        pending.cancel()
+        do {
+            _ = try await pending.value
+            XCTFail("a cancelled control request must not report success")
+        } catch BridgeClientError.controlRequestUncertain {
+            // Partial delivery cannot be assumed safe to retry.
+        } catch {
+            XCTFail("unexpected error: \(error)")
+        }
+        let stopped = await bridge.stop()
+        XCTAssertTrue(stopped)
+    }
+
     func testStalledControlTimeoutKillsChildIgnoringSigterm() async throws {
         let script = """
         #!/bin/sh
@@ -746,6 +847,22 @@ final class BridgeClientTests: XCTestCase {
         XCTAssertEqual(status.status?.liveStatus, "running")
         XCTAssertEqual(status.liveStatus, "running")
         _ = await bridge.stop()
+    }
+
+    private func fakeHandshakeScript(tail: String) -> String {
+        """
+        #!/bin/sh
+        IFS= read -r request
+        id=$(printf '%s' "$request" | sed -n 's/.*"id":"\\([^"]*\\)".*/\\1/p')
+        parent_pid=$(printf '%s' "$request" | sed -n 's/.*"parentPid":\\([0-9]*\\).*/\\1/p')
+        parent_marker=$(printf '%s' "$request" | sed -n 's/.*"parentStartMarker":"\\([^"]*\\)".*/\\1/p')
+        child_pid=$(printf '%s' "$request" | sed -n 's/.*"childPid":\\([0-9]*\\).*/\\1/p')
+        generation=$(printf '%s' "$request" | sed -n 's/.*"processGeneration":"\\([^"]*\\)".*/\\1/p')
+        project_root=$(printf '%s' "$request" | sed -n 's/.*"projectRoot":"\\([^"]*\\)".*/\\1/p')
+        app_state_root=$(printf '%s' "$request" | sed -n 's/.*"appStateRoot":"\\([^"]*\\)".*/\\1/p')
+        printf '%s\\n' '{"version":2,"id":"'"$id"'","result":{"protocolVersion":2,"binaryVersion":"1.0.0","capabilities":["agentPlugins.inspect","agentPlugins.plan","agentPlugins.approve","agentPlugins.apply","agentPlugins.discard","workflow.compose","workflow.validate","workflow.propose","workflow.launch","workflow.transition","workflow.observe","workflow.cancel-transition","workflow.status","workflow.recovery"],"binding":{"parentPid":'"$parent_pid"',"parentStartMarker":"'"$parent_marker"'","childPid":'"$child_pid"',"childStartMarker":"fake-child-start","projectRoot":"'"$project_root"'","appStateRoot":"'"$app_state_root"'","processGeneration":"'"$generation"'"}}}'
+        \(tail)
+        """
     }
 
     private func temporaryExecutable(script: String) throws -> (root: URL, executable: URL) {

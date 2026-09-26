@@ -49,6 +49,9 @@ use unpin_core::{
     },
 };
 
+#[path = "support/counting_allocations.rs"]
+mod counting_allocations;
+
 fn fixtures_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -4205,6 +4208,139 @@ fn mcp_inventory_summary_returns_project_root_and_honors_filters() {
             .expect("warnings")
             .is_empty()
     );
+}
+
+#[test]
+fn cached_inventory_views_preserve_scope_limits_and_order() {
+    let mut scoped = context();
+    scoped.provider_scope = McpProviderScope::Provider(ProviderId::Claude);
+    let unscoped = context();
+    let scoped_items = json!({"selector": {"categories": ["skill"]}, "limit": 2});
+    let filtered_items = json!({
+        "selector": {"providers": ["claude"], "categories": ["skill"]},
+        "limit": 2
+    });
+    let expected = call_tool(&unscoped, "unpin_list_items", filtered_items);
+    for _ in 0..2 {
+        let actual = call_tool(&scoped, "unpin_list_items", scoped_items.clone());
+        assert_eq!(actual["totalMatched"], expected["totalMatched"]);
+        assert_eq!(actual["items"], expected["items"]);
+        assert_eq!(actual["warnings"], expected["warnings"]);
+    }
+
+    let expected = call_tool(
+        &unscoped,
+        "unpin_get_inventory_summary",
+        json!({"providers": ["claude"], "layers": ["project"]}),
+    );
+    let actual = call_tool(
+        &scoped,
+        "unpin_get_inventory_summary",
+        json!({"layers": ["project"]}),
+    );
+    assert_eq!(actual["inventory"], expected["inventory"]);
+    assert_eq!(actual["warnings"], expected["warnings"]);
+}
+
+#[test]
+#[ignore = "release-mode performance baseline; run by name with --ignored --nocapture"]
+fn cached_mcp_inventory_benchmark() {
+    use std::{hint::black_box, time::Instant};
+
+    fn report(label: &str, unit: &str, mut samples: Vec<u128>) {
+        samples.sort_unstable();
+        println!(
+            "{label}: median={} {unit} p95={} {unit} samples={}",
+            samples[samples.len() / 2],
+            samples[samples.len() * 95 / 100],
+            samples.len()
+        );
+    }
+
+    for count in [128, 1_024, 4_096] {
+        let fixture = TempDir::new().expect("benchmark fixture");
+        let app_state = TempDir::new().expect("benchmark app state");
+        let skills = fixture.path().join("claude/project/.claude/skills");
+        for index in 0..count {
+            let dir = skills.join(format!("benchmark-{index:05}"));
+            fs::create_dir_all(&dir).expect("skill directory");
+            fs::write(dir.join("SKILL.md"), "# Benchmark skill\n").expect("skill fixture");
+        }
+        let mut context = context_with_roots(fixture.path(), app_state.path());
+        context.provider_scope = McpProviderScope::Provider(ProviderId::Claude);
+        let list_arguments = json!({"selector": {"categories": ["skill"]}, "limit": 10});
+        let summary_arguments = json!({"layers": ["project"]});
+        let first = call_tool(&context, "unpin_list_items", list_arguments.clone());
+        assert_eq!(first["totalMatched"].as_u64(), Some(count as u64));
+        let cached = context
+            .discovery_cache
+            .get_or_discover(&context.discovery_roots)
+            .expect("cached discovery");
+
+        let mut clone_samples = Vec::new();
+        let mut list_samples = Vec::new();
+        let mut summary_samples = Vec::new();
+        let mut clone_allocations = Vec::new();
+        let mut list_allocations = Vec::new();
+        let mut summary_allocations = Vec::new();
+        for _ in 0..30 {
+            let before = counting_allocations::snapshot();
+            let start = Instant::now();
+            black_box((*cached).clone());
+            clone_samples.push(start.elapsed().as_micros());
+            clone_allocations.push(counting_allocations::snapshot().0 - before.0);
+
+            let before = counting_allocations::snapshot();
+            let start = Instant::now();
+            black_box(call_tool(
+                &context,
+                "unpin_list_items",
+                list_arguments.clone(),
+            ));
+            list_samples.push(start.elapsed().as_micros());
+            list_allocations.push(counting_allocations::snapshot().0 - before.0);
+
+            let before = counting_allocations::snapshot();
+            let start = Instant::now();
+            black_box(call_tool(
+                &context,
+                "unpin_get_inventory_summary",
+                summary_arguments.clone(),
+            ));
+            summary_samples.push(start.elapsed().as_micros());
+            summary_allocations.push(counting_allocations::snapshot().0 - before.0);
+        }
+        report(
+            &format!("mcp items={count} old-clone-only"),
+            "us",
+            clone_samples,
+        );
+        report(
+            &format!("mcp items={count} cached-list-10"),
+            "us",
+            list_samples,
+        );
+        report(
+            &format!("mcp items={count} cached-summary"),
+            "us",
+            summary_samples,
+        );
+        report(
+            &format!("mcp items={count} old-clone allocations"),
+            "events",
+            clone_allocations.into_iter().map(u128::from).collect(),
+        );
+        report(
+            &format!("mcp items={count} list allocations"),
+            "events",
+            list_allocations.into_iter().map(u128::from).collect(),
+        );
+        report(
+            &format!("mcp items={count} summary allocations"),
+            "events",
+            summary_allocations.into_iter().map(u128::from).collect(),
+        );
+    }
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use std::{
+    cell::RefCell,
     collections::BTreeMap,
     error::Error,
     io,
@@ -40,6 +41,10 @@ use unpin_core::mutation::{
     load_backup_summaries_authenticated, plan_toggle,
 };
 use unpin_core::sessions::SessionAuthorityKey;
+
+#[cfg(test)]
+#[path = "../../unpin-core/tests/support/counting_allocations.rs"]
+mod counting_allocations;
 
 #[cfg(test)]
 use unpin_core::snapshots::write_discovery_snapshot;
@@ -163,6 +168,8 @@ pub(super) enum CategoryFilter {
 
 pub(super) struct TuiState {
     discovery: DiscoveryOutput,
+    inventory_cache: RefCell<inventory::InventoryRenderCache>,
+    preview_cache: RefCell<Option<(DiscoveryItem, Vec<String>)>>,
     backups: Vec<BackupSummary>,
     app_state_root: PathBuf,
     project_root: PathBuf,
@@ -354,6 +361,8 @@ impl TuiState {
         let package_workflow = agent_plugins::AgentPluginWorkflow::new(&discovery);
         Self {
             discovery,
+            inventory_cache: RefCell::new(inventory::InventoryRenderCache::default()),
+            preview_cache: RefCell::new(None),
             backups,
             app_state_root,
             project_root,
@@ -432,10 +441,8 @@ impl TuiState {
     }
 
     fn selected_item(&self) -> Option<&DiscoveryItem> {
-        let visible_indices = self.visible_indices();
-        visible_indices
-            .get(self.selected)
-            .and_then(|index| self.discovery.items.get(*index))
+        self.visible_index(self.selected)
+            .and_then(|index| self.discovery.items.get(index))
     }
 
     fn cycle_view(&mut self) {
@@ -462,20 +469,7 @@ impl TuiState {
 
     fn active_rows(&self) -> Vec<String> {
         match self.view {
-            TuiView::Inventory => self
-                .visible_items()
-                .into_iter()
-                .map(|item| {
-                    format!(
-                        "{} {} {} [{}] {}",
-                        item.provider.as_str(),
-                        item.layer.as_str(),
-                        item.category.as_str(),
-                        enabled_label(item.enabled),
-                        item.display_name
-                    )
-                })
-                .collect(),
+            TuiView::Inventory => self.prepared_inventory_rows(),
             TuiView::Packages => self.package_workflow.rows(),
             TuiView::Profiles => self.profile_workflow.rows(),
             TuiView::Groups if self.group_workflow.uses_inventory_rows() => {
@@ -1379,6 +1373,7 @@ impl TuiState {
             target_enabled,
         };
         self.staged.insert(inventory_item_key(&item), staged);
+        self.preview_cache.borrow_mut().take();
         self.pending_confirmation = false;
         true
     }
@@ -1401,14 +1396,8 @@ impl TuiState {
         let mut results = Vec::new();
         for staged in &staged {
             let result = self.apply_staged_toggle(staged);
-            if result.status == ToggleStatus::Applied
-                && let Some(item) = self
-                    .discovery
-                    .items
-                    .iter_mut()
-                    .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
-            {
-                item.enabled = staged.target_enabled;
+            if result.status == ToggleStatus::Applied {
+                self.record_applied_toggle(staged);
             }
             results.push(result);
         }
@@ -1541,6 +1530,18 @@ impl TuiState {
             TuiActionStatus::Error(format!("{summary}; {}", failures.join("; ")))
         });
         results
+    }
+
+    fn record_applied_toggle(&mut self, staged: &StagedToggle) {
+        if let Some(item) = self
+            .discovery
+            .items
+            .iter_mut()
+            .find(|item| inventory_item_key(item) == inventory_item_key(&staged.item))
+        {
+            item.enabled = staged.target_enabled;
+            *self.inventory_cache.borrow_mut() = inventory::InventoryRenderCache::default();
+        }
     }
 
     fn apply_staged_toggle(&self, staged: &StagedToggle) -> ToggleResult {
@@ -2750,12 +2751,19 @@ fn selected_detail_strings(item: &DiscoveryItem) -> Vec<String> {
 }
 
 fn plan_preview_strings(state: &TuiState, item: &DiscoveryItem) -> Vec<String> {
+    if let Some((cached_item, lines)) = state.preview_cache.borrow().as_ref()
+        && cached_item == item
+    {
+        return lines.clone();
+    }
     let plan = plan_toggle(TogglePlanRequest {
         app_state_root: state.app_state_root.clone(),
         item: item.clone(),
     });
 
-    render_plan_preview(&plan)
+    let lines = render_plan_preview(&plan);
+    *state.preview_cache.borrow_mut() = Some((item.clone(), lines.clone()));
+    lines
 }
 
 fn render_plan_preview(plan: &ToggleResult) -> Vec<String> {
@@ -4083,6 +4091,213 @@ mod tests {
     }
 
     #[test]
+    fn tui_refresh_invalidates_prepared_rows_and_display_preview() {
+        let original = item(
+            "claude-first",
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Tool,
+            DiscoveryKind::Setting,
+        );
+        let mut state = TuiState::new(discovery(vec![original.clone()]));
+        let first_rows = state.active_rows();
+        let _ = state.active_details();
+        assert!(state.preview_cache.borrow().is_some());
+
+        let mut changed = original;
+        changed.display_name = "changed display name".to_string();
+        state.refresh_discovery(&discovery(vec![changed]));
+
+        assert!(state.preview_cache.borrow().is_none());
+        let second_rows = state.active_rows();
+        assert_ne!(first_rows, second_rows);
+        assert!(second_rows[0].contains("changed display name"));
+    }
+
+    #[test]
+    #[ignore = "release-mode performance baseline; run by name with --ignored --nocapture"]
+    fn tui_search_redraw_and_preview_benchmark() {
+        use std::{hint::black_box, time::Instant};
+
+        fn report(label: &str, mut samples: Vec<u128>) {
+            samples.sort_unstable();
+            println!(
+                "{label}: median={}us p95={}us samples={}",
+                samples[samples.len() / 2],
+                samples[samples.len() * 95 / 100],
+                samples.len()
+            );
+        }
+
+        fn report_allocations(label: &str, samples: Vec<u64>) {
+            let mut samples = samples;
+            samples.sort_unstable();
+            println!(
+                "{label}: median={} allocations p95={} allocations",
+                samples[samples.len() / 2],
+                samples[samples.len() * 95 / 100],
+            );
+        }
+
+        fn reference_rows(items: &[DiscoveryItem], query: &str) -> Vec<String> {
+            items
+                .iter()
+                .filter(|item| {
+                    let query = query.to_lowercase();
+                    [
+                        item.id.as_str(),
+                        item.display_name.as_str(),
+                        item.provider.as_str(),
+                        item.layer.as_str(),
+                        item.category.as_str(),
+                        item.kind.as_str(),
+                        item.source_path.as_str(),
+                        item.state_path.as_str(),
+                    ]
+                    .iter()
+                    .any(|field| field.to_lowercase().contains(&query))
+                })
+                .map(|item| {
+                    format!(
+                        "{} {} {} [{}] {}",
+                        item.provider.as_str(),
+                        item.layer.as_str(),
+                        item.category.as_str(),
+                        enabled_label(item.enabled),
+                        item.display_name
+                    )
+                })
+                .collect()
+        }
+
+        for count in [128, 1_024, 4_096] {
+            let items = (0..count)
+                .map(|index| {
+                    let mut value = item(
+                        &format!("claude-skill-{index}"),
+                        ProviderId::Claude,
+                        DiscoveryLayer::Project,
+                        DiscoveryCategory::Skill,
+                        DiscoveryKind::Skill,
+                    );
+                    if index % 8 == 0 {
+                        value.display_name.push_str(" needle");
+                    }
+                    value
+                })
+                .collect::<Vec<_>>();
+            let mut state = TuiState::new(discovery(items));
+            state.set_search_query("needle");
+            black_box(state.active_rows());
+
+            let mut reference_redraw = Vec::new();
+            let mut prepared_redraw = Vec::new();
+            let mut reference_search_updates = Vec::new();
+            let mut search_updates = Vec::new();
+            let mut reference_allocations = Vec::new();
+            let mut prepared_allocations = Vec::new();
+            let mut reference_search_allocations = Vec::new();
+            let mut search_allocations = Vec::new();
+            for iteration in 0..30 {
+                state.set_search_query("needle");
+                black_box(state.active_rows());
+
+                let before = counting_allocations::snapshot();
+                let start = Instant::now();
+                black_box(reference_rows(&state.discovery.items, "needle"));
+                reference_redraw.push(start.elapsed().as_micros());
+                reference_allocations.push(counting_allocations::snapshot().0 - before.0);
+
+                let before = counting_allocations::snapshot();
+                let start = Instant::now();
+                black_box(state.active_rows());
+                prepared_redraw.push(start.elapsed().as_micros());
+                prepared_allocations.push(counting_allocations::snapshot().0 - before.0);
+
+                let next_query = if iteration % 2 == 0 {
+                    "missing"
+                } else {
+                    "skill"
+                };
+                let before = counting_allocations::snapshot();
+                let start = Instant::now();
+                black_box(reference_rows(&state.discovery.items, next_query));
+                reference_search_updates.push(start.elapsed().as_micros());
+                reference_search_allocations.push(counting_allocations::snapshot().0 - before.0);
+
+                let before = counting_allocations::snapshot();
+                let start = Instant::now();
+                state.set_search_query(next_query);
+                black_box(state.active_rows());
+                search_updates.push(start.elapsed().as_micros());
+                search_allocations.push(counting_allocations::snapshot().0 - before.0);
+            }
+            report(
+                &format!("tui rows={count} reference-redraw"),
+                reference_redraw,
+            );
+            report(
+                &format!("tui rows={count} prepared-redraw"),
+                prepared_redraw,
+            );
+            report(
+                &format!("tui rows={count} reference-search-update"),
+                reference_search_updates,
+            );
+            report(&format!("tui rows={count} search-update"), search_updates);
+            report_allocations(
+                &format!("tui rows={count} reference-redraw"),
+                reference_allocations,
+            );
+            report_allocations(
+                &format!("tui rows={count} prepared-redraw"),
+                prepared_allocations,
+            );
+            report_allocations(
+                &format!("tui rows={count} reference-search-update"),
+                reference_search_allocations,
+            );
+            report_allocations(
+                &format!("tui rows={count} search-update"),
+                search_allocations,
+            );
+
+            state.clear_search_query();
+            let selected = state.selected_item().expect("selected item").clone();
+            let mut fresh_preview = Vec::new();
+            let mut cached_preview = Vec::new();
+            let mut fresh_allocations = Vec::new();
+            let mut cached_allocations = Vec::new();
+            black_box(plan_preview_strings(&state, &selected));
+            for _ in 0..30 {
+                let before = counting_allocations::snapshot();
+                let start = Instant::now();
+                black_box(plan_toggle(TogglePlanRequest {
+                    app_state_root: state.app_state_root.clone(),
+                    item: selected.clone(),
+                }));
+                fresh_preview.push(start.elapsed().as_micros());
+                fresh_allocations.push(counting_allocations::snapshot().0 - before.0);
+                let before = counting_allocations::snapshot();
+                let start = Instant::now();
+                black_box(plan_preview_strings(&state, &selected));
+                cached_preview.push(start.elapsed().as_micros());
+                cached_allocations.push(counting_allocations::snapshot().0 - before.0);
+            }
+            report(&format!("tui rows={count} fresh-preview"), fresh_preview);
+            report(&format!("tui rows={count} cached-preview"), cached_preview);
+            report_allocations(
+                &format!("tui rows={count} fresh-preview"),
+                fresh_allocations,
+            );
+            report_allocations(
+                &format!("tui rows={count} cached-preview"),
+                cached_allocations,
+            );
+        }
+    }
+
+    #[test]
     fn tui_search_editing_updates_query_and_selection() {
         let mut state = TuiState::new(discovery(vec![
             item(
@@ -4762,6 +4977,7 @@ mod tests {
             project_root.clone(),
             roots,
         );
+        assert!(state.active_rows()[0].contains("[on]"));
 
         assert!(state.stage_selected_toggle());
         assert!(state.confirm_staged());
@@ -4770,6 +4986,7 @@ mod tests {
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].status, ToggleStatus::Applied);
         assert!(!live_skill.exists());
+        assert!(state.active_rows()[0].contains("[off]"));
         let output = render_headless_state(&state);
         assert!(output.contains("Last action: error: Applied 1/1 staged change"));
         assert!(output.contains("refresh failed:"));
