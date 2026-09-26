@@ -36,11 +36,25 @@ pub(super) fn provider_summaries(
     arguments: &Value,
     scope: McpProviderScope,
 ) -> Vec<Value> {
-    let mut summaries = build_inventory_summary(discovery)
-        .providers
-        .into_iter()
-        .map(|summary| serde_json::to_value(summary).expect("provider summary serializes"))
-        .collect::<Vec<_>>();
+    let mut summaries = build_inventory_summary_filtered(
+        discovery,
+        |item| {
+            scope.allows(item.provider)
+                && selector_array_matches(arguments, "providers", item.provider.as_str())
+                && selector_array_matches(arguments, "layers", item.layer.as_str())
+        },
+        |warning| {
+            scope.allows(warning.provider)
+                && selector_array_matches(arguments, "providers", warning.provider.as_str())
+                && warning
+                    .layer
+                    .is_none_or(|layer| selector_array_matches(arguments, "layers", layer.as_str()))
+        },
+    )
+    .providers
+    .into_iter()
+    .map(|summary| serde_json::to_value(summary).expect("provider summary serializes"))
+    .collect::<Vec<_>>();
     summaries.retain(|summary| {
         summary
             .get("provider")
@@ -51,23 +65,6 @@ pub(super) fn provider_summaries(
             })
     });
     summaries
-}
-
-pub(super) fn filter_summary_discovery(
-    mut discovery: DiscoveryOutput,
-    arguments: &Value,
-) -> DiscoveryOutput {
-    discovery.items.retain(|item| {
-        selector_array_matches(arguments, "providers", item.provider.as_str())
-            && selector_array_matches(arguments, "layers", item.layer.as_str())
-    });
-    discovery.warnings.retain(|warning| {
-        selector_array_matches(arguments, "providers", warning.provider.as_str())
-            && warning
-                .layer
-                .is_none_or(|layer| selector_array_matches(arguments, "layers", layer.as_str()))
-    });
-    discovery
 }
 
 pub(super) fn selector_matches(item: &DiscoveryItem, selector: &Value) -> bool {

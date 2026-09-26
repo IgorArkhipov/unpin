@@ -61,7 +61,7 @@ use crate::sessions::{
     PinnedExposure, PinnedProfile, SessionAuthorityKey, SessionEndController, WorkflowProposalV1,
     WorkflowReloadLimitation,
 };
-use crate::snapshots::build_inventory_summary;
+use crate::snapshots::build_inventory_summary_filtered;
 use crate::state::workspace::resolve_workspace_identity;
 use crate::workflows::{
     CompiledWorkflowRevision, WorkflowDefinitionEntry, WorkflowStore, compile_workflow,
@@ -966,6 +966,12 @@ pub(super) fn discover_scoped_cached(context: &McpContext) -> Result<DiscoveryOu
                 .provider_scope
                 .filter_discovery((*discovery).clone())
         })
+}
+
+pub(super) fn discover_shared_cached(context: &McpContext) -> Result<Arc<DiscoveryOutput>, String> {
+    context
+        .discovery_cache
+        .get_or_discover(&context.discovery_roots)
 }
 
 pub(super) fn optional_provider(

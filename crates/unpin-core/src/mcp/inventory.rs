@@ -7,8 +7,18 @@ pub(super) fn get_inventory_summary(
     arguments: &Value,
 ) -> Result<Value, String> {
     validate_selector(arguments)?;
-    let discovery = discover_scoped_cached(context)?;
-    let discovery = filter_summary_discovery(discovery, arguments);
+    let discovery = discover_shared_cached(context)?;
+    let warnings = discovery
+        .warnings
+        .iter()
+        .filter(|warning| {
+            context.provider_scope.allows(warning.provider)
+                && selector_array_matches(arguments, "providers", warning.provider.as_str())
+                && warning
+                    .layer
+                    .is_none_or(|layer| selector_array_matches(arguments, "layers", layer.as_str()))
+        })
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "status": "ok",
@@ -26,12 +36,12 @@ pub(super) fn get_inventory_summary(
         "inventory": {
             "providers": provider_summaries(&discovery, arguments, context.provider_scope)
         },
-        "warnings": discovery.warnings
+        "warnings": warnings
     }))
 }
 
 pub(super) fn list_items(context: &McpContext, arguments: &Value) -> Result<Value, String> {
-    let discovery = discover_scoped_cached(context)?;
+    let discovery = discover_shared_cached(context)?;
     let selector = arguments.get("selector").unwrap_or(&Value::Null);
     validate_selector(selector)?;
     let limit = arguments
@@ -39,22 +49,27 @@ pub(super) fn list_items(context: &McpContext, arguments: &Value) -> Result<Valu
         .and_then(Value::as_u64)
         .and_then(|value| usize::try_from(value).ok())
         .filter(|value| *value > 0);
-    let mut items = discovery
-        .items
-        .into_iter()
-        .filter(|item| selector_matches(item, selector))
+    let matching = || {
+        discovery.items.iter().filter(|item| {
+            context.provider_scope.allows(item.provider) && selector_matches(item, selector)
+        })
+    };
+    let total_matched = matching().count();
+    let items = matching()
+        .take(limit.unwrap_or(usize::MAX))
         .collect::<Vec<_>>();
-    let total_matched = items.len();
-    if let Some(limit) = limit {
-        items.truncate(limit);
-    }
+    let warnings = discovery
+        .warnings
+        .iter()
+        .filter(|warning| context.provider_scope.allows(warning.provider))
+        .collect::<Vec<_>>();
 
     Ok(json!({
         "status": "ok",
         "selector": selector,
         "totalMatched": total_matched,
         "items": items,
-        "warnings": discovery.warnings
+        "warnings": warnings
     }))
 }
 pub(super) fn list_backups(context: &McpContext, arguments: &Value) -> Value {
