@@ -2045,7 +2045,7 @@ fn discovers_modern_provider_surfaces_with_expected_mutability() {
             DiscoveryLayer::Global,
             DiscoveryMutability::ReadWrite,
             "cursor-global-reviewer",
-            "cursor/global/agents/reviewer.md",
+            "cursor/home/agents/reviewer.md",
         ),
         (
             "cursor:global:plugin-manifest:local:example-plugin",
@@ -2155,7 +2155,7 @@ fn discovers_modern_provider_surfaces_with_expected_mutability() {
             ProviderId::Cursor,
             DiscoveryLayer::Global,
             "BeforeShellExecution",
-            "cursor/global/hooks.json",
+            "cursor/home/hooks.json",
         ),
     ] {
         let item = result
@@ -2600,7 +2600,7 @@ fn discovers_vaulted_agent_as_disabled_when_app_state_root_is_configured() {
     let original_path = fixture_copy
         .path()
         .join("cursor")
-        .join("global")
+        .join("home")
         .join("agents")
         .join("reviewer.md");
     fs::remove_file(&original_path).expect("remove live agent");

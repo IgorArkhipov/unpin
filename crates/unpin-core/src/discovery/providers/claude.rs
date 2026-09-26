@@ -12,6 +12,52 @@ pub(crate) fn discover_claude(
         agent_plugin_metadata,
         agent_plugin_item_keys,
     } = state;
+    let settings_sources = [
+        read_settings_source::<ClaudeSettings>(
+            roots.claude_global.join("settings.json"),
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            "settings",
+            "settings.json",
+            warnings,
+        )?,
+        read_settings_source::<ClaudeSettings>(
+            roots.claude_global.join("settings.local.json"),
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            "settings-local",
+            "settings.local.json",
+            warnings,
+        )?,
+        read_settings_source::<ClaudeSettings>(
+            roots.claude_project.join(".claude").join("settings.json"),
+            ProviderId::Claude,
+            DiscoveryLayer::Project,
+            "settings",
+            ".claude/settings.json",
+            warnings,
+        )?,
+        read_settings_source::<ClaudeSettings>(
+            roots
+                .claude_project
+                .join(".claude")
+                .join("settings.local.json"),
+            ProviderId::Claude,
+            DiscoveryLayer::Project,
+            "settings-local",
+            ".claude/settings.local.json",
+            warnings,
+        )?,
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    let disable_all_hooks = settings_sources
+        .iter()
+        .rev()
+        .find_map(|source| source.document.disable_all_hooks)
+        .unwrap_or(false);
+
     let global_skill_root = roots.claude_global.join("skills");
     let live_skill_ids = discover_direct_child_skill_dirs(
         &global_skill_root,
@@ -21,6 +67,20 @@ pub(crate) fn discover_claude(
         DiscoveryMutability::ReadWrite,
         items,
     )?;
+    let global_plugin_roots = discover_claude_skill_directory_plugins(
+        &global_skill_root,
+        "claude:global:skill:",
+        DiscoveryLayer::Global,
+        disable_all_hooks,
+        items,
+        warnings,
+    )?;
+    apply_claude_skill_overrides(
+        items,
+        DiscoveryLayer::Global,
+        &settings_sources,
+        &global_plugin_roots,
+    );
     shared_skill_views.push(SkillView::new(
         ProviderId::Claude,
         DiscoveryLayer::Global,
@@ -56,6 +116,23 @@ pub(crate) fn discover_claude(
         warnings,
         items,
     )?;
+    let mut project_plugin_roots = BTreeSet::new();
+    for view in &project_skills.skill_views {
+        project_plugin_roots.extend(discover_claude_skill_directory_plugins(
+            &view.root,
+            &view.id_prefix,
+            DiscoveryLayer::Project,
+            disable_all_hooks,
+            items,
+            warnings,
+        )?);
+    }
+    apply_claude_skill_overrides(
+        items,
+        DiscoveryLayer::Project,
+        &settings_sources,
+        &project_plugin_roots,
+    );
     shared_skill_views.extend(project_skills.skill_views.iter().cloned());
     discover_vaulted_skill_items(
         roots.app_state_root.as_deref(),
@@ -161,12 +238,13 @@ pub(crate) fn discover_claude(
         .claude_project
         .join(".claude")
         .join("settings.local.json");
-    let project_settings = read_json_if_exists::<ClaudeSettings>(
-        &settings_path,
-        ProviderId::Claude,
-        Some(DiscoveryLayer::Project),
-        warnings,
-    )?;
+    let project_settings = settings_sources
+        .iter()
+        .rev()
+        .find(|source| {
+            source.layer == DiscoveryLayer::Project && source.source_label == "settings-local"
+        })
+        .map(|source| &source.document);
 
     if let Some(document) = read_json_if_exists::<McpDocument>(
         &mcp_path,
@@ -205,46 +283,7 @@ pub(crate) fn discover_claude(
         ));
     }
 
-    for source in [
-        read_settings_source::<ClaudeSettings>(
-            roots.claude_global.join("settings.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Global,
-            "settings",
-            "settings.json",
-            warnings,
-        )?,
-        read_settings_source::<ClaudeSettings>(
-            roots.claude_global.join("settings.local.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Global,
-            "settings-local",
-            "settings.local.json",
-            warnings,
-        )?,
-        read_settings_source::<ClaudeSettings>(
-            roots.claude_project.join(".claude").join("settings.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Project,
-            "settings",
-            ".claude/settings.json",
-            warnings,
-        )?,
-        read_settings_source::<ClaudeSettings>(
-            roots
-                .claude_project
-                .join(".claude")
-                .join("settings.local.json"),
-            ProviderId::Claude,
-            DiscoveryLayer::Project,
-            "settings-local",
-            ".claude/settings.local.json",
-            warnings,
-        )?,
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for source in &settings_sources {
         items.push(provider_setting_item(
             ProviderId::Claude,
             source.layer,
@@ -256,8 +295,8 @@ pub(crate) fn discover_claude(
             source.display_name,
             &source.path,
         ));
-        items.extend(claude_plugin_config_items(&source));
-        items.extend(claude_hook_items(&source, warnings));
+        items.extend(claude_plugin_config_items(source));
+        items.extend(claude_hook_items(source, disable_all_hooks, warnings));
     }
 
     let activations = crate::agent_plugins::activation_candidates(ProviderId::Claude, items);
@@ -271,6 +310,522 @@ pub(crate) fn discover_claude(
     )?;
 
     Ok(())
+}
+
+fn apply_claude_skill_overrides(
+    items: &mut [DiscoveryItem],
+    layer: DiscoveryLayer,
+    settings_sources: &[SettingsSource<ClaudeSettings>],
+    plugin_roots: &BTreeSet<PathBuf>,
+) {
+    let mut overrides = BTreeMap::new();
+    for source in settings_sources
+        .iter()
+        .filter(|source| source.layer <= layer)
+    {
+        overrides.extend(
+            source
+                .document
+                .skill_overrides
+                .iter()
+                .map(|(name, state)| (name.as_str(), state.as_str())),
+        );
+    }
+
+    for item in items.iter_mut().filter(|item| {
+        item.provider == ProviderId::Claude
+            && item.layer == layer
+            && item.category == DiscoveryCategory::Skill
+            && !plugin_roots.contains(Path::new(&item.state_path))
+    }) {
+        let Some(state) = overrides.get(item.display_name.as_str()) else {
+            continue;
+        };
+        match *state {
+            "on" => item.enabled = true,
+            "off" => {
+                item.enabled = false;
+                item.mutability = DiscoveryMutability::ReadOnly;
+            }
+            "name-only" | "user-invocable-only" => {
+                item.enabled = true;
+                item.mutability = DiscoveryMutability::ReadOnly;
+            }
+            _ => {}
+        }
+    }
+}
+
+fn discover_claude_skill_directory_plugins(
+    skill_root: &Path,
+    skill_id_prefix: &str,
+    layer: DiscoveryLayer,
+    disable_all_hooks: bool,
+    items: &mut Vec<DiscoveryItem>,
+    warnings: &mut Vec<DiscoveryWarning>,
+) -> Result<BTreeSet<PathBuf>, DiscoveryError> {
+    let mut plugin_roots = BTreeSet::new();
+    if !skill_root.exists() {
+        return Ok(plugin_roots);
+    }
+
+    let mut entries = Vec::new();
+    let mut skipped_entries = 0;
+    for entry in fs::read_dir(skill_root)? {
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(error) if recoverable_project_scope_scan_error(&error) => skipped_entries += 1,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    entries.sort_by_key(|entry| entry.file_name());
+    let base_skill_prefix = format!("claude:{}:skill:", layer.as_str());
+    let scope_suffix = skill_id_prefix
+        .strip_prefix(&base_skill_prefix)
+        .unwrap_or_default();
+    let plugin_id_prefix = format!(
+        "claude:{}:plugin-manifest:skills-dir:{}",
+        layer.as_str(),
+        scope_suffix
+    );
+
+    for entry in entries {
+        let skill_dir = entry.path();
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if recoverable_project_scope_scan_error(&error) => {
+                skipped_entries += 1;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let is_skill_dir = if file_type.is_dir() {
+            true
+        } else if file_type.is_symlink() {
+            fs::metadata(&skill_dir)
+                .map(|metadata| metadata.is_dir())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !is_skill_dir || !skill_dir.join("SKILL.md").is_file() {
+            continue;
+        }
+
+        let plugin_dir = skill_dir.join(".claude-plugin");
+        let plugin_dir_metadata = match fs::symlink_metadata(&plugin_dir) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                push_claude_plugin_warning(
+                    warnings,
+                    layer,
+                    &plugin_dir,
+                    format!("plugin directory could not be read: {error}"),
+                );
+                continue;
+            }
+        };
+        if plugin_dir_metadata.file_type().is_symlink() || !plugin_dir_metadata.is_dir() {
+            push_claude_plugin_warning(
+                warnings,
+                layer,
+                &plugin_dir,
+                "plugin directory must be a regular directory",
+            );
+            continue;
+        }
+
+        let manifest_path = plugin_dir.join("plugin.json");
+        let manifest_metadata = match fs::symlink_metadata(&manifest_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                push_claude_plugin_warning(
+                    warnings,
+                    layer,
+                    &manifest_path,
+                    format!("plugin manifest could not be read: {error}"),
+                );
+                continue;
+            }
+        };
+        if manifest_metadata.file_type().is_symlink() || !manifest_metadata.is_file() {
+            push_claude_plugin_warning(
+                warnings,
+                layer,
+                &manifest_path,
+                "plugin.json must be a regular file",
+            );
+            continue;
+        }
+
+        let raw = match fs::read_to_string(&manifest_path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                push_claude_plugin_warning(
+                    warnings,
+                    layer,
+                    &manifest_path,
+                    format!("plugin manifest could not be read: {error}"),
+                );
+                continue;
+            }
+        };
+        let value = match serde_json::from_str::<serde_json::Value>(&raw) {
+            Ok(value) => value,
+            Err(_) => {
+                push_claude_plugin_warning(
+                    warnings,
+                    layer,
+                    &manifest_path,
+                    "plugin manifest is not valid JSON",
+                );
+                continue;
+            }
+        };
+        let Some(name) = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .filter(|name| !name.trim().is_empty())
+        else {
+            push_claude_plugin_warning(
+                warnings,
+                layer,
+                &manifest_path,
+                "plugin manifest must contain a non-empty name",
+            );
+            continue;
+        };
+
+        let relative_id = skill_dir.strip_prefix(skill_root)?;
+        let plugin_id = format!("{}{}", plugin_id_prefix, skill_id_path(relative_id));
+        items.push(DiscoveryItem {
+            provider: ProviderId::Claude,
+            kind: DiscoveryKind::Plugin,
+            category: DiscoveryCategory::PluginManifest,
+            layer,
+            id: plugin_id.clone(),
+            display_name: format!("{name}@skills-dir"),
+            enabled: true,
+            mutability: DiscoveryMutability::ReadOnly,
+            source_path: path_string(&manifest_path),
+            state_path: path_string(&skill_dir),
+            source_fingerprint: Some(source_fingerprint(&raw)),
+            hook: None,
+        });
+        plugin_roots.insert(skill_dir.clone());
+        for item in items.iter_mut().filter(|item| {
+            item.provider == ProviderId::Claude
+                && item.layer == layer
+                && item.category == DiscoveryCategory::Skill
+                && item.state_path == path_string(&skill_dir)
+        }) {
+            // A skill-directory plugin is an auto-loaded unit. Mutating its
+            // child skill would vault the directory and make the plugin row
+            // disappear on the next discovery pass.
+            item.mutability = DiscoveryMutability::ReadOnly;
+        }
+        let mut hook_target = ClaudePluginHookTarget {
+            layer,
+            disable_all_hooks,
+            items: &mut *items,
+            warnings: &mut *warnings,
+        };
+        discover_claude_plugin_hooks(
+            &skill_dir,
+            &manifest_path,
+            &plugin_id,
+            &value,
+            &mut hook_target,
+        );
+    }
+
+    if skipped_entries > 0 {
+        warnings.push(DiscoveryWarning {
+            provider: ProviderId::Claude,
+            layer: Some(layer),
+            code: "scope-scan-incomplete".to_string(),
+            message: format!(
+                "Claude {} plugin skill scan skipped {skipped_entries} unreadable or vanished entries",
+                layer.as_str()
+            ),
+        });
+    }
+    Ok(plugin_roots)
+}
+
+struct ClaudePluginHookTarget<'a> {
+    layer: DiscoveryLayer,
+    disable_all_hooks: bool,
+    items: &'a mut Vec<DiscoveryItem>,
+    warnings: &'a mut Vec<DiscoveryWarning>,
+}
+
+fn discover_claude_plugin_hooks(
+    plugin_root: &Path,
+    manifest_path: &Path,
+    plugin_id: &str,
+    manifest: &serde_json::Value,
+    target: &mut ClaudePluginHookTarget<'_>,
+) {
+    let default_hook_suffix = if manifest.get("hooks").is_some() {
+        "default:"
+    } else {
+        ""
+    };
+    match claude_plugin_relative_path(plugin_root, "./hooks/hooks.json") {
+        Ok(default_hooks_path) => append_claude_plugin_hook_file(
+            &default_hooks_path,
+            &format!("{plugin_id}:hook:{default_hook_suffix}"),
+            target.layer,
+            target.disable_all_hooks,
+            false,
+            target.items,
+            target.warnings,
+        ),
+        Err(reason) => push_claude_plugin_warning(
+            target.warnings,
+            target.layer,
+            &plugin_root.join("hooks/hooks.json"),
+            reason,
+        ),
+    }
+
+    let Some(declared_hooks) = manifest.get("hooks") else {
+        return;
+    };
+
+    match declared_hooks {
+        serde_json::Value::Array(entries) => {
+            for (index, entry) in entries.iter().enumerate() {
+                append_claude_plugin_hook_component(
+                    plugin_root,
+                    manifest_path,
+                    &format!("{plugin_id}:hook:manifest:{index}:"),
+                    entry,
+                    target,
+                );
+            }
+        }
+        serde_json::Value::Object(_) => append_claude_plugin_hook_component(
+            plugin_root,
+            manifest_path,
+            &format!("{plugin_id}:hook:"),
+            declared_hooks,
+            target,
+        ),
+        entry => append_claude_plugin_hook_component(
+            plugin_root,
+            manifest_path,
+            &format!("{plugin_id}:hook:manifest:"),
+            entry,
+            target,
+        ),
+    }
+}
+
+fn append_claude_plugin_hook_component(
+    plugin_root: &Path,
+    manifest_path: &Path,
+    hook_id_prefix: &str,
+    component: &serde_json::Value,
+    target: &mut ClaudePluginHookTarget<'_>,
+) {
+    match component {
+        serde_json::Value::Object(_) => {
+            let hook_document = serde_json::json!({ "hooks": component });
+            append_claude_plugin_hook_document(
+                &hook_document,
+                manifest_path,
+                hook_id_prefix,
+                target.layer,
+                target.disable_all_hooks,
+                target.items,
+                target.warnings,
+            );
+        }
+        serde_json::Value::String(path) => {
+            let path = match claude_plugin_relative_path(plugin_root, path) {
+                Ok(path) => path,
+                Err(reason) => {
+                    push_claude_plugin_warning(
+                        target.warnings,
+                        target.layer,
+                        manifest_path,
+                        reason,
+                    );
+                    return;
+                }
+            };
+            append_claude_plugin_hook_file(
+                &path,
+                hook_id_prefix,
+                target.layer,
+                target.disable_all_hooks,
+                true,
+                target.items,
+                target.warnings,
+            );
+        }
+        _ => push_claude_plugin_warning(
+            target.warnings,
+            target.layer,
+            manifest_path,
+            "plugin hooks must be an object, relative JSON path, or array of those",
+        ),
+    }
+}
+
+fn append_claude_plugin_hook_file(
+    path: &Path,
+    hook_id_prefix: &str,
+    layer: DiscoveryLayer,
+    disable_all_hooks: bool,
+    warn_if_missing: bool,
+    items: &mut Vec<DiscoveryItem>,
+    warnings: &mut Vec<DiscoveryWarning>,
+) {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !warn_if_missing => return,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            push_claude_plugin_warning(warnings, layer, path, "bundled hooks file was not found");
+            return;
+        }
+        Err(_) => {
+            push_claude_plugin_warning(
+                warnings,
+                layer,
+                path,
+                "bundled hooks file could not be inspected",
+            );
+            return;
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        push_claude_plugin_warning(
+            warnings,
+            layer,
+            path,
+            "bundled hooks path must be a regular file",
+        );
+        return;
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(raw) => raw,
+        Err(_) => {
+            push_claude_plugin_warning(
+                warnings,
+                layer,
+                path,
+                "bundled hooks file could not be read",
+            );
+            return;
+        }
+    };
+    let document = match serde_json::from_str::<serde_json::Value>(&raw) {
+        Ok(document) => document,
+        Err(_) => {
+            push_claude_plugin_warning(
+                warnings,
+                layer,
+                path,
+                "bundled hooks file is not valid JSON",
+            );
+            return;
+        }
+    };
+    append_claude_plugin_hook_document(
+        &document,
+        path,
+        hook_id_prefix,
+        layer,
+        disable_all_hooks,
+        items,
+        warnings,
+    );
+}
+
+fn append_claude_plugin_hook_document(
+    document: &serde_json::Value,
+    source_path: &Path,
+    hook_id_prefix: &str,
+    layer: DiscoveryLayer,
+    disable_all_hooks: bool,
+    items: &mut Vec<DiscoveryItem>,
+    warnings: &mut Vec<DiscoveryWarning>,
+) {
+    let mut hook_items = parsed_hook_items(
+        ProviderId::Claude,
+        layer,
+        hook_id_prefix,
+        document,
+        false,
+        source_path,
+        warnings,
+    );
+    if disable_all_hooks {
+        for item in &mut hook_items {
+            item.enabled = false;
+        }
+    }
+    items.extend(hook_items);
+}
+
+fn claude_plugin_relative_path(
+    plugin_root: &Path,
+    raw_path: &str,
+) -> Result<PathBuf, &'static str> {
+    let path = Path::new(raw_path);
+    if path.is_absolute() {
+        return Err("plugin hooks path must stay inside the plugin directory");
+    }
+    if !raw_path.starts_with("./") {
+        return Err("plugin hooks path must start with ./");
+    }
+
+    let mut resolved = plugin_root.to_path_buf();
+    let mut has_component = false;
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::Normal(component) => {
+                has_component = true;
+                resolved.push(component);
+                if fs::symlink_metadata(&resolved)
+                    .map(|metadata| metadata.file_type().is_symlink())
+                    .unwrap_or(false)
+                {
+                    return Err("plugin hooks path cannot traverse a symlink");
+                }
+            }
+            _ => return Err("plugin hooks path must stay inside the plugin directory"),
+        }
+    }
+    if !has_component {
+        return Err("plugin hooks path must name a JSON file");
+    }
+    Ok(resolved)
+}
+
+fn push_claude_plugin_warning(
+    warnings: &mut Vec<DiscoveryWarning>,
+    layer: DiscoveryLayer,
+    path: &Path,
+    reason: impl AsRef<str>,
+) {
+    warnings.push(DiscoveryWarning {
+        provider: ProviderId::Claude,
+        layer: Some(layer),
+        code: "agent-plugin-invalid".to_string(),
+        message: format!(
+            "{}: {}",
+            path.file_name()
+                .and_then(OsStr::to_str)
+                .unwrap_or("plugin file"),
+            reason.as_ref()
+        ),
+    });
 }
 
 fn claude_configured_mcp_enabled(settings: &ClaudeSettings, server_id: &str) -> bool {

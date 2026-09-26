@@ -131,7 +131,7 @@ pub(crate) fn discover_cursor(
         items,
         warnings,
     )?;
-    let global_agent_root = roots.cursor_global.join("agents");
+    let global_agent_root = roots.cursor_config.join("agents");
     let live_agent_ids = discover_agent_files(
         &global_agent_root,
         ProviderId::Cursor,
@@ -219,7 +219,7 @@ pub(crate) fn discover_cursor(
     )?;
 
     discover_json_hooks_file(
-        &roots.cursor_global.join("hooks.json"),
+        &roots.cursor_config.join("hooks.json"),
         JsonHooksSpec {
             provider: ProviderId::Cursor,
             layer: DiscoveryLayer::Global,
@@ -236,17 +236,17 @@ pub(crate) fn discover_cursor(
         DiscoveryLayer::Global,
         &[
             (
-                roots.cursor_global.join("permissions.json"),
+                roots.cursor_config.join("permissions.json"),
                 "cursor:global:setting:permissions-json",
                 "permissions.json",
             ),
             (
-                roots.cursor_global.join("sandbox.json"),
+                roots.cursor_config.join("sandbox.json"),
                 "cursor:global:setting:sandbox-json",
                 "sandbox.json",
             ),
             (
-                roots.cursor_global.join("cli-config.json"),
+                roots.cursor_config.join("cli-config.json"),
                 "cursor:global:setting:cli-config-json",
                 "cli-config.json",
             ),

@@ -4133,7 +4133,15 @@ pub(super) fn directory_item_title(item: &DiscoveryItem) -> &'static str {
 pub(super) fn directory_item_original_path(item: &DiscoveryItem) -> Option<PathBuf> {
     let source_path = Path::new(&item.source_path);
     if is_supported_cursor_local_plugin(item) {
-        source_path.parent()?.parent().map(Path::to_path_buf)
+        let manifest_directory = source_path.parent()?;
+        if manifest_directory
+            .file_name()
+            .is_some_and(|name| name == ".cursor-plugin" || name == ".claude-plugin")
+        {
+            manifest_directory.parent().map(Path::to_path_buf)
+        } else {
+            Some(manifest_directory.to_path_buf())
+        }
     } else {
         source_path.parent().map(Path::to_path_buf)
     }
@@ -5307,6 +5315,8 @@ pub(super) fn prepare_pi_package_enable(
 pub(super) struct OpenCodePluginVaultPayload {
     plugin_id: String,
     original_order: Vec<String>,
+    #[serde(default)]
+    original_entry: Option<Value>,
 }
 
 pub(super) struct OpenCodePluginRemoval {
@@ -5323,13 +5333,7 @@ pub(super) fn opencode_plugin_ids(raw: &str) -> Result<Vec<String>, String> {
         .ok_or_else(|| "plugin is missing or not an array".to_string())?;
     let plugin_ids = plugins
         .iter()
-        .map(|plugin| {
-            plugin
-                .as_str()
-                .filter(|plugin_id| !plugin_id.is_empty())
-                .map(str::to_owned)
-                .ok_or_else(|| "plugin entries must be non-empty strings".to_string())
-        })
+        .map(|plugin| opencode_plugin_entry_id(plugin).map(str::to_owned))
         .collect::<Result<Vec<_>, _>>()?;
     if plugin_ids.iter().collect::<BTreeSet<_>>().len() != plugin_ids.len() {
         return Err("plugin entries must be unique".to_string());
@@ -5337,11 +5341,52 @@ pub(super) fn opencode_plugin_ids(raw: &str) -> Result<Vec<String>, String> {
     Ok(plugin_ids)
 }
 
+fn opencode_plugin_entry_id(entry: &Value) -> Result<&str, String> {
+    if let Some(source) = entry.as_str().filter(|source| !source.is_empty()) {
+        return Ok(source);
+    }
+    let Some(tuple) = entry.as_array().filter(|tuple| tuple.len() == 2) else {
+        return Err(
+            "plugin entries must be non-empty strings or [source, options] pairs".to_string(),
+        );
+    };
+    let source = tuple[0]
+        .as_str()
+        .filter(|source| !source.is_empty())
+        .ok_or_else(|| "plugin option entries must start with a non-empty source".to_string())?;
+    if !tuple[1].is_object() {
+        return Err("plugin option entries must end with an options object".to_string());
+    }
+    Ok(source)
+}
+
+fn opencode_plugin_entry_input(entry: &Value) -> CstInputValue {
+    match entry {
+        Value::Null => CstInputValue::Null,
+        Value::Bool(value) => CstInputValue::Bool(*value),
+        Value::Number(value) => CstInputValue::Number(value.to_string()),
+        Value::String(value) => CstInputValue::String(value.clone()),
+        Value::Array(values) => {
+            CstInputValue::Array(values.iter().map(opencode_plugin_entry_input).collect())
+        }
+        Value::Object(values) => CstInputValue::Object(
+            values
+                .iter()
+                .map(|(key, value)| (key.clone(), opencode_plugin_entry_input(value)))
+                .collect(),
+        ),
+    }
+}
+
 pub(super) fn validate_opencode_plugin_vault_payload(
     payload: &OpenCodePluginVaultPayload,
     plugin_id: &str,
 ) -> Result<(), String> {
     if payload.plugin_id != plugin_id
+        || payload
+            .original_entry
+            .as_ref()
+            .is_some_and(|entry| opencode_plugin_entry_id(entry).ok() != Some(plugin_id))
         || payload
             .original_order
             .iter()
@@ -5506,7 +5551,12 @@ pub(super) fn prepare_opencode_plugin_removal(
         .iter()
         .position(|current| current == plugin_id)
         .ok_or_else(|| format!("OpenCode plugin reference {plugin_id} is missing"))?;
-    let selected_value = Value::String(plugin_id.to_string());
+    let selected_value = parse_jsonc_value(raw)?
+        .get("plugin")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.get(array_index))
+        .cloned()
+        .ok_or_else(|| "OpenCode plugin entry could not be read".to_string())?;
     if let Some(discovered_fingerprint) = discovered_fingerprint {
         let current_fingerprint = json_value_source_fingerprint(&selected_value);
         if current_fingerprint != discovered_fingerprint {
@@ -5526,6 +5576,7 @@ pub(super) fn prepare_opencode_plugin_removal(
     let payload = OpenCodePluginVaultPayload {
         plugin_id: plugin_id.to_string(),
         original_order,
+        original_entry: Some(selected_value),
     };
 
     if serde_json::from_str::<Value>(raw).is_err() {
@@ -5617,16 +5668,6 @@ pub(super) fn prepare_opencode_plugin_removal(
         .get(array_index)
         .cloned()
         .ok_or_else(|| format!("OpenCode plugin reference {plugin_id} is missing"))?;
-    if element
-        .as_string_lit()
-        .and_then(|literal| literal.decoded_value().ok())
-        .as_deref()
-        != Some(plugin_id)
-    {
-        return Err(format!(
-            "OpenCode plugin reference {plugin_id} changed during JSON parsing"
-        ));
-    }
     element.remove();
 
     let rendered = root.to_string();
@@ -5679,6 +5720,10 @@ pub(super) fn prepare_opencode_plugin_restore(
     jsonc_format: Option<&JsoncVaultFormat>,
 ) -> Result<String, String> {
     validate_opencode_plugin_vault_payload(payload, plugin_id)?;
+    let original_entry = payload
+        .original_entry
+        .clone()
+        .unwrap_or_else(|| Value::String(plugin_id.to_string()));
     let plugin_ids = opencode_plugin_ids(raw)?;
     if plugin_ids.iter().any(|current| current == plugin_id) {
         return Err(format!(
@@ -5701,7 +5746,7 @@ pub(super) fn prepare_opencode_plugin_restore(
             ));
         }
         let restored_raw = format!("{}{}", format.property_prefix, format.property_suffix);
-        if parse_jsonc_value(&format.property_prefix)?.as_str() != Some(plugin_id) {
+        if parse_jsonc_value(&format.property_prefix)? != original_entry {
             return Err("OpenCode npm plugin JSONC vault format changed payload".to_string());
         }
         let mut rendered =
@@ -5734,7 +5779,7 @@ pub(super) fn prepare_opencode_plugin_restore(
         .ok_or_else(|| "plugin is missing or not an array".to_string())?;
     plugins.insert(
         insertion_index,
-        CstInputValue::String(plugin_id.to_string()),
+        opencode_plugin_entry_input(&original_entry),
     );
 
     let rendered = root.to_string();

@@ -701,7 +701,9 @@ fn parse_package(root: &Path, native_plugin_id: String) -> io::Result<Option<Par
     }))
 }
 
-fn parse_manifest(value: &serde_json::Value) -> io::Result<(AgentPluginManifestView, Vec<String>)> {
+pub(crate) fn parse_manifest(
+    value: &serde_json::Value,
+) -> io::Result<(AgentPluginManifestView, Vec<String>)> {
     let object = value
         .as_object()
         .ok_or_else(|| invalid_data("plugin.json must contain an object"))?;

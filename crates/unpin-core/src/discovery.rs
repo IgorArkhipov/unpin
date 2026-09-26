@@ -4,6 +4,7 @@ use std::{
     ffi::{OsStr, OsString},
     fmt::Write as _,
     fs,
+    io::Read as _,
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -91,6 +92,8 @@ const CURSOR_COMPAT_SKILL_NAMESPACES: [&str; 3] = [
 const PI_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const OPENCODE_COMPAT_AGENTS_SKILL_NAMESPACE: &str = "@compat/agents/";
 const OPENCODE_COMPAT_CLAUDE_SKILL_NAMESPACE: &str = "@compat/claude/";
+const MAX_CONFIGURED_SKILL_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_CONFIGURED_SKILL_ENTRIES: usize = 4096;
 
 #[derive(Debug, Clone)]
 pub struct DiscoveryRoots {
@@ -426,6 +429,9 @@ struct McpDocument {
 #[serde(rename_all = "camelCase")]
 struct ClaudeSettings {
     enable_all_project_mcp_servers: Option<bool>,
+    disable_all_hooks: Option<bool>,
+    #[serde(default)]
+    skill_overrides: BTreeMap<String, String>,
     #[serde(default)]
     enabled_mcpjson_servers: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -448,6 +454,7 @@ struct OpenCodeConfig {
     mcp: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
     plugin: Vec<serde_json::Value>,
+    skills: Option<serde_json::Value>,
 }
 
 const CURSOR_WORKSPACE_DISABLED_SERVERS_KEY: &str = "cursor/disabledMcpServers";
@@ -601,7 +608,12 @@ where
                 provider,
                 layer,
                 code: "json-parse-error".to_string(),
-                message: format!("{} is not valid JSON: {error}", path.display()),
+                message: format!(
+                    "{} is not valid JSON: {error}",
+                    path.file_name()
+                        .and_then(OsStr::to_str)
+                        .unwrap_or("settings file")
+                ),
             });
             Ok(None)
         }
@@ -627,11 +639,27 @@ where
                 provider,
                 layer,
                 code: "json-parse-error".to_string(),
-                message: format!("{} is not valid JSONC: {error}", path.display()),
+                message: format!(
+                    "{} is not valid JSONC: {error}",
+                    path.file_name()
+                        .and_then(OsStr::to_str)
+                        .unwrap_or("settings file")
+                ),
             });
             Ok(None)
         }
     }
+}
+
+fn path_within_scope(path: &Path, scope: &Path) -> bool {
+    fs::canonicalize(path)
+        .ok()
+        .zip(fs::canonicalize(scope).ok())
+        .is_some_and(|(path, scope)| path.starts_with(scope))
+}
+
+fn path_within_canonical_scope(path: &Path, scope: &Path) -> bool {
+    fs::canonicalize(path).is_ok_and(|path| path.starts_with(scope))
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -650,6 +678,8 @@ struct SkillItemDiscoverySpec<'a> {
     layer: DiscoveryLayer,
     id_prefix: &'a str,
     mutability: DiscoveryMutability,
+    max_fingerprint_bytes: Option<u64>,
+    scan_scope: Option<&'a Path>,
 }
 
 struct VaultedSkillDiscoverySpec<'a> {
@@ -1683,23 +1713,51 @@ fn skill_id_path(path: &Path) -> String {
 
 fn discover_direct_skill_markdown_files(
     root: &Path,
-    provider: ProviderId,
-    layer: DiscoveryLayer,
-    id_prefix: &str,
-    mutability: DiscoveryMutability,
+    spec: SkillItemDiscoverySpec<'_>,
     items: &mut Vec<DiscoveryItem>,
+    warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<BTreeSet<String>, DiscoveryError> {
+    let SkillItemDiscoverySpec {
+        provider,
+        layer,
+        id_prefix,
+        mutability,
+        max_fingerprint_bytes,
+        scan_scope,
+    } = spec;
     let mut live_ids = BTreeSet::new();
     if !root.exists() {
         return Ok(live_ids);
     }
 
-    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    let mut entries = Vec::new();
+    let mut limited = false;
+    for entry in fs::read_dir(root)? {
+        if entries.len() == MAX_CONFIGURED_SKILL_ENTRIES {
+            limited = true;
+            break;
+        }
+        entries.push(entry?);
+    }
     entries.sort_by_key(|entry| entry.file_name());
+    let mut remaining_bytes = max_fingerprint_bytes.unwrap_or(MAX_CONFIGURED_SKILL_BYTES);
+    let mut outside_scope = false;
+    let mut incomplete = false;
+    let canonical_scope = match scan_scope.map(fs::canonicalize).transpose() {
+        Ok(scope) => scope,
+        Err(_) => {
+            warnings.push(DiscoveryWarning {
+                provider,
+                layer: Some(layer),
+                code: "scope-scan-incomplete".to_string(),
+                message: "Pi Markdown skill scan could not verify the project boundary".to_string(),
+            });
+            return Ok(live_ids);
+        }
+    };
     for entry in entries {
         let path = entry.path();
-        if !path.is_file()
-            || path.extension().and_then(OsStr::to_str) != Some("md")
+        if path.extension().and_then(OsStr::to_str) != Some("md")
             || path.file_name() == Some(OsStr::new("SKILL.md"))
         {
             continue;
@@ -1710,11 +1768,31 @@ fn discover_direct_skill_markdown_files(
         if stem.is_empty() {
             continue;
         }
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                incomplete = true;
+                continue;
+            }
+        };
+        if !metadata.is_file() {
+            continue;
+        }
+        if canonical_scope
+            .as_deref()
+            .is_some_and(|scope| !path_within_canonical_scope(&path, scope))
+        {
+            outside_scope = true;
+            continue;
+        }
+        if metadata.len() > remaining_bytes {
+            limited = true;
+            continue;
+        }
+        remaining_bytes -= metadata.len();
         let id = format!("{id_prefix}{}", skill_id_path(Path::new(stem)));
         live_ids.insert(id.clone());
-        let source_fingerprint = fs::read_to_string(&path)
-            .ok()
-            .map(|raw| source_fingerprint(&raw));
+        let source_fingerprint = skill_file_fingerprint(&path, Some(metadata.len()));
         items.push(DiscoveryItem {
             provider,
             kind: DiscoveryKind::Skill,
@@ -1728,6 +1806,37 @@ fn discover_direct_skill_markdown_files(
             state_path: path_string(&path),
             source_fingerprint,
             hook: None,
+        });
+    }
+
+    if limited {
+        warnings.push(DiscoveryWarning {
+            provider,
+            layer: Some(layer),
+            code: "scope-scan-limited".to_string(),
+            message: format!(
+                "{} Markdown skill scan reached its entry or byte limit",
+                provider.as_str()
+            ),
+        });
+    }
+    if outside_scope {
+        warnings.push(DiscoveryWarning {
+            provider,
+            layer: Some(layer),
+            code: "scope-outside-project".to_string(),
+            message: format!(
+                "{} Markdown skill file is outside the selected project",
+                provider.as_str()
+            ),
+        });
+    }
+    if incomplete {
+        warnings.push(DiscoveryWarning {
+            provider,
+            layer: Some(layer),
+            code: "scope-scan-incomplete".to_string(),
+            message: format!("{} Markdown skill scan was incomplete", provider.as_str()),
         });
     }
 
@@ -1754,6 +1863,8 @@ fn discover_direct_child_skill_dirs(
         layer,
         id_prefix,
         mutability,
+        max_fingerprint_bytes: None,
+        scan_scope: None,
     };
 
     for entry in entries {
@@ -1787,6 +1898,8 @@ fn discover_recursive_skill_dirs(
         layer,
         id_prefix,
         mutability,
+        max_fingerprint_bytes: None,
+        scan_scope: None,
     };
     let mut skipped_directories = 0;
     while let Some(directory) = pending.pop() {
@@ -1860,6 +1973,195 @@ fn discover_recursive_skill_dirs(
     Ok(live_ids)
 }
 
+fn discover_configured_skill_dirs(
+    root: &Path,
+    spec: SkillItemDiscoverySpec<'_>,
+    include_root: bool,
+    items: &mut Vec<DiscoveryItem>,
+    warnings: &mut Vec<DiscoveryWarning>,
+) -> Result<BTreeSet<String>, DiscoveryError> {
+    const MAX_DIRECTORIES: usize = 512;
+    const MAX_DEPTH: usize = 32;
+
+    fn add_skill(
+        root: &Path,
+        directory: &Path,
+        spec: SkillItemDiscoverySpec<'_>,
+        remaining_bytes: &mut u64,
+        limited: &mut bool,
+        live_ids: &mut BTreeSet<String>,
+        items: &mut Vec<DiscoveryItem>,
+    ) -> Result<(), DiscoveryError> {
+        let skill_file = directory.join("SKILL.md");
+        let Ok(metadata) = fs::metadata(&skill_file) else {
+            return Ok(());
+        };
+        if !metadata.is_file() {
+            return Ok(());
+        }
+        if spec
+            .scan_scope
+            .is_some_and(|scope| !path_within_canonical_scope(&skill_file, scope))
+        {
+            *limited = true;
+            return Ok(());
+        }
+        if metadata.len() > *remaining_bytes {
+            *limited = true;
+            return Ok(());
+        }
+        *remaining_bytes -= metadata.len();
+        discover_skill_dir(
+            root,
+            directory,
+            SkillItemDiscoverySpec {
+                max_fingerprint_bytes: Some(metadata.len()),
+                ..spec
+            },
+            live_ids,
+            items,
+        )
+    }
+
+    let mut live_ids = BTreeSet::new();
+    if !root.is_dir() {
+        return Ok(live_ids);
+    }
+    let canonical_scope = match spec.scan_scope.map(fs::canonicalize).transpose() {
+        Ok(scope) => scope,
+        Err(_) => {
+            warnings.push(DiscoveryWarning {
+                provider: spec.provider,
+                layer: Some(spec.layer),
+                code: "scope-scan-incomplete".to_string(),
+                message: "configured skill scan could not verify the project boundary".to_string(),
+            });
+            return Ok(live_ids);
+        }
+    };
+    let spec = SkillItemDiscoverySpec {
+        scan_scope: canonical_scope.as_deref(),
+        ..spec
+    };
+    let mut remaining_bytes = MAX_CONFIGURED_SKILL_BYTES;
+    let mut limited = false;
+    let mut skipped = 0;
+    if include_root {
+        add_skill(
+            root.parent().unwrap_or(root),
+            root,
+            spec,
+            &mut remaining_bytes,
+            &mut limited,
+            &mut live_ids,
+            items,
+        )?;
+    }
+
+    let mut pending = vec![(root.to_path_buf(), 0)];
+    let mut visited_directories = 0;
+    let mut visited_entries = 0;
+    while let Some((directory, depth)) = pending.pop() {
+        if visited_directories == MAX_DIRECTORIES {
+            limited = true;
+            break;
+        }
+        visited_directories += 1;
+        let read_dir = match fs::read_dir(&directory) {
+            Ok(read_dir) => read_dir,
+            Err(error) if recoverable_project_scope_scan_error(&error) => {
+                skipped += 1;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut entries = Vec::new();
+        for entry in read_dir {
+            if visited_entries == MAX_CONFIGURED_SKILL_ENTRIES {
+                limited = true;
+                break;
+            }
+            visited_entries += 1;
+            match entry {
+                Ok(entry) => entries.push(entry),
+                Err(error) if recoverable_project_scope_scan_error(&error) => skipped += 1,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries.into_iter().rev() {
+            let skill_dir = entry.path();
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if recoverable_project_scope_scan_error(&error) => {
+                    skipped += 1;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            if (file_type.is_dir() || file_type.is_symlink())
+                && spec
+                    .scan_scope
+                    .is_some_and(|scope| !path_within_canonical_scope(&skill_dir, scope))
+            {
+                skipped += 1;
+                continue;
+            }
+            if file_type.is_dir() {
+                add_skill(
+                    root,
+                    &skill_dir,
+                    spec,
+                    &mut remaining_bytes,
+                    &mut limited,
+                    &mut live_ids,
+                    items,
+                )?;
+                if depth < MAX_DEPTH && pending.len() + visited_directories < MAX_DIRECTORIES {
+                    pending.push((skill_dir, depth + 1));
+                } else {
+                    limited = true;
+                }
+            } else if file_type.is_symlink()
+                && fs::metadata(&skill_dir).is_ok_and(|metadata| metadata.is_dir())
+            {
+                add_skill(
+                    root,
+                    &skill_dir,
+                    spec,
+                    &mut remaining_bytes,
+                    &mut limited,
+                    &mut live_ids,
+                    items,
+                )?;
+            }
+        }
+        if visited_entries == MAX_CONFIGURED_SKILL_ENTRIES {
+            limited = true;
+            break;
+        }
+    }
+    if limited || skipped > 0 {
+        warnings.push(DiscoveryWarning {
+            provider: spec.provider,
+            layer: Some(spec.layer),
+            code: if limited {
+                "scope-scan-limited"
+            } else {
+                "scope-scan-incomplete"
+            }
+            .to_string(),
+            message: format!(
+                "{} {} configured skill scan was {}",
+                spec.provider.as_str(),
+                spec.layer.as_str(),
+                if limited { "limited" } else { "incomplete" }
+            ),
+        });
+    }
+    Ok(live_ids)
+}
+
 fn discover_skill_dir(
     root: &Path,
     skill_dir: &Path,
@@ -1885,9 +2187,7 @@ fn discover_skill_dir(
 
     let id = format!("{}{}", spec.id_prefix, skill_id_path(relative_id));
     live_ids.insert(id.clone());
-    let source_fingerprint = fs::read_to_string(&skill_file)
-        .ok()
-        .map(|raw| source_fingerprint(&raw));
+    let source_fingerprint = skill_file_fingerprint(&skill_file, spec.max_fingerprint_bytes);
     let item_mutability = skill_path_mutability(root, &skill_file, spec.mutability, true)?;
     items.push(DiscoveryItem {
         provider: spec.provider,
@@ -1905,6 +2205,26 @@ fn discover_skill_dir(
     });
 
     Ok(())
+}
+
+fn skill_file_fingerprint(skill_file: &Path, max_bytes: Option<u64>) -> Option<String> {
+    if let Some(max_bytes) = max_bytes {
+        fs::File::open(skill_file)
+            .ok()
+            .and_then(|file| {
+                let mut bytes = Vec::new();
+                file.take(max_bytes.saturating_add(1))
+                    .read_to_end(&mut bytes)
+                    .ok()?;
+                (bytes.len() as u64 <= max_bytes).then_some(bytes)
+            })
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .map(|raw| source_fingerprint(&raw))
+    } else {
+        fs::read_to_string(skill_file)
+            .ok()
+            .map(|raw| source_fingerprint(&raw))
+    }
 }
 
 fn discover_vaulted_skill_items(
@@ -2997,10 +3317,11 @@ fn claude_plugin_config_items(source: &SettingsSource<ClaudeSettings>) -> Vec<Di
 
 fn claude_hook_items(
     source: &SettingsSource<ClaudeSettings>,
+    disable_all_hooks: bool,
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Vec<DiscoveryItem> {
     let value = serde_json::json!({ "hooks": &source.document.hooks });
-    parsed_hook_items(
+    let mut items = parsed_hook_items(
         ProviderId::Claude,
         source.layer,
         &format!(
@@ -3012,7 +3333,13 @@ fn claude_hook_items(
         false,
         &source.path,
         warnings,
-    )
+    );
+    if disable_all_hooks {
+        for item in &mut items {
+            item.enabled = false;
+        }
+    }
+    items
 }
 
 fn discover_setting_files(
@@ -3093,7 +3420,10 @@ fn parsed_hook_items(
             code: issue.code.to_string(),
             message: format!(
                 "ignored invalid hook definition in {}",
-                source_path.display()
+                source_path
+                    .file_name()
+                    .unwrap_or(OsStr::new("hook file"))
+                    .to_string_lossy()
             ),
         });
     }
@@ -3327,6 +3657,7 @@ fn codex_inline_hook_document(raw: &str) -> serde_json::Value {
         let has_command = toml_assignment_value(&section, "command").is_some();
         let has_url = toml_assignment_value(&section, "url").is_some();
         if !nested_handler && action_type.is_none() && !has_command && !has_url {
+            groups.remove(&event);
             if let Some(matcher) = matcher {
                 groups.insert(event, matcher);
             }
@@ -3405,13 +3736,24 @@ fn discover_cursor_plugin_manifests(
         let Some(manifest_path) = cursor_plugin_manifest_path(&path) else {
             continue;
         };
-        let Some(value) = read_json_if_exists::<serde_json::Value>(
+        let value = match read_json_if_exists::<serde_json::Value>(
             &manifest_path,
             ProviderId::Cursor,
             Some(DiscoveryLayer::Global),
             warnings,
-        )?
-        else {
+        ) {
+            Ok(value) => value,
+            Err(_) => {
+                warnings.push(DiscoveryWarning {
+                    provider: ProviderId::Cursor,
+                    layer: Some(DiscoveryLayer::Global),
+                    code: "read-error".to_string(),
+                    message: "Cursor plugin manifest could not be read".to_string(),
+                });
+                continue;
+            }
+        };
+        let Some(value) = value else {
             continue;
         };
         if !value.is_object() {
@@ -3419,18 +3761,46 @@ fn discover_cursor_plugin_manifests(
                 provider: ProviderId::Cursor,
                 layer: Some(DiscoveryLayer::Global),
                 code: "invalid-shape".to_string(),
-                message: format!("{} must be a JSON object", manifest_path.display()),
+                message: "Cursor plugin manifest must be a JSON object".to_string(),
             });
             continue;
         }
-        let display_name = value
-            .get("displayName")
-            .and_then(serde_json::Value::as_str)
-            .or_else(|| value.get("name").and_then(serde_json::Value::as_str))
-            .map_or_else(
-                || entry.file_name().to_string_lossy().into_owned(),
-                str::to_string,
-            );
+        let display_name = if manifest_path == path.join("plugin.json") {
+            match crate::agent_plugins::parse_manifest(&value) {
+                Ok((manifest, diagnostics)) => {
+                    for diagnostic in diagnostics {
+                        warnings.push(DiscoveryWarning {
+                            provider: ProviderId::Cursor,
+                            layer: Some(DiscoveryLayer::Global),
+                            code: diagnostic,
+                            message:
+                                "Cursor plugin manifest contains an ignored portable plugin field"
+                                    .to_string(),
+                        });
+                    }
+                    manifest.name
+                }
+                Err(_) => {
+                    warnings.push(DiscoveryWarning {
+                        provider: ProviderId::Cursor,
+                        layer: Some(DiscoveryLayer::Global),
+                        code: "invalid-shape".to_string(),
+                        message: "Cursor plugin manifest is not a valid Agent Plugin manifest"
+                            .to_string(),
+                    });
+                    continue;
+                }
+            }
+        } else {
+            value
+                .get("displayName")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| value.get("name").and_then(serde_json::Value::as_str))
+                .map_or_else(
+                    || entry.file_name().to_string_lossy().into_owned(),
+                    str::to_string,
+                )
+        };
         let plugin_id = entry.file_name().to_string_lossy().into_owned();
         let id = format!("cursor:global:plugin-manifest:local:{plugin_id}");
         let source_fingerprint = fs::read_to_string(&manifest_path)
@@ -3633,7 +4003,12 @@ fn cursor_plugin_manifest_path(plugin_path: &Path) -> Option<PathBuf> {
     }
 
     let claude_manifest = plugin_path.join(".claude-plugin").join("plugin.json");
-    claude_manifest.is_file().then_some(claude_manifest)
+    if claude_manifest.is_file() {
+        return Some(claude_manifest);
+    }
+
+    let portable_manifest = plugin_path.join("plugin.json");
+    portable_manifest.is_file().then_some(portable_manifest)
 }
 
 fn cursor_plugin_path_mutability(
