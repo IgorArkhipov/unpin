@@ -36,7 +36,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v1.5.0-TARGET.tar.gz \
+gh attestation verify unpin-v1.5.1-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -45,7 +45,7 @@ Extract the archive, install both included executables together on your user
 before installing the stable broker under the app-state root:
 
 ```bash
-cd unpin-v1.5.0-TARGET
+cd unpin-v1.5.1-TARGET
 install -d "$HOME/.local/bin"
 install -m 0755 unpin unpin-credential-broker "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
@@ -119,9 +119,9 @@ archive against `SHA256SUMS` and its GitHub attestation before extracting it:
 
 ```bash
 gh attestation verify \
-  unpin-desktop-v1.5.0-TARGET.tar.gz \
+  unpin-desktop-v1.5.1-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
-tar -xzf unpin-desktop-v1.5.0-TARGET.tar.gz
+tar -xzf unpin-desktop-v1.5.1-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
@@ -342,6 +342,8 @@ OpenCode is the supported harness in this provider family. OpenRouter is a model
 ## Agent Plugins packages
 
 Unpin recognizes the [Agent Plugins 1.0.0](https://agent-plugins.org/specification) package layout already installed by a supported host. A root `plugin.json` provides safe package metadata, immediate `skills/*/SKILL.md` entries and root `mcp.json` describe component coverage, and the host's native activation setting remains the only writable authority. Unpin does not install, update, import, delete, or persist desired state for packages, and it never creates missing Skill or MCP inventory rows.
+
+Schema-less Codex compatibility manifests are outside this portable package projection; Unpin does not label them invalid Agent Plugins. Known Codex cache metadata and a `latest` alias to a cached version do not make package inventory incomplete, but unexpected or escaping cache symlinks still do.
 
 Packages are a derived workbench projection. Each scan groups matching existing inventory under one logical package, reports `on`, `off`, `mixed`, or `unknown` state, and distinguishes actionable, diagnostics-only, and unsupported instances. A toggle expands to the exact existing native activation identities, requires explicit selected-provider or all-provider reach, and reuses Unpin's review, fingerprint, drift, backup, audit, recovery, and restore boundaries. Visibility filters never grant mutation reach.
 

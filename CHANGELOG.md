@@ -7,6 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-09-26
+
+### Fixed
+
+- Stopped treating schema-less Codex compatibility plugin manifests as invalid
+  portable Agent Plugins. Native Codex plugin activation remains discoverable.
+- Stopped reporting an incomplete Codex Agent Plugin cache for its known
+  remote-install metadata file or an in-cache `latest` version alias. Unexpected
+  entries and escaping or broken aliases still warn.
+
 ## [1.5.0] - 2026-09-25
 
 ### Compatibility

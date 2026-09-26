@@ -599,7 +599,12 @@ fn read_cache_packages(
     let mut remaining = MAX_PACKAGE_ENTRIES;
     let mut packages = Vec::new();
 
-    let marketplaces = bounded_directories(&cache_root, &cache_root, &mut remaining)?;
+    let marketplaces = bounded_directories(
+        &cache_root,
+        &cache_root,
+        &mut remaining,
+        DirectoryScanKind::Strict,
+    )?;
     if marketplaces.incomplete {
         push_cache_incomplete_warning(warnings, provider);
     }
@@ -611,7 +616,12 @@ fn read_cache_packages(
                 continue;
             }
         };
-        let plugins = match bounded_directories(&marketplace, &cache_root, &mut remaining) {
+        let plugins = match bounded_directories(
+            &marketplace,
+            &cache_root,
+            &mut remaining,
+            DirectoryScanKind::Strict,
+        ) {
             Ok(plugins) => plugins,
             Err(_) => {
                 push_cache_incomplete_warning(warnings, provider);
@@ -629,13 +639,19 @@ fn read_cache_packages(
                     continue;
                 }
             };
-            let versions = match bounded_directories(&plugin, &cache_root, &mut remaining) {
-                Ok(versions) => versions,
-                Err(_) => {
-                    push_cache_incomplete_warning(warnings, provider);
-                    continue;
-                }
+            let scan_kind = if provider == ProviderId::Codex {
+                DirectoryScanKind::CodexCacheVersions
+            } else {
+                DirectoryScanKind::Strict
             };
+            let versions =
+                match bounded_directories(&plugin, &cache_root, &mut remaining, scan_kind) {
+                    Ok(versions) => versions,
+                    Err(_) => {
+                        push_cache_incomplete_warning(warnings, provider);
+                        continue;
+                    }
+                };
             if versions.incomplete {
                 push_cache_incomplete_warning(warnings, provider);
             }
@@ -676,6 +692,12 @@ fn parse_package(root: &Path, native_plugin_id: String) -> io::Result<Option<Par
     }
     let manifest_raw = read_bounded_file(&manifest_path, root)?;
     let manifest_value = parse_bounded_json(&manifest_raw)?;
+    if manifest_value
+        .as_object()
+        .is_some_and(|object| !object.contains_key("$schema"))
+    {
+        return Ok(None);
+    }
     let (manifest, mut diagnostics) = parse_manifest(&manifest_value)?;
     let mut blockers = Vec::new();
     let manifest_source_fingerprint = source_fingerprint(&manifest_raw);
@@ -823,7 +845,7 @@ fn read_skills(
     }
     let mut remaining = MAX_PACKAGE_ENTRIES;
     let mut components = Vec::new();
-    let scan = match bounded_directories(&skills, root, &mut remaining) {
+    let scan = match bounded_directories(&skills, root, &mut remaining, DirectoryScanKind::Strict) {
         Ok(scan) => scan,
         Err(_) => {
             blockers.push("skills-read-error".to_string());
@@ -1210,10 +1232,17 @@ struct BoundedDirectoryScan {
     incomplete: bool,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirectoryScanKind {
+    Strict,
+    CodexCacheVersions,
+}
+
 fn bounded_directories(
     directory: &Path,
     root: &Path,
     remaining: &mut usize,
+    scan_kind: DirectoryScanKind,
 ) -> io::Result<BoundedDirectoryScan> {
     let mut directories = Vec::new();
     let mut incomplete = false;
@@ -1238,6 +1267,25 @@ fn bounded_directories(
                 continue;
             }
         };
+        let entry_name = entry.file_name();
+        if scan_kind == DirectoryScanKind::CodexCacheVersions
+            && entry_name.to_str() == Some("latest")
+            && metadata.file_type().is_symlink()
+        {
+            if fs::canonicalize(&path)
+                .ok()
+                .is_none_or(|target| target.parent() != Some(directory) || !target.is_dir())
+            {
+                incomplete = true;
+            }
+            continue;
+        }
+        if scan_kind == DirectoryScanKind::CodexCacheVersions
+            && entry_name.to_str() == Some(".codex-remote-plugin-install.json")
+            && metadata.is_file()
+        {
+            continue;
+        }
         if metadata.file_type().is_symlink() || !metadata.is_dir() {
             incomplete = true;
             continue;
