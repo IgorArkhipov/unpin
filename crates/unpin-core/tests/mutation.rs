@@ -3632,6 +3632,53 @@ fn applies_codex_shared_skill_toggle_without_moving_shared_source() {
 }
 
 #[test]
+fn blocks_codex_skill_toggle_before_appending_to_inline_config_array() {
+    for config_template in [
+        "[skills]\nconfig = [{ path = {path}, enabled = false }]\n",
+        "skills.config = [{ path = {path}, enabled = false }]\n",
+        "skills = { config = [{ path = {path}, enabled = false }] }\n",
+        "[skills.config]\npath = {path}\nenabled = false\n",
+        "[skills]\nconfig.entries = [{ path = {path}, enabled = false }]\n",
+    ] {
+        let fixture_copy = TempDir::new().expect("temp fixture copy");
+        let app_state = TempDir::new().expect("temp app state");
+        copy_dir_all(&fixtures_root(), fixture_copy.path());
+        let roots = DiscoveryRoots::fixture_root(fixture_copy.path());
+        let item = discover_all(&roots)
+            .expect("fixture discovery")
+            .items
+            .into_iter()
+            .find(|item| item.id == "codex:global:skill:admin/example-codex-admin-skill")
+            .expect("Codex admin skill");
+        let skill_path = fixture_copy
+            .path()
+            .join("codex/admin/skills/example-codex-admin-skill/SKILL.md");
+        let config_path = fixture_copy.path().join("codex/global/config.toml");
+        let inline_config =
+            config_template.replace("{path}", &format!("{:?}", skill_path.to_string_lossy()));
+        fs::write(&config_path, &inline_config).expect("write inline config array");
+
+        let result = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item,
+            apply: false,
+            backup_authentication_key: None,
+        });
+        assert_eq!(result.status, ToggleStatus::Blocked);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("unsupported skills.config"))
+        );
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("unchanged config"),
+            inline_config
+        );
+    }
+}
+
+#[test]
 fn blocks_codex_skill_toggle_when_native_config_has_duplicate_paths() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
@@ -6891,6 +6938,34 @@ fn blocks_codex_configured_mcp_disable_when_source_section_drifted_after_discove
     assert!(!app_state.path().join("backups").exists());
     assert!(!app_state.path().join("vault").exists());
     assert!(!app_state.path().join("audit").exists());
+}
+
+#[test]
+fn codex_mcp_fingerprint_matches_mutation_with_interleaved_nested_tables() {
+    let fixture = TempDir::new().expect("temporary fixture");
+    let app_state = TempDir::new().expect("temporary app state");
+    let config_path = fixture.path().join("codex/global/config.toml");
+    fs::create_dir_all(config_path.parent().expect("Codex config parent"))
+        .expect("create Codex config directory");
+    fs::write(
+        &config_path,
+        "[mcp_servers.docs]\ncommand = \"echo\"\n[mcp_servers.docs.zeta]\nKEY = \"one\"\n[mcp_servers.other]\ncommand = \"echo\"\n[mcp_servers.docs.alpha]\nKEY = \"two\"\n",
+    )
+    .expect("write Codex config");
+    let item = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("Codex discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "codex:global:configured-mcp:docs")
+        .expect("configured MCP server");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(result.status, ToggleStatus::Applied, "{:?}", result.reason);
 }
 
 #[test]

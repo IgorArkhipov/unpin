@@ -26,8 +26,9 @@ use sha2::{Digest, Sha256};
 use crate::clock::{current_timestamp, unix_nanos_id};
 use crate::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, ProviderId,
-    claude_local_scope_token, codex_skill_config_enabled, codex_skill_config_path,
-    json_value_source_fingerprint, skill_payload_has_skill, source_fingerprint,
+    claude_local_scope_token, codex_has_unsupported_skill_config_assignment,
+    codex_skill_config_enabled, codex_skill_config_path, json_value_source_fingerprint,
+    skill_payload_has_skill, source_fingerprint,
 };
 use crate::encode_path_segment;
 use crate::fs_support::read_optional_string;
@@ -6124,6 +6125,9 @@ pub(super) fn set_codex_skill_config_enabled(
     enabled: bool,
 ) -> Result<String, String> {
     ensure_unique_standard_toml_tables(raw)?;
+    if codex_has_unsupported_skill_config_assignment(raw) {
+        return Err("unsupported skills.config assignment form".to_string());
+    }
     let skill_path_string = path_string(skill_path.to_path_buf());
     let mut matching_sections = Vec::new();
     for section in find_toml_array_table_sections(raw, "skills.config") {

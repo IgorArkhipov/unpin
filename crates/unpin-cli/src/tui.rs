@@ -1642,6 +1642,11 @@ impl TuiState {
             .ok_or_else(|| "discovery roots are unavailable after apply".to_string())?;
         let roots = roots.with_app_state_root(&self.app_state_root);
         let discovery = discover_all(&roots).map_err(|error| error.to_string())?;
+        if let Some(warning) = discovery.warnings.iter().find(|warning| {
+            warning.code.ends_with("-incomplete") || warning.code.ends_with("-limited")
+        }) {
+            return Err(format!("inventory incomplete: {}", warning.code));
+        }
         self.refresh_discovery(&discovery);
         Ok(discovery)
     }

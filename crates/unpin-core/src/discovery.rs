@@ -27,8 +27,7 @@ use crate::{
     providers::registry::provider_registry,
     toml_syntax::{
         all_table_sections, duplicate_standard_table_names, duplicate_top_level_key_tables,
-        find_array_table_sections, find_table_section, malformed_table_header_lines,
-        table_child_ids, table_subtree_content,
+        find_array_table_sections, malformed_table_header_lines, table_child_ids,
     },
 };
 
@@ -534,7 +533,39 @@ pub fn discover_all_with_progress(
         }) {
             return Err(DiscoveryCancelled.into());
         }
-        (descriptor.discoverer)(roots, &mut state)?;
+        let item_count = state.items.len();
+        let shared_skill_view_count = state.shared_skill_views.len();
+        if let Err(error) = (descriptor.discoverer)(roots, &mut state) {
+            let recoverable = error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io_error| {
+                    recoverable_project_scope_scan_error(io_error)
+                        || matches!(
+                            io_error.kind(),
+                            std::io::ErrorKind::InvalidData | std::io::ErrorKind::IsADirectory
+                        )
+                });
+            if !recoverable {
+                return Err(error);
+            }
+            state.items.truncate(item_count);
+            state.shared_skill_views.truncate(shared_skill_view_count);
+            state
+                .agent_plugin_metadata
+                .retain(|metadata| metadata.provider != descriptor.id);
+            state
+                .agent_plugin_item_keys
+                .retain(|identity, _| identity.provider != descriptor.id);
+            state.warnings.push(DiscoveryWarning {
+                provider: descriptor.id,
+                layer: None,
+                code: "provider-discovery-incomplete".to_string(),
+                message: format!(
+                    "{} discovery was incomplete because a provider file or directory could not be read",
+                    descriptor.id.as_str()
+                ),
+            });
+        }
     }
     if !report_progress(DiscoveryProgress {
         phase: DiscoveryProgressPhase::Finalizing,
@@ -1100,6 +1131,7 @@ fn discover_project_skill_dirs(
                 &scoped_prefix,
                 spec.mutability,
                 items,
+                warnings,
             )?,
             SkillRootTraversal::Recursive => discover_recursive_skill_dirs(
                 &skill_root,
@@ -1650,6 +1682,12 @@ fn recoverable_project_scope_scan_error(error: &std::io::Error) -> bool {
     )
 }
 
+fn recoverable_skill_scan_error(error: &DiscoveryError) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(recoverable_project_scope_scan_error)
+}
+
 fn should_skip_project_scope_dir(name: &OsStr) -> bool {
     matches!(
         name.to_str(),
@@ -1730,19 +1768,36 @@ fn discover_direct_skill_markdown_files(
         return Ok(live_ids);
     }
 
+    let read_dir = match fs::read_dir(root) {
+        Ok(read_dir) => read_dir,
+        Err(error) if recoverable_project_scope_scan_error(&error) => {
+            warnings.push(DiscoveryWarning {
+                provider,
+                layer: Some(layer),
+                code: "scope-scan-incomplete".to_string(),
+                message: format!("{} Markdown skill scan was incomplete", provider.as_str()),
+            });
+            return Ok(live_ids);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut entries = Vec::new();
     let mut limited = false;
-    for entry in fs::read_dir(root)? {
+    let mut incomplete = false;
+    for entry in read_dir {
         if entries.len() == MAX_CONFIGURED_SKILL_ENTRIES {
             limited = true;
             break;
         }
-        entries.push(entry?);
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(error) if recoverable_project_scope_scan_error(&error) => incomplete = true,
+            Err(error) => return Err(error.into()),
+        }
     }
     entries.sort_by_key(|entry| entry.file_name());
     let mut remaining_bytes = max_fingerprint_bytes.unwrap_or(MAX_CONFIGURED_SKILL_BYTES);
     let mut outside_scope = false;
-    let mut incomplete = false;
     let canonical_scope = match scan_scope.map(fs::canonicalize).transpose() {
         Ok(scope) => scope,
         Err(_) => {
@@ -1850,13 +1905,39 @@ fn discover_direct_child_skill_dirs(
     id_prefix: &str,
     mutability: DiscoveryMutability,
     items: &mut Vec<DiscoveryItem>,
+    warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<BTreeSet<String>, DiscoveryError> {
     let mut live_ids = BTreeSet::new();
     if !root.exists() {
         return Ok(live_ids);
     }
 
-    let mut entries = fs::read_dir(root)?.collect::<Result<Vec<_>, _>>()?;
+    let read_dir = match fs::read_dir(root) {
+        Ok(read_dir) => read_dir,
+        Err(error) if recoverable_project_scope_scan_error(&error) => {
+            warnings.push(DiscoveryWarning {
+                provider,
+                layer: Some(layer),
+                code: "scope-scan-incomplete".to_string(),
+                message: format!(
+                    "{} {} direct skill scan was incomplete",
+                    provider.as_str(),
+                    layer.as_str()
+                ),
+            });
+            return Ok(live_ids);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let mut entries = Vec::new();
+    let mut skipped = 0;
+    for entry in read_dir {
+        match entry {
+            Ok(entry) => entries.push(entry),
+            Err(error) if recoverable_project_scope_scan_error(&error) => skipped += 1,
+            Err(error) => return Err(error.into()),
+        }
+    }
     entries.sort_by_key(|entry| entry.file_name());
     let spec = SkillItemDiscoverySpec {
         provider,
@@ -1872,7 +1953,24 @@ fn discover_direct_child_skill_dirs(
         if !skill_dir.is_dir() {
             continue;
         }
-        discover_skill_dir(root, &skill_dir, spec, &mut live_ids, items)?;
+        match discover_skill_dir(root, &skill_dir, spec, &mut live_ids, items) {
+            Ok(()) => {}
+            Err(error) if recoverable_skill_scan_error(&error) => skipped += 1,
+            Err(error) => return Err(error),
+        }
+    }
+
+    if skipped > 0 {
+        warnings.push(DiscoveryWarning {
+            provider,
+            layer: Some(layer),
+            code: "scope-scan-incomplete".to_string(),
+            message: format!(
+                "{} {} direct skill scan skipped {skipped} unreadable or vanished entries",
+                provider.as_str(),
+                layer.as_str()
+            ),
+        });
     }
 
     Ok(live_ids)
@@ -1887,25 +1985,38 @@ fn discover_recursive_skill_dirs(
     items: &mut Vec<DiscoveryItem>,
     warnings: &mut Vec<DiscoveryWarning>,
 ) -> Result<BTreeSet<String>, DiscoveryError> {
+    const MAX_DIRECTORIES: usize = 512;
+    const MAX_DEPTH: usize = 32;
+
     let mut live_ids = BTreeSet::new();
     if !root.exists() {
         return Ok(live_ids);
     }
 
-    let mut pending = vec![root.to_path_buf()];
+    let mut pending = vec![(root.to_path_buf(), 0)];
     let spec = SkillItemDiscoverySpec {
         provider,
         layer,
         id_prefix,
         mutability,
-        max_fingerprint_bytes: None,
+        max_fingerprint_bytes: Some(MAX_CONFIGURED_SKILL_BYTES),
         scan_scope: None,
     };
     let mut skipped_directories = 0;
-    while let Some(directory) = pending.pop() {
+    let mut unfingerprinted_skills = 0;
+    let mut visited_directories = 0;
+    let mut visited_entries = 0;
+    let mut limited = false;
+    let mut entry_limit_reached = false;
+    while let Some((directory, depth)) = pending.pop() {
+        if visited_directories == MAX_DIRECTORIES {
+            limited = true;
+            break;
+        }
+        visited_directories += 1;
         let read_dir = match fs::read_dir(&directory) {
             Ok(read_dir) => read_dir,
-            Err(error) if directory != root && recoverable_project_scope_scan_error(&error) => {
+            Err(error) if recoverable_project_scope_scan_error(&error) => {
                 skipped_directories += 1;
                 continue;
             }
@@ -1913,6 +2024,12 @@ fn discover_recursive_skill_dirs(
         };
         let mut entries = Vec::new();
         for entry in read_dir {
+            if visited_entries == MAX_CONFIGURED_SKILL_ENTRIES {
+                limited = true;
+                entry_limit_reached = true;
+                break;
+            }
+            visited_entries += 1;
             match entry {
                 Ok(entry) => entries.push(entry),
                 Err(error) if recoverable_project_scope_scan_error(&error) => {
@@ -1935,8 +2052,29 @@ fn discover_recursive_skill_dirs(
             };
 
             if file_type.is_dir() {
-                discover_skill_dir(root, &skill_dir, spec, &mut live_ids, items)?;
-                pending.push(skill_dir);
+                let previous_items = items.len();
+                match discover_skill_dir(root, &skill_dir, spec, &mut live_ids, items) {
+                    Ok(()) => {}
+                    Err(error) if recoverable_skill_scan_error(&error) => {
+                        skipped_directories += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+                if items.len() > previous_items {
+                    if items
+                        .last()
+                        .is_some_and(|item| item.source_fingerprint.is_none())
+                    {
+                        unfingerprinted_skills += 1;
+                    }
+                    continue;
+                }
+                if depth < MAX_DEPTH && pending.len() + visited_directories < MAX_DIRECTORIES {
+                    pending.push((skill_dir, depth + 1));
+                } else {
+                    limited = true;
+                }
                 continue;
             }
 
@@ -1945,7 +2083,21 @@ fn discover_recursive_skill_dirs(
             }
             match fs::metadata(&skill_dir) {
                 Ok(metadata) if metadata.is_dir() => {
-                    discover_skill_dir(root, &skill_dir, spec, &mut live_ids, items)?;
+                    let previous_items = items.len();
+                    match discover_skill_dir(root, &skill_dir, spec, &mut live_ids, items) {
+                        Ok(()) => {}
+                        Err(error) if recoverable_skill_scan_error(&error) => {
+                            skipped_directories += 1
+                        }
+                        Err(error) => return Err(error),
+                    }
+                    if items.len() > previous_items
+                        && items
+                            .last()
+                            .is_some_and(|item| item.source_fingerprint.is_none())
+                    {
+                        unfingerprinted_skills += 1;
+                    }
                 }
                 Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -1955,17 +2107,27 @@ fn discover_recursive_skill_dirs(
                 Err(error) => return Err(error.into()),
             }
         }
+        if entry_limit_reached {
+            break;
+        }
     }
 
-    if skipped_directories > 0 {
+    if limited || skipped_directories > 0 || unfingerprinted_skills > 0 {
+        let limited = limited || unfingerprinted_skills > 0;
         warnings.push(DiscoveryWarning {
             provider,
             layer: Some(layer),
-            code: "scope-scan-incomplete".to_string(),
+            code: if limited {
+                "scope-scan-limited"
+            } else {
+                "scope-scan-incomplete"
+            }
+            .to_string(),
             message: format!(
-                "{} {} recursive skill scan skipped {skipped_directories} unreadable or vanished directories",
+                "{} {} recursive skill scan was {} (visited {visited_directories} directories, skipped {skipped_directories} unreadable or vanished directories, found {unfingerprinted_skills} read-only skills without fingerprints)",
                 provider.as_str(),
-                layer.as_str()
+                layer.as_str(),
+                if limited { "limited" } else { "incomplete" }
             ),
         });
     }
@@ -2186,9 +2348,12 @@ fn discover_skill_dir(
     }
 
     let id = format!("{}{}", spec.id_prefix, skill_id_path(relative_id));
-    live_ids.insert(id.clone());
     let source_fingerprint = skill_file_fingerprint(&skill_file, spec.max_fingerprint_bytes);
-    let item_mutability = skill_path_mutability(root, &skill_file, spec.mutability, true)?;
+    let mut item_mutability = skill_path_mutability(root, &skill_file, spec.mutability, true)?;
+    if spec.max_fingerprint_bytes.is_some() && source_fingerprint.is_none() {
+        item_mutability = DiscoveryMutability::ReadOnly;
+    }
+    live_ids.insert(id.clone());
     items.push(DiscoveryItem {
         provider: spec.provider,
         kind: DiscoveryKind::Skill,
@@ -2255,6 +2420,14 @@ fn discover_vaulted_skill_items(
     let mut entries = fs::read_dir(vault_root)?.collect::<Result<Vec<_>, _>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     let expected_id_prefix = format!("{}:{}:skill:", provider.as_str(), layer.as_str());
+    let scan_incomplete = warnings.iter().any(|warning| {
+        warning.provider == provider
+            && warning.layer == Some(layer)
+            && matches!(
+                warning.code.as_str(),
+                "scope-scan-incomplete" | "scope-scan-limited"
+            )
+    });
 
     for entry in entries {
         let Some((entry_path, vault_entry)) = read_stored_vault_entry(
@@ -2309,7 +2482,11 @@ fn discover_vaulted_skill_items(
             id: vault_entry.item_id,
             display_name: vault_entry.display_name,
             enabled: false,
-            mutability: DiscoveryMutability::ReadWrite,
+            mutability: if scan_incomplete {
+                DiscoveryMutability::ReadOnly
+            } else {
+                DiscoveryMutability::ReadWrite
+            },
             source_path: path_string(&Path::new(&vault_entry.original_path).join("SKILL.md")),
             state_path: path_string(&entry_path),
             source_fingerprint: None,
@@ -4021,10 +4198,6 @@ fn cursor_plugin_path_mutability(
         DiscoveryMutability::ReadWrite,
         false,
     )
-}
-
-fn parse_codex_section_ids(raw: &str, section_prefix: &str) -> Vec<String> {
-    table_child_ids(raw, section_prefix)
 }
 
 pub(crate) fn source_fingerprint(raw: &str) -> String {

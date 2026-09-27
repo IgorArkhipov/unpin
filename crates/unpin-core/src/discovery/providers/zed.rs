@@ -18,6 +18,7 @@ pub(crate) fn discover_zed(
         "zed:global:skill:",
         DiscoveryMutability::ReadWrite,
         items,
+        warnings,
     )?;
     shared_skill_views.push(SkillView::new(
         ProviderId::Zed,
@@ -47,6 +48,7 @@ pub(crate) fn discover_zed(
         "zed:project:skill:",
         DiscoveryMutability::ReadWrite,
         items,
+        warnings,
     )?;
     shared_skill_views.push(SkillView::new(
         ProviderId::Zed,
@@ -162,7 +164,7 @@ fn discover_zed_settings(
     ));
 
     for (server_id, value) in &document.context_servers {
-        if !value.is_object() {
+        let Some(server) = value.as_object() else {
             warnings.push(DiscoveryWarning {
                 provider: ProviderId::Zed,
                 layer: Some(layer),
@@ -173,11 +175,29 @@ fn discover_zed_settings(
                 ),
             });
             continue;
-        }
+        };
+
+        let enabled = match server.get("enabled") {
+            None => true,
+            Some(serde_json::Value::Bool(enabled)) => *enabled,
+            Some(_) => {
+                warnings.push(DiscoveryWarning {
+                    provider: ProviderId::Zed,
+                    layer: Some(layer),
+                    code: "invalid-shape".to_string(),
+                    message: "Zed context server has a non-boolean enabled setting".to_string(),
+                });
+                false
+            }
+        };
 
         let id = format!("zed:{}:configured-mcp:{server_id}", layer.as_str());
         live_ids.insert(id.clone());
-        let mut item = configured_mcp_item(ProviderId::Zed, layer, id, server_id, true, path, path);
+        let mut item =
+            configured_mcp_item(ProviderId::Zed, layer, id, server_id, enabled, path, path);
+        if !enabled {
+            item.mutability = DiscoveryMutability::ReadOnly;
+        }
         item.source_fingerprint = Some(json_value_source_fingerprint(value));
         items.push(item);
     }

@@ -13,17 +13,31 @@ pub(crate) fn discover_codex(
         agent_plugin_item_keys,
     } = state;
     let config_path = roots.codex_global.join("config.toml");
+    let mut unsupported_skill_config_shape = false;
     let skill_config_states = if let Some(raw) = read_optional_string(&config_path)? {
-        match parse_codex_skill_config_states(&raw) {
-            Ok(states) => states,
-            Err(error) => {
-                warnings.push(DiscoveryWarning {
-                    provider: ProviderId::Codex,
-                    layer: Some(DiscoveryLayer::Global),
-                    code: "toml-parse-error".to_string(),
-                    message: format!("Codex skills.config could not be read: {error}"),
-                });
-                BTreeMap::new()
+        if codex_has_unsupported_skill_config_assignment(&raw) {
+            unsupported_skill_config_shape = true;
+            warnings.push(DiscoveryWarning {
+                provider: ProviderId::Codex,
+                layer: Some(DiscoveryLayer::Global),
+                code: "unsupported-toml-shape".to_string(),
+                message:
+                    "Codex skills.config uses an assignment form that Unpin cannot safely toggle"
+                        .to_string(),
+            });
+            BTreeMap::new()
+        } else {
+            match parse_codex_skill_config_states(&raw) {
+                Ok(states) => states,
+                Err(error) => {
+                    warnings.push(DiscoveryWarning {
+                        provider: ProviderId::Codex,
+                        layer: Some(DiscoveryLayer::Global),
+                        code: "toml-parse-error".to_string(),
+                        message: format!("Codex skills.config could not be read: {error}"),
+                    });
+                    BTreeMap::new()
+                }
             }
         }
     } else {
@@ -38,6 +52,7 @@ pub(crate) fn discover_codex(
         "codex:global:skill:",
         DiscoveryMutability::ReadWrite,
         items,
+        warnings,
     )?;
     shared_skill_views.push(SkillView::new(
         ProviderId::Codex,
@@ -53,6 +68,7 @@ pub(crate) fn discover_codex(
         "codex:global:skill:admin/",
         DiscoveryMutability::ReadOnly,
         items,
+        warnings,
     )?;
     let project_skills = discover_project_skill_dirs(
         &roots.shared_project,
@@ -76,6 +92,13 @@ pub(crate) fn discover_codex(
         &config_path,
         &skill_config_states,
     );
+    if unsupported_skill_config_shape {
+        for item in &mut items[skill_item_start..] {
+            if item.provider == ProviderId::Codex && item.category == DiscoveryCategory::Skill {
+                item.mutability = DiscoveryMutability::ReadOnly;
+            }
+        }
+    }
     discover_vaulted_skill_items(
         roots.app_state_root.as_deref(),
         VaultedSkillDiscoverySpec {
@@ -286,6 +309,9 @@ pub(crate) fn codex_skill_config_path(section: &str) -> Result<Option<String>, S
 }
 
 fn parse_codex_skill_config_states(raw: &str) -> Result<BTreeMap<String, bool>, String> {
+    if codex_has_unsupported_skill_config_assignment(raw) {
+        return Err("unsupported skills.config assignment form".to_string());
+    }
     let mut states = BTreeMap::new();
     for section in codex_array_table_sections(raw, "skills.config") {
         let path = codex_skill_config_path(section)?
@@ -299,6 +325,92 @@ fn parse_codex_skill_config_states(raw: &str) -> Result<BTreeMap<String, bool>, 
         }
     }
     Ok(states)
+}
+
+pub(crate) fn codex_has_unsupported_skill_config_assignment(raw: &str) -> bool {
+    let sections = all_table_sections(raw);
+    let root_end = sections
+        .first()
+        .map_or(raw.len(), |(_, section)| section.start);
+    if crate::toml_syntax::assignment_key_paths(&raw[..root_end], false)
+        .iter()
+        .any(|key| key.first().is_some_and(|component| component == "skills"))
+    {
+        return true;
+    }
+    sections.iter().any(|(header, section)| {
+        let Some(parts) = crate::toml_syntax::table_key_components(&header.name) else {
+            return false;
+        };
+        if parts.len() >= 2 && parts[0] == "skills" && parts[1] == "config" {
+            return parts.len() != 2 || header.kind != crate::toml_syntax::TomlTableKind::Array;
+        }
+        parts.len() == 1
+            && parts[0] == "skills"
+            && crate::toml_syntax::assignment_key_paths(section.content, true)
+                .iter()
+                .any(|key| key.first().is_some_and(|component| component == "config"))
+    })
+}
+
+fn codex_has_unsupported_child_table_shape(raw: &str, prefix: &str) -> bool {
+    let sections = all_table_sections(raw);
+    let root_end = sections
+        .first()
+        .map_or(raw.len(), |(_, section)| section.start);
+    if crate::toml_syntax::assignment_key_paths(&raw[..root_end], false)
+        .iter()
+        .any(|key| key.first().is_some_and(|component| component == prefix))
+    {
+        return true;
+    }
+
+    let known_ids = table_child_ids(raw, prefix)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    sections.iter().any(|(header, section)| {
+        let Some(components) = crate::toml_syntax::table_key_components(&header.name) else {
+            return false;
+        };
+        if components
+            .first()
+            .is_none_or(|component| component != prefix)
+        {
+            return false;
+        }
+        if components.len() == 1 {
+            return !crate::toml_syntax::assignment_key_paths(section.content, true).is_empty();
+        }
+        (header.kind == crate::toml_syntax::TomlTableKind::Array || components.len() > 2)
+            && !known_ids.contains(&components[1])
+    })
+}
+
+fn codex_configured_tables<'a>(
+    sections: &[(
+        crate::toml_syntax::TomlTableHeader,
+        crate::toml_syntax::TomlTableSection<'a>,
+    )],
+    prefix: &str,
+) -> Vec<(String, &'a str, String)> {
+    let mut tables = BTreeMap::<String, (Option<&'a str>, String)>::new();
+    for (header, section) in sections {
+        let Some(components) = crate::toml_syntax::table_key_components(&header.name) else {
+            continue;
+        };
+        if components.len() < 2 || components[0] != prefix {
+            continue;
+        }
+        let entry = tables.entry(components[1].clone()).or_default();
+        if components.len() == 2 && header.kind == crate::toml_syntax::TomlTableKind::Standard {
+            entry.0 = Some(section.content);
+        }
+        entry.1.push_str(section.content);
+    }
+    tables
+        .into_iter()
+        .filter_map(|(id, (parent, subtree))| parent.map(|parent| (id, parent, subtree)))
+        .collect()
 }
 
 fn codex_array_table_sections<'a>(raw: &'a str, target: &str) -> Vec<&'a str> {
@@ -434,6 +546,18 @@ fn discover_codex_config_file(
         });
         return Ok(live_mcp_ids);
     }
+    for prefix in ["mcp_servers", "plugins"] {
+        if codex_has_unsupported_child_table_shape(&raw, prefix) {
+            warnings.push(DiscoveryWarning {
+                provider: ProviderId::Codex,
+                layer: Some(spec.layer),
+                code: "unsupported-toml-shape".to_string(),
+                message: format!(
+                    "Codex {prefix} contains a TOML shape that Unpin cannot inventory safely"
+                ),
+            });
+        }
+    }
     items.extend(codex_inline_hook_items(
         config_path,
         &raw,
@@ -442,17 +566,15 @@ fn discover_codex_config_file(
         warnings,
     ));
 
-    for server_id in parse_codex_section_ids(&raw, "mcp_servers") {
+    let sections = all_table_sections(&raw);
+    for (server_id, section, subtree) in codex_configured_tables(&sections, "mcp_servers") {
         let id = format!(
             "codex:{}:configured-mcp:{}{server_id}",
             spec.layer.as_str(),
             spec.id_scope
         );
         live_mcp_ids.insert(id.clone());
-        let section = find_table_section(&raw, "mcp_servers", &server_id);
-        let enabled = section
-            .map(|section| codex_section_enabled(section.content))
-            .unwrap_or(true);
+        let enabled = codex_section_enabled(section);
         let mut item = configured_mcp_item(
             ProviderId::Codex,
             spec.layer,
@@ -462,17 +584,13 @@ fn discover_codex_config_file(
             config_path,
             config_path,
         );
-        item.source_fingerprint = table_subtree_content(&raw, "mcp_servers", &server_id)
-            .map(|content| source_fingerprint(&content));
+        item.source_fingerprint = Some(source_fingerprint(&subtree));
         items.push(item);
     }
 
     if spec.layer == DiscoveryLayer::Global {
-        for plugin_id in parse_codex_section_ids(&raw, "plugins") {
-            let section = find_table_section(&raw, "plugins", &plugin_id);
-            let enabled = section
-                .map(|section| codex_section_enabled(section.content))
-                .unwrap_or(true);
+        for (plugin_id, section, subtree) in codex_configured_tables(&sections, "plugins") {
+            let enabled = codex_section_enabled(section);
             let mut item = plugin_config_item(
                 ProviderId::Codex,
                 spec.layer,
@@ -481,8 +599,7 @@ fn discover_codex_config_file(
                 enabled,
                 config_path,
             );
-            item.source_fingerprint = table_subtree_content(&raw, "plugins", &plugin_id)
-                .map(|content| source_fingerprint(&content));
+            item.source_fingerprint = Some(source_fingerprint(&subtree));
             items.push(item);
         }
     }

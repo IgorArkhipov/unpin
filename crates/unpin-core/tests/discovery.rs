@@ -601,6 +601,278 @@ fn recursive_cursor_skill_scan_warns_and_continues_past_unreadable_categories() 
 }
 
 #[test]
+fn recursive_skill_scan_skips_skill_assets_and_reports_depth_limit() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    let skill_root = fixture.path().join("cursor/home/skills");
+    write_file(&skill_root.join("parent/SKILL.md"), "# Parent\n");
+    write_file(
+        &skill_root.join("parent/assets/sub/SKILL.md"),
+        "# Not a separate skill\n",
+    );
+    write_file(
+        &skill_root.join("z-category/healthy/SKILL.md"),
+        "# Healthy sibling\n",
+    );
+    let mut deep_skill = skill_root.join("deep");
+    for depth in 0..40 {
+        deep_skill.push(format!("level-{depth}"));
+    }
+    write_file(&deep_skill.join("SKILL.md"), "# Too deep\n");
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("bounded recursive discovery succeeds");
+    assert!(
+        result
+            .items
+            .iter()
+            .any(|item| item.id == "cursor:global:skill:parent")
+    );
+    assert!(
+        result
+            .items
+            .iter()
+            .any(|item| item.id == "cursor:global:skill:z-category/healthy")
+    );
+    assert!(!result.items.iter().any(|item| {
+        item.provider == ProviderId::Cursor
+            && item.category == DiscoveryCategory::Skill
+            && item
+                .source_path
+                .starts_with(deep_skill.to_string_lossy().as_ref())
+    }));
+    assert!(
+        !result
+            .items
+            .iter()
+            .any(|item| item.id == "cursor:global:skill:parent/assets/sub")
+    );
+    assert!(result.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Cursor && warning.code == "scope-scan-limited"
+    }));
+}
+
+#[test]
+fn oversized_recursive_skill_is_visible_but_read_only() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    let skill_file = fixture.path().join("cursor/home/skills/oversized/SKILL.md");
+    write_file(&skill_file, "# Oversized\n");
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&skill_file)
+        .expect("open oversized skill")
+        .set_len(8 * 1024 * 1024 + 1)
+        .expect("extend oversized skill");
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("bounded discovery succeeds");
+    let item = result
+        .items
+        .iter()
+        .find(|item| item.id == "cursor:global:skill:oversized")
+        .expect("oversized skill remains visible");
+    assert_eq!(item.mutability, DiscoveryMutability::ReadOnly);
+    assert!(item.source_fingerprint.is_none());
+    assert!(result.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Cursor && warning.code == "scope-scan-limited"
+    }));
+}
+
+#[test]
+fn limited_recursive_scan_keeps_vaulted_skills_read_only() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    let app_state = tempfile::TempDir::new().expect("temporary app state");
+    let skill_root = fixture.path().join("cursor/home/skills");
+    let mut deep_path = skill_root.join("deep");
+    for depth in 0..40 {
+        deep_path.push(format!("level-{depth}"));
+    }
+    write_file(&deep_path.join("SKILL.md"), "# Too deep\n");
+
+    let entry_root = app_state
+        .path()
+        .join("vault/cursor/global/skill/cursor%3Aglobal%3Askill%3Ahidden");
+    let payload = entry_root.join("payload");
+    write_file(&payload.join("SKILL.md"), "# Vaulted skill\n");
+    write_file(
+        &entry_root.join("entry.json"),
+        &format!(
+            "{}\n",
+            serde_json::json!({
+                "version": 1,
+                "provider": "cursor",
+                "kind": "skill",
+                "layer": "global",
+                "itemId": "cursor:global:skill:hidden",
+                "displayName": "hidden",
+                "originalPath": skill_root.join("hidden").to_string_lossy(),
+                "vaultedPath": payload.to_string_lossy(),
+                "payloadKind": "path"
+            })
+        ),
+    );
+
+    let roots = DiscoveryRoots::fixture_root(fixture.path()).with_app_state_root(app_state.path());
+    let result = discover_all(&roots).expect("limited scan succeeds");
+    let vaulted = result
+        .items
+        .iter()
+        .find(|item| item.id == "cursor:global:skill:hidden")
+        .expect("vaulted skill remains visible");
+    assert!(!vaulted.enabled);
+    assert_eq!(vaulted.mutability, DiscoveryMutability::ReadOnly);
+}
+
+#[test]
+fn non_directory_shared_skill_root_does_not_hide_other_providers() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    write_file(
+        &fixture.path().join("claude/global/skills/healthy/SKILL.md"),
+        "# Healthy Claude skill\n",
+    );
+    write_file(
+        &fixture.path().join("shared/global/.agents/skills"),
+        "not a directory",
+    );
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("one malformed optional skill root must not abort discovery");
+    assert!(
+        result
+            .items
+            .iter()
+            .any(|item| item.id == "claude:global:skill:healthy")
+    );
+    assert!(result.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Codex
+            && warning.code == "scope-scan-incomplete"
+            && !warning
+                .message
+                .contains(fixture.path().to_string_lossy().as_ref())
+    }));
+}
+
+#[test]
+fn unreadable_codex_config_does_not_hide_other_providers() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    write_file(
+        &fixture.path().join("claude/global/skills/healthy/SKILL.md"),
+        "# Healthy Claude skill\n",
+    );
+    let config = fixture.path().join("codex/global/config.toml");
+    fs::create_dir_all(config.parent().expect("Codex config parent"))
+        .expect("create Codex config directory");
+    fs::write(&config, [0xff]).expect("write unreadable UTF-8 config");
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("an invalid provider file must not abort discovery");
+    assert!(
+        result
+            .items
+            .iter()
+            .any(|item| item.id == "claude:global:skill:healthy")
+    );
+    assert!(result.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Codex
+            && warning.code == "provider-discovery-incomplete"
+            && !warning
+                .message
+                .contains(fixture.path().to_string_lossy().as_ref())
+    }));
+}
+
+#[test]
+fn provider_read_failure_discards_items_discovered_before_the_failure() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    write_file(
+        &fixture.path().join("claude/global/skills/healthy/SKILL.md"),
+        "# Healthy Claude skill\n",
+    );
+    write_file(
+        &fixture.path().join("codex/admin/skills/early/SKILL.md"),
+        "# Early Codex skill\n",
+    );
+    let project_config = fixture.path().join("codex/project/.codex/config.toml");
+    fs::create_dir_all(project_config.parent().expect("project config parent"))
+        .expect("create project config directory");
+    fs::write(project_config, [0xff]).expect("write invalid UTF-8 config");
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("other providers remain discoverable");
+    assert!(
+        result
+            .items
+            .iter()
+            .any(|item| item.id == "claude:global:skill:healthy")
+    );
+    assert!(
+        !result
+            .items
+            .iter()
+            .any(|item| item.provider == ProviderId::Codex)
+    );
+    assert!(result.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Codex && warning.code == "provider-discovery-incomplete"
+    }));
+}
+
+#[test]
+fn unsupported_codex_skill_config_assignments_warn_and_are_read_only() {
+    for config_template in [
+        "[skills]\nconfig = [{ path = {path}, enabled = false }]\n",
+        "skills.config = [{ path = {path}, enabled = false }]\n",
+        "skills = { config = [{ path = {path}, enabled = false }] }\n",
+        "[skills.config]\npath = {path}\nenabled = false\n",
+        "[skills]\nconfig.entries = [{ path = {path}, enabled = false }]\n",
+    ] {
+        let fixture = tempfile::TempDir::new().expect("temporary fixture");
+        let skill_path = fixture
+            .path()
+            .join("codex/admin/skills/fixture-skill/SKILL.md");
+        write_file(&skill_path, "# Fixture skill\n");
+        let config_path = fixture.path().join("codex/global/config.toml");
+        write_file(
+            &config_path,
+            &config_template.replace("{path}", &format!("{:?}", skill_path.to_string_lossy())),
+        );
+
+        let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+            .expect("Codex discovery must survive an unsupported config shape");
+        let item = result
+            .items
+            .iter()
+            .find(|item| item.id == "codex:global:skill:admin/fixture-skill")
+            .expect("Codex skill remains visible");
+        assert_eq!(item.mutability, DiscoveryMutability::ReadOnly);
+        assert!(result.warnings.iter().any(|warning| {
+            warning.provider == ProviderId::Codex && warning.code == "unsupported-toml-shape"
+        }));
+    }
+}
+
+#[test]
+fn unsupported_codex_mcp_and_plugin_shapes_warn_instead_of_disappearing() {
+    for config in [
+        "[mcp_servers]\ndocs = { command = \"echo\" }\n",
+        "mcp_servers.docs.command = \"echo\"\n",
+        "[mcp_servers.docs.env]\nKEY = \"value\"\n",
+        "[plugins]\nlocal = { enabled = false }\n",
+    ] {
+        let fixture = tempfile::TempDir::new().expect("temporary fixture");
+        write_file(&fixture.path().join("codex/global/config.toml"), config);
+
+        let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+            .expect("unsupported TOML shapes must not abort discovery");
+        assert!(
+            result.warnings.iter().any(|warning| {
+                warning.provider == ProviderId::Codex && warning.code == "unsupported-toml-shape"
+            }),
+            "missing warning for {config:?}: {:#?}",
+            result.warnings
+        );
+    }
+}
+
+#[test]
 fn applies_codex_native_config_state_without_disabling_other_shared_skill_views() {
     let fixture_copy = tempfile::TempDir::new().expect("temp fixture copy");
     copy_dir_all(&fixtures_root(), fixture_copy.path());
@@ -1691,6 +1963,46 @@ fn discovers_zed_settings_with_jsonc_comments_and_trailing_commas() {
             .any(|item| item.id == "zed:global:configured-mcp:jsonc-docs"),
         "missing JSONC Zed MCP item; got {:#?}",
         result.items
+    );
+}
+
+#[test]
+fn discovers_native_disabled_zed_server_without_offering_a_vault_toggle() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    write_file(
+        &fixture.path().join("zed/global/.config/zed/settings.json"),
+        r#"{"context_servers":{"native-disabled":{"command":"echo","enabled":false},"default-enabled":{"command":"echo"},"invalid-enabled":{"command":"echo","enabled":"false"}}}"#,
+    );
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("Zed discovery succeeds");
+    let disabled = result
+        .items
+        .iter()
+        .find(|item| item.id == "zed:global:configured-mcp:native-disabled")
+        .expect("native disabled Zed server remains visible");
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.mutability, DiscoveryMutability::ReadOnly);
+
+    let enabled = result
+        .items
+        .iter()
+        .find(|item| item.id == "zed:global:configured-mcp:default-enabled")
+        .expect("default enabled Zed server remains visible");
+    assert!(enabled.enabled);
+    assert_eq!(enabled.mutability, DiscoveryMutability::ReadWrite);
+
+    let invalid = result
+        .items
+        .iter()
+        .find(|item| item.id == "zed:global:configured-mcp:invalid-enabled")
+        .expect("invalid Zed server remains visible");
+    assert!(!invalid.enabled);
+    assert_eq!(invalid.mutability, DiscoveryMutability::ReadOnly);
+    assert!(
+        result.warnings.iter().any(|warning| {
+            warning.provider == ProviderId::Zed && warning.code == "invalid-shape"
+        })
     );
 }
 

@@ -396,7 +396,7 @@ pub(crate) fn table_child_id(header: &str, table_prefix: &str) -> Option<String>
     components.pop().filter(|child| !child.is_empty())
 }
 
-fn table_key_components(header: &str) -> Option<Vec<String>> {
+pub(crate) fn table_key_components(header: &str) -> Option<Vec<String>> {
     let mut components = Vec::new();
     let mut remaining = header.trim();
 
@@ -495,6 +495,35 @@ fn parse_unicode_escape(input: &str, index: &mut usize, digits: usize) -> Option
 
 pub(crate) fn top_level_assignment<'a>(section: &'a str, key: &str) -> Option<TomlAssignment<'a>> {
     top_level_assignments(section, key).into_iter().next()
+}
+
+pub(crate) fn assignment_key_paths(section: &str, skip_header: bool) -> Vec<Vec<String>> {
+    let mut state = TomlScanState::default();
+    let mut keys = Vec::new();
+    for (index, line) in section.split_inclusive('\n').enumerate() {
+        if (!skip_header || index != 0)
+            && state.is_top_level()
+            && let Some(key) = assignment_key_components(line)
+        {
+            keys.push(key);
+        }
+        let _unterminated_single_line_string = state.scan_line(line);
+    }
+    keys
+}
+
+fn assignment_key_components(line: &str) -> Option<Vec<String>> {
+    let mut remaining = line_without_comment(line).trim_start();
+    let mut components = Vec::new();
+    loop {
+        let (component, rest) = parse_key_component(remaining)?;
+        components.push(component);
+        remaining = rest.trim_start();
+        if remaining.starts_with('=') {
+            return Some(components);
+        }
+        remaining = remaining.strip_prefix('.')?.trim_start();
+    }
 }
 
 pub(crate) fn top_level_assignments<'a>(section: &'a str, key: &str) -> Vec<TomlAssignment<'a>> {

@@ -336,6 +336,13 @@ Unpin does not invent repository plugin state for Codex or write Cursor marketpl
 Skill discovery follows current provider layouts. Claude scans `.claude/skills`; Codex scans shared `.agents/skills` and administrator-managed `/etc/codex/skills`; Cursor recursively scans native and compatibility roots. Pi recursively scans native `.pi` and shared `.agents` roots and also inventories direct Markdown skills in native roots. OpenCode scans native `.opencode` plus shared `.agents` and `.claude` roots from selected directory to repository root. Zed uses global and selected-project `.agents/skills`. Reserved `@compat/...` and `@file/...` namespaces prevent native, shared, and direct-file item-id collisions. Vaulted skills remain filtered to currently resolved roots, so disabled items from another home or repository do not leak into inventory. Unreadable nested directories produce path-safe warnings while readable scopes remain available. Provider-owned skill links preserve link identity; skills under symlinked provider roots remain read-only.
 
 Zed `context_servers` and OpenCode `mcp.<id>.enabled` mutation are JSONC-aware: comments, trailing commas, and surrounding formatting survive toggles and backup restore.
+Zed servers with native `enabled: false` are inventoried as disabled and read-only;
+Unpin's Zed toggle currently manages its own vaulted entries, not that native
+setting. Codex skill toggles require `[[skills.config]]` entries. When
+`skills.config` is written as an assignment, or MCP/plugin entries use an
+unsupported TOML shape, discovery warns instead of silently treating that
+configuration as mutable or complete. Recursive skill scans are bounded and
+report when their limits leave inventory incomplete.
 
 OpenCode is the supported harness in this provider family. OpenRouter is a model/API router with per-request plugins, not a standard local global/project agent-configuration host, so it has no Unpin provider adapter.
 
