@@ -4705,6 +4705,64 @@ fn plans_zed_configured_mcp_toggle_over_mcp() {
 }
 
 #[test]
+fn plans_native_zed_enabled_flag_over_mcp_without_writes() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let settings_path = fixture_copy.path().join("zed/project/.zed/settings.json");
+    let original = r#"{
+  // Keep project settings.
+  "context_servers": {
+    "local-docs": { "command": "python3", "enabled": false },
+  },
+}
+"#;
+    fs::write(&settings_path, original).expect("write Zed project settings");
+    let planned = call_tool(
+        &context_with_roots(fixture_copy.path(), app_state.path()),
+        "unpin_plan_toggle_item",
+        json!({
+            "provider": "zed",
+            "kind": "mcp",
+            "layer": "project",
+            "id": "zed:project:configured-mcp:local-docs",
+            "targetEnabled": true
+        }),
+    );
+
+    assert_eq!(planned["status"], "planned");
+    assert!(planned.get("writes").is_none());
+    assert_eq!(planned["operations"][0]["type"], "replaceFile");
+    assert!(
+        planned["operations"][0]["path"]
+            .as_str()
+            .expect("project settings path")
+            .ends_with("zed/project/.zed/settings.json")
+    );
+    assert_eq!(planned["affectedTargets"][0]["type"], "path");
+    assert_eq!(
+        planned["affectedTargets"]
+            .as_array()
+            .expect("targets")
+            .len(),
+        1
+    );
+    assert_eq!(
+        planned["operation"]["details"]["plan"]["preview"]["operations"][0]["jsonPath"],
+        json!(["context_servers", "local-docs", "enabled"])
+    );
+    assert_eq!(
+        planned["operation"]["details"]["plan"]["preview"]["operations"][0]["value"],
+        true
+    );
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("unchanged Zed settings"),
+        original
+    );
+    assert!(!app_state.path().join("vault/zed").exists());
+}
+
+#[test]
 fn control_plane_configured_mcp_disable_is_blocked_over_single_mcp_tools() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");

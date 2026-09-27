@@ -8125,6 +8125,252 @@ fn blocks_pi_package_disable_after_selected_entry_drift() {
 }
 
 #[test]
+fn zed_native_enabled_flag_round_trips_without_vaulting_or_losing_jsonc() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let settings_path = fixture_copy
+        .path()
+        .join("zed/global/.config/zed/settings.json");
+    let original = r#"// Keep top-level guidance.
+{
+  "theme": "Ayu Dark", // Keep theme note.
+  "context_servers": {
+    "docs": { "command": "echo" },
+    "github": {
+      // Keep server note.
+      "command": "npx",
+      "enabled": false, // Keep flag note.
+    },
+  },
+}
+"#;
+    fs::write(&settings_path, original).expect("write Zed JSONC settings");
+    let roots =
+        DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(app_state.path());
+    let find_item = || {
+        discover_all(&roots)
+            .expect("Zed discovery")
+            .items
+            .into_iter()
+            .find(|item| item.id == "zed:global:configured-mcp:github")
+            .expect("Zed GitHub server")
+    };
+    let disabled = find_item();
+    assert!(!disabled.enabled);
+    assert_eq!(disabled.mutability, DiscoveryMutability::ReadWrite);
+
+    let plan = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: disabled.clone(),
+        apply: false,
+        backup_authentication_key: None,
+    });
+    assert_eq!(plan.status, ToggleStatus::DryRun);
+    assert!(plan.target_enabled);
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("dry-run settings"),
+        original
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+
+    fs::write(
+        &settings_path,
+        original.replace("\"enabled\": false", "\"enabled\": true"),
+    )
+    .expect("drift native flag");
+    let drifted = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: disabled.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(drifted.status, ToggleStatus::Blocked);
+    assert!(
+        drifted
+            .reason
+            .as_deref()
+            .expect("drift reason")
+            .contains("state drifted")
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+    fs::write(&settings_path, original).expect("restore native flag");
+
+    let changed_server = original.replace("\"command\": \"npx\"", "\"command\": \"other\"");
+    fs::write(&settings_path, &changed_server).expect("drift native server command");
+    let drifted_source = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: disabled.clone(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(drifted_source.status, ToggleStatus::Blocked);
+    assert!(
+        drifted_source
+            .reason
+            .as_deref()
+            .expect("source drift reason")
+            .contains("source drifted")
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("current settings"),
+        changed_server
+    );
+    fs::write(&settings_path, original).expect("restore native server command");
+
+    let enabled = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: disabled,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(enabled.status, ToggleStatus::Applied);
+    let enabled_backup = enabled.backup_id.expect("enabled backup");
+    let enabled_raw = fs::read_to_string(&settings_path).expect("enabled settings");
+    assert_eq!(
+        enabled_raw,
+        original.replace("\"enabled\": false", "\"enabled\": true")
+    );
+    assert!(find_item().enabled);
+    assert!(!app_state.path().join("vault/zed").exists());
+
+    let disabled_again = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: find_item(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(disabled_again.status, ToggleStatus::Applied);
+    let disabled_backup = disabled_again.backup_id.expect("disabled backup");
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("disabled settings"),
+        original
+    );
+    assert!(!find_item().enabled);
+    assert!(!app_state.path().join("vault/zed").exists());
+
+    let unrelated_vault_root = app_state
+        .path()
+        .join("vault/zed/global/configured-mcp/zed%3Aglobal%3Aconfigured-mcp%3Agithub");
+    fs::create_dir_all(&unrelated_vault_root).expect("create unrelated vault directory");
+    fs::write(unrelated_vault_root.join("marker"), "preserve me")
+        .expect("create unrelated vault marker");
+
+    let restored_disable = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: disabled_backup,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(restored_disable.status, RestoreStatus::Restored);
+    assert_eq!(
+        fs::read_to_string(unrelated_vault_root.join("marker"))
+            .expect("unrelated vault directory survives native restore"),
+        "preserve me"
+    );
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("restored enabled"),
+        enabled_raw
+    );
+
+    let restored_enable = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: enabled_backup,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(restored_enable.status, RestoreStatus::Restored);
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("restored disabled"),
+        original
+    );
+}
+
+#[test]
+fn zed_project_native_enabled_flag_round_trips_without_vaulting() {
+    let fixture_copy = TempDir::new().expect("temp fixture copy");
+    let app_state = TempDir::new().expect("temp app state");
+    copy_dir_all(&fixtures_root(), fixture_copy.path());
+    let settings_path = fixture_copy.path().join("zed/project/.zed/settings.json");
+    let original = r#"{
+  // Keep project guidance.
+  "context_servers": {
+    "local-docs": {
+      "command": "python3",
+      "enabled": true, // Keep project flag note.
+    },
+  },
+}
+"#;
+    fs::write(&settings_path, original).expect("write project Zed JSONC settings");
+    let roots =
+        DiscoveryRoots::fixture_root(fixture_copy.path()).with_app_state_root(app_state.path());
+    let find_item = || {
+        discover_all(&roots)
+            .expect("project Zed discovery")
+            .items
+            .into_iter()
+            .find(|item| item.id == "zed:project:configured-mcp:local-docs")
+            .expect("project Zed server")
+    };
+    let item = find_item();
+    assert!(item.enabled);
+    assert_eq!(item.mutability, DiscoveryMutability::ReadWrite);
+    let plan = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: item.clone(),
+        apply: false,
+        backup_authentication_key: None,
+    });
+    assert_eq!(plan.status, ToggleStatus::DryRun);
+    assert!(!plan.target_enabled);
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("dry-run settings"),
+        original
+    );
+
+    let disabled = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(disabled.status, ToggleStatus::Applied);
+    let disabled_backup = disabled.backup_id.expect("project disable backup");
+    let disabled_raw = fs::read_to_string(&settings_path).expect("disabled project settings");
+    assert_eq!(
+        disabled_raw,
+        original.replace("\"enabled\": true", "\"enabled\": false")
+    );
+    assert!(!find_item().enabled);
+    assert!(!app_state.path().join("vault/zed").exists());
+
+    let enabled = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item: find_item(),
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(enabled.status, ToggleStatus::Applied);
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("enabled project settings"),
+        original
+    );
+    assert!(find_item().enabled);
+    assert!(!app_state.path().join("vault/zed").exists());
+
+    let restored = restore_backup(RestoreBackupInput {
+        app_state_root: app_state.path().to_path_buf(),
+        backup_id: disabled_backup,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(restored.status, RestoreStatus::Restored);
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("restored project settings"),
+        original
+    );
+}
+
+#[test]
 fn zed_jsonc_disable_and_reenable_preserves_formatting_and_server_comments() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");

@@ -177,9 +177,9 @@ fn discover_zed_settings(
             continue;
         };
 
-        let enabled = match server.get("enabled") {
-            None => true,
-            Some(serde_json::Value::Bool(enabled)) => *enabled,
+        let (enabled, valid_enabled) = match server.get("enabled") {
+            None => (true, true),
+            Some(serde_json::Value::Bool(enabled)) => (*enabled, true),
             Some(_) => {
                 warnings.push(DiscoveryWarning {
                     provider: ProviderId::Zed,
@@ -187,7 +187,7 @@ fn discover_zed_settings(
                     code: "invalid-shape".to_string(),
                     message: "Zed context server has a non-boolean enabled setting".to_string(),
                 });
-                false
+                (false, false)
             }
         };
 
@@ -195,7 +195,7 @@ fn discover_zed_settings(
         live_ids.insert(id.clone());
         let mut item =
             configured_mcp_item(ProviderId::Zed, layer, id, server_id, enabled, path, path);
-        if !enabled {
+        if !valid_enabled {
             item.mutability = DiscoveryMutability::ReadOnly;
         }
         item.source_fingerprint = Some(json_value_source_fingerprint(value));

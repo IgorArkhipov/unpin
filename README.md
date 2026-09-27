@@ -663,6 +663,8 @@ cargo run -p unpin-cli -- toggle \
   --plan-fingerprint PLAN_FINGERPRINT_FROM_DRY_RUN
 ```
 
+Zed `context_servers` entries with an explicit boolean `enabled` field toggle that field in place, preserving JSONC comments and the rest of the server configuration. Entries without an `enabled` field continue to use Unpin's vault toggle; previously vaulted entries remain restorable. An invalid non-boolean field is read-only.
+
 Apply a Zed configured MCP `context_servers` vault toggle against disposable fixtures:
 
 ```bash

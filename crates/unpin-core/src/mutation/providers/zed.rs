@@ -9,7 +9,7 @@ pub(crate) fn plan_zed_configured_mcp_toggle(
         None => return blocked(item, "invalid Zed configured MCP item id"),
     };
 
-    if !item.enabled {
+    if !item.enabled && item.state_path != item.source_path {
         return plan_disabled_zed_configured_mcp_vault_toggle(app_state_root, item, &server_id);
     }
 
@@ -18,6 +18,15 @@ pub(crate) fn plan_zed_configured_mcp_toggle(
         Ok(raw) => raw,
         Err(reason) => return blocked(item, reason),
     };
+    let server_value = match parse_jsonc_value(&source_raw)
+        .and_then(|document| zed_context_server_value(&document, &server_id))
+    {
+        Ok(value) => value,
+        Err(reason) => return blocked(item, reason),
+    };
+    if server_value.get("enabled").is_some() || !item.enabled {
+        return plan_native_zed_configured_mcp_toggle(item, &server_id, &source_raw, &server_value);
+    }
     if let Err(reason) = prepare_zed_context_server_removal(
         &source_raw,
         &server_id,
@@ -60,6 +69,75 @@ pub(crate) fn plan_zed_configured_mcp_toggle(
                 path: path_string(vault_root.join("entry.json")),
             },
         ],
+        backup_id: None,
+        reason: None,
+        writes: Some("no writes were performed".to_string()),
+        provider_reach: None,
+        coverage: None,
+    }
+}
+
+fn plan_native_zed_configured_mcp_toggle(
+    item: DiscoveryItem,
+    server_id: &str,
+    source_raw: &str,
+    server_value: &Value,
+) -> ToggleResult {
+    let Some(current_enabled) = server_value.get("enabled").and_then(Value::as_bool) else {
+        return blocked(
+            item,
+            format!("context_servers.{server_id}.enabled is missing or not a boolean"),
+        );
+    };
+    if current_enabled != item.enabled {
+        return blocked(
+            item.clone(),
+            format!(
+                "Zed configured MCP state drifted for {server_id}: discovered {}, current {current_enabled}",
+                item.enabled
+            ),
+        );
+    }
+    let Some(discovered_fingerprint) = item.source_fingerprint.as_deref() else {
+        return blocked(item, "Zed configured MCP source fingerprint is missing");
+    };
+    let current_fingerprint = json_value_source_fingerprint(server_value);
+    if current_fingerprint != discovered_fingerprint {
+        let reason = format!(
+            "Zed configured MCP source drifted for {server_id}: discovered {discovered_fingerprint}, current {current_fingerprint}"
+        );
+        return blocked(item, reason);
+    }
+
+    let target_enabled = !current_enabled;
+    if let Err(reason) = set_zed_context_server_enabled_jsonc(source_raw, server_id, target_enabled)
+    {
+        return blocked(item, reason);
+    }
+    ToggleResult {
+        status: ToggleStatus::DryRun,
+        selection: item.clone(),
+        target_enabled,
+        operations: vec![MutationOperation {
+            operation_type: "replaceFile".to_string(),
+            from_path: Some(item.state_path.clone()),
+            to_path: None,
+            summary: format!(
+                "Set {} enabled = {target_enabled} in Zed context_servers settings.",
+                item.id
+            ),
+            path: Some(item.state_path.clone()),
+            json_path: Some(vec![
+                "context_servers".to_string(),
+                server_id.to_string(),
+                "enabled".to_string(),
+            ]),
+            value: Some(Value::Bool(target_enabled)),
+        }],
+        affected_targets: vec![MutationTarget {
+            target_type: "statePath".to_string(),
+            path: item.state_path.clone(),
+        }],
         backup_id: None,
         reason: None,
         writes: Some("no writes were performed".to_string()),
@@ -144,8 +222,30 @@ pub(crate) fn apply_zed_configured_mcp_toggle(
     item: DiscoveryItem,
     backup_authentication_key: &BackupAuthenticationKey,
 ) -> ToggleResult {
-    if !item.enabled {
+    if !item.enabled && item.state_path != item.source_path {
         return apply_disabled_zed_configured_mcp_vault_toggle(
+            app_state_root,
+            item,
+            backup_authentication_key,
+        );
+    }
+
+    let server_id = match zed_configured_mcp_server_id(&item) {
+        Some(server_id) => server_id.to_string(),
+        None => return blocked(item, "invalid Zed configured MCP item id"),
+    };
+    let source_raw = match read_jsonc_raw(Path::new(&item.state_path)) {
+        Ok(raw) => raw,
+        Err(reason) => return blocked(item, reason),
+    };
+    let server_value = match parse_jsonc_value(&source_raw)
+        .and_then(|document| zed_context_server_value(&document, &server_id))
+    {
+        Ok(value) => value,
+        Err(reason) => return blocked(item, reason),
+    };
+    if server_value.get("enabled").is_some() || !item.enabled {
+        return apply_native_zed_configured_mcp_toggle(
             app_state_root,
             item,
             backup_authentication_key,
@@ -310,6 +410,156 @@ pub(crate) fn apply_zed_configured_mcp_toggle(
         return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
     }
 
+    ToggleResult {
+        status: ToggleStatus::Applied,
+        backup_id: Some(backup_id),
+        writes: Some("writes were performed".to_string()),
+        ..plan
+    }
+}
+
+fn apply_native_zed_configured_mcp_toggle(
+    app_state_root: PathBuf,
+    item: DiscoveryItem,
+    backup_authentication_key: &BackupAuthenticationKey,
+) -> ToggleResult {
+    let lock = match acquire_mutation_lock(&app_state_root) {
+        Ok(lock) => lock,
+        Err(reason) => return blocked(item, reason),
+    };
+    let plan = plan_zed_configured_mcp_toggle(app_state_root.clone(), item.clone());
+    if plan.status == ToggleStatus::Blocked {
+        drop(lock);
+        return plan;
+    }
+    if plan
+        .operations
+        .first()
+        .and_then(|operation| operation.json_path.as_ref())
+        .is_none()
+    {
+        drop(lock);
+        return blocked(
+            item,
+            "Zed configured MCP toggle changed from native to vault mode",
+        );
+    }
+
+    let server_id = match zed_configured_mcp_server_id(&item) {
+        Some(server_id) => server_id.to_string(),
+        None => {
+            drop(lock);
+            return blocked(item, "invalid Zed configured MCP item id");
+        }
+    };
+    let source_path = PathBuf::from(&item.state_path);
+    let source_raw = match read_jsonc_raw(&source_path) {
+        Ok(raw) => raw,
+        Err(reason) => {
+            drop(lock);
+            return blocked(item, reason);
+        }
+    };
+    let current_server = match parse_jsonc_value(&source_raw)
+        .and_then(|document| zed_context_server_value(&document, &server_id))
+    {
+        Ok(server) => server,
+        Err(reason) => {
+            drop(lock);
+            return blocked(item, reason);
+        }
+    };
+    let current_fingerprint = json_value_source_fingerprint(&current_server);
+    if item.source_fingerprint.as_deref() != Some(current_fingerprint.as_str()) {
+        drop(lock);
+        return blocked(
+            item,
+            format!("Zed configured MCP source drifted for {server_id} before apply"),
+        );
+    }
+    let rendered =
+        match set_zed_context_server_enabled_jsonc(&source_raw, &server_id, plan.target_enabled) {
+            Ok(rendered) => rendered,
+            Err(reason) => {
+                drop(lock);
+                return blocked(item, reason);
+            }
+        };
+    if !source_path.is_file() {
+        drop(lock);
+        return blocked(
+            item,
+            format!("Zed settings file not found: {}", source_path.display()),
+        );
+    }
+
+    let (backup_id, created_at) = match current_backup_metadata() {
+        Ok(metadata) => metadata,
+        Err(reason) => return blocked(item, reason),
+    };
+    let backup_root = app_state_root.join("backups").join(&backup_id);
+    let backup_payload = backup_root.join("entries").join("entry-1").join("payload");
+    if backup_root.exists() {
+        drop(lock);
+        return blocked(item, format!("backup already exists: {backup_id}"));
+    }
+
+    let apply_result = (|| -> Result<(), io::Error> {
+        fs::create_dir_all(app_state_root.join("backups"))?;
+        fs::create_dir_all(app_state_root.join("audit"))?;
+        fs::create_dir_all(
+            backup_payload
+                .parent()
+                .expect("backup payload path has a parent"),
+        )?;
+        fs::copy(&source_path, &backup_payload)?;
+        let mut manifest = BackupManifest {
+            version: BACKUP_MANIFEST_VERSION,
+            authenticity: None,
+            backup_id: backup_id.clone(),
+            created_at: created_at.clone(),
+            selection: item.clone(),
+            target_enabled: plan.target_enabled,
+            affected_targets: plan.affected_targets.clone(),
+            entries: vec![BackupEntry {
+                entry_id: "entry-1".to_string(),
+                target: MutationTarget {
+                    target_type: "path".to_string(),
+                    path: item.state_path.clone(),
+                },
+                existed: true,
+                path_kind: Some("file".to_string()),
+                payload: Some(BackupPayload {
+                    storage: "path".to_string(),
+                    path: "entries/entry-1/payload".to_string(),
+                }),
+            }],
+        };
+        write_authenticated_backup_manifest(
+            &backup_root,
+            &mut manifest,
+            backup_authentication_key,
+        )?;
+        write_provider_config(&source_path, &rendered)?;
+        append_audit_entry(
+            &app_state_root,
+            &ApplyAuditEntry {
+                version: 1,
+                event: "apply".to_string(),
+                created_at,
+                backup_id: backup_id.clone(),
+                selection: item.clone(),
+                target_enabled: plan.target_enabled,
+                affected_targets: plan.affected_targets.clone(),
+            },
+        )?;
+        Ok(())
+    })();
+    drop(lock);
+
+    if let Err(error) = apply_result {
+        return apply_failure_result(plan, backup_id, &backup_root, error.to_string());
+    }
     ToggleResult {
         status: ToggleStatus::Applied,
         backup_id: Some(backup_id),

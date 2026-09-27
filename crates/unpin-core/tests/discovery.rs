@@ -1967,7 +1967,7 @@ fn discovers_zed_settings_with_jsonc_comments_and_trailing_commas() {
 }
 
 #[test]
-fn discovers_native_disabled_zed_server_without_offering_a_vault_toggle() {
+fn discovers_native_disabled_zed_server_as_writable() {
     let fixture = tempfile::TempDir::new().expect("temporary fixture");
     write_file(
         &fixture.path().join("zed/global/.config/zed/settings.json"),
@@ -1982,7 +1982,7 @@ fn discovers_native_disabled_zed_server_without_offering_a_vault_toggle() {
         .find(|item| item.id == "zed:global:configured-mcp:native-disabled")
         .expect("native disabled Zed server remains visible");
     assert!(!disabled.enabled);
-    assert_eq!(disabled.mutability, DiscoveryMutability::ReadOnly);
+    assert_eq!(disabled.mutability, DiscoveryMutability::ReadWrite);
 
     let enabled = result
         .items
