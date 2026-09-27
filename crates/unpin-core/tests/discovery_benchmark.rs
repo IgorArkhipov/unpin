@@ -15,6 +15,7 @@ const BENCHMARK_DIRECTORY_COUNTS: [usize; 3] = [256, 2_048, 8_192];
 const SKILL_INTERVAL: usize = 16;
 const WARM_RUNS: usize = 5;
 const AGENT_PLUGIN_PACKAGE_COUNT: usize = 128;
+const CODEX_MCP_SERVER_COUNT: usize = 200;
 
 struct ProjectSkillFixture {
     _home_root: tempfile::TempDir,
@@ -88,6 +89,42 @@ fn large_agent_plugin_fixture_projects_deterministically() {
     eprintln!(
         "Agent Plugins benchmark packages={} first={first_duration:?} second={second_duration:?}",
         AGENT_PLUGIN_PACKAGE_COUNT
+    );
+}
+
+#[test]
+#[ignore = "manual Codex MCP config performance baseline; run with --ignored --nocapture"]
+fn benchmarks_codex_mcp_config_discovery() {
+    let fixture = tempfile::TempDir::new().expect("temporary Codex MCP fixture");
+    let mut config = String::new();
+    for index in 0..CODEX_MCP_SERVER_COUNT {
+        config.push_str(&format!(
+            "[mcp_servers.server-{index:03}]\ncommand = \"echo\"\n\n"
+        ));
+    }
+    write_file(&fixture.path().join("codex/global/config.toml"), &config);
+    let roots = DiscoveryRoots::fixture_root(fixture.path());
+    let (first, first_duration) = timed_discovery(&roots);
+    let mut warm_durations = Vec::with_capacity(WARM_RUNS);
+    for _ in 0..WARM_RUNS {
+        let (discovery, duration) = timed_discovery(&roots);
+        assert_discovery_matches(&first, &discovery);
+        warm_durations.push(duration);
+    }
+    warm_durations.sort();
+    assert_eq!(
+        first
+            .items
+            .iter()
+            .filter(|item| item.provider == ProviderId::Codex
+                && item.category == unpin_core::discovery::DiscoveryCategory::ConfiguredMcp)
+            .count(),
+        CODEX_MCP_SERVER_COUNT
+    );
+    eprintln!(
+        "Codex MCP benchmark servers={} first={first_duration:?} warm_median={:?}",
+        CODEX_MCP_SERVER_COUNT,
+        warm_durations[WARM_RUNS / 2]
     );
 }
 

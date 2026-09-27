@@ -66,6 +66,7 @@ pub(crate) fn discover_claude(
         "claude:global:skill:",
         DiscoveryMutability::ReadWrite,
         items,
+        warnings,
     )?;
     let global_plugin_roots = discover_claude_skill_directory_plugins(
         &global_skill_root,

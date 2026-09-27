@@ -21,6 +21,7 @@ pub(crate) fn discover_opencode(
         OPENCODE_GLOBAL_SKILL_ID_PREFIX,
         DiscoveryMutability::ReadWrite,
         items,
+        warnings,
     )?;
     for (root, namespace) in [
         (&agents_global_root, OPENCODE_COMPAT_AGENTS_SKILL_NAMESPACE),
@@ -34,6 +35,7 @@ pub(crate) fn discover_opencode(
             &id_prefix,
             DiscoveryMutability::ReadWrite,
             items,
+            warnings,
         )?);
         shared_skill_views.push(SkillView::new(
             ProviderId::OpenCode,

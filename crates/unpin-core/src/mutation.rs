@@ -26,8 +26,9 @@ use sha2::{Digest, Sha256};
 use crate::clock::{current_timestamp, unix_nanos_id};
 use crate::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, ProviderId,
-    claude_local_scope_token, codex_skill_config_enabled, codex_skill_config_path,
-    json_value_source_fingerprint, skill_payload_has_skill, source_fingerprint,
+    claude_local_scope_token, codex_has_unsupported_skill_config_assignment,
+    codex_skill_config_enabled, codex_skill_config_path, json_value_source_fingerprint,
+    skill_payload_has_skill, source_fingerprint, zed_release_channel_override,
 };
 use crate::encode_path_segment;
 use crate::fs_support::read_optional_string;
@@ -3410,8 +3411,29 @@ pub(super) fn restore_manifest_transaction(
     let rollback_root = backup_root.join("rollback");
     validate_restore_manifest_preconditions(manifest)?;
     let audit_target = prepare_restore_audit_target(app_state_root)?;
+    let canonical_app_state_root = fs::canonicalize(app_state_root).ok();
     let vault_selections = if !manifest.target_enabled {
         backup_manifest_selections(manifest)
+            .into_iter()
+            .filter(|selection| {
+                // Existing providers' backups predate explicit native/vault evidence.
+                // Zed's native flag writes are new and never create a vault.
+                if selection.provider != ProviderId::Zed {
+                    return true;
+                }
+                let vault_root = vault_root_path(app_state_root, selection);
+                let canonical_vault_root = canonical_app_state_root
+                    .as_ref()
+                    .map(|root| vault_root_path(root, selection));
+                manifest.affected_targets.iter().any(|target| {
+                    target.target_type == "vaultPath"
+                        && (Path::new(&target.path).starts_with(&vault_root)
+                            || canonical_vault_root
+                                .as_ref()
+                                .is_some_and(|root| Path::new(&target.path).starts_with(root)))
+                })
+            })
+            .collect()
     } else {
         Vec::new()
     };
@@ -4015,6 +4037,7 @@ pub(super) fn remove_restored_vault_entry(
 ) -> Result<(), String> {
     let vault_root = vault_root_path(app_state_root, selection);
     if vault_root.exists() {
+        validate_path_has_no_symlink_components(app_state_root, &vault_root)?;
         fs::remove_dir_all(vault_root).map_err(|error| error.to_string())?;
     }
 
@@ -5828,6 +5851,56 @@ pub(super) fn zed_context_server_value(document: &Value, server_id: &str) -> Res
     Ok(value.clone())
 }
 
+pub(super) fn zed_settings_without_channel_override(
+    raw: &str,
+    server_id: &str,
+) -> Result<Value, String> {
+    let document = parse_jsonc_value(raw)?;
+    if let Some(channel) = zed_release_channel_override(server_id, |name| document.get(name)) {
+        return Err(format!(
+            "Zed context server has a {channel} release-channel override; its root setting cannot be toggled safely"
+        ));
+    }
+    Ok(document)
+}
+
+pub(super) fn set_zed_context_server_enabled_jsonc(
+    raw: &str,
+    server_id: &str,
+    enabled: bool,
+) -> Result<String, String> {
+    let document = parse_jsonc_value(raw)?;
+    let original = zed_context_server_value(&document, server_id)?;
+    if !original.get("enabled").is_some_and(Value::is_boolean) {
+        return Err(format!(
+            "context_servers.{server_id}.enabled is missing or not a boolean"
+        ));
+    }
+
+    let root = CstRootNode::parse(raw, &ParseOptions::default())
+        .map_err(|error| format!("Zed JSONC settings could not be parsed: {error}"))?;
+    let server = root
+        .object_value()
+        .and_then(|root| root.object_value("context_servers"))
+        .and_then(|servers| servers.object_value(server_id))
+        .ok_or_else(|| format!("context_servers.{server_id} is missing or not an object"))?;
+    let property = server
+        .get("enabled")
+        .ok_or_else(|| format!("context_servers.{server_id}.enabled is missing"))?;
+    property.set_value(CstInputValue::Bool(enabled));
+
+    let rendered = root.to_string();
+    let rewritten = zed_context_server_value(&parse_jsonc_value(&rendered)?, server_id)?;
+    let mut expected = original;
+    expected["enabled"] = Value::Bool(enabled);
+    if rewritten != expected {
+        return Err(format!(
+            "Zed JSONC edit did not preserve context_servers.{server_id}"
+        ));
+    }
+    Ok(rendered)
+}
+
 pub(super) struct ZedJsoncRemoval {
     rendered: String,
     value_raw: String,
@@ -6124,6 +6197,9 @@ pub(super) fn set_codex_skill_config_enabled(
     enabled: bool,
 ) -> Result<String, String> {
     ensure_unique_standard_toml_tables(raw)?;
+    if codex_has_unsupported_skill_config_assignment(raw) {
+        return Err("unsupported skills.config assignment form".to_string());
+    }
     let skill_path_string = path_string(skill_path.to_path_buf());
     let mut matching_sections = Vec::new();
     for section in find_toml_array_table_sections(raw, "skills.config") {
