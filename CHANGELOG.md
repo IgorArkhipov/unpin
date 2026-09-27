@@ -7,6 +7,18 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-09-27
+
+### Fixed
+
+- Kept discovery honest when provider directories are unreadable, bounded
+  recursive skill scans, reduced repeated Codex TOML reads, and left unsupported
+  Codex skill-configuration shapes read-only with a warning.
+- Added native enable/disable for explicit Zed `context_servers.<id>.enabled`
+  flags in global and project settings while preserving JSONC comments and
+  trailing commas. Root servers with matching release-channel overrides remain
+  read-only until channel-aware writes are supported.
+
 ## [1.5.1] - 2026-09-26
 
 ### Fixed
