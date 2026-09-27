@@ -28,7 +28,7 @@ use crate::discovery::{
     DiscoveryCategory, DiscoveryItem, DiscoveryLayer, DiscoveryMutability, ProviderId,
     claude_local_scope_token, codex_has_unsupported_skill_config_assignment,
     codex_skill_config_enabled, codex_skill_config_path, json_value_source_fingerprint,
-    skill_payload_has_skill, source_fingerprint,
+    skill_payload_has_skill, source_fingerprint, zed_release_channel_override,
 };
 use crate::encode_path_segment;
 use crate::fs_support::read_optional_string;
@@ -5849,6 +5849,19 @@ pub(super) fn zed_context_server_value(document: &Value, server_id: &str) -> Res
     }
 
     Ok(value.clone())
+}
+
+pub(super) fn zed_settings_without_channel_override(
+    raw: &str,
+    server_id: &str,
+) -> Result<Value, String> {
+    let document = parse_jsonc_value(raw)?;
+    if let Some(channel) = zed_release_channel_override(server_id, |name| document.get(name)) {
+        return Err(format!(
+            "Zed context server has a {channel} release-channel override; its root setting cannot be toggled safely"
+        ));
+    }
+    Ok(document)
 }
 
 pub(super) fn set_zed_context_server_enabled_jsonc(

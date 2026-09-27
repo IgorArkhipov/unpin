@@ -198,6 +198,19 @@ fn discover_zed_settings(
         if !valid_enabled {
             item.mutability = DiscoveryMutability::ReadOnly;
         }
+        if let Some(channel) =
+            zed_release_channel_override(server_id, |name| document.other_settings.get(name))
+        {
+            item.mutability = DiscoveryMutability::ReadOnly;
+            warnings.push(DiscoveryWarning {
+                provider: ProviderId::Zed,
+                layer: Some(layer),
+                code: "release-channel-override".to_string(),
+                message: format!(
+                    "Zed context server has a {channel} release-channel override; its root setting cannot be toggled safely"
+                ),
+            });
+        }
         item.source_fingerprint = Some(json_value_source_fingerprint(value));
         items.push(item);
     }

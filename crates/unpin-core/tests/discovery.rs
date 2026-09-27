@@ -2007,6 +2007,44 @@ fn discovers_native_disabled_zed_server_as_writable() {
 }
 
 #[test]
+fn zed_release_channel_override_keeps_root_server_read_only() {
+    let fixture = tempfile::TempDir::new().expect("temporary fixture");
+    write_file(
+        &fixture.path().join("zed/global/.config/zed/settings.json"),
+        r#"{
+          "context_servers": {
+            "overridden": {"command":"echo", "enabled": false},
+            "independent": {"command":"echo", "enabled": true}
+          },
+          "preview": {
+            "context_servers": {
+              "overridden": {"enabled": true}
+            }
+          }
+        }"#,
+    );
+
+    let result = discover_all(&DiscoveryRoots::fixture_root(fixture.path()))
+        .expect("Zed discovery succeeds");
+    let overridden = result
+        .items
+        .iter()
+        .find(|item| item.id == "zed:global:configured-mcp:overridden")
+        .expect("overridden Zed server remains visible");
+    assert!(!overridden.enabled);
+    assert_eq!(overridden.mutability, DiscoveryMutability::ReadOnly);
+    let independent = result
+        .items
+        .iter()
+        .find(|item| item.id == "zed:global:configured-mcp:independent")
+        .expect("unrelated Zed server remains visible");
+    assert_eq!(independent.mutability, DiscoveryMutability::ReadWrite);
+    assert!(result.warnings.iter().any(|warning| {
+        warning.provider == ProviderId::Zed && warning.code == "release-channel-override"
+    }));
+}
+
+#[test]
 fn discovers_cursor_configured_mcp_disabled_flag_as_disabled() {
     let fixture_copy = tempfile::TempDir::new().expect("temp fixture copy");
     copy_dir_all(&fixtures_root(), fixture_copy.path());

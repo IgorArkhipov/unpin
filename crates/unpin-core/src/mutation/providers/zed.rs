@@ -18,7 +18,7 @@ pub(crate) fn plan_zed_configured_mcp_toggle(
         Ok(raw) => raw,
         Err(reason) => return blocked(item, reason),
     };
-    let server_value = match parse_jsonc_value(&source_raw)
+    let server_value = match zed_settings_without_channel_override(&source_raw, &server_id)
         .and_then(|document| zed_context_server_value(&document, &server_id))
     {
         Ok(value) => value,
@@ -160,6 +160,9 @@ pub(crate) fn plan_disabled_zed_configured_mcp_vault_toggle(
         Ok(raw) => raw,
         Err(reason) => return blocked(item, reason),
     };
+    if let Err(reason) = zed_settings_without_channel_override(&source_raw, server_id) {
+        return blocked(item, reason);
+    }
 
     let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
     let vault_payload_raw = match read_jsonc_raw(&vault_payload) {
@@ -238,7 +241,7 @@ pub(crate) fn apply_zed_configured_mcp_toggle(
         Ok(raw) => raw,
         Err(reason) => return blocked(item, reason),
     };
-    let server_value = match parse_jsonc_value(&source_raw)
+    let server_value = match zed_settings_without_channel_override(&source_raw, &server_id)
         .and_then(|document| zed_context_server_value(&document, &server_id))
     {
         Ok(value) => value,
@@ -279,6 +282,10 @@ pub(crate) fn apply_zed_configured_mcp_toggle(
             return blocked(item, reason);
         }
     };
+    if let Err(reason) = zed_settings_without_channel_override(&source_raw, &server_id) {
+        drop(lock);
+        return blocked(item, reason);
+    }
     let removal = match prepare_zed_context_server_removal(
         &source_raw,
         &server_id,
@@ -460,7 +467,7 @@ fn apply_native_zed_configured_mcp_toggle(
             return blocked(item, reason);
         }
     };
-    let current_server = match parse_jsonc_value(&source_raw)
+    let current_server = match zed_settings_without_channel_override(&source_raw, &server_id)
         .and_then(|document| zed_context_server_value(&document, &server_id))
     {
         Ok(server) => server,
@@ -606,6 +613,10 @@ pub(crate) fn apply_disabled_zed_configured_mcp_vault_toggle(
             return blocked(item, reason);
         }
     };
+    if let Err(reason) = zed_settings_without_channel_override(&source_raw, &server_id) {
+        drop(lock);
+        return blocked(item, reason);
+    }
 
     let vault_payload = PathBuf::from(&vault_entry.vaulted_path);
     let vaulted_server_raw = match read_jsonc_raw(&vault_payload) {

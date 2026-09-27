@@ -445,6 +445,25 @@ struct ClaudeSettings {
 struct ZedSettings {
     #[serde(default)]
     context_servers: BTreeMap<String, serde_json::Value>,
+    #[serde(flatten)]
+    other_settings: BTreeMap<String, serde_json::Value>,
+}
+
+pub(crate) fn zed_release_channel_override<'a>(
+    server_id: &str,
+    channel_setting: impl Fn(&str) -> Option<&'a serde_json::Value>,
+) -> Option<&'static str> {
+    ["stable", "preview", "nightly", "dev"]
+        .into_iter()
+        .find(|channel| {
+            channel_setting(channel)
+                .and_then(|settings| settings.get("context_servers"))
+                .is_some_and(|servers| {
+                    servers
+                        .as_object()
+                        .is_none_or(|servers| servers.contains_key(server_id))
+                })
+        })
 }
 
 #[derive(Debug, Deserialize)]

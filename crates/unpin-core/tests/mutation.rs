@@ -8286,6 +8286,89 @@ fn zed_native_enabled_flag_round_trips_without_vaulting_or_losing_jsonc() {
 }
 
 #[test]
+fn zed_release_channel_override_blocks_stale_toggle_without_writes() {
+    let fixture = TempDir::new().expect("temporary fixture");
+    let app_state = TempDir::new().expect("temporary app state");
+    let settings_path = fixture.path().join("zed/global/.config/zed/settings.json");
+    let original = r#"{"context_servers":{"docs":{"command":"echo","enabled":true}}}"#;
+    fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .expect("create Zed settings directory");
+    fs::write(&settings_path, original).expect("write Zed settings");
+    let roots = DiscoveryRoots::fixture_root(fixture.path()).with_app_state_root(app_state.path());
+    let item = discover_all(&roots)
+        .expect("initial discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "zed:global:configured-mcp:docs")
+        .expect("Zed server");
+    let changed = r#"{"context_servers":{"docs":{"command":"echo","enabled":true}},"preview":{"context_servers":{"docs":{"enabled":true}}}}"#;
+    fs::write(&settings_path, changed).expect("add channel override after discovery");
+
+    for apply in [false, true] {
+        let result = plan_toggle(TogglePlanInput {
+            app_state_root: app_state.path().to_path_buf(),
+            item: item.clone(),
+            apply,
+            backup_authentication_key: apply.then(backup_authentication_key),
+        });
+        assert_eq!(result.status, ToggleStatus::Blocked);
+        assert!(
+            result
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("release-channel")
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("settings unchanged"),
+        changed
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+}
+
+#[test]
+fn zed_release_channel_override_blocks_vault_toggle_without_writes() {
+    let fixture = TempDir::new().expect("temporary fixture");
+    let app_state = TempDir::new().expect("temporary app state");
+    let settings_path = fixture.path().join("zed/project/.zed/settings.json");
+    fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .expect("create project settings directory");
+    let original = r#"{"context_servers":{"docs":{"command":"echo"}}}"#;
+    fs::write(&settings_path, original).expect("write Zed project settings");
+    let roots = DiscoveryRoots::fixture_root(fixture.path()).with_app_state_root(app_state.path());
+    let item = discover_all(&roots)
+        .expect("project discovery")
+        .items
+        .into_iter()
+        .find(|item| item.id == "zed:project:configured-mcp:docs")
+        .expect("project Zed server");
+    assert_eq!(item.mutability, DiscoveryMutability::ReadWrite);
+    let changed = r#"{"context_servers":{"docs":{"command":"echo"}},"nightly":{"context_servers":{"docs":{"enabled":true}}}}"#;
+    fs::write(&settings_path, changed).expect("add channel override after discovery");
+
+    let result = plan_toggle(TogglePlanInput {
+        app_state_root: app_state.path().to_path_buf(),
+        item,
+        apply: true,
+        backup_authentication_key: Some(backup_authentication_key()),
+    });
+    assert_eq!(result.status, ToggleStatus::Blocked);
+    assert!(
+        result
+            .reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("release-channel")
+    );
+    assert_eq!(
+        fs::read_to_string(&settings_path).expect("settings unchanged"),
+        changed
+    );
+    assert_eq!(backup_count(app_state.path()), 0);
+}
+
+#[test]
 fn zed_project_native_enabled_flag_round_trips_without_vaulting() {
     let fixture_copy = TempDir::new().expect("temp fixture copy");
     let app_state = TempDir::new().expect("temp app state");
