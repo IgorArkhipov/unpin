@@ -153,6 +153,18 @@ jobs:
           -derivedDataPath /tmp/unpin-desktop-ci-derived-data
           CODE_SIGNING_ALLOWED=NO
 
+      - name: Test desktop fixture interactions
+        run: >
+          xcodebuild test
+          -project apps/unpin-desktop/UnpinDesktop.xcodeproj
+          -scheme UnpinDesktopUI
+          -configuration Debug
+          -destination 'platform=macOS,arch=arm64'
+          -derivedDataPath /tmp/unpin-desktop-ui-ci-derived-data
+          -parallel-testing-enabled NO
+          ONLY_ACTIVE_ARCH=YES
+          SWIFT_TREAT_WARNINGS_AS_ERRORS=YES
+
       - name: Test desktop release verifier
         run: >
           python3 -m unittest

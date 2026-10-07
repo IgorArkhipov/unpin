@@ -144,6 +144,26 @@ The shared scheme includes the XCTest action and bundles a matching Debug
 `unpin` child. Its tests use repository fixtures and temporary app-state roots;
 they do not inspect or mutate real provider state.
 
+Run the native interaction tests separately in a logged-in macOS session:
+
+```bash
+xcodebuild test \
+  -project apps/unpin-desktop/UnpinDesktop.xcodeproj \
+  -scheme UnpinDesktopUI \
+  -destination 'platform=macOS' \
+  -parallel-testing-enabled NO
+```
+
+This scheme launches a separate fixture application, not the normal workbench.
+It reuses the production views with synthetic inventory and temporary roots,
+without starting the bridge or update checker. XCUITest checks accessibility
+roles, selected values, control bounds, menu interaction, and filter replacement
+instead of SwiftUI's internal AppKit view classes. Control bounds and text-width
+checks do not replace visual clipping review in the desktop capture matrix.
+Allow Xcode's UI automation permission if macOS requests it. Keep failed
+`.xcresult` bundles private: automatic diagnostics may include desktop or
+system-menu information beyond the fixture window.
+
 ## Architecture
 
 ```mermaid

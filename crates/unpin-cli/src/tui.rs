@@ -166,6 +166,25 @@ pub(super) enum CategoryFilter {
     Category(DiscoveryCategory),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EvidencePane {
+    Rows,
+    Selected,
+    Warnings,
+    Backups,
+}
+
+impl EvidencePane {
+    fn next(self) -> Self {
+        match self {
+            Self::Rows => Self::Selected,
+            Self::Selected => Self::Warnings,
+            Self::Warnings => Self::Backups,
+            Self::Backups => Self::Rows,
+        }
+    }
+}
+
 pub(super) struct TuiState {
     discovery: DiscoveryOutput,
     inventory_cache: RefCell<inventory::InventoryRenderCache>,
@@ -182,6 +201,8 @@ pub(super) struct TuiState {
     approval_context_error: Option<String>,
     fixture_mode: bool,
     view: TuiView,
+    evidence_pane: EvidencePane,
+    terminal_too_small: bool,
     control_scroll: u16,
     control_scroll_limit: u16,
     profile_workflow: profiles::ProfileWorkflow,
@@ -375,6 +396,8 @@ impl TuiState {
             approval_context_error,
             fixture_mode: cfg!(test),
             view: TuiView::Inventory,
+            evidence_pane: EvidencePane::Rows,
+            terminal_too_small: false,
             control_scroll: 0,
             control_scroll_limit: u16::MAX,
             profile_workflow,
@@ -452,15 +475,22 @@ impl TuiState {
             .unwrap_or(0);
         self.view = TuiView::ALL[(current + 1) % TuiView::ALL.len()];
         self.search_editing = false;
+        self.evidence_pane = EvidencePane::Rows;
         self.control_scroll = 0;
         self.control_scroll_limit = u16::MAX;
     }
 
     fn scroll_control_up(&mut self) {
+        if self.evidence_pane == EvidencePane::Rows {
+            self.evidence_pane = EvidencePane::Selected;
+        }
         self.control_scroll = self.control_scroll.saturating_sub(CONTROL_SCROLL_STEP);
     }
 
     fn scroll_control_down(&mut self) {
+        if self.evidence_pane == EvidencePane::Rows {
+            self.evidence_pane = EvidencePane::Selected;
+        }
         self.control_scroll = self
             .control_scroll
             .saturating_add(CONTROL_SCROLL_STEP)
@@ -2134,6 +2164,15 @@ enum TuiEventOutcome {
 }
 
 fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
+    if state.terminal_too_small {
+        return match event {
+            Event::Resize(_, _) => TuiEventOutcome::Redraw,
+            Event::Key(key) if matches!(key.code, KeyCode::Char('q' | 'Q') | KeyCode::Esc) => {
+                TuiEventOutcome::Quit
+            }
+            _ => TuiEventOutcome::Ignore,
+        };
+    }
     let should_draw = match event {
         Event::Resize(_, _) => true,
         Event::Paste(text) if state.group_text_editing() => {
@@ -2177,6 +2216,11 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
         Event::Key(key) => match key.code {
             KeyCode::Char('q' | 'Q') => return TuiEventOutcome::Quit,
             KeyCode::Esc => {
+                if state.evidence_pane != EvidencePane::Rows {
+                    state.evidence_pane = EvidencePane::Rows;
+                    state.control_scroll = 0;
+                    return TuiEventOutcome::Redraw;
+                }
                 if !state.cancel_package_interaction() && !state.cancel_group_interaction() {
                     return TuiEventOutcome::Quit;
                 }
@@ -2186,12 +2230,29 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 state.cycle_view();
                 true
             }
-            KeyCode::PageUp if state.view != TuiView::Inventory => {
+            KeyCode::Tab => {
+                state.evidence_pane = state.evidence_pane.next();
+                state.control_scroll = 0;
+                state.control_scroll_limit = u16::MAX;
+                true
+            }
+            KeyCode::PageUp => {
                 state.scroll_control_up();
                 true
             }
-            KeyCode::PageDown if state.view != TuiView::Inventory => {
+            KeyCode::PageDown => {
                 state.scroll_control_down();
+                true
+            }
+            KeyCode::Down if state.evidence_pane != EvidencePane::Rows => {
+                state.control_scroll = state
+                    .control_scroll
+                    .saturating_add(1)
+                    .min(state.control_scroll_limit);
+                true
+            }
+            KeyCode::Up if state.evidence_pane != EvidencePane::Rows => {
+                state.control_scroll = state.control_scroll.saturating_sub(1);
                 true
             }
             KeyCode::Down => {
@@ -2374,6 +2435,9 @@ fn command_legend(view: TuiView) -> Vec<Line<'static>> {
         );
     }
     let mut lines = vec![Line::from(primary_controls), Line::from(secondary_controls)];
+    lines.push(Line::from(
+        "Tab panes | ↑/↓ or PgUp/PgDn evidence | Esc return to rows",
+    ));
 
     match view {
         TuiView::Packages => lines.push(Line::from(vec![
@@ -2536,6 +2600,16 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     const MAX_HEADER_HEIGHT: u16 = 14;
 
     let area = frame.area();
+    state.terminal_too_small = area.width < 50 || area.height < 18;
+    if state.terminal_too_small {
+        frame.render_widget(
+            Paragraph::new("Resize to at least 50 × 18 to review evidence.\nChange actions are paused. Q quits.")
+                .wrap(Wrap { trim: true })
+                .block(Block::default().borders(Borders::ALL).title("Unpin")),
+            area,
+        );
+        return;
+    }
     let command_legend = command_legend_for_state(state);
     let requested_footer_height = command_footer_height(&command_legend, area.width);
     let header_minimum = MIN_HEADER_HEIGHT.min(area.height);
@@ -2581,6 +2655,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         .block(Block::default().borders(Borders::ALL).title("Inventory"));
     frame.render_widget(header, chunks[0]);
 
+    let compact = area.width < 90;
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
@@ -2609,61 +2684,73 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     let mut list_state = ListState::default();
     list_state.select(selected_row);
-    frame.render_stateful_widget(list, body[0], &mut list_state);
-
-    let detail_chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(50),
-            Constraint::Percentage(25),
-            Constraint::Percentage(25),
-        ])
-        .split(body[1]);
-
-    let control_scroll_limit = control_scroll_offset(
-        &state.active_details(),
-        u16::MAX,
-        detail_chunks[0].width,
-        detail_chunks[0].height,
-    );
+    if !compact || state.evidence_pane == EvidencePane::Rows {
+        frame.render_stateful_widget(
+            list,
+            if compact { chunks[1] } else { body[0] },
+            &mut list_state,
+        );
+    }
+    let detail_area = if compact { chunks[1] } else { body[1] };
+    let details = match state.evidence_pane {
+        EvidencePane::Rows | EvidencePane::Selected => selected_detail_lines(state),
+        EvidencePane::Warnings => warning_detail_lines(state),
+        EvidencePane::Backups => backup_detail_lines(state),
+    };
+    let control_scroll_limit =
+        control_scroll_offset(&details, u16::MAX, detail_area.width, detail_area.height);
     state.control_scroll_limit = control_scroll_limit;
     let control_scroll = state.control_scroll.min(control_scroll_limit);
     state.control_scroll = control_scroll;
-    frame.render_widget(selected_detail(state, control_scroll), detail_chunks[0]);
-    frame.render_widget(warning_detail(state), detail_chunks[1]);
-    frame.render_widget(backup_detail(state), detail_chunks[2]);
+    if !compact || state.evidence_pane != EvidencePane::Rows {
+        let paragraph = match state.evidence_pane {
+            EvidencePane::Rows | EvidencePane::Selected => selected_detail(state, control_scroll),
+            EvidencePane::Warnings => warning_detail(state),
+            EvidencePane::Backups => backup_detail(state),
+        };
+        frame.render_widget(paragraph, detail_area);
+    }
 
     frame.render_widget(footer, chunks[2]);
 }
 
 fn selected_detail(state: &TuiState, control_scroll: u16) -> Paragraph<'static> {
-    if state.view != TuiView::Inventory {
-        let lines: Vec<_> = state.active_details().into_iter().map(Line::from).collect();
-        return Paragraph::new(lines)
-            .wrap(Wrap { trim: true })
-            .scroll((control_scroll, 0))
-            .block(Block::default().borders(Borders::ALL).title("Control"));
-    }
-    let lines = if let Some(item) = state.selected_item() {
-        let mut lines = Vec::new();
-        if let Some((position, total)) = state.selected_position() {
-            lines.push(Line::from(format!("selected: {position}/{total}")));
-        }
-        lines.extend(selected_detail_strings(item).into_iter().map(Line::from));
-        lines.extend(
-            plan_preview_strings(state, item)
-                .into_iter()
-                .map(Line::from),
-        );
-        lines
+    let title = if state.view == TuiView::Inventory {
+        "Selected"
     } else {
-        vec![
-            Line::from("selected: none"),
-            Line::from("No discovered items match current filters."),
-        ]
+        "Control"
     };
+    evidence_detail(
+        selected_detail_lines(state),
+        title,
+        control_scroll,
+        state.control_scroll_limit,
+    )
+}
 
-    Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Selected"))
+fn selected_detail_lines(state: &TuiState) -> Vec<String> {
+    let mut lines = state.active_details();
+    if state.view == TuiView::Inventory {
+        lines.insert(
+            0,
+            state.selected_position().map_or_else(
+                || "selected: none".to_string(),
+                |(position, total)| format!("selected: {position}/{total}"),
+            ),
+        );
+    }
+    lines
+}
+
+fn evidence_detail(lines: Vec<String>, title: &str, scroll: u16, limit: u16) -> Paragraph<'static> {
+    Paragraph::new(lines.into_iter().map(Line::from).collect::<Vec<_>>())
+        .wrap(Wrap { trim: true })
+        .scroll((scroll, 0))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!("{title} · {scroll}/{limit} · Tab panes")),
+        )
 }
 
 fn control_scroll_offset(
@@ -2713,32 +2800,37 @@ fn wrapped_control_line_count(details: &[String], width: usize) -> usize {
 }
 
 fn warning_detail(state: &TuiState) -> Paragraph<'static> {
-    let lines = if state.discovery.warnings.is_empty() {
-        vec![Line::from("No discovery warnings.")]
-    } else {
-        state
-            .discovery
-            .warnings
-            .iter()
-            .map(|warning| Line::from(warning_label(warning)))
-            .collect()
-    };
+    evidence_detail(
+        warning_detail_lines(state),
+        "Warnings",
+        state.control_scroll,
+        state.control_scroll_limit,
+    )
+}
 
-    Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Warnings"))
+fn warning_detail_lines(state: &TuiState) -> Vec<String> {
+    if state.discovery.warnings.is_empty() {
+        vec!["No discovery warnings.".to_string()]
+    } else {
+        state.discovery.warnings.iter().map(warning_label).collect()
+    }
 }
 
 fn backup_detail(state: &TuiState) -> Paragraph<'static> {
-    let lines = if state.backups.is_empty() {
-        vec![Line::from("No backups found.")]
-    } else {
-        state
-            .backups
-            .iter()
-            .map(|backup| Line::from(backup_label(backup)))
-            .collect()
-    };
+    evidence_detail(
+        backup_detail_lines(state),
+        "Backups",
+        state.control_scroll,
+        state.control_scroll_limit,
+    )
+}
 
-    Paragraph::new(lines).block(Block::default().borders(Borders::ALL).title("Backups"))
+fn backup_detail_lines(state: &TuiState) -> Vec<String> {
+    if state.backups.is_empty() {
+        vec!["No backups found.".to_string()]
+    } else {
+        state.backups.iter().map(backup_label).collect()
+    }
 }
 
 fn selected_detail_strings(item: &DiscoveryItem) -> Vec<String> {
@@ -5349,7 +5441,8 @@ mod tests {
         state.view = TuiView::Groups;
         state.control_scroll = u16::MAX;
 
-        let backend = ratatui::backend::TestBackend::new(28, 30);
+        state.evidence_pane = EvidencePane::Selected;
+        let backend = ratatui::backend::TestBackend::new(61, 30);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
         terminal
             .draw(|frame| draw(frame, &mut state))
@@ -5390,13 +5483,102 @@ mod tests {
     }
 
     #[test]
-    fn inventory_legend_omits_disabled_control_scrolling() {
+    fn inventory_legend_documents_evidence_scrolling() {
         assert!(
-            !command_legend(TuiView::Inventory)
+            command_legend(TuiView::Inventory)
                 .iter()
                 .flat_map(|line| line.spans.iter())
                 .any(|span| span.content.contains("PgUp/PgDn"))
         );
+    }
+
+    #[test]
+    fn inventory_evidence_scrolls_without_staging_a_change() {
+        let mut state = TuiState::new(DiscoveryOutput::default());
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::PageDown)),
+            TuiEventOutcome::Redraw
+        );
+        assert_eq!(state.control_scroll, CONTROL_SCROLL_STEP);
+        assert!(state.staged.is_empty());
+        assert!(!state.pending_confirmation);
+        handle_tui_event(&mut state, key_event(KeyCode::PageUp));
+        assert_eq!(state.control_scroll, 0);
+    }
+
+    #[test]
+    fn evidence_panes_expose_every_long_plan_warning_and_backup() {
+        for (width, height) in [(120, 40), (80, 24), (61, 24)] {
+            let mut selected = item(
+                "selected-fixture",
+                ProviderId::Claude,
+                DiscoveryLayer::Global,
+                DiscoveryCategory::Skill,
+                DiscoveryKind::Skill,
+            );
+            selected.source_path = format!("/fixtures/{}source-end", "長いパス/".repeat(30));
+            let mut state = TuiState::new(discovery_with_warnings(
+                vec![selected.clone()],
+                (0..50)
+                    .map(|index| DiscoveryWarning {
+                        provider: ProviderId::Claude,
+                        layer: Some(DiscoveryLayer::Global),
+                        code: format!("warning-{index:03}"),
+                        message:
+                            "Fixture-only diagnostic that needs to wrap without losing evidence."
+                                .to_string(),
+                    })
+                    .collect(),
+            ));
+            let preview = (0..200).map(|index| format!("affected-target-{index:03}: review this exact fixture configuration before applying"))
+                .collect::<Vec<_>>();
+            *state.preview_cache.borrow_mut() = Some((selected, preview));
+            state.backups = (0..31).map(restore_backup_summary).collect();
+            let mut terminal =
+                ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            for (pane, prefix, count) in [
+                (EvidencePane::Selected, "affected-target-", 200),
+                (EvidencePane::Warnings, "warning-", 50),
+                (EvidencePane::Backups, "backup-", 31),
+            ] {
+                state.evidence_pane = pane;
+                state.control_scroll = 0;
+                let mut seen = String::new();
+                loop {
+                    terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                    seen.push_str(
+                        &terminal
+                            .backend()
+                            .buffer()
+                            .content
+                            .iter()
+                            .map(|cell| cell.symbol())
+                            .collect::<String>(),
+                    );
+                    if state.control_scroll >= state.control_scroll_limit {
+                        break;
+                    }
+                    handle_tui_event(&mut state, key_event(KeyCode::Down));
+                }
+                for index in 0..count {
+                    assert!(
+                        seen.contains(&format!("{prefix}{index:03}")),
+                        "{width}x{height} hid {prefix}{index:03}"
+                    );
+                }
+                if pane == EvidencePane::Selected {
+                    assert!(seen.contains("source-end"));
+                    assert!(seen.contains("長"));
+                }
+                assert_eq!(state.selected, 0);
+                assert!(state.staged.is_empty());
+            }
+            assert_eq!(
+                handle_tui_event(&mut state, key_event(KeyCode::Esc)),
+                TuiEventOutcome::Redraw
+            );
+            assert_eq!(state.evidence_pane, EvidencePane::Rows);
+        }
     }
 
     #[test]
@@ -5763,17 +5945,19 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Unpin"));
-        assert!(rendered.contains("Items:"));
+        assert!(rendered.contains("Resize to at least"));
+        assert!(state.terminal_too_small);
     }
 
     #[test]
-    fn short_narrow_layout_preserves_filter_and_search_state() {
+    fn undersized_layout_pauses_changes_and_preserves_state() {
         let mut state = TuiState::new(DiscoveryOutput {
             items: Vec::new(),
             warnings: Vec::new(),
             ..DiscoveryOutput::default()
         });
         state.view = TuiView::Groups;
+        state.search_query = "preserved search".to_string();
         let backend = ratatui::backend::TestBackend::new(40, 20);
         let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
 
@@ -5787,8 +5971,18 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(rendered.contains("Filters:"));
-        assert!(rendered.contains("Search:"));
+        assert!(rendered.contains("50 × 18"));
+        assert!(rendered.contains("Change actions are paused."));
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Enter)),
+            TuiEventOutcome::Ignore
+        );
+        assert_eq!(
+            handle_tui_event(&mut state, key_event(KeyCode::Char('a'))),
+            TuiEventOutcome::Ignore
+        );
+        assert_eq!(state.search_query, "preserved search");
+        assert_eq!(state.view, TuiView::Groups);
     }
 
     #[test]
@@ -5812,7 +6006,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(rendered.contains("Unpin"));
-        assert!(rendered.contains("View:"));
+        assert!(rendered.contains("Resize to at least"));
     }
 
     fn restore_backup_summary(index: usize) -> BackupSummary {

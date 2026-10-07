@@ -105,6 +105,7 @@ extension View {
     }
 }
 
+#if !UNPIN_UI_TEST_HOST
 @main
 struct UnpinDesktopApp: App {
     @StateObject private var workspace = WorkspaceStore()
@@ -164,6 +165,7 @@ struct UnpinDesktopApp: App {
         }
     }
 }
+#endif
 
 struct WorkbenchViewFixture {
     let workArea: WorkArea
@@ -292,16 +294,8 @@ struct WorkbenchView: View {
                 }
                 .padding(16)
 
-                    if let message = presentation.statusMessage {
-                    HStack(spacing: 8) {
-                        Circle()
-                            .fill(palette.green)
-                            .frame(width: 7, height: 7)
-                        Text(message)
-                            .font(.footnote.monospaced())
-                            .foregroundStyle(.secondary)
-                        Spacer()
-                    }
+                if let status = presentation.status {
+                    WorkbenchStatusView(status: status)
                     .padding(.horizontal, 18)
                     .padding(.bottom, 12)
                 }

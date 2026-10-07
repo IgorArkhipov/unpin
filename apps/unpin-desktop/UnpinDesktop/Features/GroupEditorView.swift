@@ -37,6 +37,7 @@ func matchesGroupMemberFilter(
 struct GroupEditorView: View {
     @EnvironmentObject private var workspace: WorkspaceStore
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.colorScheme) private var colorScheme
 
     let group: GroupSummary?
     @State private var name: String
@@ -66,6 +67,7 @@ struct GroupEditorView: View {
     }
 
     var body: some View {
+        let palette = WorkbenchPalette.resolve(for: colorScheme)
         let inventory = workspace.snapshot?.inventory ?? []
         let facets = InventoryFacets(inventory: inventory)
         let filterRevision = InventoryFilterRevision(inventory: inventory)
@@ -129,8 +131,9 @@ struct GroupEditorView: View {
                             Text("Off").tag("off")
                         }
                         .accessibilityLabel(WorkbenchFilterAccessibility.state)
+                        .accessibilityIdentifier("group-member-filter-state")
                         .labelsHidden()
-                        .frame(minWidth: 150, maxWidth: .infinity)
+                        .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
                     VStack(alignment: .leading, spacing: 4) {
@@ -143,8 +146,9 @@ struct GroupEditorView: View {
                             Text("Not included").tag("excluded")
                         }
                         .accessibilityLabel(WorkbenchFilterAccessibility.membership)
+                        .accessibilityIdentifier("group-member-filter-membership")
                         .labelsHidden()
-                        .frame(minWidth: 150, maxWidth: .infinity)
+                        .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
                 }
@@ -204,6 +208,13 @@ struct GroupEditorView: View {
             }
             .disabled(workspace.mutationsBlocked)
             .frame(minHeight: 300)
+            .scrollContentBackground(.hidden)
+            .background(palette.table)
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .stroke(palette.border, lineWidth: 1)
+            }
 
             if let review = workspace.reviewedDefinition {
                 definitionReview(review)
@@ -354,8 +365,9 @@ struct GroupEditorView: View {
                 ForEach(values, id: \.self) { Text($0).tag($0) }
             }
             .accessibilityLabel(WorkbenchFilterAccessibility.label(for: title))
+            .accessibilityIdentifier("group-member-filter-\(title.lowercased())")
             .labelsHidden()
-            .frame(minWidth: 150, maxWidth: .infinity)
+            .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
         }
         .frame(minWidth: 150, maxWidth: .infinity, alignment: .leading)
     }

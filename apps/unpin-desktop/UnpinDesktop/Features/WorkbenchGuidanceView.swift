@@ -132,6 +132,46 @@ enum WorkbenchPresentationState: Equatable {
     case blocked(String)
 }
 
+enum WorkbenchStatusRole: Equatable {
+    case workspace
+    case progress
+    case error
+}
+
+struct WorkbenchStatus: Equatable {
+    let role: WorkbenchStatusRole
+    let message: String
+}
+
+struct WorkbenchStatusView: View {
+    let status: WorkbenchStatus
+
+    var body: some View {
+        HStack(spacing: 8) {
+            switch status.role {
+            case .workspace:
+                Image(systemName: "folder")
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+            case .progress:
+                ProgressView()
+                    .controlSize(.small)
+                    .accessibilityHidden(true)
+            case .error:
+                Image(systemName: "exclamationmark.triangle")
+                    .foregroundStyle(.red)
+                    .accessibilityHidden(true)
+            }
+            Text(status.message)
+                .font(.footnote)
+                .textSelection(.enabled)
+            Spacer()
+        }
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel(status.role == .error ? "Workspace unavailable: \(status.message)" : status.message)
+    }
+}
+
 struct WorkbenchPresentationInputs: Equatable {
     let state: WorkbenchPresentationState
     let hasWorkspace: Bool
@@ -142,16 +182,16 @@ struct WorkbenchPresentationInputs: Equatable {
     var allowsGuidanceDisclosure: Bool { true }
     var allowsCopy: Bool { true }
     var allowsWorkspaceMutation: Bool { !isBusy }
-    var statusMessage: String? {
+    var status: WorkbenchStatus? {
         switch state {
         case .needsWorkspace:
-            WorkspaceStatusText.chooseWorkspace
+            WorkbenchStatus(role: .workspace, message: WorkspaceStatusText.chooseWorkspace)
         case .loading:
-            WorkspaceStatusText.connecting
+            WorkbenchStatus(role: .progress, message: WorkspaceStatusText.connecting)
         case .ready:
             nil
         case .blocked(let message):
-            message
+            WorkbenchStatus(role: .error, message: message)
         }
     }
 

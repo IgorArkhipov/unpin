@@ -294,7 +294,7 @@ final class WorkbenchFlowTests: XCTestCase {
                 hasWorkspace: false,
                 isBusy: false,
                 workspaceName: nil
-            ).statusMessage,
+            ).status?.message,
             "Choose a workspace folder to begin."
         )
         XCTAssertEqual(
@@ -303,7 +303,7 @@ final class WorkbenchFlowTests: XCTestCase {
                 hasWorkspace: true,
                 isBusy: true,
                 workspaceName: "fixture"
-            ).statusMessage,
+            ).status?.message,
             "Connecting to the bundled Unpin bridge…"
         )
         XCTAssertNil(
@@ -312,7 +312,7 @@ final class WorkbenchFlowTests: XCTestCase {
                 hasWorkspace: true,
                 isBusy: false,
                 workspaceName: "fixture"
-            ).statusMessage
+            ).status?.message
         )
         XCTAssertEqual(
             WorkbenchPresentationInputs.fixture(
@@ -320,9 +320,23 @@ final class WorkbenchFlowTests: XCTestCase {
                 hasWorkspace: true,
                 isBusy: false,
                 workspaceName: "fixture"
-            ).statusMessage,
+            ).status?.message,
             "bridge unavailable"
         )
+    }
+
+    func testPresentationStatusDistinguishesWorkspaceProgressAndError() {
+        let cases: [(WorkbenchPresentationState, WorkbenchStatusRole?)] = [
+            (.needsWorkspace, .workspace), (.loading, .progress),
+            (.blocked("bridge unavailable"), .error), (.ready, nil),
+        ]
+        for (state, role) in cases {
+            let presentation = WorkbenchPresentationInputs.fixture(
+                state: state, hasWorkspace: true, isBusy: state == .loading,
+                workspaceName: "fixture"
+            )
+            XCTAssertEqual(presentation.status?.role, role)
+        }
     }
 
     func testDiscoverFiltersClearAllFiveDimensions() {
@@ -357,46 +371,6 @@ final class WorkbenchFlowTests: XCTestCase {
 
         navigation.isPresentingGroupEditor = false
         XCTAssertFalse(navigation.isPresentingGroupEditor)
-    }
-
-    func testInventoryFilterSelectionsFitAtDefaultWindowWidth() {
-        let host = NSHostingView(
-            rootView: DiscoverOrganizeView(
-                inventoryOverride: [
-                    inventoryItem(name: "Alpha", provider: "codex", id: "alpha"),
-                ]
-            )
-                .environmentObject(WorkspaceStore())
-        )
-        host.frame = NSRect(x: 0, y: 0, width: 1_180, height: 760)
-        let window = NSWindow(
-            contentRect: host.bounds,
-            styleMask: [.titled],
-            backing: .buffered,
-            defer: false
-        )
-        window.isReleasedWhenClosed = false
-        window.contentView = host
-        window.makeKeyAndOrderFront(nil)
-        defer { window.close() }
-        host.layoutSubtreeIfNeeded()
-        host.displayIfNeeded()
-        RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.03))
-
-        let popupButtons = host.descendants(of: NSPopUpButton.self)
-        let expectedTitles = ["All provider", "All layer", "All category", "Any state"]
-
-        for title in expectedTitles {
-            let popup = popupButtons.first { $0.titleOfSelectedItem == title }
-            XCTAssertNotNil(popup, "Missing filter selection named \(title)")
-            if let popup {
-                XCTAssertGreaterThanOrEqual(
-                    popup.bounds.width,
-                    popup.fittingSize.width,
-                    "Filter selection \(title) is clipped at the default window width"
-                )
-            }
-        }
     }
 
     func testInventoryFiltersDeclareMeaningfulAccessibilityLabels() {
@@ -558,36 +532,6 @@ final class WorkbenchFlowTests: XCTestCase {
         XCTAssertFalse(inputs.allowsWorkspaceMutation)
     }
 
-    func testGroupEditorFilterSelectionsFitAtCaptureWidth() {
-        let host = NSHostingView(
-            rootView: GroupEditorView(group: nil)
-                .environmentObject(WorkspaceStore())
-        )
-        host.frame = NSRect(x: 0, y: 0, width: 1_040, height: 720)
-        host.layoutSubtreeIfNeeded()
-
-        let popupButtons = host.descendants(of: NSPopUpButton.self)
-        let expectedTitles = [
-            "All provider",
-            "All layer",
-            "All category",
-            "Any state",
-            "All items",
-        ]
-
-        for title in expectedTitles {
-            let popup = popupButtons.first { $0.titleOfSelectedItem == title }
-            XCTAssertNotNil(popup, "Missing group filter selection named \(title)")
-            if let popup {
-                XCTAssertGreaterThanOrEqual(
-                    popup.bounds.width,
-                    popup.fittingSize.width,
-                    "Group filter selection \(title) is clipped at the capture width"
-                )
-            }
-        }
-    }
-
     func testInventoryFilterRevisionNormalizesSameSecondReplacement() {
         let original = [inventoryItem(name: "Claude skill", provider: "claude", id: "old")]
         let replacement = [inventoryItem(
@@ -609,55 +553,6 @@ final class WorkbenchFlowTests: XCTestCase {
             facets: InventoryFacets(inventory: replacement)
         )
         XCTAssertEqual(normalized, InventoryFacetSelection())
-    }
-
-    func testDiscoverFacetReplacementDoesNotRemainInStaleFilterZeroState() {
-        let original = [inventoryItem(name: "Claude skill", provider: "claude", id: "old")]
-        let replacement = [inventoryItem(
-            name: "Zed MCP",
-            provider: "zed",
-            id: "new",
-            category: "mcp",
-            layer: "project"
-        )]
-        let workspace = WorkspaceStore()
-        let host = NSHostingView(
-            rootView: DiscoverOrganizeView(
-                inventoryOverride: original,
-                filtersOverride: DiscoverFilterState(
-                    provider: "claude",
-                    layer: "global",
-                    category: "skill"
-                )
-            )
-                .environmentObject(workspace)
-        )
-        host.frame = NSRect(x: 0, y: 0, width: 1_180, height: 760)
-        host.layoutSubtreeIfNeeded()
-
-        host.rootView = DiscoverOrganizeView(inventoryOverride: replacement)
-            .environmentObject(workspace)
-        host.layoutSubtreeIfNeeded()
-        let deadline = Date(timeIntervalSinceNow: 1)
-        var selectedTitles = Set<String>()
-        repeat {
-            host.layoutSubtreeIfNeeded()
-            selectedTitles = Set(
-                host.descendants(of: NSPopUpButton.self).compactMap(\.titleOfSelectedItem)
-            )
-            if selectedTitles.isSuperset(of: ["All provider", "All layer", "All category"]) {
-                break
-            }
-            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.01))
-        } while Date() < deadline
-
-        XCTAssertTrue(selectedTitles.contains("All provider"))
-        XCTAssertTrue(selectedTitles.contains("All layer"))
-        XCTAssertTrue(selectedTitles.contains("All category"))
-        XCTAssertFalse(
-            host.descendants(of: NSButton.self).contains { $0.title == "Clear filters" },
-            "a removed facet must be normalized before the view settles in filterZero"
-        )
     }
 
     func testGroupMemberFilterCoversEveryDimension() {
@@ -1101,14 +996,5 @@ private struct WorkbenchGuidanceStorageProbe {
             WorkbenchGuidanceStorage.key(for: area),
             store: defaults
         )
-    }
-}
-
-private extension NSView {
-    func descendants<ViewType: NSView>(of type: ViewType.Type) -> [ViewType] {
-        subviews.flatMap { subview in
-            (subview as? ViewType).map { [$0] } ?? []
-                + subview.descendants(of: type)
-        }
     }
 }
