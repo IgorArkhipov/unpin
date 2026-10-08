@@ -58,6 +58,7 @@ enum GroupTextInputKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum GroupTextSubmission {
     DefinitionName,
+    RenamePlanned,
     McpChallenge(String),
 }
 
@@ -828,7 +829,7 @@ impl GroupWorkflow {
                 self.phase = WorkflowPhase::Planned;
                 self.reviewed = None;
                 self.last_error = None;
-                Ok(GroupTextSubmission::DefinitionName)
+                Ok(GroupTextSubmission::RenamePlanned)
             }
             GroupTextInputKind::McpChallenge => {
                 if value.is_empty() {

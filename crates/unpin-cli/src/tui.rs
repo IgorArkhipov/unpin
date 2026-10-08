@@ -203,6 +203,7 @@ pub(super) struct TuiState {
     view: TuiView,
     evidence_pane: EvidencePane,
     terminal_too_small: bool,
+    compact_layout: bool,
     control_scroll: u16,
     control_scroll_limit: u16,
     profile_workflow: profiles::ProfileWorkflow,
@@ -398,6 +399,7 @@ impl TuiState {
             view: TuiView::Inventory,
             evidence_pane: EvidencePane::Rows,
             terminal_too_small: false,
+            compact_layout: false,
             control_scroll: 0,
             control_scroll_limit: u16::MAX,
             profile_workflow,
@@ -487,6 +489,31 @@ impl TuiState {
         self.control_scroll = self.control_scroll.saturating_sub(CONTROL_SCROLL_STEP);
     }
 
+    fn show_operation_evidence(&mut self) {
+        if self.compact_layout || self.evidence_pane != EvidencePane::Rows {
+            self.evidence_pane = EvidencePane::Selected;
+        }
+        self.control_scroll = 0;
+        self.control_scroll_limit = u16::MAX;
+    }
+
+    fn review_key_is_paused(&self, code: KeyCode) -> bool {
+        let confirms_or_applies = matches!(code, KeyCode::Enter | KeyCode::Char('a' | 'A'));
+        match self.evidence_pane {
+            EvidencePane::Warnings | EvidencePane::Backups => {
+                confirms_or_applies
+                    || (code == KeyCode::Char(' ')
+                        && !(self.view == TuiView::Groups
+                            && self.group_workflow.is_member_editor()))
+                    || (self.view == TuiView::RestoreOperations && code == KeyCode::Char('D'))
+                    || (self.view == TuiView::Groups
+                        && matches!(code, KeyCode::Char('d' | 'D' | 'r' | 'R' | 'w' | 'W')))
+            }
+            EvidencePane::Rows => self.compact_layout && confirms_or_applies,
+            EvidencePane::Selected => false,
+        }
+    }
+
     fn scroll_control_down(&mut self) {
         if self.evidence_pane == EvidencePane::Rows {
             self.evidence_pane = EvidencePane::Selected;
@@ -515,14 +542,27 @@ impl TuiState {
 
     fn active_details(&self) -> Vec<String> {
         match self.view {
-            TuiView::Inventory => self.selected_item().map_or_else(
-                || vec!["No discovered items match current filters.".to_string()],
-                |item| {
-                    let mut details = selected_detail_strings(item);
-                    details.extend(plan_preview_strings(self, item));
-                    details
-                },
-            ),
+            TuiView::Inventory => {
+                let mut details = Vec::new();
+                if !self.staged.is_empty() {
+                    details.push("Staged changes:".to_string());
+                    details.extend(self.staged_summary_strings());
+                    if self.pending_confirmation() {
+                        details.push("Pending confirmation:".to_string());
+                        details.push(confirmation_summary_label(self.staged_count()));
+                    }
+                    details.push(String::new());
+                }
+                details.extend(self.selected_item().map_or_else(
+                    || vec!["No discovered items match current filters.".to_string()],
+                    |item| {
+                        let mut selected = selected_detail_strings(item);
+                        selected.extend(plan_preview_strings(self, item));
+                        selected
+                    },
+                ));
+                details
+            }
             TuiView::Packages => self.package_workflow.details(),
             TuiView::Profiles => self.profile_workflow.details(),
             TuiView::Groups => {
@@ -1073,6 +1113,12 @@ impl TuiState {
                         .to_string(),
                 ));
             }
+            Ok(groups::GroupTextSubmission::RenamePlanned) => {
+                self.show_operation_evidence();
+                self.last_action = Some(TuiActionStatus::Success(
+                    "rename preview ready; Enter confirms and a applies".to_string(),
+                ));
+            }
             Ok(groups::GroupTextSubmission::McpChallenge(challenge)) => {
                 let result = self
                     .approval_context
@@ -1097,6 +1143,7 @@ impl TuiState {
                     });
                 match result {
                     Ok(()) => {
+                        self.show_operation_evidence();
                         self.last_action = Some(TuiActionStatus::Success(
                             "MCP challenge authenticated; review every effect, then Enter confirms artifact issuance"
                                 .to_string(),
@@ -1149,13 +1196,15 @@ impl TuiState {
         }
     }
 
-    fn start_group_delete(&mut self) {
+    fn start_group_delete(&mut self) -> bool {
         if self.view == TuiView::Groups {
             let result = self.group_workflow.start_delete();
             self.record_group_definition_result(
                 result,
                 "delete preview ready; Enter confirms and a applies",
-            );
+            )
+        } else {
+            false
         }
     }
 
@@ -1169,13 +1218,15 @@ impl TuiState {
         }
     }
 
-    fn stage_group_restore(&mut self) {
+    fn stage_group_restore(&mut self) -> bool {
         if self.view == TuiView::Groups {
             let result = self.group_workflow.stage_history_restore();
             self.record_group_definition_result(
                 result,
                 "restore preview ready; Enter confirms and a applies",
-            );
+            )
+        } else {
+            false
         }
     }
 
@@ -1233,13 +1284,15 @@ impl TuiState {
         });
     }
 
-    fn stage_group_definition_save(&mut self) {
+    fn stage_group_definition_save(&mut self) -> bool {
         if self.view == TuiView::Groups {
             let result = self.group_workflow.stage_definition_save();
             self.record_group_definition_result(
                 result,
                 "definition preview ready; Enter confirms and a applies",
-            );
+            )
+        } else {
+            false
         }
     }
 
@@ -1280,14 +1333,20 @@ impl TuiState {
         false
     }
 
-    fn record_group_definition_result(&mut self, result: Result<(), String>, success: &str) {
+    fn record_group_definition_result(
+        &mut self,
+        result: Result<(), String>,
+        success: &str,
+    ) -> bool {
         match result {
             Ok(()) => {
                 self.last_action = Some(TuiActionStatus::Success(success.to_string()));
+                true
             }
             Err(error) => {
                 self.group_workflow.record_error(error.clone());
                 self.last_action = Some(TuiActionStatus::Error(error));
+                false
             }
         }
     }
@@ -2213,6 +2272,12 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
             }
             _ => false,
         },
+        Event::Key(key) if state.review_key_is_paused(key.code) => {
+            state.last_action = Some(TuiActionStatus::Error(
+                "Change actions paused: Tab to Selected evidence first.".to_string(),
+            ));
+            true
+        }
         Event::Key(key) => match key.code {
             KeyCode::Char('q' | 'Q') => return TuiEventOutcome::Quit,
             KeyCode::Esc => {
@@ -2277,7 +2342,9 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
             }
             KeyCode::Char('r') => {
                 if state.view == TuiView::Groups {
-                    state.stage_group_restore();
+                    if state.stage_group_restore() {
+                        state.show_operation_evidence();
+                    }
                 } else {
                     state.cycle_profile_provider();
                 }
@@ -2296,11 +2363,15 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 true
             }
             KeyCode::Char('D') if state.view == TuiView::RestoreOperations => {
-                state.plan_backup_deletion();
+                if state.plan_backup_deletion() {
+                    state.show_operation_evidence();
+                }
                 true
             }
             KeyCode::Char('d' | 'D') => {
-                state.start_group_delete();
+                if state.start_group_delete() {
+                    state.show_operation_evidence();
+                }
                 true
             }
             KeyCode::Char('h' | 'H') => {
@@ -2312,7 +2383,9 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 true
             }
             KeyCode::Char('w' | 'W') => {
-                state.stage_group_definition_save();
+                if state.stage_group_definition_save() {
+                    state.show_operation_evidence();
+                }
                 true
             }
             KeyCode::Char('p') if state.inventory_filters_available() => {
@@ -2344,8 +2417,8 @@ fn handle_tui_event(state: &mut TuiState, event: Event) -> TuiEventOutcome {
                 true
             }
             KeyCode::Char(' ') => {
-                if !state.toggle_group_member() {
-                    state.plan_active_action();
+                if !state.toggle_group_member() && state.plan_active_action() {
+                    state.show_operation_evidence();
                 }
                 true
             }
@@ -2600,6 +2673,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
     const MAX_HEADER_HEIGHT: u16 = 14;
 
     let area = frame.area();
+    state.compact_layout = area.width < 90;
     state.terminal_too_small = area.width < 50 || area.height < 18;
     if state.terminal_too_small {
         frame.render_widget(
@@ -2655,7 +2729,7 @@ fn draw(frame: &mut Frame<'_>, state: &mut TuiState) {
         .block(Block::default().borders(Borders::ALL).title("Inventory"));
     frame.render_widget(header, chunks[0]);
 
-    let compact = area.width < 90;
+    let compact = state.compact_layout;
     let body = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(48), Constraint::Percentage(52)])
@@ -3502,161 +3576,212 @@ mod tests {
     }
 
     #[test]
-    fn group_mcp_approval_event_path_issues_and_exports_without_provider_writes() {
-        let temp = TempDir::new().expect("temporary TUI approval root");
-        let root = fs::canonicalize(temp.path()).expect("canonical TUI approval root");
-        let app_state_root = root.join("state");
-        let project_root = root.join("project");
-        fs::create_dir_all(&app_state_root).expect("app state");
-        fs::create_dir_all(&project_root).expect("project root");
-        let git = StdCommand::new("git")
-            .args(["init", "-q"])
-            .current_dir(&project_root)
-            .output()
-            .expect("git init");
-        assert!(git.status.success());
+    fn evidence_review_mcp_approval_requires_visible_separate_confirmation() {
+        for width in [61, 120] {
+            for initial_pane in [
+                EvidencePane::Rows,
+                EvidencePane::Selected,
+                EvidencePane::Warnings,
+                EvidencePane::Backups,
+            ] {
+                let temp = TempDir::new().expect("temporary TUI approval root");
+                let root = fs::canonicalize(temp.path()).expect("canonical TUI approval root");
+                let app_state_root = root.join("state");
+                let project_root = root.join("project");
+                fs::create_dir_all(&app_state_root).expect("app state");
+                fs::create_dir_all(&project_root).expect("project root");
+                let git = StdCommand::new("git")
+                    .args(["init", "-q"])
+                    .current_dir(&project_root)
+                    .output()
+                    .expect("git init");
+                assert!(git.status.success());
 
-        let roots =
-            DiscoveryRoots::fixture_root(fixtures_root()).with_app_state_root(&app_state_root);
-        let discovery = discover_all(&roots).expect("fixture discovery");
-        let member_item = discovery
-            .items
-            .iter()
-            .find(|item| item.id == "codex:global:configured-mcp:github")
-            .expect("toggleable fixture MCP");
-        let member = GroupMemberIdentity::try_from(member_item).expect("group member identity");
-        let provider_path = PathBuf::from(&member_item.source_path);
-        let provider_before = fs::read(&provider_path).expect("provider config before approval");
-        let backup_key = BackupAuthenticationKey::new([0x42; 32]);
-        let session_key = SessionAuthorityKey::new([0x53; 32]);
-        let access =
-            GroupAccessContext::from_runtime(&app_state_root, &project_root, &roots, None, None)
+                let roots = DiscoveryRoots::fixture_root(fixtures_root())
+                    .with_app_state_root(&app_state_root);
+                let discovery = discover_all(&roots).expect("fixture discovery");
+                let member_item = discovery
+                    .items
+                    .iter()
+                    .find(|item| item.id == "codex:global:configured-mcp:github")
+                    .expect("toggleable fixture MCP");
+                let member =
+                    GroupMemberIdentity::try_from(member_item).expect("group member identity");
+                let provider_path = PathBuf::from(&member_item.source_path);
+                let provider_before =
+                    fs::read(&provider_path).expect("provider config before approval");
+                let backup_key = BackupAuthenticationKey::new([0x42; 32]);
+                let session_key = SessionAuthorityKey::new([0x53; 32]);
+                let access = GroupAccessContext::from_runtime(
+                    &app_state_root,
+                    &project_root,
+                    &roots,
+                    None,
+                    None,
+                )
                 .expect("group access");
-        let personal = PersonalGroupStore::new(access.clone())
-            .with_history_authentication_key(backup_key.clone());
-        personal
-            .create(
-                &GroupDefinitionV1 {
-                    schema_version: GROUP_DEFINITION_SCHEMA_VERSION,
-                    name: "event-approval".to_string(),
-                    members: vec![member],
-                },
-                OwnerGeneration::new("tui-event-test", 1).expect("owner"),
-            )
-            .expect("create approval group");
-        let repository = RepositoryGroupStore::new(access.clone())
-            .with_history_authentication_key(backup_key.clone());
-        let plan = GroupPlanner::new(GroupResolver::new(access.clone(), personal, repository))
-            .plan(
-                &GroupRef::parse("personal:event-approval").expect("group reference"),
-                GroupTargetState::Disable,
-                10,
-                GroupPlanMode::McpHandoff,
-            )
-            .expect("MCP handoff plan");
-        let now_unix = unix_now();
-        let lease_store = McpGroupSessionLeaseStore::new(&app_state_root);
-        let session = lease_store
-            .create(
-                McpGroupSessionBinding {
-                    provider: None,
-                    repository_key: access.repository_key().to_string(),
-                    workspace_key: access.workspace_key().to_string(),
-                },
-                &session_key,
-                now_unix,
-            )
-            .expect("MCP session lease");
-        let lease_expires_at = lease_store
-            .verify(&session, &session_key, now_unix)
-            .expect("session expiry");
-        let challenge =
-            issue_group_approval_challenge(plan, session, lease_expires_at, &session_key, now_unix)
+                let personal = PersonalGroupStore::new(access.clone())
+                    .with_history_authentication_key(backup_key.clone());
+                personal
+                    .create(
+                        &GroupDefinitionV1 {
+                            schema_version: GROUP_DEFINITION_SCHEMA_VERSION,
+                            name: "event-approval".to_string(),
+                            members: vec![member],
+                        },
+                        OwnerGeneration::new("tui-event-test", 1).expect("owner"),
+                    )
+                    .expect("create approval group");
+                let repository = RepositoryGroupStore::new(access.clone())
+                    .with_history_authentication_key(backup_key.clone());
+                let plan =
+                    GroupPlanner::new(GroupResolver::new(access.clone(), personal, repository))
+                        .plan(
+                            &GroupRef::parse("personal:event-approval").expect("group reference"),
+                            GroupTargetState::Disable,
+                            10,
+                            GroupPlanMode::McpHandoff,
+                        )
+                        .expect("MCP handoff plan");
+                let now_unix = unix_now();
+                let lease_store = McpGroupSessionLeaseStore::new(&app_state_root);
+                let session = lease_store
+                    .create(
+                        McpGroupSessionBinding {
+                            provider: None,
+                            repository_key: access.repository_key().to_string(),
+                            workspace_key: access.workspace_key().to_string(),
+                        },
+                        &session_key,
+                        now_unix,
+                    )
+                    .expect("MCP session lease");
+                let lease_expires_at = lease_store
+                    .verify(&session, &session_key, now_unix)
+                    .expect("session expiry");
+                let challenge = issue_group_approval_challenge(
+                    plan,
+                    session,
+                    lease_expires_at,
+                    &session_key,
+                    now_unix,
+                )
                 .expect("approval challenge");
 
-        let mut state = TuiState::new_with_paths_and_roots_and_key(
-            discovery,
-            app_state_root.clone(),
-            project_root,
-            roots,
-            Some(backup_key),
-            Some(session_key),
-        );
-        state.fixture_mode = true;
-        state.view = TuiView::Groups;
+                let mut state = TuiState::new_with_paths_and_roots_and_key(
+                    discovery,
+                    app_state_root.clone(),
+                    project_root,
+                    roots,
+                    Some(backup_key),
+                    Some(session_key),
+                );
+                state.fixture_mode = true;
+                state.view = TuiView::Groups;
+                state.evidence_pane = initial_pane;
+                state.control_scroll = 12;
+                let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 40)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
 
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Char('o'))),
-            TuiEventOutcome::Redraw
-        );
-        assert!(state.group_text_editing());
-        assert_eq!(
-            handle_tui_event(&mut state, Event::Paste(challenge)),
-            TuiEventOutcome::Redraw
-        );
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Enter)),
-            TuiEventOutcome::Redraw
-        );
-        assert!(
-            state
-                .group_workflow
-                .details()
-                .iter()
-                .any(|line| line.contains("MCP approval review"))
-        );
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Enter)),
-            TuiEventOutcome::Redraw
-        );
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Char('a'))),
-            TuiEventOutcome::Redraw
-        );
-        let handoff = state
-            .mcp_approval_handoff
-            .clone()
-            .expect("issued handoff remains structured");
-        let export_legend = command_legend_for_state(&state)
-            .iter()
-            .flat_map(|line| line.spans.iter())
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        assert!(export_legend.contains("MCP approval: eXport"));
-        assert_eq!(
-            fs::read(&provider_path).expect("provider config after approval"),
-            provider_before
-        );
-        assert!(!app_state_root.join("backups").exists());
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Char('o'))),
+                    TuiEventOutcome::Redraw
+                );
+                assert!(state.group_text_editing());
+                assert_eq!(
+                    handle_tui_event(&mut state, Event::Paste(challenge)),
+                    TuiEventOutcome::Redraw
+                );
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Enter)),
+                    TuiEventOutcome::Redraw
+                );
+                assert!(
+                    state
+                        .group_workflow
+                        .details()
+                        .iter()
+                        .any(|line| line.contains("MCP approval review"))
+                );
+                assert!(state.group_workflow.details()[0].contains("phase=planned"));
+                assert!(state.mcp_approval_handoff.is_none());
+                assert_eq!(state.control_scroll, 0);
+                assert_eq!(
+                    state.evidence_pane,
+                    if width >= 90 && initial_pane == EvidencePane::Rows {
+                        EvidencePane::Rows
+                    } else {
+                        EvidencePane::Selected
+                    }
+                );
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                for pane in [EvidencePane::Warnings, EvidencePane::Backups] {
+                    state.evidence_pane = pane;
+                    handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                    handle_tui_event(&mut state, key_event(KeyCode::Char('A')));
+                    assert!(state.group_workflow.details()[0].contains("phase=planned"));
+                    assert!(state.mcp_approval_handoff.is_none());
+                }
+                state.evidence_pane = EvidencePane::Selected;
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Enter)),
+                    TuiEventOutcome::Redraw
+                );
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Char('a'))),
+                    TuiEventOutcome::Redraw
+                );
+                let handoff = state
+                    .mcp_approval_handoff
+                    .clone()
+                    .expect("issued handoff remains structured");
+                let export_legend = command_legend_for_state(&state)
+                    .iter()
+                    .flat_map(|line| line.spans.iter())
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>();
+                assert!(export_legend.contains("MCP approval: eXport"));
+                assert_eq!(
+                    fs::read(&provider_path).expect("provider config after approval"),
+                    provider_before
+                );
+                assert!(!app_state_root.join("backups").exists());
 
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Char('X'))),
-            TuiEventOutcome::Redraw
-        );
-        let export_path = app_state_root
-            .join("groups")
-            .join("handoff-exports")
-            .join(format!("{}.json", handoff.approval_artifact));
-        let exported = AtomicJsonStore::new(export_path, 1)
-            .load::<serde_json::Value>()
-            .expect("load exported handoff")
-            .expect("exported handoff document");
-        assert_eq!(exported.value, handoff.export_value());
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Char('X'))),
+                    TuiEventOutcome::Redraw
+                );
+                let export_path = app_state_root
+                    .join("groups")
+                    .join("handoff-exports")
+                    .join(format!("{}.json", handoff.approval_artifact));
+                let exported = AtomicJsonStore::new(export_path, 1)
+                    .load::<serde_json::Value>()
+                    .expect("load exported handoff")
+                    .expect("exported handoff document");
+                assert_eq!(exported.value, handoff.export_value());
 
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Char('o'))),
-            TuiEventOutcome::Redraw
-        );
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Esc)),
-            TuiEventOutcome::Redraw,
-            "Esc cancels the active interaction before quitting"
-        );
-        assert!(!state.group_text_editing());
-        assert_eq!(
-            handle_tui_event(&mut state, key_event(KeyCode::Esc)),
-            TuiEventOutcome::Quit
-        );
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Char('o'))),
+                    TuiEventOutcome::Redraw
+                );
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Esc)),
+                    TuiEventOutcome::Redraw,
+                    "Esc cancels the active interaction before quitting"
+                );
+                assert!(!state.group_text_editing());
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Esc)),
+                    TuiEventOutcome::Redraw
+                );
+                assert_eq!(state.evidence_pane, EvidencePane::Rows);
+                assert_eq!(
+                    handle_tui_event(&mut state, key_event(KeyCode::Esc)),
+                    TuiEventOutcome::Quit
+                );
+            }
+        }
     }
 
     fn item(
@@ -4664,6 +4789,560 @@ mod tests {
         assert!(output.contains("Plan preview:"));
         assert!(output.contains("plan status: blocked"));
         assert!(output.contains("reason: read-only item cannot be planned for toggle"));
+    }
+
+    #[test]
+    fn evidence_review_preserves_wide_bulk_staging_navigation() {
+        let mut state = TuiState::new(discovery(vec![
+            item(
+                "batch-first",
+                ProviderId::Claude,
+                DiscoveryLayer::Global,
+                DiscoveryCategory::Skill,
+                DiscoveryKind::Skill,
+            ),
+            item(
+                "batch-second",
+                ProviderId::Codex,
+                DiscoveryLayer::Project,
+                DiscoveryCategory::Skill,
+                DiscoveryKind::Skill,
+            ),
+        ]));
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        handle_tui_event(&mut state, key_event(KeyCode::Char(' ')));
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        handle_tui_event(&mut state, key_event(KeyCode::Down));
+        assert_eq!(state.selected_item().unwrap().id, "batch-second");
+        handle_tui_event(&mut state, key_event(KeyCode::Char(' ')));
+        assert_eq!(state.staged_count(), 2);
+        assert_eq!(state.evidence_pane, EvidencePane::Rows);
+        assert!(!state.pending_confirmation);
+    }
+
+    #[test]
+    fn evidence_review_shows_the_whole_batch_even_when_filtered_out() {
+        let mut state = TuiState::new(discovery(vec![
+            item(
+                "batch-first",
+                ProviderId::Claude,
+                DiscoveryLayer::Global,
+                DiscoveryCategory::Skill,
+                DiscoveryKind::Skill,
+            ),
+            item(
+                "batch-second",
+                ProviderId::Codex,
+                DiscoveryLayer::Project,
+                DiscoveryCategory::Skill,
+                DiscoveryKind::Skill,
+            ),
+        ]));
+        assert!(state.stage_selected_toggle());
+        state.move_next();
+        assert!(state.stage_selected_toggle());
+        state.set_search_query("nothing-matches");
+        state.evidence_pane = EvidencePane::Selected;
+        for width in [61, 120] {
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 40)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            let rendered = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert!(rendered.contains("batch-first -> off"));
+            assert!(rendered.contains("batch-second -> off"));
+        }
+        handle_tui_event(&mut state, key_event(KeyCode::Enter));
+        assert!(state.pending_confirmation);
+        let details = state.active_details().join("\n");
+        assert!(details.contains("Pending confirmation:"));
+        assert!(details.contains("Confirm 2 staged changes"));
+    }
+
+    #[test]
+    fn evidence_review_does_not_change_focus_for_failed_or_noop_planning() {
+        let mut read_only = item(
+            "read-only",
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        );
+        read_only.mutability = DiscoveryMutability::ReadOnly;
+        let mut state = TuiState::new(discovery(vec![read_only]));
+        state.compact_layout = true;
+        state.control_scroll = 3;
+        for key in [' ', 'w', 'W'] {
+            handle_tui_event(&mut state, key_event(KeyCode::Char(key)));
+            assert_eq!(
+                state.evidence_pane,
+                EvidencePane::Rows,
+                "{key:?} changed focus without a plan"
+            );
+            assert_eq!(state.control_scroll, 3);
+            assert_eq!(state.staged_count(), 0);
+        }
+        state.view = TuiView::Groups;
+        for key in ['d', 'D', 'r', 'w'] {
+            handle_tui_event(&mut state, key_event(KeyCode::Char(key)));
+            assert_eq!(state.evidence_pane, EvidencePane::Rows);
+        }
+        state.view = TuiView::RestoreOperations;
+        handle_tui_event(&mut state, key_event(KeyCode::Char('D')));
+        assert_eq!(state.evidence_pane, EvidencePane::Rows);
+
+        for pane in [EvidencePane::Rows, EvidencePane::Selected] {
+            let (_temp, mut state) = group_evidence_fixture();
+            state.start_group_edit();
+            state.set_search_query("claude:project:skill:example-claude-skill");
+            assert_eq!(state.visible_count(), 1);
+            assert!(state.toggle_group_member());
+            assert!(
+                state
+                    .active_details()
+                    .iter()
+                    .any(|line| { line.starts_with("draft:") && line.contains("members=0") })
+            );
+            state.compact_layout = true;
+            state.evidence_pane = pane;
+            state.control_scroll = 12;
+            handle_tui_event(&mut state, key_event(KeyCode::Char('w')));
+            assert!(matches!(state.last_action, Some(TuiActionStatus::Error(_))));
+            assert!(state.group_workflow.details()[0].contains("phase=blocked"));
+            assert_eq!(state.evidence_pane, pane);
+            assert_eq!(state.control_scroll, 12);
+            assert_eq!(state.group_workflow.len(), 1);
+        }
+    }
+
+    fn group_evidence_fixture() -> (TempDir, TuiState) {
+        let temp = TempDir::new().unwrap();
+        let root = fs::canonicalize(temp.path()).unwrap();
+        let project = root.join("project");
+        fs::create_dir(&project).unwrap();
+        assert!(
+            StdCommand::new("git")
+                .args(["init", "-q"])
+                .current_dir(&project)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let fixture = root.join("fixtures");
+        copy_dir_all(&fixtures_root(), &fixture);
+        let state_root = root.join("state");
+        let roots = DiscoveryRoots::fixture_root(&fixture).with_app_state_root(&state_root);
+        let discovered = discover_all(&roots).unwrap();
+        let access =
+            GroupAccessContext::from_runtime(&state_root, &project, &roots, None, None).unwrap();
+        let store = PersonalGroupStore::new(access)
+            .with_history_authentication_key(BackupAuthenticationKey::new([0x42; 32]));
+        let members = discovered
+            .items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.id.as_str(),
+                    "claude:project:skill:example-claude-skill"
+                        | "codex:global:configured-mcp:github"
+                )
+            })
+            .map(|item| GroupMemberIdentity::try_from(item).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(members.len(), 2);
+        let mut definition = GroupDefinitionV1 {
+            schema_version: GROUP_DEFINITION_SCHEMA_VERSION,
+            name: "evidence-review".to_string(),
+            members,
+        };
+        let record = store
+            .create(
+                &definition,
+                OwnerGeneration::new(unpin_core::groups::GROUP_DEFINITION_OWNER_ID, 1).unwrap(),
+            )
+            .unwrap();
+        definition.members.pop();
+        store
+            .replace(
+                &definition,
+                Some(&record.revision),
+                OwnerGeneration::new(unpin_core::groups::GROUP_DEFINITION_OWNER_ID, 1).unwrap(),
+            )
+            .unwrap();
+        let mut state = TuiState::new_with_paths_and_roots(discovered, state_root, project, roots);
+        state.view = TuiView::Groups;
+        assert_eq!(state.group_workflow.len(), 1);
+        (temp, state)
+    }
+
+    #[test]
+    fn evidence_review_pauses_real_group_plans_in_diagnostic_panes() {
+        for pane in [EvidencePane::Warnings, EvidencePane::Backups] {
+            for key in ['d', 'D', 'r', 'w', 'W'] {
+                let (_temp, mut state) = group_evidence_fixture();
+                if key == 'r' {
+                    state.show_group_history();
+                }
+                if matches!(key, 'w' | 'W') {
+                    state.start_group_edit();
+                }
+                state.evidence_pane = pane;
+                let before = state.active_details();
+                handle_tui_event(&mut state, key_event(KeyCode::Char(key)));
+                assert_eq!(
+                    state.active_details(),
+                    before,
+                    "{key} staged hidden group evidence"
+                );
+                assert!(state.group_workflow.details()[0].contains("phase=browsing"));
+                assert_eq!(state.evidence_pane, pane);
+                state.evidence_pane = EvidencePane::Selected;
+                state.control_scroll = 12;
+                handle_tui_event(&mut state, key_event(KeyCode::Char(key)));
+                assert!(
+                    state.group_workflow.details()[0].contains("phase=planned"),
+                    "{key} fixture must produce a real plan"
+                );
+                assert_eq!(
+                    state.control_scroll, 0,
+                    "{key} left new evidence scrolled away"
+                );
+                state.evidence_pane = pane;
+                handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                assert!(state.group_workflow.details()[0].contains("phase=planned"));
+                state.evidence_pane = EvidencePane::Selected;
+                handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                assert!(state.group_workflow.details()[0].contains("phase=confirmed"));
+                state.evidence_pane = pane;
+                handle_tui_event(&mut state, key_event(KeyCode::Char('A')));
+                assert!(state.group_workflow.details()[0].contains("phase=confirmed"));
+                assert_eq!(state.group_workflow.len(), 1);
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_review_preserves_nonwriting_group_member_edits() {
+        for pane in [EvidencePane::Warnings, EvidencePane::Backups] {
+            let (_temp, mut state) = group_evidence_fixture();
+            state.start_group_edit();
+            assert!(state.group_workflow.is_member_editor());
+            state.evidence_pane = pane;
+            let draft_before = state
+                .active_details()
+                .into_iter()
+                .find(|line| line.starts_with("draft:"))
+                .expect("draft membership evidence");
+            handle_tui_event(&mut state, key_event(KeyCode::Char(' ')));
+            let draft_after = state
+                .active_details()
+                .into_iter()
+                .find(|line| line.starts_with("draft:"))
+                .expect("draft membership evidence");
+            assert_ne!(draft_after, draft_before);
+            assert!(matches!(
+                state.last_action,
+                Some(TuiActionStatus::Success(_))
+            ));
+            assert!(state.group_workflow.details()[0].contains("phase=browsing"));
+            assert_eq!(state.evidence_pane, pane);
+            assert_eq!(state.group_workflow.len(), 1);
+        }
+    }
+
+    #[test]
+    fn evidence_review_group_rename_requires_visible_separate_confirmation() {
+        for width in [61, 120] {
+            for pane in [EvidencePane::Rows, EvidencePane::Selected] {
+                let (_temp, mut state) = group_evidence_fixture();
+                state.evidence_pane = pane;
+                let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 40)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                state.control_scroll = 12;
+                handle_tui_event(&mut state, key_event(KeyCode::Char('R')));
+                assert!(state.group_text_editing());
+                handle_tui_event(&mut state, Event::Paste("evidence-renamed".to_string()));
+                handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                assert!(!state.group_text_editing());
+                assert!(state.group_workflow.details()[0].contains("phase=planned"));
+                assert_eq!(state.control_scroll, 0);
+                assert_eq!(
+                    state.evidence_pane,
+                    if width >= 90 && pane == EvidencePane::Rows {
+                        EvidencePane::Rows
+                    } else {
+                        EvidencePane::Selected
+                    }
+                );
+                assert!(
+                    matches!(state.last_action, Some(TuiActionStatus::Success(ref message)) if message.contains("rename preview"))
+                );
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                let rendered = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(rendered.contains("definition review: rename"));
+                assert!(rendered.contains("evidence-renamed"));
+                handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                assert!(state.group_workflow.details()[0].contains("phase=confirmed"));
+                for diagnostic in [EvidencePane::Warnings, EvidencePane::Backups] {
+                    state.evidence_pane = diagnostic;
+                    handle_tui_event(&mut state, key_event(KeyCode::Char('A')));
+                    assert!(state.group_workflow.details()[0].contains("phase=confirmed"));
+                }
+                state.evidence_pane = EvidencePane::Selected;
+                handle_tui_event(&mut state, key_event(KeyCode::Char('A')));
+                assert!(
+                    matches!(state.last_action, Some(TuiActionStatus::Success(_))),
+                    "rename apply at width={width}, pane={pane:?}: {:?}",
+                    state.last_action
+                );
+                assert!(
+                    state
+                        .active_rows()
+                        .iter()
+                        .any(|row| row.contains("evidence-renamed"))
+                );
+                assert!(
+                    !state
+                        .active_rows()
+                        .iter()
+                        .any(|row| row.contains("personal:evidence-review"))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn evidence_review_diagnostic_panes_pause_group_rename_input() {
+        for pane in [EvidencePane::Warnings, EvidencePane::Backups] {
+            let (_temp, mut state) = group_evidence_fixture();
+            state.evidence_pane = pane;
+            let before = state.active_details();
+            handle_tui_event(&mut state, key_event(KeyCode::Char('R')));
+            assert!(!state.group_text_editing());
+            assert_eq!(state.active_details(), before);
+            assert_eq!(state.evidence_pane, pane);
+            assert!(
+                matches!(state.last_action, Some(TuiActionStatus::Error(ref message)) if message.contains("Tab to Selected"))
+            );
+        }
+    }
+
+    #[test]
+    fn diagnostic_panes_do_not_plan_confirm_or_apply_inventory_changes() {
+        for (width, height) in [(120, 40), (61, 24)] {
+            for pane in [EvidencePane::Warnings, EvidencePane::Backups] {
+                let temp = TempDir::new().expect("temporary hidden-evidence fixture");
+                let fixture = temp.path().join("fixtures");
+                copy_dir_all(&fixtures_root(), &fixture);
+                let project = temp.path().join("project");
+                fs::create_dir(&project).unwrap();
+                assert!(
+                    StdCommand::new("git")
+                        .args(["init", "-q"])
+                        .current_dir(&project)
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                let roots = DiscoveryRoots::fixture_root(&fixture)
+                    .with_app_state_root(temp.path().join("state"));
+                let mut discovered = discover_all(&roots).unwrap();
+                discovered
+                    .items
+                    .retain(|item| item.id == "claude:project:skill:example-claude-skill");
+                assert_eq!(discovered.items.len(), 1);
+                let source = PathBuf::from(&discovered.items[0].source_path);
+                let original = fs::read(&source).unwrap();
+                let mut state = TuiState::new_with_paths_and_roots(
+                    discovered,
+                    temp.path().join("state"),
+                    project,
+                    roots,
+                );
+                state.evidence_pane = pane;
+                let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                let selected = state.selected_item().unwrap().id.clone();
+
+                handle_tui_event(&mut state, key_event(KeyCode::Char(' ')));
+                assert_eq!(
+                    state.staged_count(),
+                    0,
+                    "{width}x{height} {pane:?} planned hidden evidence"
+                );
+                assert_eq!(state.evidence_pane, pane);
+                assert_eq!(state.selected_item().unwrap().id, selected);
+
+                assert!(state.stage_selected_toggle());
+                let staged = state.staged_summary_strings();
+                handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                assert!(!state.pending_confirmation, "hidden plan was confirmed");
+                assert!(state.confirm_staged());
+                for key in ['a', 'A'] {
+                    handle_tui_event(&mut state, key_event(KeyCode::Char(key)));
+                    assert!(
+                        state.pending_confirmation,
+                        "hidden confirmed plan was applied"
+                    );
+                    assert_eq!(state.staged_summary_strings(), staged);
+                    assert_eq!(fs::read(&source).unwrap(), original);
+                    assert!(state.backups.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn diagnostic_panes_do_not_stage_confirm_or_delete_backups() {
+        for (width, height) in [(120, 40), (61, 24)] {
+            for pane in [EvidencePane::Warnings, EvidencePane::Backups] {
+                let temp = TempDir::new().unwrap();
+                let mut state = TuiState::new_with_app_state_root(
+                    discovery(Vec::new()),
+                    temp.path().to_path_buf(),
+                );
+                let backup = restore_backup_summary(1);
+                let backup_root = temp.path().join("backups").join(&backup.backup_id);
+                fs::create_dir_all(&backup_root).unwrap();
+                fs::write(
+                    backup_root.join("manifest.json"),
+                    "{\"backupId\":\"backup-001\"}\n",
+                )
+                .unwrap();
+                state.backups = vec![backup.clone()];
+                state.restore_workflow = RestoreWorkflow::new(vec![backup], Vec::new());
+                state.view = TuiView::RestoreOperations;
+                state.evidence_pane = pane;
+                let mut terminal = ratatui::Terminal::new(TestBackend::new(width, height)).unwrap();
+                terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+                handle_tui_event(&mut state, key_event(KeyCode::Char('D')));
+                assert!(!state.restore_workflow.has_pending_deletion());
+                state.plan_backup_deletion();
+                assert!(state.restore_workflow.has_pending_deletion());
+                handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                assert!(!state.restore_workflow.deletion_is_confirmed());
+                assert!(state.confirm_active_action());
+                handle_tui_event(&mut state, key_event(KeyCode::Char('A')));
+                assert!(backup_root.is_dir(), "hidden backup deletion applied");
+                assert!(state.restore_workflow.deletion_is_confirmed());
+            }
+        }
+    }
+
+    #[test]
+    fn compact_rows_cannot_confirm_until_the_plan_is_visible() {
+        let mut state = TuiState::new(discovery(vec![item(
+            "compact-review",
+            ProviderId::Claude,
+            DiscoveryLayer::Global,
+            DiscoveryCategory::Skill,
+            DiscoveryKind::Skill,
+        )]));
+        assert!(state.stage_selected_toggle());
+        let mut terminal = ratatui::Terminal::new(TestBackend::new(61, 24)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        handle_tui_event(&mut state, key_event(KeyCode::Enter));
+        assert!(!state.pending_confirmation);
+        assert!(state.confirm_staged());
+        handle_tui_event(&mut state, key_event(KeyCode::Char('A')));
+        assert!(state.pending_confirmation);
+        handle_tui_event(&mut state, key_event(KeyCode::Tab));
+        terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+        state.pending_confirmation = false;
+        handle_tui_event(&mut state, key_event(KeyCode::Enter));
+        assert!(
+            state.pending_confirmation,
+            "visible plan must remain confirmable"
+        );
+    }
+
+    #[test]
+    fn diagnostic_panes_pause_review_keys_in_every_workflow() {
+        for view in TuiView::ALL {
+            for pane in [EvidencePane::Warnings, EvidencePane::Backups] {
+                let temp = TempDir::new().unwrap();
+                let mut state = TuiState::new_with_app_state_root(
+                    discovery(Vec::new()),
+                    temp.path().to_path_buf(),
+                );
+                state.view = view;
+                state.evidence_pane = pane;
+                let before = state.active_details();
+                let mut keys = vec![
+                    KeyCode::Char(' '),
+                    KeyCode::Enter,
+                    KeyCode::Char('a'),
+                    KeyCode::Char('A'),
+                ];
+                if view == TuiView::Groups {
+                    keys.extend(['d', 'D', 'r', 'R', 'w', 'W'].map(KeyCode::Char));
+                }
+                if view == TuiView::RestoreOperations {
+                    keys.push(KeyCode::Char('D'));
+                }
+                for key in keys {
+                    assert_eq!(
+                        handle_tui_event(&mut state, key_event(key)),
+                        TuiEventOutcome::Redraw
+                    );
+                    assert_eq!(state.active_details(), before);
+                    assert_eq!(state.evidence_pane, pane);
+                    assert!(
+                        matches!(state.last_action, Some(TuiActionStatus::Error(ref message)) if message.contains("Tab to Selected"))
+                    );
+                }
+                handle_tui_event(&mut state, key_event(KeyCode::Char('/')));
+                if state.search_editing() {
+                    handle_tui_event(&mut state, key_event(KeyCode::Enter));
+                    assert!(
+                        !state.search_editing(),
+                        "Enter must still finish text input"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn planning_from_rows_reveals_evidence_before_confirmation() {
+        for width in [61, 120] {
+            let mut state = TuiState::new(discovery(vec![item(
+                "revealed-review",
+                ProviderId::Claude,
+                DiscoveryLayer::Global,
+                DiscoveryCategory::Skill,
+                DiscoveryKind::Skill,
+            )]));
+            let mut terminal = ratatui::Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            state.control_scroll = 3;
+            handle_tui_event(&mut state, key_event(KeyCode::Char(' ')));
+            assert_eq!(
+                state.evidence_pane,
+                if width < 90 {
+                    EvidencePane::Selected
+                } else {
+                    EvidencePane::Rows
+                }
+            );
+            assert_eq!(state.control_scroll, 0);
+            assert_eq!(state.staged_count(), 1);
+            assert!(!state.pending_confirmation);
+            terminal.draw(|frame| draw(frame, &mut state)).unwrap();
+            handle_tui_event(&mut state, key_event(KeyCode::Enter));
+            assert!(state.pending_confirmation);
+        }
     }
 
     #[test]
