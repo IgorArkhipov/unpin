@@ -7,6 +7,29 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+## [1.6.0] - 2026-10-07
+
+### Changed
+
+- Made TUI review evidence wrap and scroll, with explicit pane focus and
+  preserved screen state when long transcripts are trimmed.
+- Paused confirmation and apply when diagnostic panes or compact layouts hide
+  the review. Planning reveals evidence before a separate confirmation, and
+  review covers the full staged batch, including filtered-out items.
+- Aligned native filter captions with their controls, rounded inventory-group
+  table headers and bodies consistently, and distinguished loading and blocked
+  states from successful outcomes.
+- Refreshed compatible Cargo dependencies and pinned CI actions using a
+  48-hour release-age minimum, without disabling the Aikido firewall.
+- Clarified provider coverage, safety rules, and release guidance in the README
+  and project overview.
+
+### Verification tooling
+
+- Replaced private native-view introspection with supported XCUITest APIs and
+  a dedicated fixture app. The provider matrix now starts a reviewable real
+  PTY and waits for inventory readiness without changing production guards.
+
 ## [1.5.2] - 2026-09-27
 
 ### Fixed
@@ -569,7 +592,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   managed-hook activation remain explicitly unavailable where provider adapters
   cannot prove enforcement.
 
-[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/IgorArkhipov/unpin/compare/v1.6.0...HEAD
+[1.6.0]: https://github.com/IgorArkhipov/unpin/compare/v1.5.2...v1.6.0
 [1.1.0]: https://github.com/IgorArkhipov/unpin/compare/v1.0.2...v1.1.0
 [1.0.2]: https://github.com/IgorArkhipov/unpin/compare/v1.0.1...v1.0.2
 [1.0.1]: https://github.com/IgorArkhipov/unpin/compare/v1.0.0...v1.0.1

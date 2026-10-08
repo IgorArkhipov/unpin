@@ -18,7 +18,7 @@ audit evidence, and explicit recovery outcomes.
 
 ## Current status
 
-- Version: `1.0.0` stable unified release.
+- Version: `1.6.0` stable unified release.
 - Canonical repository: `https://github.com/IgorArkhipov/unpin`.
 - License: MIT, copyright Igor Arkhipov.
 - Distribution: GitHub release archives for Apple Silicon macOS, Intel macOS,
