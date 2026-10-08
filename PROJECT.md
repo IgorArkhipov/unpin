@@ -2,14 +2,17 @@
 
 Unpin is a Rust CLI and terminal UI for discovering, inspecting, and safely
 managing local AI-agent configuration across Claude Code, Codex, Cursor, Pi,
-OpenCode, and Zed. The headless core owns provider discovery, normalized
+OpenCode, and Zed.
+
+The headless core owns provider discovery, normalized
 inventory, profiles and layered policy, guarded transitions, authenticated
 backups, restore, sessions, gateway policy, hook trust, and MCP-safe control
-workflows. The CLI and Ratatui interface are thin surfaces over that core.
+workflows. The CLI and Ratatui provide thin interfaces that delegate that
+behavior to the core.
 
-The original Rust bootstrap was informed by an earlier TypeScript
-implementation from `ai-setup`. Unpin now has its own architecture and safety
-contract: plan-first writes, exact reviewed fingerprints, purpose-separated
+An earlier TypeScript implementation from `ai-setup` informed the original
+Rust bootstrap. Unpin now has its own architecture and safety contract:
+plan-first writes, exact reviewed fingerprints, purpose-separated
 approval, authenticated backup and session keys, drift and conflict protection,
 audit evidence, and explicit recovery outcomes.
 
@@ -46,15 +49,20 @@ SBOM generation, provenance attestation, checksums, and a draft-only release
 workflow. crates.io, Homebrew, Linux ARM64, Windows, and platform code signing
 remain deferred.
 
-Publishing `v1.0.0` is gated on required CI, workflow lint, locked package
-metadata, a version smoke, and Linux artifact verification on an exact clean
-release commit (a `GLIBC_2.35`-or-older symbol ceiling and Debian 12 smoke),
-plus generated checksums attached to the draft, enabled branch protection,
-private-security-reporting, and immutable-release controls. The preceding
-implementation commit passed the full provider matrix and live-host validation;
-the delivery-only stable promotion uses the documented maintainer-approved
-unsigned-GA exception. Publication still requires fresh-download checksum,
-attestation, signature, bridge-handshake, and installed-artifact verification.
+Publishing `v1.0.0` requires these checks on an exact clean release commit:
+
+- Required CI, workflow lint, and locked package metadata.
+- A version smoke.
+- Linux artifact verification with a `GLIBC_2.35`-or-older symbol ceiling and
+  Debian 12 smoke.
+
+The draft must also have generated checksums attached, with branch protection,
+private-security-reporting, and immutable-release controls enabled. The
+preceding implementation commit passed the full provider matrix and live-host
+validation. The delivery-only stable promotion uses the documented
+maintainer-approved unsigned-GA exception. Publication still requires
+fresh-download checksum, attestation, signature, bridge-handshake, and
+installed-artifact verification.
 
 The [README](README.md#five-minute-local-setup) provides the installed-user
 quick start and exact project toggle recipe. The [MCP setup guide](docs/MCP.md)
