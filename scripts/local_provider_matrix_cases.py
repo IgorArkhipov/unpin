@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import codecs
 import concurrent.futures
 import fcntl
 import hashlib
@@ -1519,7 +1520,10 @@ def run_mcp_session(
     return result
 
 
-def drain_pty(master_fd: int, timeout_seconds: float, transcript: bytearray) -> None:
+def drain_pty(
+    master_fd: int, timeout_seconds: float, transcript: bytearray,
+    *, screen: TuiScreen | None = None,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -1537,58 +1541,82 @@ def drain_pty(master_fd: int, timeout_seconds: float, transcript: bytearray) -> 
         transcript.extend(chunk)
         if len(transcript) > 262144:
             del transcript[:-131072]
+        if screen is not None:
+            screen.feed(chunk)
 
 
 TUI_CSI_PATTERN = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
 
 
-def tui_screen_lines(transcript: bytearray) -> list[str]:
-    """Replay the cursor/erase commands emitted by our fixed 120x40 fixture TUI.
+class TuiScreen:
+    """Incremental screen probe for our fixed 120x40 fixture TUI, not an emulator.
 
-    This is a bounded screen probe, not a general terminal emulator. Replaying
-    redraws avoids accepting readiness or selection text from an obsolete frame.
+    Keep cursor and unchanged cells independently of diagnostic transcript
+    trimming. Decode UTF-8 and CSI commands across PTY read boundaries.
     """
-    cells = [[" " for _ in range(120)] for _ in range(40)]
-    row = column = index = 0
-    output = transcript.decode("utf-8", errors="replace")
-    while index < len(output):
-        char = output[index]
-        if char == "\x1b":
-            match = TUI_CSI_PATTERN.match(output, index)
-            if not match:
-                break  # An incomplete command cannot establish readiness.
-            values = [int(value) if value.isdigit() else 0 for value in match[1].split(";")]
-            distance = values[0] or 1
-            command = match[3]
-            if command in ("H", "f"):
-                row = distance - 1
-                column = (values[1] or 1) - 1 if len(values) > 1 else 0
-            elif command in ("A", "B"):
-                row = max(0, min(39, row + (-distance if command == "A" else distance)))
-            elif command in ("C", "D"):
-                column = max(0, min(119, column + (-distance if command == "D" else distance)))
-            elif command == "G":
-                column = distance - 1
-            elif command == "J" and values[0] in (2, 3):
-                cells = [[" " for _ in range(120)] for _ in range(40)]
-            elif command == "K" and 0 <= row < 40:
-                start = 0 if values[0] in (1, 2) else column
-                end = column + 1 if values[0] == 1 else 120
-                cells[row][start:end] = [" "] * max(0, end - start)
-            index = match.end()
-            continue
-        if char == "\r":
-            column = 0
-        elif char == "\n":
-            row = min(39, row + 1)
-        elif char == "\b":
-            column = max(0, column - 1)
-        elif ord(char) >= 32 and char != "\x7f":
-            if 0 <= row < 40 and 0 <= column < 120:
-                cells[row][column] = char
-            column += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
-        index += 1
-    return ["".join(line) for line in cells]
+
+    def __init__(self) -> None:
+        self.cells = [[" " for _ in range(120)] for _ in range(40)]
+        self.row = self.column = 0
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.pending = ""
+
+    def lines(self) -> list[str]:
+        return ["".join(line) for line in self.cells]
+
+    def feed(self, chunk: bytes | bytearray) -> None:
+        output = self.pending + self.decoder.decode(chunk)
+        index = 0
+        while index < len(output):
+            char = output[index]
+            if char == "\x1b":
+                match = TUI_CSI_PATTERN.match(output, index)
+                if not match:
+                    remainder = output[index:]
+                    if remainder != "\x1b" and not re.fullmatch(r"\x1b\[[0-?]*[ -/]*", remainder):
+                        raise MatrixFailure("unsupported terminal escape in fixture TUI screen probe")
+                    if len(remainder) > 262144:
+                        raise MatrixFailure("incomplete terminal escape exceeds fixture TUI probe limit")
+                    break  # Incomplete commands cannot establish new readiness.
+                values = [int(value) if value.isdigit() else 0 for value in match[1].split(";")]
+                distance = values[0] or 1
+                command = match[3]
+                if command in ("H", "f"):
+                    self.row = distance - 1
+                    self.column = (values[1] or 1) - 1 if len(values) > 1 else 0
+                elif command in ("A", "B"):
+                    self.row = max(0, min(39, self.row + (-distance if command == "A" else distance)))
+                elif command in ("C", "D"):
+                    self.column = max(0, min(119, self.column + (-distance if command == "D" else distance)))
+                elif command == "G":
+                    self.column = distance - 1
+                elif command == "J" and values[0] in (2, 3):
+                    self.cells = [[" " for _ in range(120)] for _ in range(40)]
+                elif command == "K" and 0 <= self.row < 40:
+                    start = 0 if values[0] in (1, 2) else self.column
+                    end = self.column + 1 if values[0] == 1 else 120
+                    self.cells[self.row][start:end] = [" "] * max(0, end - start)
+                index = match.end()
+                continue
+            if char == "\r":
+                self.column = 0
+            elif char == "\n":
+                self.row = min(39, self.row + 1)
+            elif char == "\b":
+                self.column = max(0, self.column - 1)
+            elif ord(char) >= 32 and char != "\x7f":
+                if 0 <= self.row < 40 and 0 <= self.column < 120:
+                    self.cells[self.row][self.column] = char
+                self.column += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+            index += 1
+        self.pending = output[index:]
+
+
+def tui_screen_lines(transcript: bytearray) -> list[str]:
+    """Replay a complete transcript for unit tests; live probes use TuiScreen."""
+    screen = TuiScreen()
+    screen.feed(transcript)
+    return screen.lines()
 
 
 def tui_inventory_ready(lines: list[str]) -> bool:
@@ -1616,17 +1644,18 @@ def wait_for_tui_screen(
     transcript: bytearray,
     predicate: Callable[[list[str]], bool],
     description: str,
+    *, screen: TuiScreen,
 ) -> None:
     deadline = time.monotonic() + 20
     while True:
         if process.poll() is not None:
             raise MatrixFailure(f"interactive TUI exited before {description}")
-        if predicate(tui_screen_lines(transcript)):
+        if predicate(screen.lines()):
             return
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise MatrixFailure(f"interactive TUI timed out waiting for {description}")
-        drain_pty(master_fd, min(0.1, remaining), transcript)
+        drain_pty(master_fd, min(0.1, remaining), transcript, screen=screen)
 
 
 def drive_tui_toggle(
@@ -1667,21 +1696,23 @@ def drive_tui_toggle(
         raise
     os.close(slave_fd)
     transcript = bytearray()
+    screen = TuiScreen()
     try:
         wait_for_tui_screen(
-            master_fd, process, transcript, tui_inventory_ready, "inventory"
+            master_fd, process, transcript, tui_inventory_ready, "inventory", screen=screen
         )
         for action in (b"/", item_id.encode("utf-8"), b"\r"):
             if process.poll() is not None:
                 raise MatrixFailure("interactive TUI exited during search")
             os.write(master_fd, action)
-            drain_pty(master_fd, 0.15, transcript)
+            drain_pty(master_fd, 0.15, transcript, screen=screen)
         wait_for_tui_screen(
             master_fd,
             process,
             transcript,
             lambda lines: tui_target_selected(lines, item_id),
             "target selection",
+            screen=screen,
         )
         actions = [b" "]
         actions.extend([b"\r", b"a"] if confirm else [b"a"])
@@ -1690,7 +1721,7 @@ def drive_tui_toggle(
             if process.poll() is not None:
                 raise MatrixFailure("interactive TUI exited before change actions completed")
             os.write(master_fd, action)
-            drain_pty(master_fd, 0.15 if action != b"a" else 0.5, transcript)
+            drain_pty(master_fd, 0.15 if action != b"a" else 0.5, transcript, screen=screen)
         try:
             return_code = process.wait(timeout=20)
         except subprocess.TimeoutExpired as error:

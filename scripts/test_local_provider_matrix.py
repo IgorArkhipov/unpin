@@ -75,13 +75,16 @@ class TuiDriverTerminalTests(unittest.TestCase):
         writes = []
         drains = []
 
-        def drain(master, timeout, transcript):
+        def drain(master, timeout, transcript, *, screen=None):
             drains.append(timeout)
             if ready and len(drains) >= 2:
                 target = selected if b"fixture-item" in writes else "default-item"
-                transcript.extend(self.inventory_frame(target))
+                chunk = self.inventory_frame(target)
             else:
-                transcript.extend(b"\x1b[2J\x1b[1;1HDiscovering\x1b[2;1HPress Q or Esc to cancel.")
+                chunk = b"\x1b[2J\x1b[1;1HDiscovering\x1b[2;1HPress Q or Esc to cancel."
+            transcript.extend(chunk)
+            if screen is not None:
+                screen.feed(chunk)
 
         def write(master, action):
             self.assertGreaterEqual(len(drains), 2, "input sent before inventory readiness")
@@ -172,6 +175,53 @@ class TuiDriverTerminalTests(unittest.TestCase):
         self.assertFalse(matrix_cases.tui_inventory_ready(matrix_cases.tui_screen_lines(transcript)))
         transcript.extend(b"1HInventory\x1b[2;1HItems: 94\x1b[10;1HView: Inventory")
         self.assertTrue(matrix_cases.tui_inventory_ready(matrix_cases.tui_screen_lines(transcript)))
+
+    def test_trimmed_transcript_preserves_screen_and_fragmented_cursor(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        transcript = bytearray()
+        output = self.inventory_frame() + b"\x1b[39;1Htick" * 24000 + b"\x1b[17;6"
+        chunks = [output[offset:offset + 65536] for offset in range(0, len(output), 65536)]
+        with mock.patch.object(matrix_cases.select, "select", return_value=([self.master_fd], [], [])), mock.patch.object(
+            matrix_cases.os, "read", side_effect=chunks + [b""]
+        ):
+            matrix_cases.drain_pty(self.master_fd, 1, transcript, screen=screen)
+        self.assertLessEqual(len(transcript), 131072)
+        self.assertTrue(matrix_cases.tui_target_selected(screen.lines(), "fixture-item"))
+        screen.feed(b"0Hid: wrong-item\x1b[K")
+        self.assertFalse(matrix_cases.tui_target_selected(screen.lines(), "fixture-item"))
+        self.assertTrue(matrix_cases.tui_target_selected(screen.lines(), "wrong-item"))
+
+    def test_screen_wait_uses_preserved_cells_not_trimmed_transcript(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        screen.feed(self.inventory_frame())
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(matrix_cases, "drain_pty") as drain:
+            matrix_cases.wait_for_tui_screen(
+                self.master_fd, process, bytearray(b"tick"),
+                lambda lines: matrix_cases.tui_target_selected(lines, "fixture-item"),
+                "target selection", screen=screen,
+            )
+        drain.assert_not_called()
+
+    def test_unsupported_escape_reports_error_instead_of_hiding_later_frames(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        screen.feed(b"\x1b")
+        with self.assertRaisesRegex(MatrixFailure, "unsupported terminal escape"):
+            screen.feed(b"]0;title\x07" + self.inventory_frame())
+
+    def test_unterminated_cursor_command_has_bounded_pending_state(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        with self.assertRaisesRegex(MatrixFailure, "exceeds.*probe limit"):
+            screen.feed(b"\x1b[" + b"1" * 262144)
+
+    def test_incremental_screen_retains_fragmented_utf8(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        frame = self.inventory_frame("fixture-\u00e9")
+        split = frame.index("\u00e9".encode()) + 1
+        screen.feed(frame[:split])
+        screen.feed(frame[split:])
+        self.assertTrue(matrix_cases.tui_target_selected(screen.lines(), "fixture-\u00e9"))
 
     def test_selection_requires_one_match_not_ten(self) -> None:
         frame = self.inventory_frame().replace(b"selected: 1/1", b"selected: 1/10")
