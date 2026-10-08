@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -9,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 from pathlib import Path
@@ -35,6 +37,61 @@ from run_local_provider_matrix import (
     live_plan_state_paths,
     validate_workflow_routing_evidence,
 )
+
+
+class TuiDriverTerminalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.master_fd, self.slave_fd = matrix_cases.pty.openpty()
+        self.addCleanup(self.close_terminal)
+
+    def close_terminal(self) -> None:
+        for descriptor in (self.master_fd, self.slave_fd):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def drive(self) -> None:
+        matrix_cases.drive_tui_toggle(
+            Path("/fixture/unpin"),
+            Path("/fixture/providers"),
+            Path("/fixture/state"),
+            "fixture-item",
+            confirm=True,
+        )
+
+    def test_terminal_has_reviewable_dimensions_before_launch(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+
+        def launch(*args, **kwargs):
+            dimensions = struct.unpack(
+                "HHHH", fcntl.ioctl(kwargs["stdin"], termios.TIOCGWINSZ, bytes(8))
+            )
+            self.assertEqual(dimensions[:2], (40, 120))
+            return process
+
+        with mock.patch.object(
+            matrix_cases.pty, "openpty", return_value=(self.master_fd, self.slave_fd)
+        ), mock.patch.object(
+            matrix_cases.subprocess, "Popen", side_effect=launch
+        ), mock.patch.object(matrix_cases, "drain_pty"):
+            self.drive()
+
+    def test_failed_terminal_setup_closes_descriptors_without_launch(self) -> None:
+        with mock.patch.object(
+            matrix_cases.pty, "openpty", return_value=(self.master_fd, self.slave_fd)
+        ), mock.patch.object(
+            fcntl, "ioctl", side_effect=OSError("terminal setup failed")
+        ), mock.patch.object(matrix_cases.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(OSError, "terminal setup failed"):
+                self.drive()
+            launch.assert_not_called()
+
+        for descriptor in (self.master_fd, self.slave_fd):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
 
 class ArtifactRootTests(unittest.TestCase):

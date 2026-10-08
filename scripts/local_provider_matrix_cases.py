@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
@@ -10,6 +11,8 @@ import pty
 import select
 import selectors
 import subprocess
+import struct
+import termios
 import time
 from pathlib import Path
 from typing import Any
@@ -1545,23 +1548,30 @@ def drive_tui_toggle(
     master_fd, slave_fd = pty.openpty()
     environment = fixture_subprocess_environment()
     environment.setdefault("TERM", "xterm-256color")
-    process = subprocess.Popen(
-        [
-            str(binary),
-            "tui",
-            "--fixture-root",
-            str(fixture_root),
-            "--app-state-root",
-            str(app_state_root),
-        ],
-        cwd=REPO_ROOT,
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=environment,
-        close_fds=True,
-        start_new_session=True,
-    )
+    try:
+        # A new PTY starts at 0x0, which correctly pauses TUI change actions.
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        process = subprocess.Popen(
+            [
+                str(binary),
+                "tui",
+                "--fixture-root",
+                str(fixture_root),
+                "--app-state-root",
+                str(app_state_root),
+            ],
+            cwd=REPO_ROOT,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=environment,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
     os.close(slave_fd)
     transcript = bytearray()
     try:
