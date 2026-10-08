@@ -116,6 +116,58 @@ final class WorkbenchGuidanceMatrixTests: XCTestCase {
         return value
     }
 
+    func testCompareCachedAndCompositorTabs() throws {
+        guard let output = nonEmptyEnvironmentValue(
+            ProcessInfo.processInfo.environment["UNPIN_COMPOSITOR_COMPARISON_DIR"]
+        ) else {
+            throw XCTSkip("On-screen comparison is an explicitly requested diagnostic")
+        }
+        guard CGPreflightScreenCaptureAccess() else {
+            throw XCTSkip("Screen Recording permission is required for compositor comparison")
+        }
+        let outputRoot = URL(fileURLWithPath: output, isDirectory: true)
+        try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+        for theme in [WorkbenchColorScheme.light, .dark] {
+            let fixture = try fixture(for: "discover-ready-expanded", theme: theme)
+            let root = WorkbenchView(fixture: fixture)
+                .environmentObject(WorkspaceStore())
+                .frame(width: 1180, height: 760)
+            let host = NSHostingView(rootView: root)
+            host.frame = NSRect(x: 0, y: 0, width: 1180, height: 760)
+            host.appearance = NSAppearance(named: theme == .light ? .aqua : .darkAqua)
+            let window = NSWindow(contentRect: host.bounds, styleMask: [.titled], backing: .buffered, defer: false)
+            window.isReleasedWhenClosed = false
+            window.title = "Unpin fixture-only tab comparison"
+            window.contentView = host
+            window.center()
+            window.makeKeyAndOrderFront(nil)
+            defer { window.close() }
+            host.layoutSubtreeIfNeeded()
+            host.displayIfNeeded()
+            RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.5))
+            let cached = try XCTUnwrap(host.bitmapImageRepForCachingDisplay(in: host.bounds))
+            host.cacheDisplay(in: host.bounds, to: cached)
+            try XCTUnwrap(cached.representation(using: .png, properties: [:])).write(
+                to: outputRoot.appendingPathComponent("\(theme.rawValue)-cached.png"), options: .atomic
+            )
+            let capture = Process()
+            capture.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
+            capture.arguments = ["-x", "-o", "-l", String(window.windowNumber),
+                                 outputRoot.appendingPathComponent("\(theme.rawValue)-compositor.png").path]
+            try capture.run()
+            let deadline = Date(timeIntervalSinceNow: 5)
+            while capture.isRunning && Date() < deadline {
+                RunLoop.current.run(until: Date(timeIntervalSinceNow: 0.05))
+            }
+            if capture.isRunning {
+                capture.terminate()
+                XCTFail("Fixture-window compositor capture timed out")
+                return
+            }
+            XCTAssertEqual(capture.terminationStatus, 0, "Window-only capture requires Screen Recording permission")
+        }
+    }
+
     func testGuidanceFixturesRenderAtCompactWorkbenchSize() throws {
         for scenarioID in Self.scenarioIDs {
             let fixture = try fixture(for: scenarioID, theme: .dark)

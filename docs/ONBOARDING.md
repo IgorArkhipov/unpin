@@ -56,6 +56,22 @@ Persistent writes require confirmation, an exact plan fingerprint, scoped
 approval, conflict protection, authenticated backup evidence, audit evidence,
 and a restore path.
 
+## Terminal review panes
+
+Use Tab to cycle Rows, Selected, Warnings, and Backups. Successful planning resets
+evidence to its start and opens Selected in compact layout. Wide layout keeps
+Rows focused so arrow keys still select the next item while evidence is visible
+alongside it. Failed or no-op planning does not change focus. Inventory evidence
+lists the whole staged batch, including items hidden by current filters.
+
+Warnings and Backups pause operation planning, confirmation, apply, group
+delete/rename/restore/save, and backup deletion keys; return to Selected before using
+them. Non-writing group member edits remain available. Completing authenticated
+MCP challenge input reveals its review but requires a separate confirmation.
+In compact layout, Rows also pauses confirmation and apply because evidence is
+not visible there. Changing panes never confirms or applies an operation; the
+existing approval, backup, and drift checks remain.
+
 ## Desktop first-phase boundary
 
 The macOS desktop workbench is the preferred first-phase human interface for
@@ -143,6 +159,26 @@ xcodebuild test \
 The shared scheme includes the XCTest action and bundles a matching Debug
 `unpin` child. Its tests use repository fixtures and temporary app-state roots;
 they do not inspect or mutate real provider state.
+
+Run the native interaction tests separately in a logged-in macOS session:
+
+```bash
+xcodebuild test \
+  -project apps/unpin-desktop/UnpinDesktop.xcodeproj \
+  -scheme UnpinDesktopUI \
+  -destination 'platform=macOS' \
+  -parallel-testing-enabled NO
+```
+
+This scheme launches a separate fixture application, not the normal workbench.
+It reuses the production views with synthetic inventory and temporary roots,
+without starting the bridge or update checker. XCUITest checks accessibility
+roles, selected values, control bounds, menu interaction, and filter replacement
+instead of SwiftUI's internal AppKit view classes. Control bounds and text-width
+checks do not replace visual clipping review in the desktop capture matrix.
+Allow Xcode's UI automation permission if macOS requests it. Keep failed
+`.xcresult` bundles private: automatic diagnostics may include desktop or
+system-menu information beyond the fixture window.
 
 ## Architecture
 

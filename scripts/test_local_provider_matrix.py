@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import hashlib
 import json
 import math
@@ -9,6 +10,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import termios
 import time
 import unittest
 from pathlib import Path
@@ -35,6 +37,239 @@ from run_local_provider_matrix import (
     live_plan_state_paths,
     validate_workflow_routing_evidence,
 )
+
+
+class TuiDriverTerminalTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.master_fd, self.slave_fd = matrix_cases.pty.openpty()
+        self.addCleanup(self.close_terminal)
+
+    def close_terminal(self) -> None:
+        for descriptor in (self.master_fd, self.slave_fd):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def drive(self, transcript_path=None) -> None:
+        matrix_cases.drive_tui_toggle(
+            Path("/fixture/unpin"),
+            Path("/fixture/providers"),
+            Path("/fixture/state"),
+            "fixture-item",
+            confirm=True,
+            transcript_path=transcript_path,
+        )
+
+    @staticmethod
+    def inventory_frame(item_id: str = "fixture-item") -> bytes:
+        return (
+            "\x1b[2J\x1b[1;1HInventory\x1b[2;1HItems: 94"
+            "\x1b[10;1HView: Inventory\x1b[16;59H│selected: 1/1"
+            f"\x1b[17;59H│id: {item_id}\x1b[19;59H│provider: pi"
+        ).encode()
+
+    def scripted_drive(self, *, ready=True, selected="fixture-item", exited=False, transcript_path=None):
+        process = mock.Mock()
+        process.poll.return_value = 1 if exited else None
+        writes = []
+        drains = []
+
+        def drain(master, timeout, transcript, *, screen=None):
+            drains.append(timeout)
+            if ready and len(drains) >= 2:
+                target = selected if b"fixture-item" in writes else "default-item"
+                chunk = self.inventory_frame(target)
+            else:
+                chunk = b"\x1b[2J\x1b[1;1HDiscovering\x1b[2;1HPress Q or Esc to cancel."
+            transcript.extend(chunk)
+            if screen is not None:
+                screen.feed(chunk)
+
+        def write(master, action):
+            self.assertGreaterEqual(len(drains), 2, "input sent before inventory readiness")
+            self.assertTrue(ready, "input sent while inventory unavailable")
+            if selected != "fixture-item":
+                self.assertNotIn(action, (b" ", b"a"), "change sent for wrong selection")
+            writes.append(action)
+            return len(action)
+
+        def wait(*args, **kwargs):
+            process.poll.return_value = 0
+            return 0
+
+        process.wait.side_effect = wait
+        with mock.patch.object(
+            matrix_cases.pty, "openpty", return_value=(self.master_fd, self.slave_fd)
+        ), mock.patch.object(
+            matrix_cases.subprocess, "Popen", return_value=process
+        ), mock.patch.object(
+            matrix_cases, "drain_pty", side_effect=drain
+        ), mock.patch.object(
+            matrix_cases.os, "write", side_effect=write
+        ), mock.patch.object(
+            matrix_cases.time, "monotonic", side_effect=range(0, 200, 2)
+        ):
+            try:
+                self.drive(transcript_path)
+            finally:
+                self.assertIsNotNone(process.poll())
+                with self.assertRaises(OSError):
+                    os.fstat(self.master_fd)
+        return writes
+
+    def test_delayed_inventory_blocks_input_until_ready(self) -> None:
+        writes = self.scripted_drive()
+        self.assertEqual(writes, [b"/", b"fixture-item", b"\r", b" ", b"\r", b"a", b"q"])
+
+    def test_loading_timeout_sends_no_input_and_closes_terminal(self) -> None:
+        with self.assertRaisesRegex(MatrixFailure, "timed out.*inventory"):
+            self.scripted_drive(ready=False)
+
+    def test_child_exit_before_inventory_sends_no_input(self) -> None:
+        with self.assertRaisesRegex(MatrixFailure, "exited.*inventory"):
+            self.scripted_drive(exited=True)
+
+    def test_readiness_failure_retains_fixture_terminal_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            trace_path = Path(temporary_directory) / "terminal.json"
+            with self.assertRaisesRegex(MatrixFailure, "timed out.*inventory"):
+                self.scripted_drive(ready=False, transcript_path=trace_path)
+            trace = json.loads(trace_path.read_text())
+            self.assertEqual(trace["itemId"], "fixture-item")
+            self.assertIn("Discovering", trace["terminalOutput"])
+
+    def test_wrong_selection_blocks_change_actions(self) -> None:
+        with self.assertRaisesRegex(MatrixFailure, "timed out.*selection"):
+            self.scripted_drive(selected="wrong-item")
+
+    def test_redraw_replaces_stale_inventory_readiness(self) -> None:
+        transcript = bytearray(self.inventory_frame())
+        transcript.extend(b"\x1b[2J\x1b[1;1HDiscovering")
+        self.assertFalse(matrix_cases.tui_inventory_ready(matrix_cases.tui_screen_lines(transcript)))
+
+    def test_differential_redraw_replaces_old_selected_id(self) -> None:
+        transcript = bytearray(b"\x1b[1;1HDiscovering")
+        transcript.extend(self.inventory_frame().replace(b"\x1b[2J", b""))
+        self.assertTrue(matrix_cases.tui_target_selected(
+            matrix_cases.tui_screen_lines(transcript), "fixture-item"
+        ))
+        transcript.extend(b"\x1b[17;60Hid: wrong-item\x1b[K")
+        self.assertFalse(matrix_cases.tui_target_selected(
+            matrix_cases.tui_screen_lines(transcript), "fixture-item"
+        ))
+        self.assertTrue(matrix_cases.tui_target_selected(
+            matrix_cases.tui_screen_lines(transcript), "wrong-item"
+        ))
+
+    def test_wrapped_complete_id_is_required_for_selection(self) -> None:
+        item_id = "pi:project:package-extensions:" + "x" * 46
+        frame = self.inventory_frame("placeholder")
+        frame += f"\x1b[17;59Hid: {item_id[:56]}\x1b[18;59H{item_id[56:]}".encode()
+        lines = matrix_cases.tui_screen_lines(bytearray(frame))
+        self.assertTrue(matrix_cases.tui_target_selected(lines, item_id))
+        self.assertFalse(matrix_cases.tui_target_selected(lines, item_id[:-1]))
+
+    def test_fragmented_cursor_command_is_replayed_after_completion(self) -> None:
+        transcript = bytearray(b"\x1b[2J\x1b[1;")
+        self.assertFalse(matrix_cases.tui_inventory_ready(matrix_cases.tui_screen_lines(transcript)))
+        transcript.extend(b"1HInventory\x1b[2;1HItems: 94\x1b[10;1HView: Inventory")
+        self.assertTrue(matrix_cases.tui_inventory_ready(matrix_cases.tui_screen_lines(transcript)))
+
+    def test_trimmed_transcript_preserves_screen_and_fragmented_cursor(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        transcript = bytearray()
+        output = self.inventory_frame() + b"\x1b[39;1Htick" * 24000 + b"\x1b[17;6"
+        chunks = [output[offset:offset + 65536] for offset in range(0, len(output), 65536)]
+        with mock.patch.object(matrix_cases.select, "select", return_value=([self.master_fd], [], [])), mock.patch.object(
+            matrix_cases.os, "read", side_effect=chunks + [b""]
+        ):
+            matrix_cases.drain_pty(self.master_fd, 1, transcript, screen=screen)
+        self.assertLessEqual(len(transcript), 131072)
+        self.assertTrue(matrix_cases.tui_target_selected(screen.lines(), "fixture-item"))
+        screen.feed(b"0Hid: wrong-item\x1b[K")
+        self.assertFalse(matrix_cases.tui_target_selected(screen.lines(), "fixture-item"))
+        self.assertTrue(matrix_cases.tui_target_selected(screen.lines(), "wrong-item"))
+
+    def test_screen_wait_uses_preserved_cells_not_trimmed_transcript(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        screen.feed(self.inventory_frame())
+        process = mock.Mock()
+        process.poll.return_value = None
+        with mock.patch.object(matrix_cases, "drain_pty") as drain:
+            matrix_cases.wait_for_tui_screen(
+                self.master_fd, process, bytearray(b"tick"),
+                lambda lines: matrix_cases.tui_target_selected(lines, "fixture-item"),
+                "target selection", screen=screen,
+            )
+        drain.assert_not_called()
+
+    def test_unsupported_escape_reports_error_instead_of_hiding_later_frames(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        screen.feed(b"\x1b")
+        with self.assertRaisesRegex(MatrixFailure, "unsupported terminal escape"):
+            screen.feed(b"]0;title\x07" + self.inventory_frame())
+
+    def test_unterminated_cursor_command_has_bounded_pending_state(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        with self.assertRaisesRegex(MatrixFailure, "exceeds.*probe limit"):
+            screen.feed(b"\x1b[" + b"1" * 262144)
+
+    def test_incremental_screen_retains_fragmented_utf8(self) -> None:
+        screen = matrix_cases.TuiScreen()
+        frame = self.inventory_frame("fixture-\u00e9")
+        split = frame.index("\u00e9".encode()) + 1
+        screen.feed(frame[:split])
+        screen.feed(frame[split:])
+        self.assertTrue(matrix_cases.tui_target_selected(screen.lines(), "fixture-\u00e9"))
+
+    def test_selection_requires_one_match_not_ten(self) -> None:
+        frame = self.inventory_frame().replace(b"selected: 1/1", b"selected: 1/10")
+        self.assertFalse(matrix_cases.tui_target_selected(
+            matrix_cases.tui_screen_lines(bytearray(frame)), "fixture-item"
+        ))
+
+    def test_terminal_has_reviewable_dimensions_before_launch(self) -> None:
+        process = mock.Mock()
+        process.poll.return_value = None
+
+        def wait(*args, **kwargs):
+            process.poll.return_value = 0
+            return 0
+
+        process.wait.side_effect = wait
+
+        def launch(*args, **kwargs):
+            dimensions = struct.unpack(
+                "HHHH", fcntl.ioctl(kwargs["stdin"], termios.TIOCGWINSZ, bytes(8))
+            )
+            self.assertEqual(dimensions[:2], (40, 120))
+            return process
+
+        with mock.patch.object(
+            matrix_cases.pty, "openpty", return_value=(self.master_fd, self.slave_fd)
+        ), mock.patch.object(
+            matrix_cases.subprocess, "Popen", side_effect=launch
+        ), mock.patch.object(matrix_cases, "drain_pty"), mock.patch.object(
+            matrix_cases, "wait_for_tui_screen"
+        ), mock.patch.object(
+            matrix_cases.os, "write"
+        ):
+            self.drive()
+
+    def test_failed_terminal_setup_closes_descriptors_without_launch(self) -> None:
+        with mock.patch.object(
+            matrix_cases.pty, "openpty", return_value=(self.master_fd, self.slave_fd)
+        ), mock.patch.object(
+            fcntl, "ioctl", side_effect=OSError("terminal setup failed")
+        ), mock.patch.object(matrix_cases.subprocess, "Popen") as launch:
+            with self.assertRaisesRegex(OSError, "terminal setup failed"):
+                self.drive()
+            launch.assert_not_called()
+
+        for descriptor in (self.master_fd, self.slave_fd):
+            with self.assertRaises(OSError):
+                os.fstat(descriptor)
 
 
 class ArtifactRootTests(unittest.TestCase):

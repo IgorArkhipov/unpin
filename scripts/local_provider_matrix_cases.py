@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import codecs
 import concurrent.futures
+import fcntl
 import hashlib
 import json
 import os
 import pty
+import re
 import select
 import selectors
 import subprocess
+import struct
+import termios
 import time
+import unicodedata
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from local_provider_matrix_support import (
     MATRIX,
@@ -1514,7 +1520,10 @@ def run_mcp_session(
     return result
 
 
-def drain_pty(master_fd: int, timeout_seconds: float, transcript: bytearray) -> None:
+def drain_pty(
+    master_fd: int, timeout_seconds: float, transcript: bytearray,
+    *, screen: TuiScreen | None = None,
+) -> None:
     deadline = time.monotonic() + timeout_seconds
     while True:
         remaining = deadline - time.monotonic()
@@ -1532,6 +1541,121 @@ def drain_pty(master_fd: int, timeout_seconds: float, transcript: bytearray) -> 
         transcript.extend(chunk)
         if len(transcript) > 262144:
             del transcript[:-131072]
+        if screen is not None:
+            screen.feed(chunk)
+
+
+TUI_CSI_PATTERN = re.compile(r"\x1b\[([0-?]*)([ -/]*)([@-~])")
+
+
+class TuiScreen:
+    """Incremental screen probe for our fixed 120x40 fixture TUI, not an emulator.
+
+    Keep cursor and unchanged cells independently of diagnostic transcript
+    trimming. Decode UTF-8 and CSI commands across PTY read boundaries.
+    """
+
+    def __init__(self) -> None:
+        self.cells = [[" " for _ in range(120)] for _ in range(40)]
+        self.row = self.column = 0
+        self.decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        self.pending = ""
+
+    def lines(self) -> list[str]:
+        return ["".join(line) for line in self.cells]
+
+    def feed(self, chunk: bytes | bytearray) -> None:
+        output = self.pending + self.decoder.decode(chunk)
+        index = 0
+        while index < len(output):
+            char = output[index]
+            if char == "\x1b":
+                match = TUI_CSI_PATTERN.match(output, index)
+                if not match:
+                    remainder = output[index:]
+                    if remainder != "\x1b" and not re.fullmatch(r"\x1b\[[0-?]*[ -/]*", remainder):
+                        raise MatrixFailure("unsupported terminal escape in fixture TUI screen probe")
+                    if len(remainder) > 262144:
+                        raise MatrixFailure("incomplete terminal escape exceeds fixture TUI probe limit")
+                    break  # Incomplete commands cannot establish new readiness.
+                values = [int(value) if value.isdigit() else 0 for value in match[1].split(";")]
+                distance = values[0] or 1
+                command = match[3]
+                if command in ("H", "f"):
+                    self.row = distance - 1
+                    self.column = (values[1] or 1) - 1 if len(values) > 1 else 0
+                elif command in ("A", "B"):
+                    self.row = max(0, min(39, self.row + (-distance if command == "A" else distance)))
+                elif command in ("C", "D"):
+                    self.column = max(0, min(119, self.column + (-distance if command == "D" else distance)))
+                elif command == "G":
+                    self.column = distance - 1
+                elif command == "J" and values[0] in (2, 3):
+                    self.cells = [[" " for _ in range(120)] for _ in range(40)]
+                elif command == "K" and 0 <= self.row < 40:
+                    start = 0 if values[0] in (1, 2) else self.column
+                    end = self.column + 1 if values[0] == 1 else 120
+                    self.cells[self.row][start:end] = [" "] * max(0, end - start)
+                index = match.end()
+                continue
+            if char == "\r":
+                self.column = 0
+            elif char == "\n":
+                self.row = min(39, self.row + 1)
+            elif char == "\b":
+                self.column = max(0, self.column - 1)
+            elif ord(char) >= 32 and char != "\x7f":
+                if 0 <= self.row < 40 and 0 <= self.column < 120:
+                    self.cells[self.row][self.column] = char
+                self.column += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+            index += 1
+        self.pending = output[index:]
+
+
+def tui_screen_lines(transcript: bytearray) -> list[str]:
+    """Replay a complete transcript for unit tests; live probes use TuiScreen."""
+    screen = TuiScreen()
+    screen.feed(transcript)
+    return screen.lines()
+
+
+def tui_inventory_ready(lines: list[str]) -> bool:
+    header = "\n".join(lines[:14])
+    return all(marker in header for marker in ("Inventory", "Items:", "View: Inventory"))
+
+
+def tui_target_selected(lines: list[str], item_id: str) -> bool:
+    # The right-hand Selected pane wraps long IDs. Compare the complete field,
+    # not a prefix or text retained elsewhere in the terminal transcript.
+    details = "".join("".join(line[58:119].strip(" │").split()) for line in lines[14:])
+    _, separator, fields = details.partition("id:")
+    selected_id, provider_separator, _ = fields.partition("provider:")
+    return (
+        tui_inventory_ready(lines)
+        and any(line[58:119].strip(" │") == "selected: 1/1" for line in lines[14:])
+        and bool(separator and provider_separator)
+        and selected_id == item_id
+    )
+
+
+def wait_for_tui_screen(
+    master_fd: int,
+    process: subprocess.Popen,
+    transcript: bytearray,
+    predicate: Callable[[list[str]], bool],
+    description: str,
+    *, screen: TuiScreen,
+) -> None:
+    deadline = time.monotonic() + 20
+    while True:
+        if process.poll() is not None:
+            raise MatrixFailure(f"interactive TUI exited before {description}")
+        if predicate(screen.lines()):
+            return
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise MatrixFailure(f"interactive TUI timed out waiting for {description}")
+        drain_pty(master_fd, min(0.1, remaining), transcript, screen=screen)
 
 
 def drive_tui_toggle(
@@ -1541,39 +1665,63 @@ def drive_tui_toggle(
     item_id: str,
     *,
     confirm: bool,
+    transcript_path: Path | None = None,
 ) -> None:
     master_fd, slave_fd = pty.openpty()
     environment = fixture_subprocess_environment()
     environment.setdefault("TERM", "xterm-256color")
-    process = subprocess.Popen(
-        [
-            str(binary),
-            "tui",
-            "--fixture-root",
-            str(fixture_root),
-            "--app-state-root",
-            str(app_state_root),
-        ],
-        cwd=REPO_ROOT,
-        stdin=slave_fd,
-        stdout=slave_fd,
-        stderr=slave_fd,
-        env=environment,
-        close_fds=True,
-        start_new_session=True,
-    )
+    try:
+        # A new PTY starts at 0x0, which correctly pauses TUI change actions.
+        fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+        process = subprocess.Popen(
+            [
+                str(binary),
+                "tui",
+                "--fixture-root",
+                str(fixture_root),
+                "--app-state-root",
+                str(app_state_root),
+            ],
+            cwd=REPO_ROOT,
+            stdin=slave_fd,
+            stdout=slave_fd,
+            stderr=slave_fd,
+            env=environment,
+            close_fds=True,
+            start_new_session=True,
+        )
+    except BaseException:
+        os.close(master_fd)
+        os.close(slave_fd)
+        raise
     os.close(slave_fd)
     transcript = bytearray()
+    screen = TuiScreen()
     try:
-        drain_pty(master_fd, 0.35, transcript)
-        actions = [b"/", item_id.encode("utf-8"), b"\r", b" "]
+        wait_for_tui_screen(
+            master_fd, process, transcript, tui_inventory_ready, "inventory", screen=screen
+        )
+        for action in (b"/", item_id.encode("utf-8"), b"\r"):
+            if process.poll() is not None:
+                raise MatrixFailure("interactive TUI exited during search")
+            os.write(master_fd, action)
+            drain_pty(master_fd, 0.15, transcript, screen=screen)
+        wait_for_tui_screen(
+            master_fd,
+            process,
+            transcript,
+            lambda lines: tui_target_selected(lines, item_id),
+            "target selection",
+            screen=screen,
+        )
+        actions = [b" "]
         actions.extend([b"\r", b"a"] if confirm else [b"a"])
         actions.append(b"q")
         for action in actions:
             if process.poll() is not None:
-                break
+                raise MatrixFailure("interactive TUI exited before change actions completed")
             os.write(master_fd, action)
-            drain_pty(master_fd, 0.15 if action != b"a" else 0.5, transcript)
+            drain_pty(master_fd, 0.15 if action != b"a" else 0.5, transcript, screen=screen)
         try:
             return_code = process.wait(timeout=20)
         except subprocess.TimeoutExpired as error:
@@ -1589,6 +1737,15 @@ def drive_tui_toggle(
             process.kill()
             process.wait(timeout=5)
         os.close(master_fd)
+        if transcript_path is not None:
+            write_json(
+                transcript_path,
+                {
+                    "itemId": item_id,
+                    "confirmed": confirm,
+                    "terminalOutput": transcript.decode("utf-8", errors="replace"),
+                },
+            )
 
 
 def backup_ids(app_state_root: Path) -> set[str]:
@@ -1647,6 +1804,7 @@ def run_tui_scenario(
         app_state_root,
         scenario["id"],
         confirm=False,
+        transcript_path=case_root / "00-terminal.json",
     )
     if (
         digest_path(fixture_root) != no_write_fixture_digest
@@ -1664,6 +1822,7 @@ def run_tui_scenario(
             app_state_root,
             scenario["id"],
             confirm=True,
+            transcript_path=case_root / "01-blocked-terminal.json",
         )
         after_blocked = read_inventory(binary, fixture_root, app_state_root, scenario)
         write_json(case_root / "01-inventory-after-blocked.json", after_blocked)
@@ -1702,6 +1861,7 @@ def run_tui_scenario(
         app_state_root,
         scenario["id"],
         confirm=True,
+        transcript_path=case_root / "01-terminal.json",
     )
     first_backup = new_backup_id(before_first_backups, app_state_root, scenario["slug"])
     after_first = read_inventory(binary, fixture_root, app_state_root, scenario)
@@ -1725,6 +1885,7 @@ def run_tui_scenario(
         app_state_root,
         scenario["id"],
         confirm=True,
+        transcript_path=case_root / "02-terminal.json",
     )
     second_backup = new_backup_id(before_second_backups, app_state_root, scenario["slug"])
     after_second = read_inventory(binary, fixture_root, app_state_root, scenario)

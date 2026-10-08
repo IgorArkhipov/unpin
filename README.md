@@ -1,8 +1,9 @@
 # Unpin
 
-Unpin is a Rust CLI with a terminal TUI and a macOS desktop workbench for local
-AI-agent configuration discovery, derived Agent Plugin packages, safe mutation,
-reusable inventory groups, snapshots, restore, and MCP-backed agent workflows.
+Unpin is a Rust CLI with a terminal UI and a macOS desktop workbench. It
+discovers local AI-agent configuration and supports derived Agent Plugin
+packages, safe mutation, reusable inventory groups, snapshots, restore, and
+MCP-backed agent workflows.
 
 ## Distribution status and quick start
 
@@ -36,7 +37,7 @@ After publication, download the archive for your platform from
 against `SHA256SUMS`, then verify its GitHub build provenance:
 
 ```bash
-gh attestation verify unpin-v1.5.2-TARGET.tar.gz \
+gh attestation verify unpin-v1.6.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
 ```
 
@@ -45,7 +46,7 @@ Extract the archive, install both included executables together on your user
 before installing the stable broker under the app-state root:
 
 ```bash
-cd unpin-v1.5.2-TARGET
+cd unpin-v1.6.0-TARGET
 install -d "$HOME/.local/bin"
 install -m 0755 unpin unpin-credential-broker "$HOME/.local/bin/"
 export PATH="$HOME/.local/bin:$PATH"
@@ -87,9 +88,9 @@ precedence, guided code tour, and fixture-backed first mutation.
 
 ## Desktop workbench (macOS, first phase)
 
-The native desktop workbench is the preferred first-phase human surface on
-macOS. It organizes high-volume configuration
-work around **Discover and Organize**, **Change Safely**, and **Recover and
+The native desktop workbench is the preferred first-phase interface for people
+using Unpin on macOS. It organizes high-volume configuration work around
+**Discover and Organize**, **Change Safely**, and **Recover and
 Audit** instead of mirroring every terminal view. It can inspect cross-provider
 inventory and derived Agent Plugin packages, maintain explicit groups, review
 and apply a locally approved aggregate change, and inspect backup and operation
@@ -107,7 +108,7 @@ passes that exact folder as the bridge's project root; it never infers a project
 from the app bundle or silently falls back to your home directory.
 
 CLI, MCP, and `unpin tui` remain supported. The terminal TUI is the
-compatibility surface for **Profiles**, **Gateways**, **Sessions**, and
+compatibility interface for **Profiles**, **Gateways**, **Sessions**, and
 **Hooks** until those workflows receive their own desktop workspaces. The
 desktop's local-human approval is not an MCP approval: agent-created MCP
 handoffs retain the CLI/TUI approval contract described in
@@ -119,9 +120,9 @@ archive against `SHA256SUMS` and its GitHub attestation before extracting it:
 
 ```bash
 gh attestation verify \
-  unpin-desktop-v1.5.2-TARGET.tar.gz \
+  unpin-desktop-v1.6.0-TARGET.tar.gz \
   --repo IgorArkhipov/unpin
-tar -xzf unpin-desktop-v1.5.2-TARGET.tar.gz
+tar -xzf unpin-desktop-v1.6.0-TARGET.tar.gz
 ```
 
 Quit any running copy, then move `UnpinDesktop.app` from the extracted folder
@@ -183,8 +184,8 @@ Workflow definition writes are reviewed plan/apply operations. Confirmed launch
 binds the proposal, workflow/profile/catalog revisions, process, workspace, and
 connection into one authenticated lease. Use `unpin session enter-mode` and
 `unpin session cancel-transition` with operation fields from status or the
-controlling gateway. Desktop is the primary workflow workbench; TUI is a compact
-inspection and CLI-handoff surface. See [MCP routing details](docs/MCP.md),
+controlling gateway. Desktop is the primary workflow workbench; TUI provides
+compact inspection and CLI handoffs. See [MCP routing details](docs/MCP.md),
 [desktop workflow guidance](docs/DESKTOP.md), and
 [matrix evidence](docs/local-provider-matrix.md).
 
@@ -314,9 +315,52 @@ operation remains handoff-only.
 
 ## Provider Coverage
 
-Unpin currently discovers Claude Code, Codex, Cursor, Pi, OpenCode, and Zed skills, configured MCPs, agents, hooks, provider settings, and selected plugin surfaces from fixture-backed or explicitly provided roots. Provider-owned Claude skills under `$HOME/.claude/skills` and repository-scoped `.claude/skills`, recursively nested Cursor skills under `$HOME/.cursor/skills` and repository-scoped `.cursor/skills`, Pi skills under `$HOME/.pi/agent/skills` and `.pi/skills`, OpenCode skills under `$HOME/.config/opencode/skills` and `.opencode/skills`, Cursor local plugin directories under `$HOME/.cursor/plugins/local`, and agent files are writable through guarded Unpin vault toggles with backup and restore evidence. Cursor global agents and hooks are read from `$HOME/.cursor/agents` and `$HOME/.cursor/hooks.json`. Pi direct Markdown skills use a file vault; skill directories use a directory vault. Cursor-compatible skills, Codex shared `.agents/skills`, Pi shared `.agents/skills`, OpenCode shared `.agents/skills` and `.claude/skills`, plus Zed `.agents/skills`, use the same guarded cross-provider flow. Disabling one shared source records its original path and keeps every loading provider visible as disabled; re-enable through any provider view or backup restore returns it to that path. OpenCode MCPs use native `mcp.<id>.enabled` state in global or project JSON/JSONC while preserving comments and trailing commas. OpenCode npm plugin toggles remove and restore only config references through guarded Unpin vault state with authenticated backup evidence; Bun cache files remain installed. Pi intentionally has no native MCP core; MCP connectors belong to Pi extensions/packages. Pi package extension toggles set native `packages[].extensions` filters to `[]`, retain package references and every non-extension resource, then restore the exact original package entry through guarded Unpin vault state with authenticated backup evidence. Pi 0.81.1 and OpenCode 1.18.4 global/project config compatibility was live-validated in disposable, explicitly rooted environments for this beta. OpenCode auto-loaded local plugin files are read-only because current host docs expose no local-file disable setting. Hooks, settings, instructions, permissions, and sandbox files remain non-writable inventory. IDE extensions unrelated to agent harnesses remain outside scope.
+Unpin currently discovers skills, configured MCPs, agents, hooks, provider
+settings, and selected plugin types across Claude Code, Codex, Cursor, Pi,
+OpenCode, and Zed from fixture-backed or explicitly provided roots.
 
-Unpin prefers provider-native enable state. Claude, Codex, and OpenCode plugin toggles edit supported settings references and leave installed bundles or caches untouched. Cursor local plugin directories are path-discovered and have no documented local disable reference; Unpin therefore relocates the intact bundle into authenticated Unpin vault state instead of deleting it, then restores it to its recorded origin on re-enable or backup restore.
+The following are writable through guarded Unpin vault toggles with backup
+and restore evidence:
+
+- Provider-owned Claude skills under `$HOME/.claude/skills` and
+  repository-scoped `.claude/skills`.
+- Recursively nested Cursor skills under `$HOME/.cursor/skills` and
+  repository-scoped `.cursor/skills`.
+- Pi skills under `$HOME/.pi/agent/skills` and `.pi/skills`.
+- OpenCode skills under `$HOME/.config/opencode/skills` and `.opencode/skills`.
+- Cursor local plugin directories under `$HOME/.cursor/plugins/local`.
+- Agent files.
+
+Cursor global agents and hooks are read from `$HOME/.cursor/agents` and
+`$HOME/.cursor/hooks.json`. Pi direct Markdown skills use a file vault; skill
+directories use a directory vault.
+
+Cursor-compatible skills, Codex shared `.agents/skills`, Pi shared
+`.agents/skills`, OpenCode shared `.agents/skills` and `.claude/skills`, plus
+Zed `.agents/skills`, use the same guarded cross-provider flow. Disabling one
+shared source records its original path and keeps every loading provider
+visible as disabled. Re-enabling through any provider view or backup restore
+returns it to that path.
+
+OpenCode MCPs use native `mcp.<id>.enabled` state in global or project JSON/JSONC
+while preserving comments and trailing commas. OpenCode npm plugin toggles
+remove and restore only config references through guarded Unpin vault state
+with authenticated backup evidence; Bun cache files remain installed.
+
+Pi intentionally has no native MCP core; MCP connectors belong to Pi
+extensions/packages. Pi package extension toggles set native
+`packages[].extensions` filters to `[]` while retaining package references and
+every non-extension resource. Re-enabling restores the exact original package
+entry through guarded Unpin vault state with authenticated backup evidence.
+
+Pi 0.81.1 and OpenCode 1.18.4 global/project config compatibility was
+live-validated in disposable, explicitly rooted environments for this beta.
+OpenCode auto-loaded local plugin files are read-only because current host docs
+expose no local-file disable setting. Hooks, settings, instructions, permissions,
+and sandbox files remain non-writable inventory. IDE extensions unrelated to
+agent harnesses remain outside scope.
+
+Unpin prefers provider-native enable state. Claude, Codex, and OpenCode plugin toggles edit supported settings references and leave installed bundles or caches untouched. Cursor local plugin directories are discovered by path and have no documented local disable reference. Unpin therefore relocates the intact bundle into authenticated Unpin vault state instead of deleting it. Re-enabling or restoring a backup returns it to its recorded origin.
 
 Current inventory reflects Claude `skillOverrides` and `disableAllHooks` settings, including bundled hooks in skill-directory plugins; those bundled plugin skills are read-only. OpenCode merges JSON and JSONC configuration layers, preserves `[source, options]` plugin entries through guarded toggles and restore, and inventories configured `skills.paths` as read-only. Pi inventories configured skill paths as read-only when they are outside its native writable roots. Project-owned Pi and OpenCode settings may inventory skill paths only within the selected project; user-level settings may inventory external paths read-only. Configured scans are bounded and warn when incomplete. Remote OpenCode `skills.urls` are not fetched.
 
@@ -333,7 +377,16 @@ Plugin scope support is explicit:
 
 Unpin does not invent repository plugin state for Codex or write Cursor marketplace caches/SQLite rows as if they were authoritative settings.
 
-Skill discovery follows current provider layouts. Claude scans `.claude/skills`; Codex scans shared `.agents/skills` and administrator-managed `/etc/codex/skills`; Cursor recursively scans native and compatibility roots. Pi recursively scans native `.pi` and shared `.agents` roots and also inventories direct Markdown skills in native roots. OpenCode scans native `.opencode` plus shared `.agents` and `.claude` roots from selected directory to repository root. Zed uses global and selected-project `.agents/skills`. Reserved `@compat/...` and `@file/...` namespaces prevent native, shared, and direct-file item-id collisions. Vaulted skills remain filtered to currently resolved roots, so disabled items from another home or repository do not leak into inventory. Unreadable nested directories produce path-safe warnings while readable scopes remain available. Provider-owned skill links preserve link identity; skills under symlinked provider roots remain read-only.
+Skill discovery follows current provider layouts:
+
+- Claude scans `.claude/skills`.
+- Codex scans shared `.agents/skills` and administrator-managed `/etc/codex/skills`.
+- Cursor recursively scans native and compatibility roots.
+- Pi recursively scans native `.pi` and shared `.agents` roots and also inventories direct Markdown skills in native roots.
+- OpenCode scans native `.opencode` plus shared `.agents` and `.claude` roots from selected directory to repository root.
+- Zed uses global and selected-project `.agents/skills`.
+
+Reserved `@compat/...` and `@file/...` namespaces prevent native, shared, and direct-file item-id collisions. Vaulted skills remain filtered to currently resolved roots, so disabled items from another home or repository do not leak into inventory. Unreadable nested directories produce path-safe warnings while readable scopes remain available. Provider-owned skill links preserve link identity; skills under symlinked provider roots remain read-only.
 
 Zed `context_servers` and OpenCode `mcp.<id>.enabled` mutation are JSONC-aware: comments, trailing commas, and surrounding formatting survive toggles and backup restore.
 Codex skill toggles require `[[skills.config]]` entries. When
@@ -346,11 +399,13 @@ OpenCode is the supported harness in this provider family. OpenRouter is a model
 
 ## Agent Plugins packages
 
-Unpin recognizes the [Agent Plugins 1.0.0](https://agent-plugins.org/specification) package layout already installed by a supported host. A root `plugin.json` provides safe package metadata, immediate `skills/*/SKILL.md` entries and root `mcp.json` describe component coverage, and the host's native activation setting remains the only writable authority. Unpin does not install, update, import, delete, or persist desired state for packages, and it never creates missing Skill or MCP inventory rows.
+Unpin recognizes the [Agent Plugins 1.0.0](https://agent-plugins.org/specification) package layout already installed by a supported host. A root `plugin.json` provides safe package metadata. Immediate `skills/*/SKILL.md` entries and root `mcp.json` describe component coverage. The host's native activation setting remains the only writable authority. Unpin does not install, update, import, delete, or persist desired state for packages, and it never creates missing Skill or MCP inventory rows.
 
 Schema-less Codex compatibility manifests are outside this portable package projection; Unpin does not label them invalid Agent Plugins. Known Codex cache metadata and a `latest` alias to a cached version do not make package inventory incomplete, but unexpected or escaping cache symlinks still do.
 
-Packages are a derived workbench projection. Each scan groups matching existing inventory under one logical package, reports `on`, `off`, `mixed`, or `unknown` state, and distinguishes actionable, diagnostics-only, and unsupported instances. A toggle expands to the exact existing native activation identities, requires explicit selected-provider or all-provider reach, and reuses Unpin's review, fingerprint, drift, backup, audit, recovery, and restore boundaries. Visibility filters never grant mutation reach.
+Unpin derives packages from existing inventory. Each scan groups matching existing inventory under one logical package, reports `on`, `off`, `mixed`, or `unknown` state, and distinguishes actionable, diagnostics-only, and unsupported instances.
+
+A toggle expands to the exact existing native activation identities and requires explicit selected-provider or all-provider reach. It uses the same review, fingerprint, drift, backup, audit, recovery, and restore boundaries as other Unpin changes. Visibility filters never grant mutation reach.
 
 Current package-root support is explicit:
 
@@ -363,7 +418,9 @@ Current package-root support is explicit:
 | OpenCode | Unsupported; no fixture-backed installed standard package root | Unsupported |
 | Zed | Unsupported; Zed uses standard Agent Skills | Unsupported |
 
-Use `unpin agent-plugins list --json` to obtain a safe logical package ID. Its `inventoryComplete` marker is `false` whenever an installed package cache could not be fully read; inspect diagnostics and correct access before planning. `show` exposes coverage and blockers, while `plan` previews exact dispositions. `handoff` seals a durable CLI operation, and `apply` requires the same operation ID, fingerprint, explicit reach, and human confirmation. The TUI and desktop workbench expose the same Packages projection. MCP offers list, inspect, and plan/handoff tools only; it cannot apply a package toggle.
+Use `unpin agent-plugins list --json` to obtain a safe logical package ID. Its `inventoryComplete` marker is `false` whenever an installed package cache could not be fully read. Inspect diagnostics and correct access before planning. `show` exposes coverage and blockers, while `plan` previews exact dispositions. `handoff` seals a durable CLI operation, and `apply` requires the same operation ID, fingerprint, explicit reach, and human confirmation.
+
+The TUI and desktop workbench display the same derived Packages inventory. MCP offers list, inspect, and plan/handoff tools only; it cannot apply a package toggle.
 
 ## Inventory groups
 
@@ -405,9 +462,9 @@ support reviewed definition restore. If the same name exists in both scopes,
 use `personal:name` or `repository:name`; an unqualified ambiguous name is
 rejected.
 
-Repository-definition CAS rejects revisions changed before publication and
-all Unpin writers share the same lock. Concurrent uncooperative edits to the
-repository group document during the final platform rename are outside the
+Repository-definition compare-and-swap (CAS) rejects revisions changed before
+publication. All Unpin writers share the same lock. Concurrent uncooperative
+edits to the repository group document during the final platform rename are outside the
 supported race boundary; do not edit that document with Git or an editor
 while an Unpin definition write is being confirmed.
 
@@ -429,7 +486,9 @@ provider item identities.
 
 ## Profiles and optional gateway
 
-Native provider behavior remains default. Profiles are immutable allowlists resolved by replacement: session, workspace/worktree, repository, global, then native default. Provider-specific policy wins before generic policy at each scope. Global provider capability locks are applied after that selection: `hard-enabled` restores a capability omitted by a narrower profile, while `hard-disabled` removes it. Active sessions pin profile, lock, and exposure revisions, so another process, worktree, branch change, or later policy edit cannot mutate their capability set.
+Native provider behavior remains default. Profiles are immutable allowlists resolved by replacement: session, workspace/worktree, repository, global, then native default. Provider-specific policy wins before generic policy at each scope.
+
+Global provider capability locks are applied after that selection: `hard-enabled` restores a capability omitted by a narrower profile, while `hard-disabled` removes it. Active sessions pin profile, lock, and exposure revisions, so another process, worktree, branch change, or later policy edit cannot mutate their capability set.
 
 Inspect locks with `unpin profile locks --provider codex --json`. Change one with a plan-first `unpin profile lock --provider codex --capability <id> --state hard-enabled|hard-disabled|clear --json`, then re-run with the emitted fingerprint plus `--apply --confirm`. Lock status includes repository/worktree identity, the effective gateway source, conservative enforcement quality, and `next-session-only` activation; native mode is never reported as strict when the provider cannot prove it.
 
@@ -468,7 +527,16 @@ restore the reported backup instead of retrying the mutation blindly.
 
 `profile propose --prompt ...` ranks profile metadata locally and returns a confirmation-required session proposal. It emits only the prompt digest, never prompt text, and does not mutate policy or start a session.
 
-Fixture-backed `session launch` creates one private lease, Unix-socket gateway, and overlay per child harness. Lease protection binds every applicable global, repository, and workspace gateway-mode and policy target, current mutable native-item transitions, authenticated restorable backups, and adopted-view resources, including global views shared by another worktree. Gateway, restore, and native-toggle apply acquire the same transition conflict guard before mutation. All live launches require backup and session authentication so adopted and restorable resources cannot be silently omitted from the lease. Live profile-scoped launch currently fails closed until each provider adapter can prove strict native masking and gateway attachment. Native launches remain available after those authentication prerequisites. Repository identity groups shared blast radius; physical worktree identity isolates workspace policy; opaque session identity isolates exposure. Separate worktrees remain required when agents also need source-file edit isolation.
+Fixture-backed `session launch` creates one private lease, Unix-socket gateway, and overlay per child harness. Lease protection binds:
+
+- Every applicable global, repository, and workspace gateway-mode and policy target.
+- Current mutable native-item transitions.
+- Authenticated restorable backups.
+- Adopted-view resources, including global views shared by another worktree.
+
+Gateway, restore, and native-toggle apply acquire the same transition conflict guard before mutation. All live launches require backup and session authentication so adopted and restorable resources cannot be silently omitted from the lease. Live profile-scoped launch currently fails closed until each provider adapter can prove strict native masking and gateway attachment. Native launches remain available after those authentication prerequisites.
+
+Repository identity groups shared blast radius. Physical worktree identity isolates workspace policy. Opaque session identity isolates exposure. Separate worktrees remain required when agents also need source-file edit isolation.
 
 ### Diagnose protected sessions
 
@@ -513,7 +581,7 @@ The owner process remains responsible for cleanup after fencing. If a command
 returns `recovery-required`, preserve the reported state and evidence and stop
 before retrying or editing Unpin-owned runtime files.
 
-Hook inventory records individual handlers and honest provider coverage. Trust receipts bind handler invocation fingerprint, compiled profile digest, provider, workspace, and session. Gateway-routed MCP hook policy is fixture-contract verified. Native dispatcher/managed-bridge host activation still requires live-provider wiring and verification; Zed built-in hooks remain unsupported.
+Hook inventory records individual handlers and provider coverage. Trust receipts bind handler invocation fingerprint, compiled profile digest, provider, workspace, and session. Gateway-routed MCP hook policy is fixture-contract verified. Native dispatcher/managed-bridge host activation still requires live-provider wiring and verification; Zed built-in hooks remain unsupported.
 
 ## Examples
 
@@ -610,7 +678,7 @@ cargo run -p unpin-cli -- auth session init
 cargo run -p unpin-cli -- auth session status
 ```
 
-Session state uses HMAC-SHA256 over complete bootstrap and lease records. Launch controls bind signed payload to unique control path, preventing cross-session or cross-workspace replay. Key remains in OS keychain; session documents contain only non-secret key fingerprint and authentication tag.
+Session state uses HMAC-SHA256 over complete bootstrap and lease records. Launch controls bind each signed payload to a unique control path, preventing cross-session or cross-workspace replay. The key remains in the OS keychain; session documents contain only the non-secret key fingerprint and authentication tag.
 
 Optional Cursor dashboard cookie storage reads secret bytes only from stdin, binds them to Cursor marketplace mutation purpose, and never prints them:
 
@@ -703,7 +771,7 @@ cargo run -p unpin-cli -- toggle \
 
 The TUI lists the same discovered inventory as `list`, with provider/layer/category filters, `/` search, selected-item details, dry-run plan preview, discovery warnings, and recent backups. Writable items can be staged with space, confirmed with enter, and applied with `a`. After a successful staged apply, Unpin rediscovers live provider state, reloads backups, and writes a fresh latest/history snapshot.
 
-TUI keeps last apply outcome visible. Blocked entries remain staged with confirmation reset; refresh failures skip stale snapshots, and snapshot write failures are reported after mutation succeeds.
+The TUI keeps the last apply outcome visible. Blocked entries remain staged with confirmation reset. Refresh failures skip stale snapshots, and snapshot write failures are reported after mutation succeeds.
 
 Run the MCP stdio loop with one shell-provided request:
 

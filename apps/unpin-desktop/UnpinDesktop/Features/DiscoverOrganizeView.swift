@@ -629,8 +629,9 @@ struct DiscoverOrganizeView: View {
                             Text("Off").tag("off")
                         }
                         .accessibilityLabel(WorkbenchFilterAccessibility.state)
+                        .accessibilityIdentifier("inventory-filter-state")
                         .labelsHidden()
-                        .frame(minWidth: 170, maxWidth: .infinity)
+                        .frame(minWidth: 170, maxWidth: .infinity, alignment: .leading)
                     }
                     .frame(minWidth: 170, maxWidth: .infinity, alignment: .leading)
                 }
@@ -1008,8 +1009,9 @@ struct DiscoverOrganizeView: View {
                 ForEach(values, id: \.self) { Text($0).tag($0) }
             }
             .accessibilityLabel(WorkbenchFilterAccessibility.label(for: title))
+            .accessibilityIdentifier("inventory-filter-\(title.lowercased())")
             .labelsHidden()
-            .frame(minWidth: 170, maxWidth: .infinity)
+            .frame(minWidth: 170, maxWidth: .infinity, alignment: .leading)
         }
         .frame(minWidth: 170, maxWidth: .infinity, alignment: .leading)
     }

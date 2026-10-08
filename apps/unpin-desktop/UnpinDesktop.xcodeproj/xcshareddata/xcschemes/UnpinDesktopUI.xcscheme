@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Scheme LastUpgradeVersion="2700" version="1.7">
+   <BuildAction parallelizeBuildables="YES" buildImplicitDependencies="YES">
+      <BuildActionEntries>
+         <BuildActionEntry buildForTesting="YES" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="C40000000000000000000001" BuildableName="UnpinDesktopUITestHost.app" BlueprintName="UnpinDesktopUITestHost" ReferencedContainer="container:UnpinDesktop.xcodeproj"/>
+         </BuildActionEntry>
+         <BuildActionEntry buildForTesting="YES" buildForRunning="NO" buildForProfiling="NO" buildForArchiving="NO" buildForAnalyzing="YES">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="D40000000000000000000001" BuildableName="UnpinDesktopUITests.xctest" BlueprintName="UnpinDesktopUITests" ReferencedContainer="container:UnpinDesktop.xcodeproj"/>
+         </BuildActionEntry>
+      </BuildActionEntries>
+   </BuildAction>
+   <TestAction buildConfiguration="Debug" selectedDebuggerIdentifier="Xcode.DebuggerFoundation.Debugger.LLDB" selectedLauncherIdentifier="Xcode.DebuggerFoundation.Launcher.LLDB" shouldUseLaunchSchemeArgsEnv="NO">
+      <Testables>
+         <TestableReference skipped="NO" parallelizable="NO">
+            <BuildableReference BuildableIdentifier="primary" BlueprintIdentifier="D40000000000000000000001" BuildableName="UnpinDesktopUITests.xctest" BlueprintName="UnpinDesktopUITests" ReferencedContainer="container:UnpinDesktop.xcodeproj"/>
+         </TestableReference>
+      </Testables>
+   </TestAction>
+</Scheme>
